@@ -30,7 +30,10 @@ import type { HumanInputManager } from './human-input.js';
 import { handleDialogAction, uploadFileAction, evaluateScriptAction, runScriptAction } from './actions/advanced.js';
 
 // Captcha
-import { detectCaptchaAction, screenshotCaptchaAction } from './actions/captcha.js';
+import { detectCaptchaAction, screenshotCaptchaAction, solveCaptchaVisualAction } from './actions/captcha.js';
+
+// Proxy / Geo-block
+import { detectGeoBlockAction } from './actions/proxy.js';
 
 // Extraction (BrowserOS)
 import {
@@ -88,6 +91,10 @@ export function buildDefaultActionRegistry(humanInput?: HumanInputManager): Acti
   // Captcha
   registry.register(detectCaptchaAction);
   registry.register(screenshotCaptchaAction);
+  registry.register(solveCaptchaVisualAction);
+
+  // Proxy / Geo-block
+  registry.register(detectGeoBlockAction);
 
   // Human-in-the-loop
   if (humanInput) {

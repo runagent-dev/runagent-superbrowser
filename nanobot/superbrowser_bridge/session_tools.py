@@ -38,6 +38,10 @@ SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowse
 
 # Auto-incrementing step counter for screenshot filenames
 _step_counter = 0
+_last_screenshot_time = 0.0
+_screenshot_count = 0
+_click_at_count = 0
+MAX_INDIVIDUAL_CLICKS = 3  # After 3 click_at calls, force scripts
 
 
 def _save_screenshot(screenshot_b64: str, label: str = "") -> str:
@@ -67,13 +71,21 @@ def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
     ]
 
 
+_action_count = 0
+
 def _build_text_only(data: dict, prefix: str = "") -> str:
     """Build minimal text response — just confirmation, no element list, no screenshot to LLM.
     Does NOT save screenshot to disk either (too noisy). Only browser_open/navigate/screenshot save."""
+    global _action_count
+    _action_count += 1
     parts = [prefix]
     if data.get("url"):
         parts.append(f"Page: {data['url']}")
-    return " | ".join(p for p in parts if p)
+    result = " | ".join(p for p in parts if p)
+    # After 3 individual actions, nudge toward scripts
+    if _action_count >= 3:
+        result += " | HINT: You've done multiple individual actions. Use browser_run_script to batch the remaining steps into ONE script instead of clicking one at a time."
+    return result
 
 
 def _format_state(data: dict) -> str:
@@ -98,6 +110,12 @@ def _format_state(data: dict) -> str:
 @tool_parameters(
     tool_parameters_schema(
         url=StringSchema("URL to open (optional)", nullable=True),
+        region=StringSchema(
+            "Region code for geo-restricted sites (e.g., 'bd' for Bangladesh, 'in' for India). "
+            "Routes through a regional proxy if configured. Use when a site is geo-blocked.",
+            nullable=True,
+        ),
+        proxy=StringSchema("Direct proxy URL (e.g., 'socks5://proxy:1080'). Overrides region.", nullable=True),
         required=[],
     )
 )
@@ -113,14 +131,23 @@ class BrowserOpenTool(Tool):
     description = (
         "Open a new browser session. Returns a screenshot of the page and "
         "a list of interactive elements you can interact with. "
-        "Use the returned session_id for all subsequent browser actions."
+        "Use the returned session_id for all subsequent browser actions. "
+        "For geo-restricted sites, pass region='bd' (Bangladesh), 'in' (India), etc. "
+        "to route through a regional proxy."
     )
 
-    async def execute(self, url: str | None = None, **kw: Any) -> Any:
-        print(f"\n>> browser_open(url={url})")
+    async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, **kw: Any) -> Any:
+        global _action_count, _click_at_count
+        _action_count = 0
+        _click_at_count = 0
+        print(f"\n>> browser_open(url={url}, region={region})")
         payload: dict[str, Any] = {}
         if url:
             payload["url"] = url
+        if region:
+            payload["region"] = region
+        if proxy:
+            payload["proxy"] = proxy
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/create", json=payload)
@@ -179,13 +206,12 @@ class BrowserNavigateTool(Tool):
     )
 )
 class BrowserScreenshotTool(Tool):
-    """Take a screenshot of the current page. Use this to SEE what's on screen."""
+    """Take a screenshot of the current page to see what's on screen."""
 
     name = "browser_screenshot"
     description = (
         "Take a screenshot of the current browser page. "
-        "Use this whenever you need to see the current state, "
-        "verify an action worked, or understand the page layout."
+        "Use to see current state, verify script results, or understand page layout."
     )
 
     @property
@@ -254,15 +280,29 @@ class BrowserClickTool(Tool):
     )
 )
 class BrowserClickAtTool(Tool):
-    """Click at specific page coordinates. Use when element index doesn't work."""
+    """Click at x,y coordinates. AVOID — prefer browser_run_script with page.click('selector') instead."""
 
     name = "browser_click_at"
     description = (
-        "Click at specific x,y coordinates on the page. "
-        "Use this when clicking by element index fails or for custom UI elements."
+        "Click at specific x,y coordinates. LAST RESORT ONLY. "
+        "Prefer browser_run_script with page.click('selector') or "
+        "browser_click with element index. Coordinate clicking is unreliable."
     )
 
     async def execute(self, session_id: str, x: float, y: float, **kw: Any) -> Any:
+        global _click_at_count
+        _click_at_count += 1
+        if _click_at_count > MAX_INDIVIDUAL_CLICKS:
+            return (
+                f"[BLOCKED] browser_click_at used {_click_at_count} times (max {MAX_INDIVIDUAL_CLICKS}). "
+                "Switch to browser_run_script for remaining interactions. Example:\n"
+                "browser_run_script(session_id, `\n"
+                "  await page.click('#fromCity');\n"
+                "  await page.type('#fromCity input', 'Dhaka');\n"
+                "  await helpers.sleep(1000);\n"
+                "  await page.click('.suggestion-item');\n"
+                "`)"
+            )
         print(f"\n>> browser_click_at({x}, {y})")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -687,29 +727,53 @@ class BrowserCaptchaScreenshotTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
+        method=StringSchema(
+            "Solving method: 'auto' (try all), 'token' (inject token), "
+            "'ai_vision' (LLM analyzes image grid), 'grid' (2captcha grid API). "
+            "Default: 'auto'",
+            nullable=True,
+        ),
         provider=StringSchema("Captcha solver: '2captcha' or 'anticaptcha'", nullable=True),
         api_key=StringSchema("API key for the solver service", nullable=True),
         required=["session_id"],
     )
 )
 class BrowserSolveCaptchaTool(Tool):
-    """Attempt to solve a captcha using an external service or wait for manual solution."""
+    """Solve a captcha using multiple strategies.
+
+    Methods (tried in order when method='auto'):
+    1. Token injection — send siteKey to 2captcha, get token, inject it (works 95%)
+    2. AI vision — screenshot the image grid, ask LLM which tiles match, click them
+    3. 2captcha grid — send grid screenshot to 2captcha, get tile indices, click them
+    4. Manual wait — wait for human to solve
+
+    For image grid captchas ("select all traffic lights"), use method='auto' or 'ai_vision'.
+    """
 
     name = "browser_solve_captcha"
     description = (
-        "Attempt to solve a detected captcha. If a solver provider and API key are given, "
-        "uses that service. Otherwise waits for the captcha to be solved manually. "
-        "Returns whether the captcha was solved."
+        "Solve a detected captcha automatically. Supports token injection, "
+        "AI vision (analyzes image grid tiles like 'select traffic lights'), "
+        "and 2captcha grid API. Use method='auto' to try all strategies."
     )
 
-    async def execute(self, session_id: str, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
+    async def execute(
+        self,
+        session_id: str,
+        method: str | None = None,
+        provider: str | None = None,
+        api_key: str | None = None,
+        **kw: Any,
+    ) -> str:
         payload: dict[str, Any] = {}
+        if method:
+            payload["method"] = method
         if provider:
             payload["provider"] = provider
         if api_key:
             payload["apiKey"] = api_key
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=180.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve",
                 json=payload,
@@ -718,8 +782,11 @@ class BrowserSolveCaptchaTool(Tool):
             data = r.json()
 
         if data.get("solved"):
-            return f"Captcha solved successfully (type: {data.get('captcha', {}).get('type', 'unknown')})"
-        return f"Captcha not solved. {data.get('error', 'You may need to ask the user to solve it manually.')}"
+            solve_method = data.get("method", "unknown")
+            attempts = data.get("attempts", 1)
+            captcha_type = data.get("captcha", {}).get("type", "unknown")
+            return f"Captcha solved via {solve_method} method ({attempts} attempt(s), type: {captcha_type})"
+        return f"Captcha not solved: {data.get('error', 'all methods failed')}. Use browser_ask_user for manual solving."
 
 
 @tool_parameters(

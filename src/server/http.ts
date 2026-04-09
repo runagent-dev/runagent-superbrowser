@@ -16,9 +16,10 @@ import { goto, type NavigationOptions } from '../browser/goto.js';
 import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '../browser/scraper.js';
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
-import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea } from '../browser/captcha.js';
+import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull } from '../browser/captcha.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
+import { ProxyPool } from '../browser/proxy-pool.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -37,6 +38,12 @@ export function createHttpServer(
 ): express.Application {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
+
+  const proxyPool = new ProxyPool(engine, {
+    headless: process.env.HEADLESS !== 'false',
+    downloadDir: process.env.DOWNLOAD_DIR || '/tmp/superbrowser/downloads',
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+  });
 
   const limiter = new Limiter(limiterConfig);
   const rateLimiter = new RateLimiter(
@@ -408,7 +415,7 @@ export function createHttpServer(
     return session.page;
   }
 
-  /** Create a new persistent session. */
+  /** Create a new persistent session. Accepts optional proxy/region for geo-restricted sites. */
   app.post('/session/create', async (req, res) => {
     if (sessions.size >= MAX_SESSIONS) {
       res.status(429).json({ error: `Max sessions (${MAX_SESSIONS}) reached` });
@@ -416,7 +423,12 @@ export function createHttpServer(
     }
 
     try {
-      const page = await engine.newPage();
+      // Support proxy/region selection for geo-restricted sites
+      const page = await proxyPool.newPage({
+        proxy: req.body.proxy,
+        region: req.body.region,
+        url: req.body.url,
+      });
       await page.setupDialogHandler();
       await page.enableConsoleCapture();
 
@@ -775,7 +787,7 @@ export function createHttpServer(
     }
   });
 
-  /** Solve captcha via external API (2captcha, anticaptcha). */
+  /** Solve captcha with multiple strategies (token, AI vision, 2captcha grid). */
   app.post('/session/:id/captcha/solve', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
@@ -793,14 +805,17 @@ export function createHttpServer(
         timeout: req.body.timeout || 60000,
       };
 
-      if (config.provider && config.apiKey) {
-        const solved = await solveWithExternalApi(page.getRawPage(), captcha, config);
-        res.json({ solved, captcha });
-      } else {
-        // No solver configured — wait for manual solution
-        const solved = await waitForCaptchaSolution(page.getRawPage(), captcha, config.timeout);
-        res.json({ solved, captcha });
-      }
+      const method = req.body.method || 'auto';
+
+      const result = await solveCaptchaFull(
+        page.getRawPage(),
+        captcha,
+        config,
+        llm, // LLM provider for AI vision (may be null)
+        method,
+      );
+
+      res.json({ ...result, captcha });
     } catch (err) {
       handleError(res, err);
     }
@@ -840,6 +855,41 @@ export function createHttpServer(
     }
     const accepted = executor.provideHumanInput(req.body);
     res.json({ accepted });
+  });
+
+  /** Detect geo-block on current page and suggest a proxy region. */
+  app.get('/session/:id/geo-block', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const rawPage = page.getRawPage();
+      const bodyText = await rawPage.evaluate(() => document.body?.innerText || '');
+      const url = rawPage.url();
+
+      const isBlocked = await proxyPool.detectGeoBlock(bodyText);
+      const suggestedRegion = isBlocked ? proxyPool.suggestRegion(url, bodyText) : null;
+      const hasProxy = suggestedRegion ? proxyPool.hasProxy(suggestedRegion) : false;
+
+      res.json({
+        blocked: isBlocked,
+        suggestedRegion,
+        hasProxy,
+        url,
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** List configured proxies. */
+  app.get('/proxies', (_req, res) => {
+    const proxies = proxyPool.listProxies().map((p) => ({
+      region: p.region,
+      domains: p.domains,
+      // Don't expose the actual proxy URL for security
+    }));
+    res.json({ proxies, count: proxies.length });
   });
 
   /** List active sessions. */

@@ -30,6 +30,8 @@ describe('ActionRegistry', () => {
     expect(names).toContain('upload_file');
     expect(names).toContain('evaluate_script');
     expect(names).toContain('run_script');
+    expect(names).toContain('solve_captcha_visual');
+    expect(names).toContain('detect_geo_block');
     expect(names).toContain('extract_markdown');
     expect(names).toContain('export_pdf');
     expect(names).toContain('dom_search');

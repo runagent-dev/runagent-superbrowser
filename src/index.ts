@@ -103,10 +103,15 @@ async function main(): Promise<void> {
       console.log(`  POST   /session/:id/dialog     - Handle alert/confirm/prompt`);
       console.log(`  GET    /session/:id/markdown    - Extract page as markdown`);
       console.log(`  GET    /session/:id/pdf         - Export page as PDF`);
+      console.log(`  GET    /session/:id/geo-block   - Detect geo-restriction`);
       console.log(`  DELETE /session/:id             - Close session`);
       console.log(`  GET    /sessions               - List active sessions`);
+      console.log(`  GET    /proxies                - List configured proxy regions`);
       console.log(`\n  GET  /health  - Health check`);
       console.log(`  GET  /metrics - Session metrics`);
+      if (process.env.PROXY_POOL) {
+        console.log(`\n  Proxy pool: ${process.env.PROXY_POOL.split(',').map(e => e.split(':')[0]).join(', ')}`);
+      }
     });
   }
 

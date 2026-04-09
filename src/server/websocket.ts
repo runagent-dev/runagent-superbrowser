@@ -38,6 +38,7 @@ import type { PageWrapper } from '../browser/page.js';
 import type { HumanInputManager, HumanInputRequest } from '../agent/human-input.js';
 import { validateUrl } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
+import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -270,6 +271,29 @@ async function handleCommand(
         data.timeout as number | undefined,
       );
       sendEvent(ws, 'script_result', scriptResult);
+      break;
+    }
+
+    case 'solve_captcha': {
+      const rawPage = page.getRawPage();
+      const captcha = await detectCaptcha(rawPage);
+      if (!captcha) {
+        sendEvent(ws, 'error', { message: 'No captcha detected' });
+        return;
+      }
+      const solveConfig = {
+        provider: (data.provider as string) || process.env.CAPTCHA_PROVIDER,
+        apiKey: (data.apiKey as string) || process.env.CAPTCHA_API_KEY,
+        timeout: (data.timeout as number) || 60000,
+      };
+      const solveResult = await solveCaptchaFull(
+        rawPage,
+        captcha,
+        solveConfig,
+        null, // LLM provider not available via WebSocket currently
+        (data.method as string) || 'auto',
+      );
+      sendEvent(ws, 'captcha_solved', { ...solveResult, captcha });
       break;
     }
 

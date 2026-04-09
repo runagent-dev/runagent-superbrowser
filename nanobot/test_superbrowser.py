@@ -25,7 +25,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "go to https://www.astrosage.com/free/free-life-report.asp and fill up the information and then download the life report for me. You can use any name and information and then save the pdf file at last"
+        "can you go to gozayaan and search for Dhaka to Chattogram flight ticket on 11th April 2026 if found any? find from gozayaan only. and list me the price of air astra flight only"
     )
 
     print(f"Task: {task}")
