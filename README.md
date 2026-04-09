@@ -1,13 +1,41 @@
 # SuperBrowser
 
-An agentic headless browser that sees, thinks, and acts. Built for AI agents that need to browse the web autonomously — fill forms, navigate complex UIs, extract data, and complete multi-step tasks.
+An agentic headless browser that sees, thinks, and acts. Part of the [RunAgent](https://runagent.cloud) super agent ecosystem.
 
-SuperBrowser combines a headless Chromium engine with a dual-agent AI loop (Navigator + Planner) and exposes everything through clean APIs. Your AI agent opens a browser, sees screenshots at every step, decides what to do, and acts — just like a human would.
+SuperBrowser runs as a serverless micro VM on RunAgent Cloud. Any super agent — OpenClaw, PicoClaw, ZeroClaw, or your own — can spin up an isolated browser instance on demand, browse the web autonomously, and shut it down when done. No infrastructure to manage.
+
+It combines a headless Chromium engine with a dual-agent AI loop (Navigator + Planner) and exposes everything through clean APIs. The agent opens a browser, sees screenshots at every step, decides what to do, and acts.
+
+## RunAgent Ecosystem
+
+```
+┌─────────────────────────────────────────────────┐
+│                 RunAgent Cloud                  │
+│                                                 │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│  │ OpenClaw  │  │ PicoClaw  │  │ ZeroClaw  │   │
+│  │  Agent    │  │  Agent    │  │  Agent    │   │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘   │
+│        │              │              │          │
+│        └──────────┬───┴──────────────┘          │
+│                   │                             │
+│           ┌───────▼────────┐                    │
+│           │  SuperBrowser  │  ← serverless      │
+│           │   micro VM     │    micro VM         │
+│           │                │    per request      │
+│           │  Chromium +    │                    │
+│           │  Navigator +   │                    │
+│           │  Planner       │                    │
+│           └────────────────┘                    │
+└─────────────────────────────────────────────────┘
+```
+
+Any claw agent sends a task (or controls step-by-step via session APIs). SuperBrowser spins up, does the job, returns results, shuts down. Each instance is fully isolated.
 
 ## How it works
 
 ```
-Your Agent (nanobot, LangChain, custom)
+Any Agent (OpenClaw, PicoClaw, ZeroClaw, nanobot, custom)
     │
     ├── browser_open("https://irctc.co.in")     → sees screenshot + interactive elements
     ├── browser_type([3], "Delhi")               → sees autocomplete appear
@@ -19,7 +47,7 @@ Your Agent (nanobot, LangChain, custom)
     └── browser_close()                          → cleanup
 ```
 
-Every action returns a screenshot. Your agent sees the page, decides, acts, verifies. When stuck, it takes a screenshot, analyzes, tries a different approach.
+Every action returns a screenshot. The agent sees the page, decides, acts, verifies. When stuck, it takes a screenshot, analyzes, tries a different approach.
 
 ## Features
 
@@ -47,63 +75,82 @@ Every action returns a screenshot. Your agent sees the page, decides, acts, veri
 - MCP server for tool discovery
 
 **Integrations**
+- RunAgent super agents: OpenClaw, PicoClaw, ZeroClaw
 - [nanobot](https://github.com/HKUDS/nanobot) — 21 registered tools (8 high-level + 13 session-based)
 - Any OpenAI-compatible LLM (Claude, GPT-4, Gemini, local models)
-- Works with any agent framework via HTTP API
+- Any agent framework via HTTP API
 
 ## Quick Start
 
+### Self-hosted
+
 ```bash
-# Clone and install
 git clone https://github.com/user/runagent-superbrowser.git
 cd runagent-superbrowser
 npm install
 
-# Set your API key
 echo "OPENAI_API_KEY=sk-..." > .env
-# or
-echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
-
-# Build and start
 npm run build
 npm start
 ```
 
-The server starts on port 3100. Test it:
+### RunAgent Cloud
 
 ```bash
-# Take a screenshot
-curl -X POST http://localhost:3100/screenshot \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}' \
-  --output screenshot.jpg
+# Deploy as a serverless micro VM
+runagent deploy superbrowser
 
-# Open a session and interact step by step
-curl -X POST http://localhost:3100/session/create \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.google.com"}'
+# Your claw agents can now use it automatically
+```
 
-# Run an agentic task (Navigator + Planner handle it)
+### Docker
+
+```bash
+docker compose up -d
+```
+
+## Usage
+
+### From any claw agent
+
+SuperBrowser is a plain HTTP server. Any agent connects via session APIs:
+
+```python
+import httpx
+
+# Open a browser session
+r = httpx.post("http://superbrowser:3100/session/create",
+    json={"url": "https://example.com"})
+session_id = r.json()["sessionId"]
+screenshot = r.json()["screenshot"]   # base64 JPEG — agent sees the page
+elements = r.json()["elements"]       # [0]<input placeholder="Search"> [1]<button>Go
+
+# Type into a field
+r = httpx.post(f"http://superbrowser:3100/session/{session_id}/type",
+    json={"index": 0, "text": "hello world"})
+new_screenshot = r.json()["screenshot"]  # agent sees the result
+
+# Click a button
+r = httpx.post(f"http://superbrowser:3100/session/{session_id}/click",
+    json={"index": 1})
+
+# Run JavaScript if needed
+r = httpx.post(f"http://superbrowser:3100/session/{session_id}/evaluate",
+    json={"script": "document.querySelectorAll('.result').length"})
+
+# Close when done
+httpx.delete(f"http://superbrowser:3100/session/{session_id}")
+```
+
+### Fire-and-forget (let Navigator+Planner handle it)
+
+```bash
 curl -X POST http://localhost:3100/task \
   -H "Content-Type: application/json" \
   -d '{"task": "Search Google for latest AI news and extract the top 3 results"}'
 ```
 
-## Usage with nanobot
-
-```bash
-# Install nanobot
-pip install nanobot-ai
-
-# Start SuperBrowser server (terminal 1)
-npm start
-
-# Run via nanobot (terminal 2)
-cd nanobot
-python run.py "Go to github.com and find trending Python repos today"
-```
-
-Or programmatically:
+### With nanobot
 
 ```python
 from nanobot import Nanobot
@@ -116,46 +163,10 @@ result = await bot.run("Fill the contact form on example.com with name John Doe"
 print(result.content)
 ```
 
-## Usage with any agent
-
-SuperBrowser is a plain HTTP server. Use it from any language or framework:
-
-```python
-import httpx
-
-# Open session
-r = httpx.post("http://localhost:3100/session/create", json={"url": "https://example.com"})
-session = r.json()
-session_id = session["sessionId"]
-screenshot = session["screenshot"]  # base64 JPEG
-elements = session["elements"]     # [0]<input placeholder="Search"> [1]<button>Go</button>
-
-# Type into the first input
-r = httpx.post(f"http://localhost:3100/session/{session_id}/type",
-    json={"index": 0, "text": "hello world"})
-new_screenshot = r.json()["screenshot"]
-
-# Click the button
-r = httpx.post(f"http://localhost:3100/session/{session_id}/click",
-    json={"index": 1})
-
-# Close
-httpx.delete(f"http://localhost:3100/session/{session_id}")
-```
-
-## CLI Mode
-
-Run a single task directly:
+### CLI
 
 ```bash
-npm run build
 node build/index.js task "Go to google.com and search for weather in Tokyo"
-```
-
-## Docker
-
-```bash
-docker compose up -d
 ```
 
 ## Project Structure
@@ -165,7 +176,7 @@ src/
 ├── browser/          # Headless engine, CDP, stealth, DOM, input dispatch
 ├── agent/            # Navigator, Planner, 30 actions, prompts, executor
 ├── llm/              # OpenAI-compatible LLM provider
-├── server/           # HTTP API + MCP server
+├── server/           # HTTP API (session + high-level) + MCP server
 └── utils/            # Logger, tokens, images
 
 nanobot/              # Python integration
@@ -179,7 +190,9 @@ nanobot/              # Python integration
 
 ## API Reference
 
-### Session APIs (step-by-step control)
+### Session APIs
+
+Step-by-step browser control. Each action returns a screenshot so the agent can see and decide.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -222,18 +235,15 @@ nanobot/              # Python integration
 | `CONCURRENT` | `10` | Max concurrent sessions |
 | `QUEUED` | `10` | Max queued requests |
 | `TIMEOUT` | `60000` | Request timeout (ms) |
-| `CORS` | `false` | Enable CORS |
 | `PUPPETEER_EXECUTABLE_PATH` | — | Custom Chromium path |
 
 ## Architecture
 
-SuperBrowser draws from three production codebases:
+SuperBrowser draws from three production codebases, with all browser code written from scratch:
 
 - **[browserless](https://github.com/browserless/browserless)** — Stealth plugin, CDP session management, request interception, hooks, concurrency limiter, goto utility with full page setup
 - **[BrowserOS](https://github.com/anthropics/browseros)** — CDP input dispatch, 3-tier element coordinate resolution, accessibility tree, cursor detection, console collector, download monitoring, dialog handling
 - **[nanobrowser](https://github.com/nicepkg/nanobrowser)** — Dual-agent Navigator+Planner loop, DOM element indexing, screenshot vision feedback, extraction protocol, multi-action DOM stability checks, action schemas
-
-All browser code is written from scratch. No imports from the above — only patterns.
 
 ## License
 
