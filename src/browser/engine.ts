@@ -57,6 +57,23 @@ const CHROME_FLAGS = [
   '--no-default-browser-check',
 ];
 
+/** Auto-detect Chrome/Chromium binary path. */
+function findChromePath(): string | undefined {
+  const fs = require('fs');
+  const candidates = [
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/local/bin/chromium',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined;
+}
+
 export class BrowserEngine extends EventEmitter {
   private browser: Browser | null = null;
   private config: BrowserConfig;
@@ -87,8 +104,10 @@ export class BrowserEngine extends EventEmitter {
       ignoreHTTPSErrors: true,
     };
 
-    if (this.config.executablePath) {
-      launchOptions.executablePath = this.config.executablePath;
+    // Set executable path — explicit config, env var, or auto-detect
+    const execPath = this.config.executablePath || findChromePath();
+    if (execPath) {
+      launchOptions.executablePath = execPath;
     }
 
     this.browser = await puppeteer.launch(launchOptions) as Browser;

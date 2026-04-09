@@ -23,7 +23,8 @@ import {
 import { openTabAction, switchTabAction, closeTabAction } from './actions/tabs.js';
 
 // Control
-import { doneAction, waitAction, cacheContentAction } from './actions/control.js';
+import { doneAction, waitAction, cacheContentAction, createAskHumanAction } from './actions/control.js';
+import type { HumanInputManager } from './human-input.js';
 
 // Advanced (BrowserOS)
 import { handleDialogAction, uploadFileAction, evaluateScriptAction } from './actions/advanced.js';
@@ -44,7 +45,7 @@ import {
 /**
  * Create and populate an ActionRegistry with all default actions.
  */
-export function buildDefaultActionRegistry(): ActionRegistry {
+export function buildDefaultActionRegistry(humanInput?: HumanInputManager): ActionRegistry {
   const registry = new ActionRegistry();
 
   // Core actions (from nanobrowser patterns)
@@ -86,6 +87,11 @@ export function buildDefaultActionRegistry(): ActionRegistry {
   // Captcha
   registry.register(detectCaptchaAction);
   registry.register(screenshotCaptchaAction);
+
+  // Human-in-the-loop
+  if (humanInput) {
+    registry.register(createAskHumanAction(humanInput));
+  }
 
   return registry;
 }

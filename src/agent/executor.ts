@@ -14,12 +14,14 @@ import { MessageManager } from './messages.js';
 import { ActionRegistry } from './actions/registry.js';
 import { buildDefaultActionRegistry } from './action-builder.js';
 import { EventManager, ExecutionState, Actor, type EventCallback } from './events.js';
+import { HumanInputManager, type HumanInputRequest, type HumanInputResponse } from './human-input.js';
 
 export class BrowserExecutor {
   private navigator: NavigatorAgent;
   private planner: PlannerAgent;
   private actionRegistry: ActionRegistry;
   private eventManager: EventManager;
+  private humanInput: HumanInputManager;
   private consecutiveFailures = 0;
   private nSteps = 0;
   private historySummary: string[] = [];
@@ -31,7 +33,8 @@ export class BrowserExecutor {
     private llm: LLMProvider,
     private options: AgentOptions = DEFAULT_OPTIONS,
   ) {
-    this.actionRegistry = buildDefaultActionRegistry();
+    this.humanInput = new HumanInputManager();
+    this.actionRegistry = buildDefaultActionRegistry(this.humanInput);
     this.eventManager = new EventManager();
     const messageManager = new MessageManager();
     this.navigator = new NavigatorAgent(llm, this.actionRegistry, messageManager, options);
@@ -225,5 +228,20 @@ export class BrowserExecutor {
   /** Get the number of steps executed. */
   getStepCount(): number {
     return this.nSteps;
+  }
+
+  /** Get the pending human input request (if any). */
+  getPendingHumanInput(): HumanInputRequest | null {
+    return this.humanInput.getPendingRequest();
+  }
+
+  /** Provide a response to the pending human input request. */
+  provideHumanInput(response: HumanInputResponse): boolean {
+    return this.humanInput.provideInput(response);
+  }
+
+  /** Check if the executor is waiting for human input. */
+  get isWaitingForHuman(): boolean {
+    return this.humanInput.hasPending;
   }
 }

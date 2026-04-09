@@ -28,11 +28,36 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+import os
+import base64
+from datetime import datetime
+
 SUPERBROWSER_URL = "http://localhost:3100"
+SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
+
+# Auto-incrementing step counter for screenshot filenames
+_step_counter = 0
+
+
+def _save_screenshot(screenshot_b64: str, label: str = "") -> str:
+    """Save screenshot to disk so the user can see what's happening."""
+    global _step_counter
+    _step_counter += 1
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    filename = f"{_step_counter:03d}-{label}.jpg" if label else f"{_step_counter:03d}.jpg"
+    filepath = os.path.join(SCREENSHOT_DIR, filename)
+    with open(filepath, "wb") as f:
+        f.write(base64.b64decode(screenshot_b64))
+    print(f"  [screenshot saved: {filepath}]")
+    return filepath
 
 
 def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
-    """Build content blocks with image for the agent to see."""
+    """Build content blocks with image for the agent to see. Also saves to disk."""
+    # Save to disk so user can check
+    label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
+    _save_screenshot(screenshot_b64, label)
+
     return [
         {"type": "text", "text": caption},
         {
@@ -78,6 +103,7 @@ class BrowserOpenTool(Tool):
     )
 
     async def execute(self, url: str | None = None, **kw: Any) -> Any:
+        print(f"\n>> browser_open(url={url})")
         payload: dict[str, Any] = {}
         if url:
             payload["url"] = url
@@ -112,6 +138,7 @@ class BrowserNavigateTool(Tool):
     )
 
     async def execute(self, session_id: str, url: str, **kw: Any) -> Any:
+        print(f"\n>> browser_navigate({url})")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/navigate",
@@ -179,6 +206,7 @@ class BrowserClickTool(Tool):
     )
 
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
+        print(f"\n>> browser_click([{index}])")
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
@@ -249,6 +277,7 @@ class BrowserTypeTool(Tool):
     )
 
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
+        print(f'\n>> browser_type([{index}], "{text}")')
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/type",
@@ -281,6 +310,7 @@ class BrowserKeysTool(Tool):
     )
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
+        print(f"\n>> browser_keys({keys})")
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/keys",
@@ -313,6 +343,7 @@ class BrowserScrollTool(Tool):
     )
 
     async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
+        print(f"\n>> browser_scroll({direction or f'{percent}%'})")
         payload: dict[str, Any] = {}
         if percent is not None:
             payload["percent"] = percent
@@ -382,6 +413,7 @@ class BrowserEvalTool(Tool):
     )
 
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
+        print(f"\n>> browser_eval({script[:60]}...)")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
@@ -466,6 +498,7 @@ class BrowserCloseTool(Tool):
     description = "Close the browser session and free resources. Always close when done."
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        print(f"\n>> browser_close({session_id})")
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.delete(f"{SUPERBROWSER_URL}/session/{session_id}")
             r.raise_for_status()
@@ -573,6 +606,56 @@ class BrowserSolveCaptchaTool(Tool):
         return f"Captcha not solved. {data.get('error', 'You may need to ask the user to solve it manually.')}"
 
 
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        question=StringSchema("What to ask the user"),
+        input_type=StringSchema(
+            "Type of input needed: credentials, captcha, confirmation, otp, card, text, choice",
+            nullable=True,
+        ),
+        required=["session_id", "question"],
+    )
+)
+class BrowserAskUserTool(Tool):
+    """Ask the user for input. Use when you need credentials, OTP, confirmation, etc.
+
+    The question and a screenshot of the current page are sent to the user.
+    This tool blocks until the user responds via their messaging channel.
+    """
+
+    name = "browser_ask_user"
+    description = (
+        "Ask the user a question and wait for their response. "
+        "Use when you need: login credentials, OTP/2FA code, captcha help, "
+        "payment confirmation, or any information you don't have. "
+        "Sends the user a screenshot of the current page for context."
+    )
+
+    async def execute(self, session_id: str, question: str, input_type: str | None = None, **kw: Any) -> Any:
+        # Get current screenshot for context
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true"},
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        screenshot = data.get("screenshot")
+
+        # Build response with screenshot so the user sees the page
+        parts = [f"[Browser needs your input]\n\n{question}"]
+        if data.get("url"):
+            parts.append(f"\nCurrent page: {data['url']}")
+
+        caption = "\n".join(parts)
+
+        if screenshot:
+            return _build_image_blocks(screenshot, caption)
+        return caption
+
+
 def register_session_tools(bot: "Nanobot") -> None:
     """Register all low-level session tools with a nanobot instance.
 
@@ -605,6 +688,7 @@ def register_session_tools(bot: "Nanobot") -> None:
         BrowserDetectCaptchaTool(),
         BrowserCaptchaScreenshotTool(),
         BrowserSolveCaptchaTool(),
+        BrowserAskUserTool(),
         BrowserCloseTool(),
     ]
     for tool in tools:

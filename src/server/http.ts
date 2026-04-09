@@ -779,11 +779,40 @@ export function createHttpServer(
     }
   });
 
+  // --- Human-in-the-loop for /task endpoint ---
+
+  const taskExecutors = new Map<string, import('../agent/executor.js').BrowserExecutor>();
+
+  /** Check if a running task needs human input. */
+  app.get('/task/:taskId/human-input', (req, res) => {
+    const executor = taskExecutors.get(req.params.taskId);
+    if (!executor) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+    const pending = executor.getPendingHumanInput();
+    res.json({ pending });
+  });
+
+  /** Provide human input to a running task. */
+  app.post('/task/:taskId/human-input', (req, res) => {
+    const executor = taskExecutors.get(req.params.taskId);
+    if (!executor) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+    const accepted = executor.provideHumanInput(req.body);
+    res.json({ accepted });
+  });
+
   /** List active sessions. */
   app.get('/sessions', (_req, res) => {
     const list = Array.from(sessions.keys());
     res.json({ sessions: list, count: list.length });
   });
+
+  // Expose sessions for WebSocket server binding
+  (app as any)._getSessions = () => sessions;
 
   return app;
 }

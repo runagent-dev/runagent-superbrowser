@@ -7,8 +7,10 @@
 import 'dotenv/config';
 import { BrowserEngine } from './browser/engine.js';
 import { LLMProvider } from './llm/provider.js';
+import { createServer } from 'http';
 import { createHttpServer } from './server/http.js';
 import { createMCPServer } from './server/mcp.js';
+import { attachWebSocketServer } from './server/websocket.js';
 import { BrowserExecutor } from './agent/executor.js';
 
 async function main(): Promise<void> {
@@ -69,7 +71,15 @@ async function main(): Promise<void> {
       maxQueued: parseInt(process.env.QUEUED || '10', 10),
       defaultTimeout: parseInt(process.env.TIMEOUT || '60000', 10),
     });
-    app.listen(port, () => {
+
+    // Create HTTP server and attach WebSocket
+    const httpServer = createServer(app);
+    const sessionsGetter = (app as any)._getSessions;
+    if (sessionsGetter) {
+      attachWebSocketServer(httpServer, sessionsGetter);
+    }
+
+    httpServer.listen(port, () => {
       console.log(`SuperBrowser HTTP server running on port ${port}`);
       console.log(`\n  === High-level APIs ===`);
       console.log(`  POST /task       - Execute an agentic browser task (Navigator+Planner)`);

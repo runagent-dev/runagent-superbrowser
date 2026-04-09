@@ -18,6 +18,8 @@ export enum ExecutionState {
   ACT_START = 'ACT_START',
   ACT_OK = 'ACT_OK',
   ACT_FAIL = 'ACT_FAIL',
+  HUMAN_INPUT_NEEDED = 'HUMAN_INPUT_NEEDED',
+  HUMAN_INPUT_RECEIVED = 'HUMAN_INPUT_RECEIVED',
 }
 
 export enum Actor {

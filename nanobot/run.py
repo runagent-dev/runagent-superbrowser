@@ -32,13 +32,9 @@ async def main():
         sys.exit(1)
 
     task = " ".join(sys.argv[1:])
-    config_path = Path(__file__).parent / "config" / "config.json"
 
-    # Create nanobot instance
-    bot = Nanobot.from_config(
-        config_path=str(config_path),
-        workspace=str(Path(__file__).parent / "workspace"),
-    )
+    # Uses ~/.nanobot/config.json (set up via `nanobot onboard`)
+    bot = Nanobot.from_config(workspace=str(Path(__file__).parent / "workspace"))
 
     # Register SuperBrowser tools (uses library, not MCP)
     register_all_tools(bot)

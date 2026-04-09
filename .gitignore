@@ -7,3 +7,13 @@ dist/
 !src/**/*.d.ts
 downloads/
 /tmp/
+
+# Python virtualenvs and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test output
+coverage/

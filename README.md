@@ -154,7 +154,8 @@ Or programmatically:
 from nanobot import Nanobot
 from superbrowser_bridge.tools import register_all_tools
 
-bot = Nanobot.from_config(config_path="nanobot/config/config.json")
+# Uses ~/.nanobot/config.json (set up via `nanobot onboard`)
+bot = Nanobot.from_config(workspace="nanobot/workspace")
 register_all_tools(bot)
 
 result = await bot.run("Fill the contact form on example.com with name John Doe")
@@ -192,9 +193,8 @@ nanobot/              # Python integration (optional)
 ├── superbrowser_bridge/
 │   ├── tools.py           # 8 high-level nanobot tools
 │   └── session_tools.py   # 16 step-by-step nanobot tools (with captcha)
-├── config/config.json
-├── workspace/SOUL.md
-└── run.py
+├── workspace/SOUL.md      # Agent personality + instructions
+└── run.py                 # CLI entry point
 ```
 
 ## API Reference
