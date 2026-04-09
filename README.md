@@ -4,34 +4,48 @@
 
 A headless browser built for AI agents. It sees, decides, and acts on web pages autonomously.
 
-SuperBrowser gives any AI agent full browser control through simple HTTP APIs. Open a session, get a screenshot, click a button, fill a form, read the results — every action returns a screenshot so your agent always knows what's on screen.
+SuperBrowser gives any AI agent full browser control through simple HTTP APIs. Open a session, get a screenshot, click a button, fill a form, run a Puppeteer script, read the results — every action returns a screenshot so your agent always knows what's on screen.
 
 Self-host it on your own machine, run it in Docker, or deploy it however you want. It's a standalone server with no external dependencies beyond Chromium.
 
 ## How it works
 
+SuperBrowser supports three levels of browser control — pick what fits your task:
+
 ```
 Your AI Agent (any framework, any language)
+    │
+    │  ── Step-by-step control ──────────────────────────────────
     │
     ├── POST /session/create  { url: "https://example.com" }
     │   └── returns: screenshot + interactive elements list
     │
-    ├── POST /session/:id/type  { index: 3, text: "Delhi" }
-    │   └── returns: updated screenshot (autocomplete appeared)
+    ├── POST /session/:id/click  { index: 3 }
+    │   └── returns: updated screenshot
     │
-    ├── POST /session/:id/keys  { keys: "ArrowDown" }
-    │   └── returns: updated screenshot (suggestion highlighted)
+    │  ── Puppeteer script execution ────────────────────────────
     │
-    ├── POST /session/:id/click  { index: 8 }
-    │   └── returns: updated screenshot (search results)
+    ├── POST /session/:id/script  { code: "
+    │       await page.type('#search', 'AI news');
+    │       await page.click('#submit');
+    │       await page.waitForNavigation();
+    │       return await page.title();
+    │   " }
+    │   └── returns: { success: true, result: "Search Results - AI news" }
     │
-    ├── GET  /session/:id/state
-    │   └── returns: DOM tree + screenshot + console errors
+    │  ── Autonomous agent ──────────────────────────────────────
+    │
+    ├── POST /task  { task: "Find trending Python repos on GitHub" }
+    │   └── returns: { success: true, finalAnswer: "1. ..." }
     │
     └── DELETE /session/:id
 ```
 
-Every action returns a screenshot. Your agent sees the page, decides what to do next, acts, and verifies the result. When stuck, it takes a screenshot, analyzes, tries a different approach.
+**Step-by-step**: Your agent calls click/type/scroll one at a time, sees a screenshot after each action, and decides the next move.
+
+**Puppeteer scripts**: Your agent writes a multi-step Puppeteer script that runs server-side with full `page` API access — `page.goto()`, `page.click()`, `page.type()`, `page.waitForSelector()`, `page.screenshot()`, `page.keyboard`, `page.mouse`, and everything else Puppeteer offers. This is the same approach that powers tools like browserless's `/function` endpoint.
+
+**Autonomous agent**: Fire-and-forget. A built-in Navigator+Planner dual-agent loop handles the entire task, with screenshot vision feedback at every step.
 
 ## Quick Start
 
@@ -66,7 +80,7 @@ docker compose up -d
 
 ## Features
 
-**Browser Engine**
+### Browser Engine
 - Headless Chromium with stealth plugin (puppeteer-extra)
 - CDP mouse and keyboard dispatch with 3-tier element coordinate resolution
 - Anti-detection: webdriver masking, plugin spoofing, WebGL override, permission patching
@@ -75,26 +89,39 @@ docker compose up -d
 - Dialog handling, file upload, PDF export, download monitoring via CDP events
 - Captcha detection (reCAPTCHA, hCaptcha, Cloudflare Turnstile) with external solver support
 
-**DOM Intelligence**
+### Puppeteer Script Execution
+- Write full Puppeteer scripts and execute them with the real `page` object
+- Full API access: `page.goto()`, `page.click()`, `page.type()`, `page.waitForSelector()`, `page.screenshot()`, `page.keyboard`, `page.mouse`, `page.evaluate()`, and everything else
+- Helper utilities: `helpers.sleep(ms)`, `helpers.log(...)`, `helpers.screenshot(path?)`
+- Timeout protection (default 60s, max 300s)
+- Available via HTTP (`/function`, `/session/:id/script`), WebSocket (`script` command), agent action (`run_script`), and nanobot tool (`browser_run_script`)
+
+### DOM Intelligence
 - Interactive element indexing: `[0]<input placeholder="Search"> [1]<button>Go`
 - Accessibility tree fallback for complex/ARIA-heavy pages
 - Cursor-interactive element detection (finds clickable divs that ARIA misses)
 - DOM search via CSS selectors and XPath
+- DOM element tracking via hash-based identity (branch path, attributes, xpath) — persists elements across page mutations
 - Clean markdown content extraction
 
-**Security**
+### Security
 - Token-based authentication (optional, via `TOKEN` env var)
 - SSRF protection: blocks localhost, private IPs, cloud metadata, file:// protocol
+- URL firewall: configurable allow/deny lists, hard-coded dangerous protocol blocking (`chrome://`, `javascript:`, `data:`, `file://`)
+- Content guardrails: prompt injection detection, task override blocking, sensitive data redaction (SSN, credit card patterns)
 - Per-IP rate limiting
 - Session auto-expiry (30 min idle, 2 hour max lifetime)
 - Session cap (default 20 concurrent)
 - Request payload limits
 
-**Built-in Agent (optional)**
+### Built-in Agent (optional)
 - Dual-agent loop: Navigator executes actions, Planner validates progress
-- 32 browser actions with Zod schema validation
+- 33 browser actions with Zod schema validation (including `run_script` for Puppeteer automation)
 - Screenshot vision feedback at every step
 - Context overflow handling with automatic message compaction
+- Step history recording for debugging and task replay
+- Typed error hierarchy: AuthError, UrlBlockedError, ScriptTimeoutError, MaxStepsError, etc.
+- Human-in-the-loop: ask for credentials, OTP, confirmation before irreversible actions
 - Requires LLM API key only if you use the `/task` endpoint
 
 ## Usage
@@ -122,7 +149,7 @@ r = httpx.post(f"http://localhost:3100/session/{session_id}/type",
 r = httpx.post(f"http://localhost:3100/session/{session_id}/click",
     json={"index": 1})
 
-# Run JavaScript
+# Run DOM-level JavaScript
 r = httpx.post(f"http://localhost:3100/session/{session_id}/evaluate",
     json={"script": "document.querySelectorAll('.result').length"})
 
@@ -136,9 +163,59 @@ r = httpx.get(f"http://localhost:3100/session/{session_id}/captcha/detect")
 httpx.delete(f"http://localhost:3100/session/{session_id}")
 ```
 
+### Puppeteer script execution
+
+Write full Puppeteer scripts and run them within a session. The script receives the `page` object with the complete Puppeteer API:
+
+```python
+import httpx
+
+# Create session
+r = httpx.post("http://localhost:3100/session/create",
+    json={"url": "https://www.astrosage.com/free/free-life-report.asp"},
+    headers={"Authorization": "Bearer YOUR_TOKEN"})
+session_id = r.json()["sessionId"]
+
+# Run a Puppeteer script — full page API access
+r = httpx.post(f"http://localhost:3100/session/{session_id}/script",
+    headers={"Authorization": "Bearer YOUR_TOKEN"},
+    json={"code": """
+        await page.type('#Name', 'John Doe', { delay: 30 });
+        await page.select('#sex', 'male');
+        await page.type('#Day', '15');
+        await page.type('#Month', '06');
+        await page.type('#Year', '1990');
+        await page.type('#place', 'Delhi', { delay: 200 });
+        await helpers.sleep(3000);
+        await page.keyboard.press('ArrowDown');
+        await helpers.sleep(300);
+        await page.keyboard.press('Enter');
+        await helpers.sleep(1500);
+        await page.click('input[name="submit"]');
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
+        return await page.title();
+    """})
+
+result = r.json()
+# { "success": true, "result": "Free Kundli - Janam Kundli", "logs": [], "duration": 12340 }
+
+httpx.delete(f"http://localhost:3100/session/{session_id}")
+```
+
+The script can also be run as a one-shot (no session) via `POST /function`:
+
+```python
+r = httpx.post("http://localhost:3100/function",
+    headers={"Authorization": "Bearer YOUR_TOKEN"},
+    json={
+        "url": "https://example.com",
+        "code": "return await page.title();"
+    })
+```
+
 ### With nanobot
 
-SuperBrowser ships with [nanobot](https://github.com/HKUDS/nanobot) integration — 24 registered tools that give the nanobot agent full browser control with screenshots at every step.
+SuperBrowser ships with [nanobot](https://github.com/HKUDS/nanobot) integration — 25 registered tools that give the nanobot agent full browser control with screenshots at every step.
 
 ```bash
 # Terminal 1: start SuperBrowser
@@ -164,6 +241,11 @@ result = await bot.run("Fill the contact form on example.com with name John Doe"
 print(result.content)
 ```
 
+The nanobot agent has three levels of control:
+- **`browser_run_script`** — Write a Puppeteer script for complex multi-step automation (navigate + fill + submit + wait + extract in one call)
+- **`browser_eval`** — Quick DOM-level JavaScript for reading values or setting form fields
+- **`browser_click` / `browser_type`** — Step-by-step control when you need to observe the page between each action
+
 ### Built-in agent (optional)
 
 If you set an LLM API key, SuperBrowser can handle tasks autonomously:
@@ -181,20 +263,43 @@ curl -X POST http://localhost:3100/task \
 node build/index.js task "Go to google.com and search for weather in Tokyo"
 ```
 
+### WebSocket real-time control
+
+For real-time bidirectional control (e.g., from a gateway or UI):
+
+```javascript
+const ws = new WebSocket('ws://localhost:3100/ws/session/SESSION_ID');
+
+// Send commands
+ws.send(JSON.stringify({ action: 'navigate', data: { url: 'https://example.com' } }));
+ws.send(JSON.stringify({ action: 'click', data: { index: 3 } }));
+ws.send(JSON.stringify({ action: 'script', data: {
+  code: 'await page.type("#q", "hello"); return await page.title();'
+} }));
+
+// Receive state updates with screenshots
+ws.onmessage = (e) => {
+  const { event, data } = JSON.parse(e.data);
+  // event: 'state' | 'script_result' | 'eval_result' | 'error' | ...
+};
+```
+
 ## Project Structure
 
 ```
 src/
-├── browser/          # 22 modules — engine, CDP, stealth, DOM, input, captcha, humanize
-├── agent/            # Navigator, Planner, 32 actions, prompts, executor, events
+├── browser/          # Engine, CDP, stealth, DOM, input, captcha, humanize,
+│                     # script-runner, guardrails, firewall, dom-history
+├── agent/            # Navigator, Planner, 33 actions, prompts, executor,
+│                     # events, errors, human-input, step history
 ├── llm/              # OpenAI-compatible provider (used by built-in agent only)
-├── server/           # HTTP API, MCP server, auth middleware
+├── server/           # HTTP API, WebSocket, MCP server, auth middleware
 └── utils/            # Logger, tokens, images
 
 nanobot/              # Python integration (optional)
 ├── superbrowser_bridge/
 │   ├── tools.py           # 8 high-level nanobot tools
-│   └── session_tools.py   # 16 step-by-step nanobot tools (with captcha)
+│   └── session_tools.py   # 17 step-by-step nanobot tools (incl. run_script, captcha)
 ├── workspace/SOUL.md      # Agent personality + instructions
 └── run.py                 # CLI entry point
 ```
@@ -216,7 +321,8 @@ Persistent browser sessions with step-by-step control. Every mutation returns an
 | POST | `/session/:id/keys` | Send keyboard keys (Enter, Tab, Control+a) |
 | POST | `/session/:id/scroll` | Scroll page (up/down/percent) |
 | POST | `/session/:id/select` | Select dropdown option |
-| POST | `/session/:id/evaluate` | Execute JavaScript in page |
+| POST | `/session/:id/evaluate` | Execute JavaScript in page DOM context |
+| POST | `/session/:id/script` | Execute Puppeteer script with full page API (requires TOKEN) |
 | POST | `/session/:id/dialog` | Handle alert/confirm/prompt |
 | GET | `/session/:id/markdown` | Extract page content as markdown |
 | GET | `/session/:id/pdf` | Export page as PDF |
@@ -234,10 +340,44 @@ Persistent browser sessions with step-by-step control. Every mutation returns an
 | POST | `/pdf` | One-shot PDF export |
 | POST | `/content` | Get rendered HTML |
 | POST | `/scrape` | Scrape elements by CSS selectors |
-| POST | `/function` | Execute JavaScript (requires TOKEN) |
+| POST | `/function` | Execute Puppeteer script (requires TOKEN) |
 | POST | `/task` | Autonomous agent task (requires LLM key) |
+| GET | `/task/:id/history` | Get step-by-step execution history for a task |
 | GET | `/health` | Server health + metrics |
 | GET | `/metrics` | Session and job metrics |
+
+### Script execution details
+
+Both `/function` and `/session/:id/script` execute Puppeteer code with full `page` API access. The code is the body of an async function that receives:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `page` | Puppeteer `Page` | Full API: goto, click, type, waitForSelector, screenshot, evaluate, keyboard, mouse, etc. |
+| `context` | `object` | Optional data passed via the request body |
+| `helpers.sleep(ms)` | function | Promise-based delay |
+| `helpers.log(...args)` | function | Logs returned in response `logs` array |
+| `helpers.screenshot(path?)` | function | Returns base64 JPEG screenshot |
+
+**Request body:**
+```json
+{
+  "code": "await page.goto('https://example.com'); return await page.title();",
+  "context": { "searchQuery": "hello" },
+  "timeout": 60000
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "result": "Example Domain",
+  "logs": [],
+  "duration": 1234
+}
+```
+
+Supported code formats: raw function body (recommended), `async ({ page }) => { ... }`, `async function({ page }) { ... }`, `export default async function({ page }) { ... }`.
 
 ## Configuration
 
@@ -258,16 +398,19 @@ Persistent browser sessions with step-by-step control. Every mutation returns an
 | `PUPPETEER_EXECUTABLE_PATH` | — | Custom Chromium binary path |
 | `CORS` | `false` | Enable CORS |
 | `CORS_ALLOW_ORIGIN` | — | Allowed CORS origin |
+| `FIREWALL_ALLOW_LIST` | — | Comma-separated allowed domains |
+| `FIREWALL_DENY_LIST` | — | Comma-separated blocked domains |
 | `OPENAI_API_KEY` | — | Only for built-in `/task` agent |
+| `ANTHROPIC_API_KEY` | — | Only for built-in `/task` agent |
 | `LLM_MODEL` | `gpt-4o` | Only for built-in `/task` agent |
 
 ## Architecture
 
 SuperBrowser is built from patterns found in three production browser automation codebases, with all code written from scratch:
 
-- **[browserless](https://github.com/browserless/browserless)** — stealth, CDP sessions, request interception, goto utility, concurrency limiter, hooks
+- **[browserless](https://github.com/browserless/browserless)** — stealth, CDP sessions, request interception, goto utility, concurrency limiter, Puppeteer script execution
 - **[BrowserOS](https://github.com/anthropics/browseros)** — CDP input dispatch, element coordinate resolution, accessibility tree, cursor detection, console collector
-- **[nanobrowser](https://github.com/nicepkg/nanobrowser)** — Navigator+Planner agent loop, DOM element indexing, screenshot feedback, extraction protocol, action schemas
+- **[nanobrowser](https://github.com/nicepkg/nanobrowser)** — Navigator+Planner agent loop, DOM element indexing, screenshot feedback, extraction protocol, action schemas, security guardrails, URL firewall, DOM history tracking, error hierarchy
 
 ## Deployment
 
