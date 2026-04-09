@@ -237,13 +237,7 @@ Step-by-step browser control. Each action returns a screenshot so the agent can 
 | `TIMEOUT` | `60000` | Request timeout (ms) |
 | `PUPPETEER_EXECUTABLE_PATH` | — | Custom Chromium path |
 
-## Architecture
 
-SuperBrowser draws from three production codebases, with all browser code written from scratch:
-
-- **[browserless](https://github.com/browserless/browserless)** — Stealth plugin, CDP session management, request interception, hooks, concurrency limiter, goto utility with full page setup
-- **[BrowserOS](https://github.com/anthropics/browseros)** — CDP input dispatch, 3-tier element coordinate resolution, accessibility tree, cursor detection, console collector, download monitoring, dialog handling
-- **[nanobrowser](https://github.com/nicepkg/nanobrowser)** — Dual-agent Navigator+Planner loop, DOM element indexing, screenshot vision feedback, extraction protocol, multi-action DOM stability checks, action schemas
 
 ## License
 
