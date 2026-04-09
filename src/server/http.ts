@@ -15,10 +15,11 @@ import { goto, type NavigationOptions } from '../browser/goto.js';
 import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '../browser/scraper.js';
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
+import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea } from '../browser/captcha.js';
 
 export function createHttpServer(
   engine: BrowserEngine,
-  llm: LLMProvider,
+  llm: LLMProvider | null,
   limiterConfig?: { maxConcurrent?: number; maxQueued?: number; defaultTimeout?: number },
 ): express.Application {
   const app = express();
@@ -64,12 +65,17 @@ export function createHttpServer(
       return;
     }
 
+    if (!llm) {
+      res.status(400).json({ error: '/task requires LLM config (OPENAI_API_KEY or ANTHROPIC_API_KEY). Use session APIs instead when nanobot is the brain.' });
+      return;
+    }
+
     try {
       await limiter.submit(async () => {
         const page = await engine.newPage();
         if (url) await page.navigate(url);
 
-        const executor = new BrowserExecutor(page, llm, options);
+        const executor = new BrowserExecutor(page, llm!, options);
         const result = await executor.executeTask(task);
 
         await page.close();
@@ -633,6 +639,68 @@ export function createHttpServer(
       await page.close();
       sessions.delete(req.params.id);
       res.json({ success: true });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Detect captcha on the page. */
+  app.get('/session/:id/captcha/detect', async (req, res) => {
+    const page = sessions.get(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+
+    try {
+      const captcha = await detectCaptcha(page.getRawPage());
+      res.json({ captcha });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Screenshot captcha area for vision-based solving. */
+  app.get('/session/:id/captcha/screenshot', async (req, res) => {
+    const page = sessions.get(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+
+    try {
+      const result = await screenshotCaptchaArea(page.getRawPage());
+      if (!result) {
+        res.status(404).json({ error: 'No captcha area found' });
+        return;
+      }
+      res.set('Content-Type', 'image/jpeg');
+      res.send(result.screenshot);
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Solve captcha via external API (2captcha, anticaptcha). */
+  app.post('/session/:id/captcha/solve', async (req, res) => {
+    const page = sessions.get(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+
+    try {
+      const captcha = await detectCaptcha(page.getRawPage());
+      if (!captcha) {
+        res.json({ solved: false, error: 'No captcha detected' });
+        return;
+      }
+
+      const config = {
+        provider: req.body.provider || process.env.CAPTCHA_PROVIDER,
+        apiKey: req.body.apiKey || process.env.CAPTCHA_API_KEY,
+        timeout: req.body.timeout || 60000,
+      };
+
+      if (config.provider && config.apiKey) {
+        const solved = await solveWithExternalApi(page.getRawPage(), captcha, config);
+        res.json({ solved, captcha });
+      } else {
+        // No solver configured — wait for manual solution
+        const solved = await waitForCaptchaSolution(page.getRawPage(), captcha, config.timeout);
+        res.json({ solved, captcha });
+      }
     } catch (err) {
       handleError(res, err);
     }

@@ -473,6 +473,106 @@ class BrowserCloseTool(Tool):
         return "Session closed"
 
 
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        required=["session_id"],
+    )
+)
+class BrowserDetectCaptchaTool(Tool):
+    """Detect if the current page has a captcha."""
+
+    name = "browser_detect_captcha"
+    description = (
+        "Check if the page has a captcha (reCAPTCHA, hCaptcha, Cloudflare Turnstile). "
+        "Use this when a page seems blocked or asks for verification."
+    )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, **kw: Any) -> str:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/detect")
+            r.raise_for_status()
+            data = r.json()
+
+        captcha = data.get("captcha")
+        if not captcha:
+            return "No captcha detected on this page."
+        return f"Captcha detected: type={captcha['type']}, siteKey={captcha.get('siteKey', 'N/A')}"
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        required=["session_id"],
+    )
+)
+class BrowserCaptchaScreenshotTool(Tool):
+    """Take a close-up screenshot of the captcha for analysis/solving."""
+
+    name = "browser_captcha_screenshot"
+    description = (
+        "Take a close-up screenshot of the captcha area. "
+        "Use this to see the captcha image and attempt to solve it visually."
+    )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, **kw: Any) -> Any:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/screenshot")
+            if r.status_code == 404:
+                return "No captcha area found on the page."
+            r.raise_for_status()
+
+        import base64
+        b64 = base64.b64encode(r.content).decode()
+        return _build_image_blocks(b64, "Captcha area — analyze this to solve")
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        provider=StringSchema("Captcha solver: '2captcha' or 'anticaptcha'", nullable=True),
+        api_key=StringSchema("API key for the solver service", nullable=True),
+        required=["session_id"],
+    )
+)
+class BrowserSolveCaptchaTool(Tool):
+    """Attempt to solve a captcha using an external service or wait for manual solution."""
+
+    name = "browser_solve_captcha"
+    description = (
+        "Attempt to solve a detected captcha. If a solver provider and API key are given, "
+        "uses that service. Otherwise waits for the captcha to be solved manually. "
+        "Returns whether the captcha was solved."
+    )
+
+    async def execute(self, session_id: str, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
+        payload: dict[str, Any] = {}
+        if provider:
+            payload["provider"] = provider
+        if api_key:
+            payload["apiKey"] = api_key
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve",
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        if data.get("solved"):
+            return f"Captcha solved successfully (type: {data.get('captcha', {}).get('type', 'unknown')})"
+        return f"Captcha not solved. {data.get('error', 'You may need to ask the user to solve it manually.')}"
+
+
 def register_session_tools(bot: "Nanobot") -> None:
     """Register all low-level session tools with a nanobot instance.
 
@@ -502,6 +602,9 @@ def register_session_tools(bot: "Nanobot") -> None:
         BrowserEvalTool(),
         BrowserGetMarkdownTool(),
         BrowserDialogTool(),
+        BrowserDetectCaptchaTool(),
+        BrowserCaptchaScreenshotTool(),
+        BrowserSolveCaptchaTool(),
         BrowserCloseTool(),
     ]
     for tool in tools:

@@ -28,6 +28,9 @@ import { doneAction, waitAction, cacheContentAction } from './actions/control.js
 // Advanced (BrowserOS)
 import { handleDialogAction, uploadFileAction, evaluateScriptAction } from './actions/advanced.js';
 
+// Captcha
+import { detectCaptchaAction, screenshotCaptchaAction } from './actions/captcha.js';
+
 // Extraction (BrowserOS)
 import {
   extractMarkdownAction,
@@ -79,6 +82,10 @@ export function buildDefaultActionRegistry(): ActionRegistry {
   registry.register(waitForConditionAction);
   registry.register(getConsoleErrorsAction);
   registry.register(getAccessibilityTreeAction);
+
+  // Captcha
+  registry.register(detectCaptchaAction);
+  registry.register(screenshotCaptchaAction);
 
   return registry;
 }

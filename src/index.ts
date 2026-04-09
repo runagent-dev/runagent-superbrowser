@@ -23,21 +23,27 @@ async function main(): Promise<void> {
   await engine.launch();
   console.log('Browser engine launched');
 
-  // Initialize LLM provider
+  // Initialize LLM provider (optional — only needed for /task endpoint and MCP mode)
+  // When using nanobot as the brain, nanobot has its own LLM config
   const apiKey = process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || '';
-  if (!apiKey && mode !== 'http') {
-    console.error('Error: ANTHROPIC_API_KEY or OPENAI_API_KEY is required');
+  let llm: LLMProvider | null = null;
+
+  if (apiKey) {
+    llm = new LLMProvider({
+      apiKey,
+      model: process.env.LLM_MODEL || 'gpt-4o',
+    });
+  }
+
+  if (!llm && (mode === 'mcp' || mode === 'task')) {
+    console.error('Error: ANTHROPIC_API_KEY or OPENAI_API_KEY required for mcp/task mode');
+    console.error('For session-only mode (nanobot as brain), just run: npm start');
     process.exit(1);
   }
 
-  const llm = new LLMProvider({
-    apiKey,
-    model: process.env.LLM_MODEL || 'gpt-4o',
-  });
-
   if (mode === 'mcp') {
     // MCP server mode (for nanobot integration)
-    await createMCPServer(engine, llm);
+    await createMCPServer(engine, llm!);
   } else if (mode === 'task') {
     // Direct task execution mode
     const task = process.argv.slice(3).join(' ');
@@ -47,7 +53,7 @@ async function main(): Promise<void> {
     }
 
     const page = await engine.newPage();
-    const executor = new BrowserExecutor(page, llm);
+    const executor = new BrowserExecutor(page, llm!);
     const result = await executor.executeTask(task);
 
     console.log('\n=== Result ===');
