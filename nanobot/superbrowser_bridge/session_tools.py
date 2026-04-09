@@ -24,6 +24,7 @@ from nanobot.agent.tools.schema import (
     BooleanSchema,
     IntegerSchema,
     NumberSchema,
+    ObjectSchema,
     StringSchema,
     tool_parameters_schema,
 )
@@ -451,6 +452,101 @@ class BrowserEvalTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
+        script=StringSchema(
+            "Puppeteer script body with full page API access. "
+            "Available variables: page (Puppeteer Page), context (optional data), "
+            "helpers (sleep, screenshot, log). "
+            "Example: await page.goto('https://example.com'); "
+            "await page.type('#search', 'hello'); "
+            "await page.click('#submit'); "
+            "return await page.title();"
+        ),
+        context=ObjectSchema(
+            description="Optional context data passed to the script",
+            nullable=True,
+        ),
+        timeout=IntegerSchema(
+            description="Script timeout in ms (default: 60000, max: 300000)",
+            nullable=True,
+        ),
+        required=["session_id", "script"],
+    )
+)
+class BrowserRunScriptTool(Tool):
+    """Execute a full Puppeteer script with page API access.
+
+    Unlike browser_eval (which runs DOM-level JavaScript like document.querySelector),
+    this tool runs Node.js-level Puppeteer code with full access to:
+    - page.goto(), page.click(), page.type(), page.waitForSelector()
+    - page.screenshot(), page.pdf(), page.evaluate()
+    - page.keyboard, page.mouse
+    - helpers.sleep(), helpers.screenshot(), helpers.log()
+
+    Use for complex multi-step browser automation.
+    """
+
+    name = "browser_run_script"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    description = (
+        "Execute a Puppeteer script with full page API access. "
+        "Unlike browser_eval (DOM-only JS), this gives access to "
+        "page.goto(), page.click(), page.type(), page.waitForSelector(), "
+        "page.screenshot(), and all Puppeteer methods. "
+        "Use for complex multi-step automation scripts."
+    )
+
+    async def execute(
+        self,
+        session_id: str,
+        script: str,
+        context: dict | None = None,
+        timeout: int | None = None,
+        **kw: Any,
+    ) -> str:
+        print(f"\n>> browser_run_script({script[:80]}...)")
+        payload: dict[str, Any] = {"code": script}
+        if context:
+            payload["context"] = context
+        if timeout:
+            payload["timeout"] = timeout
+
+        client_timeout = max(120.0, (timeout or 60000) / 1000 + 10)
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
+            r = await client.post(
+                f"{SUPERBROWSER_URL}/session/{session_id}/script",
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        if not data.get("success"):
+            return f"Script error: {data.get('error', 'Unknown error')}"
+
+        parts = []
+        result = data.get("result")
+        if result is not None:
+            if isinstance(result, (dict, list)):
+                parts.append(f"Result: {json.dumps(result, indent=2, ensure_ascii=False)[:5000]}")
+            else:
+                parts.append(f"Result: {str(result)[:5000]}")
+
+        logs = data.get("logs", [])
+        if logs:
+            parts.append("Logs:\n" + "\n".join(logs[:20]))
+
+        duration = data.get("duration", 0)
+        parts.append(f"Duration: {duration}ms")
+
+        return "\n".join(parts)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
         required=["session_id"],
     )
 )
@@ -703,6 +799,7 @@ def register_session_tools(bot: "Nanobot") -> None:
         BrowserScrollTool(),
         BrowserSelectTool(),
         BrowserEvalTool(),
+        BrowserRunScriptTool(),
         BrowserGetMarkdownTool(),
         BrowserDialogTool(),
         BrowserDetectCaptchaTool(),

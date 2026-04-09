@@ -5,6 +5,7 @@
 
 import { z } from 'zod';
 import { Action } from './registry.js';
+import { runPuppeteerScript } from '../../browser/script-runner.js';
 
 export const handleDialogAction = new Action({
   name: 'handle_dialog',
@@ -49,9 +50,9 @@ export const uploadFileAction = new Action({
 
 export const evaluateScriptAction = new Action({
   name: 'evaluate_script',
-  description: 'Execute a JavaScript snippet in the page and return the result',
+  description: 'Execute a JavaScript snippet in the page DOM context (document.querySelector, reading values). For full Puppeteer API access (page.goto, page.click, page.type), use run_script instead.',
   schema: z.object({
-    script: z.string().describe('JavaScript code to evaluate'),
+    script: z.string().describe('JavaScript code to evaluate in the browser DOM context'),
   }),
   handler: async (input, page) => {
     const { script } = input as { script: string };
@@ -60,6 +61,49 @@ export const evaluateScriptAction = new Action({
     return {
       success: true,
       extractedContent: `Script result: ${resultStr.substring(0, 500)}`,
+      includeInMemory: true,
+    };
+  },
+});
+
+export const runScriptAction = new Action({
+  name: 'run_script',
+  description:
+    'Execute a Puppeteer script with full page API access (page.goto, page.click, page.type, page.waitForSelector, page.screenshot, page.keyboard, page.mouse). Use for complex multi-step browser automation that standard actions cannot handle. The script body receives: page (Puppeteer Page), context (optional data), helpers (sleep, log, screenshot).',
+  schema: z.object({
+    script: z
+      .string()
+      .describe(
+        'Puppeteer script body. Available: page (Page API), context (data), helpers.sleep(ms), helpers.log(...), helpers.screenshot(path?). Example: await page.goto("https://example.com"); await page.type("#q", "hello"); return await page.title();',
+      ),
+    context: z
+      .record(z.unknown())
+      .optional()
+      .describe('Optional context data passed to the script'),
+  }),
+  handler: async (input, page) => {
+    const { script, context } = input as { script: string; context?: Record<string, unknown> };
+    const rawPage = page.getRawPage();
+    const scriptResult = await runPuppeteerScript(rawPage, script, context, 60000);
+
+    if (!scriptResult.success) {
+      return {
+        success: false,
+        error: `Script failed: ${scriptResult.error}`,
+      };
+    }
+
+    const resultStr =
+      typeof scriptResult.result === 'object'
+        ? JSON.stringify(scriptResult.result)
+        : String(scriptResult.result ?? 'undefined');
+
+    const logStr =
+      scriptResult.logs.length > 0 ? `\nLogs: ${scriptResult.logs.join('\n')}` : '';
+
+    return {
+      success: true,
+      extractedContent: `Script result (${scriptResult.duration}ms): ${resultStr.substring(0, 500)}${logStr.substring(0, 200)}`,
       includeInMemory: true,
     };
   },

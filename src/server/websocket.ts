@@ -23,6 +23,7 @@
  *   { action: "scroll",       data: { direction?, percent? } }
  *   { action: "select",       data: { index, value } }
  *   { action: "evaluate",     data: { script } }
+ *   { action: "script",       data: { code, context?, timeout? } }
  *   { action: "screenshot" }
  *   { action: "state" }
  *   { action: "markdown" }
@@ -36,6 +37,7 @@ import type { Server as HttpServer } from 'http';
 import type { PageWrapper } from '../browser/page.js';
 import type { HumanInputManager, HumanInputRequest } from '../agent/human-input.js';
 import { validateUrl } from './auth.js';
+import { runPuppeteerScript } from '../browser/script-runner.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -250,6 +252,24 @@ async function handleCommand(
       if (!script) { sendEvent(ws, 'error', { message: 'script required' }); return; }
       const result = await page.evaluateScript(script);
       sendEvent(ws, 'eval_result', { result });
+      break;
+    }
+
+    case 'script': {
+      if (!process.env.TOKEN) {
+        sendEvent(ws, 'error', { message: 'script command requires TOKEN to be set' });
+        return;
+      }
+      const code = data.code as string;
+      if (!code) { sendEvent(ws, 'error', { message: 'code required' }); return; }
+      const rawPage = page.getRawPage();
+      const scriptResult = await runPuppeteerScript(
+        rawPage,
+        code,
+        data.context as Record<string, unknown> | undefined,
+        data.timeout as number | undefined,
+      );
+      sendEvent(ws, 'script_result', scriptResult);
       break;
     }
 

@@ -98,7 +98,8 @@ async function main(): Promise<void> {
       console.log(`  POST   /session/:id/keys       - Send keyboard keys`);
       console.log(`  POST   /session/:id/scroll     - Scroll page`);
       console.log(`  POST   /session/:id/select     - Select dropdown option`);
-      console.log(`  POST   /session/:id/evaluate   - Execute JavaScript`);
+      console.log(`  POST   /session/:id/evaluate   - Execute JavaScript (DOM context)`);
+      console.log(`  POST   /session/:id/script     - Execute Puppeteer script (full page API)`);
       console.log(`  POST   /session/:id/dialog     - Handle alert/confirm/prompt`);
       console.log(`  GET    /session/:id/markdown    - Extract page as markdown`);
       console.log(`  GET    /session/:id/pdf         - Export page as PDF`);

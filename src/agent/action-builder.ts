@@ -27,7 +27,7 @@ import { doneAction, waitAction, cacheContentAction, createAskHumanAction } from
 import type { HumanInputManager } from './human-input.js';
 
 // Advanced (BrowserOS)
-import { handleDialogAction, uploadFileAction, evaluateScriptAction } from './actions/advanced.js';
+import { handleDialogAction, uploadFileAction, evaluateScriptAction, runScriptAction } from './actions/advanced.js';
 
 // Captcha
 import { detectCaptchaAction, screenshotCaptchaAction } from './actions/captcha.js';
@@ -75,6 +75,7 @@ export function buildDefaultActionRegistry(humanInput?: HumanInputManager): Acti
   registry.register(handleDialogAction);
   registry.register(uploadFileAction);
   registry.register(evaluateScriptAction);
+  registry.register(runScriptAction);
 
   // Extraction actions (from BrowserOS patterns)
   registry.register(extractMarkdownAction);

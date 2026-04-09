@@ -16,6 +16,29 @@ import { buildDefaultActionRegistry } from './action-builder.js';
 import { EventManager, ExecutionState, Actor, type EventCallback } from './events.js';
 import { HumanInputManager, type HumanInputRequest, type HumanInputResponse } from './human-input.js';
 
+/** A single step record for task replay and debugging. */
+export interface AgentStepRecord {
+  step: number;
+  timestamp: number;
+  duration: number;
+  url: string;
+  title: string;
+  actions: { name: string; success: boolean; content?: string; error?: string }[];
+  plannerOutput?: { done: boolean; nextSteps: string; challenges: string };
+  screenshot?: string;
+}
+
+/** Full execution history for a task. */
+export interface TaskHistory {
+  task: string;
+  startTime: number;
+  endTime: number;
+  success: boolean;
+  steps: AgentStepRecord[];
+  finalAnswer?: string;
+  error?: string;
+}
+
 export class BrowserExecutor {
   private navigator: NavigatorAgent;
   private planner: PlannerAgent;
@@ -27,6 +50,9 @@ export class BrowserExecutor {
   private historySummary: string[] = [];
   private stopped = false;
   private paused = false;
+  private stepRecords: AgentStepRecord[] = [];
+  private taskStartTime = 0;
+  private currentTask = '';
 
   constructor(
     private page: PageWrapper,
@@ -84,6 +110,9 @@ export class BrowserExecutor {
     console.log(`🚀 Executing task: ${task}`);
     this.eventManager.emit(Actor.SYSTEM, ExecutionState.TASK_START, task);
     this.navigator.initTask(task);
+    this.taskStartTime = startTime;
+    this.currentTask = task;
+    this.stepRecords = [];
 
     // Setup dialog and console handlers
     await this.page.setupDialogHandler();
@@ -164,8 +193,35 @@ export class BrowserExecutor {
 
       // Run navigator
       try {
+        const stepStartTime = Date.now();
         const { results, done } = await this.navigator.execute(this.page);
         this.nSteps++;
+
+        // Record step history for replay/debugging
+        try {
+          const currentState = await this.page.getState({ useVision: false });
+          const stepRecord: AgentStepRecord = {
+            step: step + 1,
+            timestamp: stepStartTime,
+            duration: Date.now() - stepStartTime,
+            url: currentState.url,
+            title: currentState.title,
+            actions: results.map((r) => ({
+              name: 'action',
+              success: r.success,
+              content: r.extractedContent,
+              error: r.error,
+            })),
+            plannerOutput: latestPlan ? {
+              done: latestPlan.done,
+              nextSteps: latestPlan.nextSteps,
+              challenges: latestPlan.challenges,
+            } : undefined,
+          };
+          this.stepRecords.push(stepRecord);
+        } catch {
+          // Step recording should never block execution
+        }
 
         // Record history
         const summary = results
@@ -243,5 +299,21 @@ export class BrowserExecutor {
   /** Check if the executor is waiting for human input. */
   get isWaitingForHuman(): boolean {
     return this.humanInput.hasPending;
+  }
+
+  /** Get the full step history for debugging and replay. */
+  getTaskHistory(): TaskHistory {
+    return {
+      task: this.currentTask,
+      startTime: this.taskStartTime,
+      endTime: Date.now(),
+      success: false, // Will be overridden by caller when task completes
+      steps: [...this.stepRecords],
+    };
+  }
+
+  /** Get the step records array. */
+  getStepRecords(): AgentStepRecord[] {
+    return [...this.stepRecords];
   }
 }

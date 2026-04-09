@@ -18,6 +18,7 @@ import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
 import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea } from '../browser/captcha.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
+import { runPuppeteerScript } from '../browser/script-runner.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -327,18 +328,13 @@ export function createHttpServer(
           await rawPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
 
-        // Execute user code in page context (not Node.js context)
-        // This runs in the browser sandbox, not on the server
-        const result = await rawPage.evaluate(code);
+        // Execute Puppeteer code with full page API access (goto, click, type, etc.)
+        const scriptResult = await runPuppeteerScript(rawPage, code, context, req.body.timeout);
 
         await page.close();
 
-        if (typeof result === 'object' && result !== null) {
-          res.json(result);
-        } else {
-          res.set('Content-Type', 'text/plain');
-          res.send(String(result ?? ''));
-        }
+        res.set('X-Script-Duration', String(scriptResult.duration));
+        res.json(scriptResult);
       }, req.body.timeout);
     } catch (err) {
       handleError(res, err);
@@ -644,6 +640,37 @@ export function createHttpServer(
     }
   });
 
+  /** Execute a Puppeteer script with full page API access in a session. */
+  app.post('/session/:id/script', async (req, res) => {
+    // Require TOKEN — this runs arbitrary Node.js code
+    if (!process.env.TOKEN) {
+      res.status(403).json({ error: '/session/:id/script requires TOKEN to be set for security' });
+      return;
+    }
+
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const { code, context, timeout } = req.body;
+    if (!code || typeof code !== 'string') {
+      res.status(400).json({ error: 'code (string) is required' });
+      return;
+    }
+    if (code.length > 50000) {
+      res.status(400).json({ error: 'code exceeds 50KB limit' });
+      return;
+    }
+
+    try {
+      const rawPage = page.getRawPage();
+      const scriptResult = await runPuppeteerScript(rawPage, code, context, timeout);
+      res.set('X-Script-Duration', String(scriptResult.duration));
+      res.json(scriptResult);
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Handle a pending dialog. */
   app.post('/session/:id/dialog', async (req, res) => {
     const page = getSession(req.params.id);
@@ -792,6 +819,16 @@ export function createHttpServer(
     }
     const pending = executor.getPendingHumanInput();
     res.json({ pending });
+  });
+
+  /** Get step-by-step execution history for a task. */
+  app.get('/task/:taskId/history', (req, res) => {
+    const executor = taskExecutors.get(req.params.taskId);
+    if (!executor) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+    res.json({ history: executor.getStepRecords() });
   });
 
   /** Provide human input to a running task. */

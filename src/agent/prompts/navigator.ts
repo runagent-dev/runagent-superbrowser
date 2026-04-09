@@ -76,9 +76,10 @@ ${actionsPrompt}
 15. If the interactive element tree is missing expected elements: use get_accessibility_tree or check for cursor-interactive elements.
 16. If a form requires file upload: use upload_file with the file input element index.
 17. If you need to debug failures: check console errors shown in the state, or use get_console_errors.
-18. Use evaluate_script for complex interactions standard actions cannot handle.
-19. Use extract_markdown to get clean readable content from a page.
-20. Use wait_for_condition when waiting for specific page state (loading spinner gone, element visible).
+18. Use evaluate_script for simple DOM-level JavaScript (document.querySelector, reading element values, setting form fields directly).
+19. Use run_script for complex multi-step Puppeteer automation — it has full page API access (page.goto, page.click, page.type, page.waitForSelector, page.screenshot, page.keyboard). Use it when you need to chain navigation + interaction + waiting in one script, or when standard actions are too slow/unreliable. This is like writing a Puppeteer script.
+20. Use extract_markdown to get clean readable content from a page.
+21. Use wait_for_condition when waiting for specific page state (loading spinner gone, element visible).
 
 # Captcha Handling
 21. If the page seems blocked or asks for human verification: use detect_captcha to check.
