@@ -1,6 +1,6 @@
 # SuperBrowser
 
-An agentic headless browser that sees, thinks, and acts. Part of the [RunAgent](https://runagent.cloud) super agent ecosystem.
+An agentic headless browser that sees, thinks, and acts. Part of the [RunAgent](https://github.com/runagent-dev/runagent) super agent ecosystem.
 
 SuperBrowser runs as a serverless micro VM on RunAgent Cloud. Any super agent — OpenClaw, PicoClaw, ZeroClaw, or your own — can spin up an isolated browser instance on demand, browse the web autonomously, and shut it down when done. No infrastructure to manage.
 
