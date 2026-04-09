@@ -25,8 +25,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "Go to https://www.astrosage.com/free/free-life-report.asp "
-        "and fill up the information and then download the life report for me"
+        "Go to star cineplex Bangladesh and find Bonolota express if seats are available in friday tomorrow. The location will be in Mirpur."
     )
 
     print(f"Task: {task}")

@@ -53,8 +53,7 @@ def _save_screenshot(screenshot_b64: str, label: str = "") -> str:
 
 
 def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
-    """Build content blocks with image for the agent to see. Also saves to disk."""
-    # Save to disk so user can check
+    """Build content blocks WITH image — use only when screenshot is needed."""
     label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
     _save_screenshot(screenshot_b64, label)
 
@@ -65,6 +64,15 @@ def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
             "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
         },
     ]
+
+
+def _build_text_only(data: dict, prefix: str = "") -> str:
+    """Build minimal text response — just confirmation, no element list, no screenshot to LLM.
+    Does NOT save screenshot to disk either (too noisy). Only browser_open/navigate/screenshot save."""
+    parts = [prefix]
+    if data.get("url"):
+        parts.append(f"Page: {data['url']}")
+    return " | ".join(p for p in parts if p)
 
 
 def _format_state(data: dict) -> str:
@@ -96,6 +104,11 @@ class BrowserOpenTool(Tool):
     """Open a browser session. Returns screenshot + interactive elements."""
 
     name = "browser_open"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
     description = (
         "Open a new browser session. Returns a screenshot of the page and "
         "a list of interactive elements you can interact with. "
@@ -132,6 +145,11 @@ class BrowserNavigateTool(Tool):
     """Navigate to a URL in an open session. Returns screenshot + state."""
 
     name = "browser_navigate"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
     description = (
         "Navigate to a URL in an open browser session. "
         "Returns updated screenshot and interactive elements."
@@ -197,9 +215,13 @@ class BrowserScreenshotTool(Tool):
     )
 )
 class BrowserClickTool(Tool):
-    """Click an interactive element by its [index]. Returns updated screenshot."""
+    """Click an interactive element by its [index]."""
 
     name = "browser_click"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
     description = (
         "Click on an interactive element by its [index] number. "
         "Returns updated screenshot showing the result of the click."
@@ -219,11 +241,7 @@ class BrowserClickTool(Tool):
             r.raise_for_status()
             data = r.json()
 
-        caption = f"Clicked element [{index}]\n"
-        caption += _format_state(data)
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, f"Clicked [{index}]")
 
 
 @tool_parameters(
@@ -244,6 +262,7 @@ class BrowserClickAtTool(Tool):
     )
 
     async def execute(self, session_id: str, x: float, y: float, **kw: Any) -> Any:
+        print(f"\n>> browser_click_at({x}, {y})")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{SUPERBROWSER_URL}/session/{session_id}/click",
@@ -252,10 +271,7 @@ class BrowserClickAtTool(Tool):
             r.raise_for_status()
             data = r.json()
 
-        caption = f"Clicked at ({x}, {y})\n" + _format_state(data)
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, f"Clicked at ({x}, {y})")
 
 
 @tool_parameters(
@@ -268,9 +284,13 @@ class BrowserClickAtTool(Tool):
     )
 )
 class BrowserTypeTool(Tool):
-    """Type text into a form field. Returns updated screenshot."""
+    """Type text into a form field."""
 
     name = "browser_type"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
     description = (
         "Type text into an input field by its [index] number. "
         "Clears existing content by default. Returns updated screenshot."
@@ -286,10 +306,7 @@ class BrowserTypeTool(Tool):
             r.raise_for_status()
             data = r.json()
 
-        caption = f"Typed \"{text}\" into [{index}]\n" + _format_state(data)
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, f'Typed "{text}" into [{index}]')
 
 
 @tool_parameters(
@@ -300,9 +317,13 @@ class BrowserTypeTool(Tool):
     )
 )
 class BrowserKeysTool(Tool):
-    """Send keyboard keys. Use for Enter, Tab, ArrowDown, keyboard shortcuts."""
+    """Send keyboard keys (Enter, Tab, ArrowDown, Control+a, etc)."""
 
     name = "browser_keys"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
     description = (
         "Send keyboard keys or shortcuts. Examples: "
         "'Enter', 'Tab', 'ArrowDown', 'Control+a', 'Escape'. "
@@ -319,10 +340,7 @@ class BrowserKeysTool(Tool):
             r.raise_for_status()
             data = r.json()
 
-        caption = f"Sent keys: {keys}\n" + _format_state(data)
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, f"Sent keys: {keys}")
 
 
 @tool_parameters(
@@ -334,9 +352,13 @@ class BrowserKeysTool(Tool):
     )
 )
 class BrowserScrollTool(Tool):
-    """Scroll the page. Returns updated screenshot."""
+    """Scroll the page up or down."""
 
     name = "browser_scroll"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
     description = (
         "Scroll the page up or down, or to a specific percentage. "
         "Returns updated screenshot showing new content."
@@ -359,10 +381,7 @@ class BrowserScrollTool(Tool):
             data = r.json()
 
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
-        caption = f"{action}\n" + _format_state(data)
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, action)
 
 
 @tool_parameters(
@@ -374,9 +393,13 @@ class BrowserScrollTool(Tool):
     )
 )
 class BrowserSelectTool(Tool):
-    """Select a dropdown option. Returns updated screenshot."""
+    """Select a dropdown option."""
 
     name = "browser_select"
+
+    @property
+    def exclusive(self) -> bool:
+        return True
     description = "Select an option in a dropdown by value. Returns updated screenshot."
 
     async def execute(self, session_id: str, index: int, value: str, **kw: Any) -> Any:
@@ -388,10 +411,7 @@ class BrowserSelectTool(Tool):
             r.raise_for_status()
             data = r.json()
 
-        caption = f"Selected \"{value}\" in [{index}]"
-        if data.get("screenshot"):
-            return _build_image_blocks(data["screenshot"], caption)
-        return caption
+        return _build_text_only(data, f'Selected "{value}" in [{index}]')
 
 
 @tool_parameters(
