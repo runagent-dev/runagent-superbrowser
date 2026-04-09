@@ -75,6 +75,9 @@ export class BrowserExecutor {
    * 3. Track failures and stop if max exceeded
    */
   async executeTask(task: string): Promise<ExecutorResult> {
+    const MAX_TOTAL_TIME = parseInt(process.env.TASK_TIMEOUT || '300000', 10); // 5 min default
+    const startTime = Date.now();
+
     console.log(`🚀 Executing task: ${task}`);
     this.eventManager.emit(Actor.SYSTEM, ExecutionState.TASK_START, task);
     this.navigator.initTask(task);
@@ -87,6 +90,12 @@ export class BrowserExecutor {
     let latestPlan: PlannerOutput | null = null;
 
     for (let step = 0; step < this.options.maxSteps; step++) {
+      // Total time check
+      if (Date.now() - startTime > MAX_TOTAL_TIME) {
+        this.eventManager.emit(Actor.SYSTEM, ExecutionState.TASK_FAIL, 'Total timeout exceeded');
+        return { success: false, error: `Execution timeout: exceeded ${MAX_TOTAL_TIME / 1000}s` };
+      }
+
       // Pause/stop checks (from nanobrowser executor)
       if (this.stopped) {
         return { success: false, error: 'Task cancelled' };

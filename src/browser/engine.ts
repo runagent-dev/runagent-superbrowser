@@ -102,9 +102,16 @@ export class BrowserEngine extends EventEmitter {
     this.emit('launched');
   }
 
-  /** Create a new page with stealth scripts applied. */
+  /** Create a new page with stealth scripts applied. Auto-relaunches if crashed. */
   async newPage(): Promise<PageWrapper> {
-    if (!this.browser) throw new Error('Browser not launched');
+    // Auto-recovery: relaunch if browser crashed
+    if (!this.browser || !this.running) {
+      console.log('Browser not running — auto-relaunching...');
+      this.browser = null;
+      this.running = false;
+      await this.launch();
+    }
+    if (!this.browser) throw new Error('Failed to launch browser');
 
     const page = await this.browser.newPage();
 

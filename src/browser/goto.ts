@@ -6,6 +6,7 @@
  */
 
 import type { Page, HTTPResponse, CookieParam } from 'puppeteer-core';
+import { validateUrl } from '../server/auth.js';
 
 export interface GotoOptions {
   waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2';
@@ -197,6 +198,14 @@ export async function goto(
 
       req.continue().catch(() => {});
     });
+  }
+
+  // --- Validate URL (SSRF protection) ---
+  if (options.url) {
+    const urlCheck = validateUrl(options.url);
+    if (!urlCheck.valid) {
+      throw new Error(`Blocked: ${urlCheck.error}`);
+    }
   }
 
   // --- Navigate ---

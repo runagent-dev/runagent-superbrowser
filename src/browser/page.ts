@@ -16,6 +16,7 @@ import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
 import { ConsoleCollector, type CollectedLog } from './console-collector.js';
 import { DownloadMonitor } from './download-monitor.js';
+import { validateUrl } from '../server/auth.js';
 
 export class PageWrapper {
   private cdpClient: CDPSession | null = null;
@@ -37,6 +38,12 @@ export class PageWrapper {
   // --- Navigation ---
 
   async navigate(url: string, timeout: number = 30000): Promise<void> {
+    // SSRF protection
+    const urlCheck = validateUrl(url);
+    if (!urlCheck.valid) {
+      throw new Error(`Blocked: ${urlCheck.error}`);
+    }
+
     await this.page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout,
@@ -401,19 +408,32 @@ export class PageWrapper {
   }
 
   async handleDialog(accept: boolean, text?: string): Promise<void> {
-    const dialog = this.pendingDialogs.shift();
-    if (!dialog) return;
+    this.pendingDialogs.shift();
 
-    // The dialog should still be active on the page
-    // We need to handle it through the page's dialog event
-    // Since puppeteer auto-dismisses after 200ms, we listen before action
-    this.page.once('dialog', async (d) => {
-      if (accept) {
-        await d.accept(text);
-      } else {
-        await d.dismiss();
-      }
-    });
+    // Handle via promise race with timeout to avoid unhandled rejection
+    try {
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          this.page.once('dialog', async (d) => {
+            try {
+              if (accept) {
+                await d.accept(text);
+              } else {
+                await d.dismiss();
+              }
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          });
+        }),
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('Dialog handling timed out')), 5000),
+        ),
+      ]);
+    } catch {
+      // Dialog may have already been dismissed or timed out
+    }
   }
 
   getPendingDialogs(): DialogInfo[] {
@@ -546,6 +566,15 @@ export class PageWrapper {
   // --- Lifecycle ---
 
   async close(): Promise<void> {
+    // Cleanup CDP session to prevent resource leak
+    if (this.cdpClient) {
+      try {
+        await this.cdpClient.detach();
+      } catch {
+        // Already detached
+      }
+      this.cdpClient = null;
+    }
     try {
       await this.page.close();
     } catch {

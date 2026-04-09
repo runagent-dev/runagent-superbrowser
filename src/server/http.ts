@@ -6,6 +6,7 @@
  */
 
 import express from 'express';
+import crypto from 'crypto';
 import { Stream } from 'stream';
 import type { BrowserEngine } from '../browser/engine.js';
 import type { PageWrapper } from '../browser/page.js';
@@ -16,6 +17,17 @@ import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '..
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
 import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea } from '../browser/captcha.js';
+import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
+
+/** Session with TTL tracking. */
+interface ManagedSession {
+  page: PageWrapper;
+  createdAt: number;
+  lastAccessed: number;
+}
+
+const SESSION_IDLE_TIMEOUT = 30 * 60 * 1000;   // 30 minutes idle
+const SESSION_MAX_LIFETIME = 2 * 60 * 60 * 1000; // 2 hours max
 
 export function createHttpServer(
   engine: BrowserEngine,
@@ -23,15 +35,26 @@ export function createHttpServer(
   limiterConfig?: { maxConcurrent?: number; maxQueued?: number; defaultTimeout?: number },
 ): express.Application {
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
   const limiter = new Limiter(limiterConfig);
+  const rateLimiter = new RateLimiter(
+    parseInt(process.env.RATE_LIMIT || '200', 10),
+    60000,
+  );
+
+  // Security middleware
+  app.use(tokenAuth);
+  app.use(rateLimiter.middleware());
 
   // CORS support (from browserless config)
   app.use((_req, res, next) => {
     if (process.env.CORS === 'true' || process.env.ENABLE_CORS === 'true') {
-      res.header('Access-Control-Allow-Origin', process.env.CORS_ALLOW_ORIGIN || '*');
-      res.header('Access-Control-Allow-Methods', process.env.CORS_ALLOW_METHODS || 'OPTIONS, POST, GET');
+      const allowOrigin = process.env.CORS_ALLOW_ORIGIN || '';
+      if (allowOrigin) {
+        res.header('Access-Control-Allow-Origin', allowOrigin);
+      }
+      res.header('Access-Control-Allow-Methods', process.env.CORS_ALLOW_METHODS || 'OPTIONS, POST, GET, DELETE');
       res.header('Access-Control-Allow-Headers', process.env.CORS_ALLOW_HEADERS || 'Content-Type, Authorization');
       if (process.env.CORS_ALLOW_CREDENTIALS === 'true') {
         res.header('Access-Control-Allow-Credentials', 'true');
@@ -267,13 +290,32 @@ export function createHttpServer(
     }
   });
 
-  // --- Function execution (run arbitrary puppeteer code) ---
+  // --- Function execution (run puppeteer code — requires TOKEN auth) ---
 
   app.post('/function', async (req, res) => {
-    const { code, context, url } = req.body;
-    if (!code) {
-      res.status(400).json({ error: 'code is required' });
+    // Double-check auth — this endpoint is dangerous
+    if (!process.env.TOKEN) {
+      res.status(403).json({ error: '/function endpoint requires TOKEN to be set for security' });
       return;
+    }
+
+    const { code, context, url } = req.body;
+    if (!code || typeof code !== 'string') {
+      res.status(400).json({ error: 'code (string) is required' });
+      return;
+    }
+    if (code.length > 50000) {
+      res.status(400).json({ error: 'code exceeds 50KB limit' });
+      return;
+    }
+
+    // Validate URL if provided
+    if (url) {
+      const urlCheck = validateUrl(url);
+      if (!urlCheck.valid) {
+        res.status(403).json({ error: urlCheck.error });
+        return;
+      }
     }
 
     try {
@@ -285,22 +327,17 @@ export function createHttpServer(
           await rawPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
 
-        // Create a function from the code string and execute it
-        // The function receives { page, context } as arguments
-        const fn = new Function('page', 'context', `return (async () => { ${code} })()`);
-        const result = await fn(rawPage, context || {});
+        // Execute user code in page context (not Node.js context)
+        // This runs in the browser sandbox, not on the server
+        const result = await rawPage.evaluate(code);
 
         await page.close();
 
-        // Determine response type
-        if (Buffer.isBuffer(result)) {
-          res.set('Content-Type', 'application/octet-stream');
-          res.send(result);
-        } else if (typeof result === 'object') {
+        if (typeof result === 'object' && result !== null) {
           res.json(result);
         } else {
           res.set('Content-Type', 'text/plain');
-          res.send(String(result));
+          res.send(String(result ?? ''));
         }
       }, req.body.timeout);
     } catch (err) {
@@ -351,19 +388,44 @@ export function createHttpServer(
   // The nanobot super agent sees every screenshot and decides next steps.
   // ==========================================================================
 
-  const sessions = new Map<string, PageWrapper>();
-  let sessionCounter = 0;
+  const sessions = new Map<string, ManagedSession>();
+  const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '20', 10);
+
+  // Session cleanup loop — expire idle and old sessions
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      const idle = now - session.lastAccessed > SESSION_IDLE_TIMEOUT;
+      const expired = now - session.createdAt > SESSION_MAX_LIFETIME;
+      if (idle || expired) {
+        session.page.close().catch(() => {});
+        sessions.delete(id);
+      }
+    }
+  }, 60000);
+
+  /** Get session with access tracking. */
+  function getSession(id: string): PageWrapper | null {
+    const session = sessions.get(id);
+    if (!session) return null;
+    session.lastAccessed = Date.now();
+    return session.page;
+  }
 
   /** Create a new persistent session. */
   app.post('/session/create', async (req, res) => {
+    if (sessions.size >= MAX_SESSIONS) {
+      res.status(429).json({ error: `Max sessions (${MAX_SESSIONS}) reached` });
+      return;
+    }
+
     try {
       const page = await engine.newPage();
       await page.setupDialogHandler();
       await page.enableConsoleCapture();
-      await page.enableDownloadMonitor();
 
-      const id = `session-${++sessionCounter}`;
-      sessions.set(id, page);
+      const id = `session-${crypto.randomUUID().split('-')[0]}`;
+      sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
 
       if (req.body.url) {
         await page.navigate(req.body.url);
@@ -386,11 +448,22 @@ export function createHttpServer(
 
   /** Navigate within a session. Returns screenshot + state. */
   app.post('/session/:id/navigate', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const { url } = req.body;
+    if (!url || typeof url !== 'string') {
+      res.status(400).json({ error: 'url is required' });
+      return;
+    }
+    const urlCheck = validateUrl(url);
+    if (!urlCheck.valid) {
+      res.status(403).json({ error: urlCheck.error });
+      return;
+    }
 
     try {
-      await page.navigate(req.body.url);
+      await page.navigate(url);
       const state = await page.getState({ useVision: true, includeConsole: true });
       res.json({
         url: state.url,
@@ -408,8 +481,8 @@ export function createHttpServer(
 
   /** Take a screenshot of the current session state. */
   app.get('/session/:id/screenshot', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const buffer = await page.screenshot();
@@ -422,8 +495,8 @@ export function createHttpServer(
 
   /** Get current state (DOM tree + screenshot). */
   app.get('/session/:id/state', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const useVision = req.query.vision !== 'false';
@@ -450,8 +523,8 @@ export function createHttpServer(
 
   /** Click an element by index. Returns updated screenshot + state. */
   app.post('/session/:id/click', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const { index, x, y, button, clickCount } = req.body;
@@ -486,8 +559,8 @@ export function createHttpServer(
 
   /** Type text into an element. Returns updated screenshot + state. */
   app.post('/session/:id/type', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const { index, text, clear } = req.body;
@@ -515,8 +588,8 @@ export function createHttpServer(
 
   /** Send keyboard keys. Returns updated state. */
   app.post('/session/:id/keys', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       await page.sendKeys(req.body.keys);
@@ -535,8 +608,8 @@ export function createHttpServer(
 
   /** Scroll the page. Returns updated state. */
   app.post('/session/:id/scroll', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const { direction, percent } = req.body;
@@ -560,8 +633,8 @@ export function createHttpServer(
 
   /** Execute JavaScript in the session page. */
   app.post('/session/:id/evaluate', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const result = await page.evaluateScript(req.body.script);
@@ -573,8 +646,8 @@ export function createHttpServer(
 
   /** Handle a pending dialog. */
   app.post('/session/:id/dialog', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       await page.handleDialog(req.body.accept, req.body.text);
@@ -586,8 +659,8 @@ export function createHttpServer(
 
   /** Select a dropdown option. */
   app.post('/session/:id/select', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const { index, value } = req.body;
@@ -605,8 +678,8 @@ export function createHttpServer(
 
   /** Extract page content as markdown. */
   app.get('/session/:id/markdown', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const markdown = await page.getMarkdownContent();
@@ -618,8 +691,8 @@ export function createHttpServer(
 
   /** Export current page as PDF. */
   app.get('/session/:id/pdf', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const buffer = await page.exportPdf();
@@ -632,8 +705,8 @@ export function createHttpServer(
 
   /** Close a session. */
   app.delete('/session/:id', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       await page.close();
@@ -646,8 +719,8 @@ export function createHttpServer(
 
   /** Detect captcha on the page. */
   app.get('/session/:id/captcha/detect', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const captcha = await detectCaptcha(page.getRawPage());
@@ -659,8 +732,8 @@ export function createHttpServer(
 
   /** Screenshot captcha area for vision-based solving. */
   app.get('/session/:id/captcha/screenshot', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const result = await screenshotCaptchaArea(page.getRawPage());
@@ -677,8 +750,8 @@ export function createHttpServer(
 
   /** Solve captcha via external API (2captcha, anticaptcha). */
   app.post('/session/:id/captcha/solve', async (req, res) => {
-    const page = sessions.get(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found' }); return; }
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const captcha = await detectCaptcha(page.getRawPage());
