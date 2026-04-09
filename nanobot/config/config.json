@@ -1,0 +1,24 @@
+{
+  "agents": {
+    "defaults": {
+      "model": "claude-sonnet-4-6",
+      "workspace": "./workspace",
+      "max_tool_iterations": 200,
+      "context_window_tokens": 65536
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "api_key": "${ANTHROPIC_API_KEY}"
+    }
+  },
+  "tools": {
+    "exec": {
+      "enable": true,
+      "timeout": 120
+    },
+    "web": {
+      "provider": "duckduckgo"
+    }
+  }
+}

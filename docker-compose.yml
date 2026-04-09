@@ -1,0 +1,17 @@
+services:
+  superbrowser:
+    build: .
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./downloads:/tmp/superbrowser/downloads
+      - ./nanobot/workspace:/app/nanobot/workspace
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
+      - PORT=3100
+      - HEADLESS=true
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped

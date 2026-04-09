@@ -1,0 +1,9 @@
+node_modules/
+build/
+dist/
+.env
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+downloads/
+/tmp/

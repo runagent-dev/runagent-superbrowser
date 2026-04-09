@@ -1,0 +1,13 @@
+[project]
+name = "superbrowser-bridge"
+version = "0.1.0"
+description = "Nanobot bridge for SuperBrowser"
+requires-python = ">=3.11"
+dependencies = [
+    "nanobot-ai",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
