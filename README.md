@@ -1,5 +1,7 @@
 # SuperBrowser
 
+![SuperBrowser logo](assets/icons/futuristic-runner-search-logo.png)
+
 A headless browser built for AI agents. It sees, decides, and acts on web pages autonomously.
 
 SuperBrowser gives any AI agent full browser control through simple HTTP APIs. Open a session, get a screenshot, click a button, fill a form, read the results — every action returns a screenshot so your agent always knows what's on screen.
