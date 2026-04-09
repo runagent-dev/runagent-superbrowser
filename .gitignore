@@ -17,3 +17,7 @@ __pycache__/
 
 # Test output
 coverage/
+
+workspace/.nanobot/
+workspace/memory/
+workspace/session/
