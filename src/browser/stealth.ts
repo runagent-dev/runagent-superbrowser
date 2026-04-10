@@ -99,14 +99,14 @@ export function getStealthScript(): string {
     return originalAttachShadow.call(this, ...arguments);
   };
 
-  // 9. Consistent user-agent data
+  // 9. Consistent user-agent data (match Chrome 130 stable)
   if (navigator.userAgentData) {
     Object.defineProperty(navigator, 'userAgentData', {
       get: () => ({
         brands: [
-          { brand: 'Chromium', version: '120' },
-          { brand: 'Google Chrome', version: '120' },
-          { brand: 'Not_A Brand', version: '8' },
+          { brand: 'Chromium', version: '130' },
+          { brand: 'Google Chrome', version: '130' },
+          { brand: 'Not_A Brand', version: '24' },
         ],
         mobile: false,
         platform: 'macOS',
@@ -115,12 +115,78 @@ export function getStealthScript(): string {
             architecture: 'x86',
             model: '',
             platform: 'macOS',
-            platformVersion: '14.0.0',
-            uaFullVersion: '120.0.6099.109',
+            platformVersion: '14.5.0',
+            uaFullVersion: '130.0.6723.91',
+            fullVersionList: [
+              { brand: 'Chromium', version: '130.0.6723.91' },
+              { brand: 'Google Chrome', version: '130.0.6723.91' },
+              { brand: 'Not_A Brand', version: '24.0.0.0' },
+            ],
           }),
       }),
     });
   }
+
+  // 10. Screen dimensions consistency (headless often has wrong values)
+  Object.defineProperty(screen, 'width', { get: () => 1920 });
+  Object.defineProperty(screen, 'height', { get: () => 1080 });
+  Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+  Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+  Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+  Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+
+  // 11. Network connection info (headless detection vector)
+  if (navigator.connection) {
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({
+        effectiveType: '4g',
+        rtt: 50,
+        downlink: 10,
+        saveData: false,
+      }),
+    });
+  }
+
+  // 12. Hardware fingerprinting (headless often reports 1-2 cores)
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+  // 13. Battery API spoofing (headless detection vector)
+  if (navigator.getBattery) {
+    navigator.getBattery = () => Promise.resolve({
+      charging: true,
+      chargingTime: 0,
+      dischargingTime: Infinity,
+      level: 1,
+      addEventListener: function() {},
+      removeEventListener: function() {},
+      dispatchEvent: function() { return true; },
+      onchargingchange: null,
+      onchargingtimechange: null,
+      ondischargingtimechange: null,
+      onlevelchange: null,
+    });
+  }
+
+  // 14. Canvas fingerprint subtle randomization
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (this.width > 16 && this.height > 16) {
+      try {
+        const ctx = this.getContext('2d');
+        if (ctx) {
+          const imgData = ctx.getImageData(0, 0, Math.min(this.width, 2), 1);
+          imgData.data[0] = imgData.data[0] ^ 1;
+          ctx.putImageData(imgData, 0, 0);
+        }
+      } catch(e) {}
+    }
+    return origToDataURL.apply(this, arguments);
+  };
+
+  // 15. Consistent window.outerWidth/Height (headless mismatches inner/outer)
+  Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+  Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
 })();
 `;
 }

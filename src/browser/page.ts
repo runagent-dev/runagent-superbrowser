@@ -50,6 +50,39 @@ export class PageWrapper {
     });
     // Wait a bit for dynamic content
     await this.waitForIdle(2000).catch(() => {});
+
+    // Auto-wait for Cloudflare challenge if detected
+    await this.waitForCloudflare();
+  }
+
+  /**
+   * Wait for Cloudflare challenge to resolve (auto-detected by page title).
+   * Cloudflare shows "Just a moment..." while verifying the browser.
+   * Most challenges auto-resolve within 5-15 seconds with good stealth.
+   */
+  async waitForCloudflare(maxWait: number = 15000): Promise<boolean> {
+    const title = await this.page.title();
+    const isCfChallenge = title.toLowerCase().includes('just a moment')
+      || title.toLowerCase().includes('checking your browser')
+      || title.toLowerCase().includes('attention required');
+
+    if (!isCfChallenge) return true; // No challenge detected
+
+    console.log('[stealth] Cloudflare challenge detected, waiting for resolution...');
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      await new Promise(r => setTimeout(r, 1500));
+      const currentTitle = await this.page.title();
+      if (!currentTitle.toLowerCase().includes('just a moment')
+        && !currentTitle.toLowerCase().includes('checking your browser')
+        && !currentTitle.toLowerCase().includes('attention required')) {
+        console.log(`[stealth] Cloudflare challenge resolved in ${Date.now() - start}ms`);
+        await this.waitForIdle(1500).catch(() => {});
+        return true;
+      }
+    }
+    console.log('[stealth] Cloudflare challenge did not resolve within timeout');
+    return false;
   }
 
   async goBack(): Promise<void> {

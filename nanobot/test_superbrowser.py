@@ -25,8 +25,9 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "can you go to gozayaan and search for Dhaka to Chattogram flight ticket on 11th April 2026 if found any? find from gozayaan only. and list me the price of air astra flight only"
+        "can you go to gozayaan and search for Dhaka to Chattogram flight ticket on 14th April 2026 if found any? find from gozayaan only. and list me the price of air astra flight only"
     )
+
 
     print(f"Task: {task}")
     print("-" * 60)

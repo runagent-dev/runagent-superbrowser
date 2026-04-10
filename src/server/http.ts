@@ -88,8 +88,19 @@ export function createHttpServer(
   });
 
   // --- Browser Task (agentic) ---
+  // Gated: this endpoint runs a full Navigator+Planner LLM loop (10-20+ vision calls).
+  // When nanobot is the brain, use session APIs instead. Enable only for standalone use.
 
   app.post('/task', async (req, res) => {
+    if (!process.env.ENABLE_TASK_ENDPOINT) {
+      res.status(403).json({
+        error: 'The /task endpoint is disabled. It runs a separate LLM loop that duplicates cost. '
+             + 'Use session APIs (/session/create, /session/:id/click, etc.) with nanobot as the brain. '
+             + 'Set ENABLE_TASK_ENDPOINT=true to override.',
+      });
+      return;
+    }
+
     const { task, url, options } = req.body;
     if (!task) {
       res.status(400).json({ error: 'task is required' });
@@ -439,13 +450,14 @@ export function createHttpServer(
         await page.navigate(req.body.url);
       }
 
-      const state = await page.getState({ useVision: true, includeConsole: true });
+      const wantVision = req.body.vision !== false;
+      const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
       res.json({
         sessionId: id,
         url: state.url,
         title: state.title,
-        screenshot: state.screenshot,
+        ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
       });
@@ -472,11 +484,12 @@ export function createHttpServer(
 
     try {
       await page.navigate(url);
-      const state = await page.getState({ useVision: true, includeConsole: true });
+      const wantVision = req.body.vision !== false;
+      const state = await page.getState({ useVision: wantVision, includeConsole: true });
       res.json({
         url: state.url,
         title: state.title,
-        screenshot: state.screenshot,
+        ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         consoleErrors: state.consoleErrors,
@@ -549,13 +562,12 @@ export function createHttpServer(
         return;
       }
 
-      // Return updated state with screenshot
-      const newState = await page.getState({ useVision: true, includeConsole: true });
+      // Return updated state — no screenshot (nanobot discards it anyway, saves processing time)
+      const newState = await page.getState({ useVision: false, includeConsole: true });
       res.json({
         success: true,
         url: newState.url,
         title: newState.title,
-        screenshot: newState.screenshot,
         elements: newState.elementTree.clickableElementsToString(),
         consoleErrors: newState.consoleErrors,
         pendingDialogs: newState.pendingDialogs,
@@ -565,7 +577,7 @@ export function createHttpServer(
     }
   });
 
-  /** Type text into an element. Returns updated screenshot + state. */
+  /** Type text into an element. Returns updated state. */
   app.post('/session/:id/type', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
@@ -583,10 +595,9 @@ export function createHttpServer(
 
       await page.typeText(element, text, clear !== false);
 
-      const newState = await page.getState({ useVision: true, includeConsole: true });
+      const newState = await page.getState({ useVision: false, includeConsole: true });
       res.json({
         success: true,
-        screenshot: newState.screenshot,
         elements: newState.elementTree.clickableElementsToString(),
       });
     } catch (err) {
@@ -603,10 +614,9 @@ export function createHttpServer(
       await page.sendKeys(req.body.keys);
       await new Promise((r) => setTimeout(r, 500));
 
-      const newState = await page.getState({ useVision: true });
+      const newState = await page.getState({ useVision: false });
       res.json({
         success: true,
-        screenshot: newState.screenshot,
         elements: newState.elementTree.clickableElementsToString(),
       });
     } catch (err) {
@@ -627,10 +637,9 @@ export function createHttpServer(
         await page.scrollPage(direction || 'down');
       }
 
-      const newState = await page.getState({ useVision: true });
+      const newState = await page.getState({ useVision: false });
       res.json({
         success: true,
-        screenshot: newState.screenshot,
         elements: newState.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
       });
@@ -708,8 +717,8 @@ export function createHttpServer(
       if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
       await page.selectOption(element, value);
 
-      const newState = await page.getState({ useVision: true });
-      res.json({ success: true, screenshot: newState.screenshot });
+      const newState = await page.getState({ useVision: false });
+      res.json({ success: true, elements: newState.elementTree.clickableElementsToString() });
     } catch (err) {
       handleError(res, err);
     }

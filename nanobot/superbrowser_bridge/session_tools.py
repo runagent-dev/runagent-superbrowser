@@ -1,21 +1,21 @@
 """
 Low-level session-based browser tools for nanobot.
 
-These give the nanobot super agent step-by-step control:
-  1. Open session → sees screenshot + DOM state
-  2. Navigate / click / type / scroll → sees updated screenshot
-  3. If stuck → take screenshot, analyze, try different approach
-  4. Execute script if needed → sees result
-  5. Repeat until task done
+Script-first, vision-fallback architecture:
+  1. Open session → sees DOM state (+ optional screenshot)
+  2. Inspect DOM with browser_eval → find selectors
+  3. Execute script with browser_run_script → do all actions at once
+  4. Verify with browser_get_markdown or browser_eval → check result via DOM
+  5. Screenshot ONLY if DOM state is ambiguous (max 3 per session)
   6. Close session
 
-The nanobot agent SEES every screenshot and decides what to do next,
-just like Claude Code did with browserless — but fully autonomous.
+The nanobot agent is the single brain — no inner LLM loop.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -38,10 +38,42 @@ SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowse
 
 # Auto-incrementing step counter for screenshot filenames
 _step_counter = 0
-_last_screenshot_time = 0.0
-_screenshot_count = 0
 _click_at_count = 0
 MAX_INDIVIDUAL_CLICKS = 3  # After 3 click_at calls, force scripts
+
+# Screenshot budget — hard limit per session to control vision API costs
+MAX_SCREENSHOTS_PER_SESSION = 3
+_screenshot_budget = MAX_SCREENSHOTS_PER_SESSION
+
+# Cost tracking
+_vision_calls = 0
+_text_calls = 0
+_session_start_time = 0.0
+
+
+def _reset_session_counters():
+    """Reset all per-session counters when a new session opens."""
+    global _step_counter, _click_at_count, _screenshot_budget
+    global _vision_calls, _text_calls, _session_start_time
+    _step_counter = 0
+    _click_at_count = 0
+    _screenshot_budget = MAX_SCREENSHOTS_PER_SESSION
+    _vision_calls = 0
+    _text_calls = 0
+    _session_start_time = time.time()
+
+
+def _log_session_summary():
+    """Print cost summary when session closes."""
+    elapsed = time.time() - _session_start_time if _session_start_time else 0
+    screenshots_used = MAX_SCREENSHOTS_PER_SESSION - _screenshot_budget
+    print(f"\n  [Session Summary]")
+    print(f"  Duration: {elapsed:.1f}s")
+    print(f"  Vision API calls (screenshots sent to LLM): {_vision_calls}")
+    print(f"  Text-only calls: {_text_calls}")
+    print(f"  Screenshots used: {screenshots_used}/{MAX_SCREENSHOTS_PER_SESSION}")
+    est_cost = _vision_calls * 0.03 + _text_calls * 0.002
+    print(f"  Estimated tool cost: ~${est_cost:.3f}")
 
 
 def _save_screenshot(screenshot_b64: str, label: str = "") -> str:
@@ -59,6 +91,8 @@ def _save_screenshot(screenshot_b64: str, label: str = "") -> str:
 
 def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
     """Build content blocks WITH image — use only when screenshot is needed."""
+    global _vision_calls
+    _vision_calls += 1
     label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
     _save_screenshot(screenshot_b64, label)
 
@@ -74,10 +108,10 @@ def _build_image_blocks(screenshot_b64: str, caption: str) -> list[dict]:
 _action_count = 0
 
 def _build_text_only(data: dict, prefix: str = "") -> str:
-    """Build minimal text response — just confirmation, no element list, no screenshot to LLM.
-    Does NOT save screenshot to disk either (too noisy). Only browser_open/navigate/screenshot save."""
-    global _action_count
+    """Build minimal text response — just confirmation, no element list, no screenshot to LLM."""
+    global _action_count, _text_calls
     _action_count += 1
+    _text_calls += 1
     parts = [prefix]
     if data.get("url"):
         parts.append(f"Page: {data['url']}")
@@ -137,9 +171,9 @@ class BrowserOpenTool(Tool):
     )
 
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, **kw: Any) -> Any:
-        global _action_count, _click_at_count
+        global _action_count, _screenshot_budget
         _action_count = 0
-        _click_at_count = 0
+        _reset_session_counters()
         print(f"\n>> browser_open(url={url}, region={region})")
         payload: dict[str, Any] = {}
         if url:
@@ -158,6 +192,7 @@ class BrowserOpenTool(Tool):
         caption = f"Session: {data['sessionId']}\n{caption}"
 
         if data.get("screenshot"):
+            _screenshot_budget -= 1
             return _build_image_blocks(data["screenshot"], caption)
         return caption
 
@@ -184,6 +219,7 @@ class BrowserNavigateTool(Tool):
     )
 
     async def execute(self, session_id: str, url: str, **kw: Any) -> Any:
+        global _screenshot_budget
         print(f"\n>> browser_navigate({url})")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -195,6 +231,7 @@ class BrowserNavigateTool(Tool):
 
         caption = _format_state(data)
         if data.get("screenshot"):
+            _screenshot_budget -= 1
             return _build_image_blocks(data["screenshot"], caption)
         return caption
 
@@ -219,6 +256,14 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> Any:
+        global _screenshot_budget
+        if _screenshot_budget <= 0:
+            return (
+                f"[Screenshot budget exhausted] Max {MAX_SCREENSHOTS_PER_SESSION} screenshots per session reached. "
+                "Use browser_get_markdown or browser_eval to inspect page state instead. "
+                "Example: browser_eval(session_id, 'document.body.innerText.substring(0, 3000)')"
+            )
+        _screenshot_budget -= 1
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
                 f"{SUPERBROWSER_URL}/session/{session_id}/state",
@@ -227,7 +272,12 @@ class BrowserScreenshotTool(Tool):
             r.raise_for_status()
             data = r.json()
 
+        remaining = _screenshot_budget
         caption = _format_state(data)
+        if remaining == 0:
+            caption += f"\n[Last screenshot — budget exhausted. Use browser_get_markdown or browser_eval for further verification.]"
+        else:
+            caption += f"\n[Screenshots remaining: {remaining}]"
         if data.get("screenshot"):
             return _build_image_blocks(data["screenshot"], caption)
         return caption
@@ -655,11 +705,13 @@ class BrowserCloseTool(Tool):
 
     async def execute(self, session_id: str, **kw: Any) -> str:
         print(f"\n>> browser_close({session_id})")
+        _log_session_summary()
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.delete(f"{SUPERBROWSER_URL}/session/{session_id}")
             r.raise_for_status()
 
-        return "Session closed"
+        screenshots_used = MAX_SCREENSHOTS_PER_SESSION - _screenshot_budget
+        return f"Session closed. Stats: {_vision_calls} vision calls, {_text_calls} text calls, {screenshots_used} screenshots used."
 
 
 @tool_parameters(

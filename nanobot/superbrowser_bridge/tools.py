@@ -289,14 +289,17 @@ def register_high_level_tools(bot: "Nanobot") -> None:
 
 
 def register_all_tools(bot: "Nanobot") -> None:
-    """Register ALL SuperBrowser tools — both high-level and session-based.
+    """Register SuperBrowser session tools for nanobot.
 
-    High-level tools (browse_website, fill_form, etc.):
-      Delegate entire tasks to the built-in Navigator+Planner agent loop.
+    Session tools (browser_open, browser_click, browser_screenshot, etc.)
+    give nanobot step-by-step control. The nanobot agent is the single brain —
+    it sees DOM state, writes scripts, and decides what to do next.
 
-    Session tools (browser_open, browser_click, browser_screenshot, etc.):
-      Give nanobot step-by-step control. The agent SEES screenshots and
-      decides what to do next — just like Claude Code did with browserless.
+    High-level tools (browse_website, fill_form, etc.) are intentionally
+    NOT registered here — they invoke a separate Navigator+Planner LLM loop
+    inside SuperBrowser, causing 10-20+ extra vision API calls per task
+    and doubling the cost. Use register_high_level_tools() only if you
+    explicitly need the inner executor loop.
 
     Usage:
         from nanobot import Nanobot
@@ -306,9 +309,6 @@ def register_all_tools(bot: "Nanobot") -> None:
         register_all_tools(bot)
         result = await bot.run("Go to irctc.co.in and search for trains from Delhi to Mumbai")
     """
-    # High-level (fire-and-forget to executor)
-    register_high_level_tools(bot)
-
-    # Low-level session tools (step-by-step with screenshots)
+    # Session tools only — nanobot is the single brain, no double LLM loop
     from superbrowser_bridge.session_tools import register_session_tools
     register_session_tools(bot)

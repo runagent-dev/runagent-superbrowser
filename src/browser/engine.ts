@@ -36,10 +36,10 @@ const DEFAULT_CONFIG: BrowserConfig = {
   stealth: true,
 };
 
-/** Chrome launch flags for headless automation. */
+/** Chrome launch flags for headless automation with enhanced stealth. */
 const CHROME_FLAGS = [
   '--disable-blink-features=AutomationControlled',
-  '--disable-features=IsolateOrigins,site-per-process',
+  '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
   '--disable-setuid-sandbox',
   '--no-sandbox',
   '--disable-dev-shm-usage',
@@ -55,6 +55,7 @@ const CHROME_FLAGS = [
   '--metrics-recording-only',
   '--mute-audio',
   '--no-default-browser-check',
+  '--enable-features=NetworkService,NetworkServiceInProcess',
 ];
 
 /** Auto-detect Chrome/Chromium binary path. */
@@ -143,10 +144,10 @@ export class BrowserEngine extends EventEmitter {
     // Set viewport
     await page.setViewport(this.config.viewport);
 
-    // Set user agent if configured
-    if (this.config.userAgent) {
-      await page.setUserAgent(this.config.userAgent);
-    }
+    // Set user agent — use configured value or a realistic default matching stealth script (Chrome 130)
+    const ua = this.config.userAgent
+      || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    await page.setUserAgent(ua);
 
     // Setup CDP session for download behavior
     const client = await page.createCDPSession();
