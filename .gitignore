@@ -24,3 +24,7 @@ workspace/session/nanobot/workspace*/**/*.jsonl
 nanobot/workspace*/SOUL.md
 nanobot/workspace*/learnings/
 nanobot/workspace*/**/.nanobot/
+nanobot/workspace*/**/*.jsonl
+nanobot/workspace*/SOUL.md
+nanobot/workspace*/learnings/
+nanobot/workspace*/**/.nanobot/
