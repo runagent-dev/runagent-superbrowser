@@ -73,7 +73,11 @@ class DelegateBrowserTaskTool(Tool):
 
         task_id = uuid.uuid4().hex[:8]
         session_key = f"worker:{task_id}"
-        max_iterations = 25
+
+        # Research tasks need more iterations: search + visit 3-5 pages + refine
+        _research_kw = ("search", "research", "find information", "google", "look up", "investigate")
+        is_research = any(k in instructions.lower() for k in _research_kw)
+        max_iterations = 40 if is_research else 25
 
         print(f"\n>> delegate_browser_task(session={session_key})")
         print(f"   Instructions: {instructions[:120]}...")
@@ -121,25 +125,61 @@ class DelegateBrowserTaskTool(Tool):
                 if learnings:
                     parts.append(f"\n## Site Learnings (from past tasks — FOLLOW THESE)\n{learnings}")
 
-        # Check for checkpoint from a previous failed worker attempt
+        # Check for checkpoint from a previous failed worker attempt.
+        # Only resume if the checkpoint domain matches the current task domain
+        # to prevent stale checkpoints from unrelated tasks.
         last_checkpoint_path = "/tmp/superbrowser/last_checkpoint.json"
         if os.path.exists(last_checkpoint_path):
             try:
                 with open(last_checkpoint_path) as f:
                     checkpoint = _json.load(f)
-                if checkpoint.get("url"):
+                cp_url = checkpoint.get("url", "")
+                cp_domain = _domain_from_url(cp_url) if cp_url else ""
+                # Only inject checkpoint if it's for the same domain as the current task
+                if cp_url and domain and cp_domain == domain:
                     parts.append(
                         f"\n## Resume From Checkpoint\n"
-                        f"A previous worker made progress to: {checkpoint['url']}\n"
+                        f"A previous worker made progress to: {cp_url}\n"
                         f"Start from this URL instead of the beginning. "
                         f"Call browser_open with this URL directly.\n"
                         f"Do NOT repeat the steps that led to this point."
                     )
+                else:
+                    # Stale checkpoint from a different domain — remove it
+                    os.remove(last_checkpoint_path)
             except (ValueError, KeyError):
                 pass
 
         # Enforce workflow IN the prompt itself (not just SOUL.md)
-        parts.append("""
+        if is_research:
+            parts.append("""
+## Required Execution Plan — WEB RESEARCH (follow this order)
+Step 1: browser_open(url="https://www.google.com/search?q=...") — search Google with a natural, broad query
+  Do NOT over-specify with many quoted exact-match phrases. Use natural search terms.
+Step 2: browser_get_markdown(session_id) — read the search results, identify promising links
+Step 3: For each promising result (visit 3-5 pages):
+  - browser_navigate(session_id, url="result-page-url") — ONLY URLs from search results, never fabricated
+  - browser_get_markdown(session_id) — extract relevant content (FREE, no budget cost)
+  - Note findings and source URL
+Step 4: If results are insufficient, do another Google search with refined/alternative terms:
+  - browser_navigate(session_id, url="https://www.google.com/search?q=different+query")
+  - Repeat Steps 2-3
+Step 5: browser_close(session_id) — close when done
+
+KEY FEATURES:
+- browser_get_markdown is FREE — use it liberally to read pages
+- browser_navigate moves between pages without opening new sessions
+- Every action returns updated interactive elements automatically
+
+CRITICAL RULES:
+- NEVER fabricate URLs — only visit URLs found in Google search results
+- Search snippets are NOT sufficient — you MUST visit actual pages to read full content
+- Use BROAD natural queries first, then narrow. Do NOT put all constraints in one query.
+- You have {max_iter} iterations total. After iteration 30, return whatever data you have.
+- If you see [GUIDANCE: ...] messages, follow them IMMEDIATELY.
+- Return ALL findings with source URLs. Partial results are better than no results.""".format(max_iter=max_iterations))
+        else:
+            parts.append("""
 ## Required Execution Plan (follow this order)
 Step 1: browser_open(url) — open the target page (returns screenshot + interactive elements list)
 Step 2: Read the elements list from Step 1 — you already have the selectors, no need for a separate browser_eval
@@ -274,7 +314,9 @@ class SaveLearningTool(Tool):
 
 
 def register_orchestrator_tools(bot: "Nanobot") -> None:
-    """Register orchestrator-specific tools (delegation + learnings)."""
+    """Register orchestrator-specific tools (delegation + learnings + search)."""
+    from superbrowser_bridge.search_tools import register_search_tools
+
     tools = [
         DelegateBrowserTaskTool(),
         CheckLearningsTool(),
@@ -282,3 +324,11 @@ def register_orchestrator_tools(bot: "Nanobot") -> None:
     ]
     for tool in tools:
         bot._loop.tools.register(tool)
+
+    # Register the search delegation tool
+    register_search_tools(bot)
+
+    # Remove direct web search tools — orchestrator must delegate ALL web
+    # research to the search worker (API-based) or browser worker (browser-based).
+    for name in ("web_search", "web_fetch"):
+        bot._loop.tools.unregister(name)

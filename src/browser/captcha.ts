@@ -13,7 +13,7 @@
 import type { Page, Frame } from 'puppeteer-core';
 import type { LLMProvider } from '../llm/provider.js';
 
-export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'unknown';
+export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'slider' | 'visual_puzzle' | 'unknown';
 
 export interface CaptchaInfo {
   type: CaptchaType;
@@ -106,19 +106,77 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       };
     }
 
+    // Slider CAPTCHA detection (Temu, GeeTest, custom slider puzzles)
+    const sliderSelectors = [
+      '[class*="slider" i][class*="captcha" i]',
+      '[class*="slider" i][class*="verify" i]',
+      '[class*="slide-verify" i]',
+      '[class*="slide_verify" i]',
+      '[class*="puzzle" i][class*="slider" i]',
+      '[class*="captcha-slider" i]',
+      '[class*="geetest" i]',
+      '[id*="slider" i][id*="captcha" i]',
+      '[class*="drag" i][class*="verify" i]',
+    ];
+    for (const sel of sliderSelectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        return { type: 'slider' as const, solved: false };
+      }
+    }
+
+    // Visual puzzle detection (image selection, rotation, jigsaw)
+    const puzzleSelectors = [
+      '[class*="verify-wrap" i]',
+      '[class*="verification-wrap" i]',
+      '[class*="puzzle-image" i]',
+      '[class*="captcha-image" i]',
+      '[class*="verify-img" i]',
+      '[class*="image-captcha" i]',
+    ];
+    for (const sel of puzzleSelectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        return { type: 'visual_puzzle' as const, solved: false };
+      }
+    }
+
     // Generic captcha detection (image captcha, text captcha)
-    const captchaKeywords = ['captcha', 'verify you are human', 'prove you are not a robot',
-      'security check', 'are you a robot', 'bot verification'];
+    const captchaKeywords = [
+      'captcha', 'verify you are human', 'prove you are not a robot',
+      'security check', 'are you a robot', 'bot verification',
+      'verify your identity', 'human verification',
+      'slide to verify', 'drag the slider', 'complete the puzzle',
+      'select all images', 'pick the image', 'please verify',
+      'security verification', 'prove you are human',
+    ];
     const bodyText = (document.body.innerText || '').toLowerCase();
     for (const keyword of captchaKeywords) {
       if (bodyText.includes(keyword)) {
+        // Try to distinguish slider vs image vs text
+        const hasSlider = document.querySelector(
+          '[class*="slider" i], [class*="slide" i], [class*="drag" i]',
+        );
+        if (hasSlider) {
+          return { type: 'slider' as const, solved: false };
+        }
+
         const captchaImg = document.querySelector(
           'img[src*="captcha"], img[alt*="captcha"], img[id*="captcha"]',
         );
-        return {
-          type: captchaImg ? 'image' as const : 'text' as const,
-          solved: false,
-        };
+        if (captchaImg) {
+          return { type: 'image' as const, solved: false };
+        }
+
+        // Check for image selection (multiple clickable images in a grid)
+        const imgGrid = document.querySelectorAll(
+          '[class*="verify" i] img, [class*="captcha" i] img',
+        );
+        if (imgGrid.length >= 4) {
+          return { type: 'visual_puzzle' as const, solved: false };
+        }
+
+        return { type: 'text' as const, solved: false };
       }
     }
 
@@ -883,9 +941,188 @@ function parseGridApiResult(result: string, maxTile: number): number[] {
     .filter((n) => !isNaN(n) && n >= 1 && n <= maxTile);
 }
 
+// ==========================================================================
+// GENERIC VISION SOLVER — for sliders, Temu puzzles, arbitrary challenges
+// ==========================================================================
+
+interface VisionSolveStep {
+  action: 'click' | 'drag' | 'type';
+  x?: number;
+  y?: number;
+  startX?: number;
+  startY?: number;
+  endX?: number;
+  endY?: number;
+  text?: string;
+}
+
+/**
+ * Solve arbitrary visual challenges using a screenshot-to-LLM-to-action loop.
+ * Works for slider puzzles, image selection, rotation, Temu verification, etc.
+ */
+export async function solveWithVisionGeneric(
+  page: Page,
+  llmProvider: LLMProvider,
+  maxRounds: number = 5,
+): Promise<CaptchaSolveResult> {
+  let totalAttempts = 0;
+
+  for (let round = 0; round < maxRounds; round++) {
+    totalAttempts++;
+
+    // Take full-page screenshot
+    const screenshot = await page.screenshot({
+      type: 'jpeg',
+      quality: 85,
+    }) as Buffer;
+    const b64Image = screenshot.toString('base64');
+
+    // Get viewport dimensions for coordinate reference
+    const viewport = await page.evaluate(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+    }));
+
+    try {
+      const response = await llmProvider.chat([
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${b64Image}` },
+            },
+            {
+              type: 'text',
+              text: `This page shows a verification challenge or CAPTCHA. The viewport is ${viewport.width}x${viewport.height} pixels.
+
+Analyze the screenshot and determine:
+1. What type of challenge is this? (slider puzzle, image selection, rotation, text input, click target, etc.)
+2. Is the challenge already solved? If so, return {"solved": true, "steps": []}.
+3. What actions are needed to solve it?
+
+Return ONLY valid JSON in this exact format:
+{
+  "solved": false,
+  "challenge_type": "slider|image_select|rotation|text_input|click_target|unknown",
+  "steps": [
+    {"action": "drag", "startX": 100, "startY": 300, "endX": 400, "endY": 300},
+    {"action": "click", "x": 250, "y": 400},
+    {"action": "type", "text": "abc123"}
+  ]
+}
+
+For slider puzzles: identify the slider handle position and where it needs to be dragged to.
+For image selection: click on each image that matches the prompt.
+For click targets: click on the specified target element.
+Coordinates must be in pixels relative to the viewport (${viewport.width}x${viewport.height}).`,
+            },
+          ],
+        },
+      ], { temperature: 0.1 });
+
+      // Parse the LLM response
+      const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error('Vision generic: No JSON in LLM response');
+        continue;
+      }
+
+      let parsed: { solved?: boolean; steps?: VisionSolveStep[] };
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch {
+        console.error('Vision generic: Failed to parse JSON:', jsonMatch[0].substring(0, 200));
+        continue;
+      }
+
+      if (parsed.solved) {
+        return { solved: true, method: 'vision_generic', attempts: totalAttempts };
+      }
+
+      if (!parsed.steps || parsed.steps.length === 0) {
+        console.log('Vision generic: No steps returned, checking if page changed');
+        continue;
+      }
+
+      // Execute each step
+      for (const step of parsed.steps) {
+        try {
+          if (step.action === 'click' && step.x !== undefined && step.y !== undefined) {
+            await page.mouse.click(step.x, step.y);
+            await new Promise((r) => setTimeout(r, 300 + Math.random() * 300));
+          } else if (step.action === 'drag' && step.startX !== undefined && step.startY !== undefined
+                     && step.endX !== undefined && step.endY !== undefined) {
+            // Human-like drag: move to start, press, move slowly, release
+            const steps = 25 + Math.floor(Math.random() * 10);
+            await page.mouse.move(step.startX, step.startY);
+            await page.mouse.down();
+            await new Promise((r) => setTimeout(r, 100 + Math.random() * 100));
+
+            const dx = step.endX - step.startX;
+            const dy = step.endY - step.startY;
+            for (let i = 1; i <= steps; i++) {
+              const progress = i / steps;
+              // Add slight easing and jitter for human-like motion
+              const eased = progress < 0.5
+                ? 2 * progress * progress
+                : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+              const jitterX = (Math.random() - 0.5) * 2;
+              const jitterY = (Math.random() - 0.5) * 2;
+              await page.mouse.move(
+                step.startX + dx * eased + jitterX,
+                step.startY + dy * eased + jitterY,
+              );
+              await new Promise((r) => setTimeout(r, 15 + Math.random() * 15));
+            }
+            // Final precise position
+            await page.mouse.move(step.endX, step.endY);
+            await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
+            await page.mouse.up();
+            await new Promise((r) => setTimeout(r, 500));
+          } else if (step.action === 'type' && step.text) {
+            await page.keyboard.type(step.text, { delay: 50 + Math.random() * 50 });
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        } catch (stepErr) {
+          console.error(`Vision generic: Step failed:`, stepErr);
+        }
+      }
+
+      // Wait for page to settle after actions
+      await new Promise((r) => setTimeout(r, 2000));
+
+      // Check if the page changed (verification cleared)
+      const newTitle = await page.title();
+      const newUrl = page.url();
+      const stillBlocked = await page.evaluate(() => {
+        const bodyText = (document.body.innerText || '').toLowerCase();
+        const blockKeywords = [
+          'captcha', 'verify', 'security check', 'are you a robot',
+          'human verification', 'slide to verify', 'complete the puzzle',
+        ];
+        return blockKeywords.some((k) => bodyText.includes(k));
+      });
+
+      if (!stillBlocked) {
+        console.log(`Vision generic: Challenge appears solved after ${totalAttempts} attempt(s)`);
+        return { solved: true, method: 'vision_generic', attempts: totalAttempts };
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Vision generic attempt ${totalAttempts} failed:`, msg);
+      if (totalAttempts >= maxRounds) {
+        return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: msg };
+      }
+    }
+  }
+
+  return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: 'Max rounds exceeded' };
+}
+
 /**
  * Full captcha solver orchestrator.
- * Tries methods in order: token → AI vision → 2captcha grid.
+ * Tries methods in order: token → AI vision → vision generic → 2captcha grid.
  */
 export async function solveCaptchaFull(
   page: Page,
@@ -918,6 +1155,14 @@ export async function solveCaptchaFull(
     return solveWithGridApi(page, captcha, config);
   }
 
+  // Method: generic vision (screenshot → LLM → actions)
+  if (method === 'vision_generic') {
+    if (!llmProvider) {
+      return { solved: false, method: 'vision_generic', attempts: 0, error: 'No LLM provider configured' };
+    }
+    return solveWithVisionGeneric(page, llmProvider);
+  }
+
   // Method: auto — try all strategies
   // 1. Token method (fast, works 95% of the time)
   if (config.provider && config.apiKey && captcha.siteKey) {
@@ -929,9 +1174,9 @@ export async function solveCaptchaFull(
     console.log('  Token method failed or rejected');
   }
 
-  // 2. AI vision (if LLM available)
-  if (llmProvider) {
-    console.log('  Trying AI vision method...');
+  // 2. AI vision for grid-based CAPTCHAs (reCAPTCHA, hCaptcha image grids)
+  if (llmProvider && (captcha.type === 'recaptcha' || captcha.type === 'hcaptcha' || captcha.type === 'image')) {
+    console.log('  Trying AI vision method (grid)...');
     const aiResult = await solveWithAIVision(page, captcha, llmProvider);
     if (aiResult.solved) return aiResult;
     console.log(`  AI vision failed: ${aiResult.error}`);
@@ -945,7 +1190,15 @@ export async function solveCaptchaFull(
     console.log(`  Grid method failed: ${gridResult.error}`);
   }
 
-  // 4. Wait for manual solution as last resort
+  // 4. Generic vision solver for sliders, visual puzzles, and unknown types
+  if (llmProvider) {
+    console.log('  Trying generic vision solver...');
+    const genericResult = await solveWithVisionGeneric(page, llmProvider);
+    if (genericResult.solved) return genericResult;
+    console.log(`  Generic vision failed: ${genericResult.error}`);
+  }
+
+  // 5. Wait for manual solution as last resort
   if (!config.provider) {
     console.log('  Waiting for manual solution...');
     const solved = await waitForCaptchaSolution(page, captcha, config.timeout || 60000);

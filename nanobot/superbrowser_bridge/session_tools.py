@@ -65,6 +65,8 @@ class BrowserSessionState:
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
+        # Active session ID (set by browser_open)
+        self.session_id: str = ""
 
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
@@ -356,6 +358,7 @@ class BrowserOpenTool(Tool):
             data = r.json()
 
         actual_url = data.get("url", url or "")
+        self.s.session_id = data.get("sessionId", "")
         self.s.log_activity(f"browser_open({url or 'blank'})", f"session={data.get('sessionId', '?')}")
         self.s.record_url(actual_url)
         self.s.record_checkpoint(actual_url, data.get("title", ""), f"browser_open({url or 'blank'})")
@@ -364,6 +367,14 @@ class BrowserOpenTool(Tool):
 
         caption = _format_state(data)
         caption = f"Session: {data['sessionId']}\n{caption}"
+
+        # Surface captcha detection from the server
+        if data.get("captchaDetected"):
+            ct = data["captchaDetected"]["type"]
+            caption += (
+                f"\n\n[CAPTCHA DETECTED: {ct}] "
+                f"Call browser_solve_captcha(session_id='{data['sessionId']}', method='auto') to solve it."
+            )
 
         # Show previous activity so agent knows what was already tried
         if self.s.sessions_opened > 1:
@@ -421,6 +432,14 @@ class BrowserNavigateTool(Tool):
 
         if regression:
             caption += "\n[WARNING: You already visited this URL. Fix your approach on the CURRENT page instead of going backward. Do NOT restart from the beginning.]"
+
+        # Surface captcha detection from the server
+        if data.get("captchaDetected"):
+            ct = data["captchaDetected"]["type"]
+            caption += (
+                f"\n\n[CAPTCHA DETECTED: {ct}] "
+                f"Call browser_solve_captcha(session_id='{session_id}', method='auto') to solve it."
+            )
 
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
@@ -959,6 +978,48 @@ class BrowserCloseTool(Tool):
 
 
 @tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        startX=NumberSchema("Start X coordinate"),
+        startY=NumberSchema("Start Y coordinate"),
+        endX=NumberSchema("End X coordinate"),
+        endY=NumberSchema("End Y coordinate"),
+        steps=IntegerSchema("Number of intermediate steps (default 25, higher = smoother)", nullable=True),
+        required=["session_id", "startX", "startY", "endX", "endY"],
+    )
+)
+class BrowserDragTool(Tool):
+    name = "browser_drag"
+    description = "Drag from (startX, startY) to (endX, endY). Useful for slider CAPTCHAs and drag-to-verify puzzles."
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, session_id: str, startX: float, startY: float, endX: float, endY: float, steps: int | None = None, **kw: Any) -> str:
+        print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls = 0
+
+        payload: dict[str, Any] = {
+            "startX": startX, "startY": startY,
+            "endX": endX, "endY": endY,
+        }
+        if steps is not None:
+            payload["steps"] = steps
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/drag", json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        self.s.record_step("browser_drag", f"({startX},{startY})->({endX},{endY})", data.get("url", ""))
+        caption = f"Dragged from ({startX},{startY}) to ({endX},{endY})"
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        return caption
+
+
+@tool_parameters(
     tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
 )
 class BrowserDetectCaptchaTool(Tool):
@@ -1088,6 +1149,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserEvalTool(state),
         BrowserRunScriptTool(state),
         BrowserWaitForTool(state),
+        BrowserDragTool(state),
         BrowserGetMarkdownTool(),        # stateless
         BrowserDialogTool(),             # stateless
         BrowserDetectCaptchaTool(),      # stateless

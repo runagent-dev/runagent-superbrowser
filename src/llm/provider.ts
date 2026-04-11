@@ -16,6 +16,21 @@ export interface LLMConfig {
   defaultMaxTokens?: number;
 }
 
+/**
+ * Models that require max_completion_tokens instead of max_tokens,
+ * and don't support temperature.
+ */
+const REASONING_MODEL_PREFIXES = [
+  'o1', 'o3', 'o4',
+  'gpt-5', 'gpt-6',
+];
+
+/** Check if a model is a reasoning/newer model that needs max_completion_tokens. */
+function needsMaxCompletionTokens(model: string): boolean {
+  const lower = model.toLowerCase();
+  return REASONING_MODEL_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
+
 export class LLMProvider {
   private client: OpenAI;
   private model: string;
@@ -72,12 +87,24 @@ export class LLMProvider {
     }) as OpenAI.Chat.ChatCompletionMessageParam[];
 
     try {
-      const response = await this.client.chat.completions.create({
+      // Build params — handle max_tokens vs max_completion_tokens for newer models
+      const params: Record<string, unknown> = {
         model,
         messages: openaiMessages,
-        temperature,
-        max_tokens: maxTokens,
-      });
+      };
+
+      if (needsMaxCompletionTokens(model)) {
+        // Reasoning models: use max_completion_tokens, omit temperature
+        params.max_completion_tokens = maxTokens;
+      } else {
+        // Standard models: use max_tokens + temperature
+        params.max_tokens = maxTokens;
+        params.temperature = temperature;
+      }
+
+      const response = await this.client.chat.completions.create(
+        params as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+      );
 
       const choice = response.choices[0];
       return {

@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "can you go to openrouter and find how much credit i have left? "
+        """ Task: Browse the electronics category and calculate the average price of used smartphones shown in the listings.\nwebsite: https://mercari.com"""
     )
 
     print(f"Task: {task}")

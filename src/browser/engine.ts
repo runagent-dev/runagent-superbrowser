@@ -56,6 +56,15 @@ const CHROME_FLAGS = [
   '--mute-audio',
   '--no-default-browser-check',
   '--enable-features=NetworkService,NetworkServiceInProcess',
+  // Additional anti-detection flags (from browser-use patterns)
+  '--disable-infobars',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-hang-monitor',
+  '--disable-ipc-flooding-protection',
+  '--disable-component-update',
+  '--disable-domain-reliability',
 ];
 
 /** Auto-detect Chrome/Chromium binary path. */

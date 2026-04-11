@@ -25,6 +25,7 @@ class BrowserWorkerHook(AgentHook):
         self._stagnation_url: str = ""
         self._stagnation_count: int = 0
         self._last_budget_warning_at: int = -1  # iteration of last warning
+        self._captcha_guidance_given: bool = False
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -79,6 +80,27 @@ class BrowserWorkerHook(AgentHook):
                 "to batch all remaining work into one script call.]"
             )
 
+        # --- Detect search-only loop (searching without visiting result pages) ---
+        recent_steps = self.state.step_history[-8:] if len(self.state.step_history) >= 3 else []
+        if recent_steps:
+            google_searches = sum(
+                1 for s in recent_steps
+                if s["tool"] in ("browser_open", "browser_navigate")
+                and "google.com/search" in (s.get("url", "") or "")
+            )
+            non_google_navigations = sum(
+                1 for s in recent_steps
+                if s["tool"] == "browser_navigate"
+                and "google.com" not in (s.get("url", "") or "")
+            )
+            if google_searches >= 3 and non_google_navigations == 0:
+                guidance_parts.append(
+                    f"[GUIDANCE: You have done {google_searches} Google searches "
+                    "without visiting any result pages. STOP searching. Pick the "
+                    "most promising result from your last search and navigate to it "
+                    "using browser_navigate. Read the page with browser_get_markdown.]"
+                )
+
         # --- Detect regression (already handled at tool level, reinforce here) ---
         if self.state.regression_count > 0 and self.state.best_checkpoint_url:
             # Only inject if regression happened this iteration
@@ -95,6 +117,51 @@ class BrowserWorkerHook(AgentHook):
                             "on the current page.]"
                         )
                         break
+
+        # --- Detect verification/captcha pages ---
+        if self.state.session_id and not self._captcha_guidance_given:
+            current_url = self.state.current_url or ""
+            # Check URL patterns that indicate verification/bot-protection
+            blocking_url_patterns = [
+                "/login", "/signin", "/auth", "/verify",
+                "/challenge", "/captcha", "/security",
+            ]
+            url_looks_blocking = any(
+                p in current_url.lower() for p in blocking_url_patterns
+            )
+
+            # Check recent step results for blocking signals
+            recent = (
+                self.state.step_history[-3:]
+                if self.state.step_history
+                else []
+            )
+            text_signals = [
+                "verify", "captcha", "security check", "just a moment",
+                "are you a robot", "human verification", "prove you",
+                "slide to verify", "complete the puzzle",
+            ]
+            result_looks_blocking = any(
+                any(
+                    sig in (step.get("result", "") or "").lower()
+                    for sig in text_signals
+                )
+                for step in recent
+            )
+
+            if url_looks_blocking or result_looks_blocking:
+                self._captcha_guidance_given = True
+                sid = self.state.session_id
+                guidance_parts.append(
+                    "[GUIDANCE: This page appears to be a CAPTCHA or "
+                    "security verification — NOT a login page. "
+                    f"Call browser_detect_captcha(session_id='{sid}') "
+                    "to check, then "
+                    f"browser_solve_captcha(session_id='{sid}', "
+                    "method='auto') to solve it. "
+                    "Do NOT report LOGIN REQUIRED for bot protection "
+                    "pages.]"
+                )
 
         # --- Inject guidance into the last tool result message ---
         if guidance_parts and context.messages:

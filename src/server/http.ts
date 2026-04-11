@@ -16,7 +16,7 @@ import { goto, type NavigationOptions } from '../browser/goto.js';
 import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '../browser/scraper.js';
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
-import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull } from '../browser/captcha.js';
+import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull, solveWithVisionGeneric } from '../browser/captcha.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
@@ -453,6 +453,9 @@ export function createHttpServer(
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
+      // Auto-detect captcha on the loaded page
+      const captchaInfo = await detectCaptcha(page.getRawPage()).catch(() => null);
+
       res.json({
         sessionId: id,
         url: state.url,
@@ -460,6 +463,7 @@ export function createHttpServer(
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
+        ...(captchaInfo ? { captchaDetected: { type: captchaInfo.type, siteKey: captchaInfo.siteKey } } : {}),
       });
     } catch (err) {
       handleError(res, err);
@@ -486,6 +490,10 @@ export function createHttpServer(
       await page.navigate(url);
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
+
+      // Auto-detect captcha on the navigated page
+      const captchaInfo = await detectCaptcha(page.getRawPage()).catch(() => null);
+
       res.json({
         url: state.url,
         title: state.title,
@@ -494,6 +502,7 @@ export function createHttpServer(
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
+        ...(captchaInfo ? { captchaDetected: { type: captchaInfo.type, siteKey: captchaInfo.siteKey } } : {}),
       });
     } catch (err) {
       handleError(res, err);
@@ -642,6 +651,33 @@ export function createHttpServer(
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Drag from one point to another. Useful for slider CAPTCHAs and puzzle pieces. */
+  app.post('/session/:id/drag', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { startX, startY, endX, endY, steps } = req.body;
+      if (startX === undefined || startY === undefined || endX === undefined || endY === undefined) {
+        res.status(400).json({ error: 'startX, startY, endX, endY are required' });
+        return;
+      }
+
+      await page.dragTo(startX, startY, endX, endY, { steps: steps || 25 });
+      await new Promise((r) => setTimeout(r, 500));
+
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
       });
     } catch (err) {
       handleError(res, err);
@@ -825,6 +861,28 @@ export function createHttpServer(
       );
 
       res.json({ ...result, captcha });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Solve visual puzzle via screenshot → LLM → execute actions loop. */
+  app.post('/session/:id/captcha/solve-visual', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    if (!llm) {
+      res.status(400).json({ error: 'LLM provider required for visual solving' });
+      return;
+    }
+
+    try {
+      const result = await solveWithVisionGeneric(
+        page.getRawPage(),
+        llm,
+        req.body.maxRounds || 5,
+      );
+      res.json(result);
     } catch (err) {
       handleError(res, err);
     }
