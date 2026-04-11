@@ -72,12 +72,23 @@ export class LLMProvider {
     }) as OpenAI.Chat.ChatCompletionMessageParam[];
 
     try {
+      // Newer OpenAI models (gpt-4o, gpt-5, o1, o3, etc.) require max_completion_tokens
+      // instead of max_tokens. Use max_completion_tokens for all models — the SDK handles
+      // backwards compatibility for older models.
+      const tokenParam: Record<string, number> = {};
+      const isLegacyModel = model.startsWith('gpt-3.5') || model === 'gpt-4' || model === 'gpt-4-turbo';
+      if (isLegacyModel) {
+        tokenParam.max_tokens = maxTokens;
+      } else {
+        tokenParam.max_completion_tokens = maxTokens;
+      }
+
       const response = await this.client.chat.completions.create({
         model,
         messages: openaiMessages,
         temperature,
-        max_tokens: maxTokens,
-      });
+        ...tokenParam,
+      } as any);
 
       const choice = response.choices[0];
       return {

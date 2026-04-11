@@ -85,23 +85,52 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       };
     }
 
-    // Cloudflare Turnstile
-    const turnstileIframe = document.querySelector(
-      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
-    ) as HTMLIFrameElement | null;
-    if (turnstileIframe) {
-      return {
-        type: 'turnstile' as const,
-        iframeSrc: turnstileIframe.src,
-        solved: false,
-      };
-    }
-
+    // Cloudflare Turnstile — extract siteKey from multiple sources
     const turnstileDiv = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]') as HTMLElement | null;
     if (turnstileDiv) {
       return {
         type: 'turnstile' as const,
         siteKey: turnstileDiv.getAttribute('data-turnstile-sitekey') || turnstileDiv.getAttribute('data-sitekey') || undefined,
+        solved: false,
+      };
+    }
+
+    const turnstileIframe = document.querySelector(
+      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
+    ) as HTMLIFrameElement | null;
+    if (turnstileIframe) {
+      // Try to extract siteKey from iframe src params (e.g. ?k=0x4AAAA...)
+      let siteKey: string | undefined;
+      try {
+        const iframeUrl = new URL(turnstileIframe.src);
+        siteKey = iframeUrl.searchParams.get('k') || iframeUrl.searchParams.get('sitekey') || undefined;
+      } catch {}
+
+      // Fallback: search page scripts for sitekey pattern
+      if (!siteKey) {
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+          const text = script.textContent || '';
+          const match = text.match(/sitekey\s*['":\s=]+\s*['"]([0-9a-zA-Z_-]{20,})['"]/i);
+          if (match) { siteKey = match[1]; break; }
+        }
+      }
+
+      // Fallback: check CF challenge platform script for embedded sitekey
+      if (!siteKey) {
+        const cfScript = document.querySelector('script[src*="challenges.cloudflare.com"], script[src*="turnstile"]') as HTMLScriptElement | null;
+        if (cfScript?.src) {
+          try {
+            const cfUrl = new URL(cfScript.src);
+            siteKey = cfUrl.searchParams.get('k') || cfUrl.searchParams.get('sitekey') || undefined;
+          } catch {}
+        }
+      }
+
+      return {
+        type: 'turnstile' as const,
+        siteKey,
+        iframeSrc: turnstileIframe.src,
         solved: false,
       };
     }
@@ -186,10 +215,15 @@ export async function solveWithExternalApi(
   const timeout = config.timeout || 60000;
 
   try {
-    if (config.provider === '2captcha' && captcha.siteKey) {
+    // For turnstile, siteKey may not be extractable from CF Managed Challenge pages.
+    // 2captcha supports turnstile with just the page URL (siteKey is optional).
+    const hasSiteKey = !!captcha.siteKey;
+    const isTurnstile = captcha.type === 'turnstile';
+
+    if (config.provider === '2captcha' && (hasSiteKey || isTurnstile)) {
       return await solve2Captcha(page, captcha, config.apiKey, pageUrl, timeout);
     }
-    if (config.provider === 'anticaptcha' && captcha.siteKey) {
+    if (config.provider === 'anticaptcha' && (hasSiteKey || isTurnstile)) {
       return await solveAntiCaptcha(page, captcha, config.apiKey, pageUrl, timeout);
     }
   } catch (err) {
@@ -217,8 +251,9 @@ async function solve2Captcha(
   const method = methodMap[captcha.type];
   if (!method) return false;
 
-  // Submit task
-  const submitUrl = `https://2captcha.com/in.php?key=${apiKey}&method=${method}&googlekey=${captcha.siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`;
+  // Submit task — siteKey may be undefined for CF Managed Challenge turnstile
+  const siteKeyParam = captcha.siteKey ? `&googlekey=${captcha.siteKey}` : '';
+  const submitUrl = `https://2captcha.com/in.php?key=${apiKey}&method=${method}${siteKeyParam}&pageurl=${encodeURIComponent(pageUrl)}&json=1`;
   const submitRes = await fetch(submitUrl);
   const submitData = (await submitRes.json()) as { status: number; request: string };
 
@@ -362,6 +397,33 @@ async function injectCaptchaToken(
         const input = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]') as HTMLInputElement | null;
         if (input) {
           input.value = captchaToken;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // Trigger the Turnstile success callback if available
+        try {
+          // Method 1: data-callback attribute on widget div
+          const widgets = document.querySelectorAll('.cf-turnstile, [data-turnstile-sitekey]');
+          for (const w of widgets) {
+            const callbackName = w.getAttribute('data-callback');
+            if (callbackName && typeof (window as any)[callbackName] === 'function') {
+              (window as any)[callbackName](captchaToken);
+            }
+          }
+          // Method 2: window.turnstile API (if the Turnstile JS library is loaded)
+          if (typeof (window as any).turnstile !== 'undefined' && (window as any).turnstile.getResponse) {
+            // The turnstile API doesn't expose a direct "set token" method,
+            // but triggering the callback is handled above via data-callback.
+          }
+        } catch {}
+
+        // Submit the nearest form as last resort (CF challenge pages auto-submit on token)
+        if (input) {
+          const form = input.closest('form');
+          if (form) {
+            try { form.submit(); } catch {}
+          }
         }
       }
     },

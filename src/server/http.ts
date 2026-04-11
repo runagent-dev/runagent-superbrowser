@@ -7,7 +7,13 @@
 
 import express from 'express';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { Stream } from 'stream';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 import type { BrowserEngine } from '../browser/engine.js';
 import type { PageWrapper } from '../browser/page.js';
 import type { LLMProvider } from '../llm/provider.js';
@@ -17,6 +23,7 @@ import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '..
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
 import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull } from '../browser/captcha.js';
+import { CookieAutoSave } from '../browser/cookie-autosave.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
@@ -26,6 +33,9 @@ interface ManagedSession {
   page: PageWrapper;
   createdAt: number;
   lastAccessed: number;
+  cookieAutoSave?: CookieAutoSave;
+  /** Set to true when the user clicks "Save Cookies & Done" in auth-ui. */
+  humanDone?: boolean;
 }
 
 const SESSION_IDLE_TIMEOUT = 30 * 60 * 1000;   // 30 minutes idle
@@ -412,6 +422,7 @@ export function createHttpServer(
       const idle = now - session.lastAccessed > SESSION_IDLE_TIMEOUT;
       const expired = now - session.createdAt > SESSION_MAX_LIFETIME;
       if (idle || expired) {
+        session.cookieAutoSave?.stop();
         session.page.close().catch(() => {});
         sessions.delete(id);
       }
@@ -444,11 +455,94 @@ export function createHttpServer(
       await page.enableConsoleCapture();
 
       const id = `session-${crypto.randomUUID().split('-')[0]}`;
-      sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
+      const session: ManagedSession = { page, createdAt: Date.now(), lastAccessed: Date.now() };
+      sessions.set(id, session);
+
+      // Start cookie auto-save (monitors cf_clearance via CDP + periodic 30s save)
+      try {
+        const targetDomain = req.body.url
+          ? new URL(req.body.url).hostname.replace(/^www\./, '').toLowerCase()
+          : undefined;
+        const cookieAutoSave = new CookieAutoSave(page.getRawPage(), { domain: targetDomain });
+        await cookieAutoSave.start();
+        session.cookieAutoSave = cookieAutoSave;
+      } catch {
+        // Cookie auto-save is best-effort
+      }
+
+      // Auto-load saved cookies for the target domain BEFORE navigating.
+      // Loads cookies from exact domain AND parent domain (e.g. www.example.com + example.com).
+      let cookiesLoaded = 0;
+      if (req.body.url) {
+        try {
+          const hostname = new URL(req.body.url).hostname.replace(/^www\./, '').toLowerCase();
+          const allCookies: any[] = [];
+
+          // Check exact domain and parent domain variants
+          const candidates = [hostname];
+          const parts = hostname.split('.');
+          if (parts.length > 2) {
+            candidates.push(parts.slice(1).join('.')); // parent domain
+          }
+
+          for (const domain of candidates) {
+            const cookiePath = path.join(COOKIE_DIR, `${domain}.json`);
+            if (fs.existsSync(cookiePath)) {
+              const saved = JSON.parse(fs.readFileSync(cookiePath, 'utf-8'));
+              if (Array.isArray(saved)) {
+                allCookies.push(...saved);
+              }
+            }
+          }
+
+          if (allCookies.length > 0) {
+            // Deduplicate by name+domain+path
+            const seen = new Set<string>();
+            const unique = allCookies.filter(c => {
+              const key = `${c.name}:${c.domain}:${c.path || '/'}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+            await page.getRawPage().setCookie(...unique);
+            cookiesLoaded = unique.length;
+            console.log(`[session] Auto-loaded ${cookiesLoaded} cookies for ${hostname}`);
+          }
+        } catch (cookieErr) {
+          // Cookie loading is best-effort — don't block session creation
+          console.log(`[session] Cookie auto-load failed: ${cookieErr}`);
+        }
+      }
 
       if (req.body.url) {
         await page.navigate(req.body.url);
+
+        // Auth token refresh: services like Clerk (used by OpenRouter) issue
+        // short-lived JWT session cookies. Saved cookies may have expired JWTs,
+        // but the refresh tokens are still valid. The page's JS refreshes the
+        // session on load — if we detect a redirect to a login/sign-in URL,
+        // wait for JS to run and reload once to pick up the refreshed token.
+        if (cookiesLoaded > 0) {
+          const currentUrl = page.getRawPage().url();
+          const loginPatterns = ['/sign-in', '/signin', '/login', '/auth'];
+          const wasRedirectedToLogin = loginPatterns.some(p => currentUrl.toLowerCase().includes(p));
+          if (wasRedirectedToLogin) {
+            console.log(`[session] Login redirect detected after cookie load, waiting for token refresh...`);
+            // Wait for Clerk/auth JS to refresh the session token
+            await new Promise(r => setTimeout(r, 3000));
+            // Retry the original URL — the refresh token should have generated a new session
+            try {
+              await page.navigate(req.body.url);
+            } catch {
+              // If retry fails, continue with whatever page we're on
+            }
+          }
+        }
       }
+
+      // Auto-dismiss cookie consent / GDPR popups before capturing state
+      await page.dismissConsentScreens().catch(() => {});
+      await page.dismissOverlays().catch(() => {});
 
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
@@ -460,6 +554,7 @@ export function createHttpServer(
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
+        cookiesLoaded,
       });
     } catch (err) {
       handleError(res, err);
@@ -495,6 +590,37 @@ export function createHttpServer(
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
       });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Low-level mouse events for drag/slider interactions in auth-ui. */
+  app.post('/session/:id/mouse', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { action, x, y, button } = req.body;
+      const rawPage = page.getRawPage();
+
+      switch (action) {
+        case 'move':
+          await rawPage.mouse.move(x, y);
+          break;
+        case 'down':
+          await rawPage.mouse.move(x, y);
+          await rawPage.mouse.down({ button: button || 'left' });
+          break;
+        case 'up':
+          await rawPage.mouse.move(x, y);
+          await rawPage.mouse.up({ button: button || 'left' });
+          break;
+        default:
+          res.status(400).json({ error: 'action must be move, down, or up' });
+          return;
+      }
+      res.json({ success: true });
     } catch (err) {
       handleError(res, err);
     }
@@ -757,6 +883,8 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
+      const session = sessions.get(req.params.id);
+      session?.cookieAutoSave?.stop();
       await page.close();
       sessions.delete(req.params.id);
       res.json({ success: true });
@@ -905,6 +1033,150 @@ export function createHttpServer(
   app.get('/sessions', (_req, res) => {
     const list = Array.from(sessions.keys());
     res.json({ sessions: list, count: list.length });
+  });
+
+  // ── Cookie Management ──────────────────────────────────────────────
+
+  const COOKIE_DIR = process.env.COOKIE_DIR || '/tmp/superbrowser/cookies';
+
+  /** Get all cookies from a session. */
+  app.get('/session/:id/cookies', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const cookies = await page.getRawPage().cookies();
+      res.json({ cookies });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Set cookies on a session. */
+  app.post('/session/:id/cookies', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { cookies } = req.body;
+      if (!Array.isArray(cookies)) { res.status(400).json({ error: 'cookies must be an array' }); return; }
+      await page.getRawPage().setCookie(...cookies);
+      res.json({ success: true, count: cookies.length });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Save cookies to disk grouped by domain. */
+  app.post('/cookies/save', (req, res) => {
+    try {
+      const { cookies } = req.body;
+      if (!Array.isArray(cookies)) { res.status(400).json({ error: 'cookies must be an array' }); return; }
+
+      const byDomain: Record<string, any[]> = {};
+      for (const c of cookies) {
+        const domain = (c.domain || '').replace(/^\./, '');
+        if (!domain) continue;
+        if (!byDomain[domain]) byDomain[domain] = [];
+        byDomain[domain].push(c);
+      }
+
+      fs.mkdirSync(COOKIE_DIR, { recursive: true });
+      for (const [domain, domainCookies] of Object.entries(byDomain)) {
+        const safeName = domain.replace(/[^a-zA-Z0-9.-]/g, '_');
+        fs.writeFileSync(path.join(COOKIE_DIR, `${safeName}.json`), JSON.stringify(domainCookies, null, 2));
+      }
+
+      res.json({ success: true, domains: Object.keys(byDomain) });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** List available saved cookie domains. */
+  app.get('/cookies/list', (_req, res) => {
+    if (!fs.existsSync(COOKIE_DIR)) { res.json({ domains: [] }); return; }
+    const files = fs.readdirSync(COOKIE_DIR).filter(f => f.endsWith('.json'));
+    const domains = files.map(f => f.replace('.json', ''));
+    res.json({ domains });
+  });
+
+  /** Delete all saved cookies. */
+  app.delete('/cookies', (_req, res) => {
+    try {
+      if (fs.existsSync(COOKIE_DIR)) {
+        const files = fs.readdirSync(COOKIE_DIR).filter(f => f.endsWith('.json'));
+        for (const f of files) {
+          fs.unlinkSync(path.join(COOKIE_DIR, f));
+        }
+        res.json({ success: true, deleted: files.length });
+      } else {
+        res.json({ success: true, deleted: 0 });
+      }
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Delete saved cookies for a specific domain. */
+  app.delete('/cookies/:domain', (req, res) => {
+    try {
+      const safeName = req.params.domain.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const filePath = path.join(COOKIE_DIR, `${safeName}.json`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        res.json({ success: true });
+      } else {
+        res.json({ success: true, message: 'No cookies found for this domain' });
+      }
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Load saved cookies for a domain. */
+  app.get('/cookies/load/:domain', (req, res) => {
+    const safeName = req.params.domain.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const filePath = path.join(COOKIE_DIR, `${safeName}.json`);
+    if (!fs.existsSync(filePath)) { res.json({ cookies: [] }); return; }
+    try {
+      const cookies = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      res.json({ cookies });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  // ── Auth UI (interactive login) ────────────────────────────────────
+
+  /** Serve the interactive auth UI page (no token auth — user opens in browser). */
+  /** Signal that the user finished interacting with auth-ui (solved captcha, logged in, etc.). */
+  app.post('/session/:id/human-done', (req, res) => {
+    const session = sessions.get(req.params.id);
+    if (!session) { res.status(404).json({ error: 'Session not found' }); return; }
+    session.humanDone = true;
+    console.log(`[auth-ui] User signaled done for session ${req.params.id}`);
+    res.json({ success: true });
+  });
+
+  /** Check if the user has signaled done for a session. */
+  app.get('/session/:id/human-done', (req, res) => {
+    const session = sessions.get(req.params.id);
+    if (!session) { res.status(404).json({ error: 'Session not found' }); return; }
+    res.json({ done: !!session.humanDone });
+  });
+
+  app.get('/auth-ui/:id', (req, res) => {
+    if (!sessions.has(req.params.id)) {
+      res.status(404).send('Session not found. Create a session first.');
+      return;
+    }
+    const htmlPath = path.join(__dirname, '..', 'public', 'auth-ui.html');
+    if (!fs.existsSync(htmlPath)) {
+      res.status(500).send('Auth UI page not found. Ensure src/public/auth-ui.html exists.');
+      return;
+    }
+    res.sendFile(htmlPath);
   });
 
   // Expose sessions for WebSocket server binding

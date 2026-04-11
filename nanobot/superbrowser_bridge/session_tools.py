@@ -26,6 +26,8 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from superbrowser_bridge.loop_detector import ActionLoopDetector
+
 SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
@@ -65,6 +67,8 @@ class BrowserSessionState:
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
+        # Smart loop detection (ported from browser-use)
+        self.loop_detector = ActionLoopDetector()
 
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
@@ -116,13 +120,19 @@ class BrowserSessionState:
         return self.url_visit_counts.get(norm, 0) > 0
 
     def should_allow_screenshot(self, url: str) -> tuple[bool, str]:
-        """Check if a screenshot should be allowed. Returns (allowed, reason)."""
+        """Check if a screenshot should be allowed. Returns (allowed, reason).
+
+        Vision-on-demand: allows screenshots when stuck (loop detected or
+        many actions since last screenshot) even if URL was already captured.
+        """
         if self.screenshot_budget <= 0:
             return False, "[Screenshot budget exhausted] Use browser_get_markdown or browser_eval instead."
         if self.actions_since_screenshot == 0:
             return False, "[No actions since last screenshot — reuse previous. Use browser_get_markdown to re-read content.]"
+        # Vision-on-demand: skip URL dedup when stuck
+        is_stuck = self.loop_detector.is_looping or self.actions_since_screenshot >= 8
         norm = self._normalize_url(url)
-        if norm and norm in self.screenshotted_urls:
+        if norm and norm in self.screenshotted_urls and not is_stuck:
             return False, f"[Screenshot already exists for this URL. Use browser_get_markdown or browser_eval to read page state instead.]"
         return True, ""
 
@@ -265,12 +275,16 @@ class BrowserSessionState:
         # (BrowserOS pattern: every action returns updated element snapshot)
         if data.get("elements"):
             result += f"\n\nInteractive elements:\n{data['elements']}"
+        else:
+            result += "\n\n[No interactive elements found on page. Use browser_get_markdown to read page text, or browser_eval to inspect DOM.]"
         if data.get("consoleErrors"):
             result += f"\nConsole errors: {data['consoleErrors']}"
         if data.get("pendingDialogs"):
             result += f"\nPending dialogs: {data['pendingDialogs']}"
         if self.action_count >= 5:
             result += "\n\n[HINT: Use browser_run_script to batch remaining steps into ONE script.]"
+        # Nudge the LLM to produce a non-empty response
+        result += f"\n\n[Step {self.action_count}: Analyze the result above and decide your next action.]"
         return result
 
 
@@ -299,6 +313,8 @@ def _format_state(data: dict) -> str:
         parts.append(f"URL: {data['url']}")
     if data.get("title"):
         parts.append(f"Title: {data['title']}")
+    if data.get("cookiesLoaded"):
+        parts.append(f"Cookies: {data['cookiesLoaded']} auto-loaded (do NOT call browser_load_cookies)")
     if data.get("scrollInfo"):
         si = data["scrollInfo"]
         parts.append(f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} (viewport: {si.get('viewportHeight', 0)})")
@@ -335,10 +351,24 @@ class BrowserOpenTool(Tool):
     def exclusive(self) -> bool:
         return True
 
+    MAX_OPENS = 3  # Hard cap on browser_open calls per worker
+
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
         self.s.reset_per_session()
         self.s.sessions_opened += 1
+
+        # Hard cap: prevent browser_open loop
+        if self.s.sessions_opened > self.MAX_OPENS:
+            msg = (
+                f"[ERROR: browser_open called {self.s.sessions_opened} times — limit is {self.MAX_OPENS}. "
+                "Opening new sessions repeatedly will NOT fix the problem. "
+                "Use the session you already have. Tools available: "
+                "browser_run_script, browser_eval, browser_get_markdown, browser_click, browser_type. "
+                "If the page requires login, report that back to the orchestrator instead of retrying.]"
+            )
+            self.s.log_activity("browser_open BLOCKED", f"exceeded {self.MAX_OPENS} limit")
+            return msg
 
         print(f"\n>> browser_open(url={url}, region={region}) [session #{self.s.sessions_opened}, screenshots left: {self.s.screenshot_budget}]")
 
@@ -349,6 +379,10 @@ class BrowserOpenTool(Tool):
             payload["region"] = region
         if proxy:
             payload["proxy"] = proxy
+
+        # After the first open, skip vision to preserve screenshot budget for actual work
+        if self.s.sessions_opened > 1:
+            payload["vision"] = False
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/create", json=payload)
@@ -370,6 +404,11 @@ class BrowserOpenTool(Tool):
             activity = self.s.get_activity_summary()
             if activity:
                 caption += activity
+            caption += (
+                "\n\n[WARNING: You already opened a session before. Do NOT call browser_open again. "
+                "Work within THIS session using browser_run_script, browser_click, browser_type, "
+                "browser_eval, or browser_get_markdown. If login is required, report back to orchestrator.]"
+            )
 
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
@@ -401,6 +440,7 @@ class BrowserNavigateTool(Tool):
         print(f"\n>> browser_navigate({url})")
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
+        self.s.loop_detector.record_action("browser_navigate", {"url": url})
 
         # Detect regression before navigating
         regression = self.s.is_regression(url)
@@ -490,6 +530,7 @@ class BrowserClickTool(Tool):
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_click([{index}])")
         self.s.consecutive_click_calls += 1
+        self.s.loop_detector.record_action("browser_click", {"index": index})
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
@@ -549,6 +590,7 @@ class BrowserClickAtTool(Tool):
     async def execute(self, session_id: str, x: float, y: float, **kw: Any) -> Any:
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
+        self.s.loop_detector.record_action("browser_click_at", {"x": x, "y": y})
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return f"[BLOCKED] browser_click_at used {self.s.click_at_count} times. Use browser_run_script instead."
         print(f"\n>> browser_click_at({x}, {y})")
@@ -586,6 +628,7 @@ class BrowserTypeTool(Tool):
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
         print(f'\n>> browser_type([{index}], "{text}")')
         self.s.consecutive_click_calls += 1  # type is also step-by-step
+        self.s.loop_detector.record_action("browser_type", {"index": index, "text": text})
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/type", json={"index": index, "text": text, "clear": clear})
             r.raise_for_status()
@@ -647,6 +690,7 @@ class BrowserScrollTool(Tool):
 
     async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_scroll({direction or f'{percent}%'})")
+        self.s.loop_detector.record_action("browser_scroll", {"direction": direction or "down"})
         payload: dict[str, Any] = {}
         if percent is not None:
             payload["percent"] = percent
@@ -754,6 +798,7 @@ class BrowserRunScriptTool(Tool):
     async def execute(self, session_id: str, script: str, context: dict | None = None, timeout: int | None = None, **kw: Any) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
+        self.s.loop_detector.record_action("browser_run_script", {"script": script})
         payload: dict[str, Any] = {"code": script}
         if context:
             payload["context"] = context
@@ -1062,6 +1107,352 @@ class BrowserAskUserTool(Tool):
         return caption
 
 
+COOKIE_DIR = os.environ.get("COOKIE_DIR", "/tmp/superbrowser/cookies")
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        domain=StringSchema("Domain to save cookies for (e.g., 'openrouter.ai'). If omitted, saves all cookies.", nullable=True),
+        required=["session_id"],
+    )
+)
+class BrowserSaveCookiesTool(Tool):
+    name = "browser_save_cookies"
+    description = (
+        "Save browser cookies to disk for future sessions. "
+        "Call this after a successful login to persist authentication. "
+        "Cookies are saved per-domain and auto-loaded in future sessions."
+    )
+
+    async def execute(self, session_id: str, domain: str | None = None, **kw: Any) -> str:
+        print(f"\n>> browser_save_cookies(domain={domain})")
+        # Get cookies from the session
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/cookies")
+            r.raise_for_status()
+            data = r.json()
+
+        cookies = data.get("cookies", [])
+        if not cookies:
+            return "No cookies found in this session."
+
+        # Filter by domain if specified
+        if domain:
+            domain_clean = domain.replace("www.", "").lower()
+            cookies = [c for c in cookies if domain_clean in (c.get("domain", "").replace(".", "").lower())]
+            if not cookies:
+                return f"No cookies found for domain '{domain}'."
+
+        # Group by domain and save
+        os.makedirs(COOKIE_DIR, exist_ok=True)
+        by_domain: dict[str, list] = {}
+        for c in cookies:
+            d = (c.get("domain", "")).lstrip(".").lower()
+            if not d:
+                continue
+            if d not in by_domain:
+                by_domain[d] = []
+            by_domain[d].append(c)
+
+        saved_domains = []
+        for d, domain_cookies in by_domain.items():
+            safe_name = d.replace("/", "_").replace(":", "_")
+            cookie_path = os.path.join(COOKIE_DIR, f"{safe_name}.json")
+            with open(cookie_path, "w") as f:
+                json.dump(domain_cookies, f, indent=2)
+            saved_domains.append(d)
+
+        return f"Saved {len(cookies)} cookies for domains: {', '.join(saved_domains)}. These will be auto-loaded in future sessions."
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        domain=StringSchema("Domain to load cookies for (e.g., 'openrouter.ai')"),
+        required=["session_id", "domain"],
+    )
+)
+class BrowserLoadCookiesTool(Tool):
+    name = "browser_load_cookies"
+    description = (
+        "Load saved cookies into the browser session to restore authentication. "
+        "Call this right after browser_open and BEFORE navigating to the site. "
+        "Cookies are loaded from disk (saved by a previous browser_save_cookies call)."
+    )
+
+    async def execute(self, session_id: str, domain: str, **kw: Any) -> str:
+        print(f"\n>> browser_load_cookies(domain={domain})")
+        # Try to load from disk
+        safe_name = domain.replace("/", "_").replace(":", "_").lower()
+        cookie_path = os.path.join(COOKIE_DIR, f"{safe_name}.json")
+
+        if not os.path.exists(cookie_path):
+            # Try the SuperBrowser cookie API
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(f"{SUPERBROWSER_URL}/cookies/load/{safe_name}")
+                    r.raise_for_status()
+                    data = r.json()
+                    cookies = data.get("cookies", [])
+                    if cookies:
+                        # Inject into session
+                        async with httpx.AsyncClient(timeout=10.0) as client2:
+                            r2 = await client2.post(
+                                f"{SUPERBROWSER_URL}/session/{session_id}/cookies",
+                                json={"cookies": cookies},
+                            )
+                            r2.raise_for_status()
+                        return f"Loaded {len(cookies)} cookies for {domain} from server cookie store."
+            except Exception:
+                pass
+            return f"No saved cookies found for '{domain}'. User needs to log in first."
+
+        with open(cookie_path) as f:
+            cookies = json.load(f)
+
+        if not cookies:
+            return f"Cookie file exists but is empty for '{domain}'."
+
+        # Inject cookies into the session
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{SUPERBROWSER_URL}/session/{session_id}/cookies",
+                json={"cookies": cookies},
+            )
+            r.raise_for_status()
+
+        return f"Loaded {len(cookies)} cookies for {domain}. Navigate to the site now — you should be authenticated."
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        url=StringSchema("URL of the site to log into"),
+        required=["session_id", "url"],
+    )
+)
+class BrowserAuthSetupTool(Tool):
+    name = "browser_auth_setup"
+    description = (
+        "ONLY for bot protection: Cloudflare challenge, PerimeterX 'Press & Hold', hCaptcha, "
+        "reCAPTCHA. Hands the browser to the user to solve, then returns updated page state. "
+        "NEVER use for: cookie consent, country selectors, age gates, newsletter popups, "
+        "login forms, paywalls, or any normal overlay — click those yourself with browser_click. "
+        "This tool BLOCKS until done. After it returns, CONTINUE in the SAME session."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, url: str, **kw: Any) -> Any:
+        import asyncio
+
+        print(f"\n>> browser_auth_setup(url={url}, session={session_id})")
+
+        # GUARD: Check if the page actually has bot protection before handing to user.
+        # If it just has normal overlays, REFUSE and tell the worker to click through.
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state")
+                r.raise_for_status()
+                guard_data = r.json()
+            page_title = (guard_data.get("title", "") or "").lower()
+            page_elements = (guard_data.get("elements", "") or "").lower()
+            page_url = (guard_data.get("url", "") or "").lower()
+
+            # Actual bot protection indicators
+            is_bot_protection = (
+                "just a moment" in page_title
+                or "verify you are human" in page_title
+                or "attention required" in page_title
+                or "checking your browser" in page_title
+                or "press & hold" in page_elements
+                or "press and hold" in page_elements
+                or "challenges.cloudflare.com" in page_url
+                or "cdn-cgi/challenge-platform" in page_url
+                or ("access denied" in page_elements and "reference id" in page_elements)
+                or ("access to this page has been denied" in page_elements and "reference id" in page_elements)
+            )
+
+            if not is_bot_protection:
+                # This is NOT bot protection — it's a normal overlay or website issue.
+                # Tell the worker to handle it itself.
+                print(f">> browser_auth_setup BLOCKED — page is not bot protection (title: {page_title[:60]})")
+
+                # Try server-side dismiss one more time
+                try:
+                    await client.post(
+                        f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                        json={"expression": "window.__dismissAttempted = true"},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
+
+                overlay_hints = []
+                if "accept" in page_elements or "cookie" in page_elements or "consent" in page_elements:
+                    overlay_hints.append("cookie consent — look for an 'Accept' or 'I agree' button and click it")
+                if "stay" in page_elements or "country" in page_elements or "location" in page_elements:
+                    overlay_hints.append("country/locale selector — look for 'Yes, stay' or 'Continue' button and click it")
+                if "newsletter" in page_elements or "subscribe" in page_elements or "email" in page_elements:
+                    overlay_hints.append("newsletter popup — look for a close/X button or 'No thanks' and click it")
+                if "age" in page_elements or "18" in page_elements or "21" in page_elements:
+                    overlay_hints.append("age gate — look for 'I am over 18' or 'Enter' button and click it")
+
+                hint_text = ""
+                if overlay_hints:
+                    hint_text = "\nDetected overlays:\n" + "\n".join(f"  - {h}" for h in overlay_hints)
+
+                return (
+                    f"[REFUSED: This is NOT bot protection — do NOT call browser_auth_setup for normal overlays.]\n"
+                    f"The page has a normal website overlay/modal. Handle it yourself:\n"
+                    f"1. Look at the elements list for buttons like 'Accept', 'Yes, stay', 'Continue', 'Close', 'No thanks'\n"
+                    f"2. Use browser_click(index=N, session_id='{session_id}') to click the right button\n"
+                    f"3. Then continue with your task in this same session\n"
+                    f"{hint_text}"
+                )
+        except Exception:
+            pass  # If guard check fails, fall through to normal auth flow
+
+        # Get the current page state before handing to user (to detect changes)
+        initial_title = ""
+        initial_url = ""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state")
+                r.raise_for_status()
+                initial_data = r.json()
+                initial_title = initial_data.get("title", "")
+                initial_url = initial_data.get("url", "")
+        except Exception:
+            pass
+
+        auth_url = f"http://localhost:3100/auth-ui/{session_id}"
+        print(f">> Waiting for user to complete auth at: {auth_url}")
+
+        # Tell the user to solve the challenge — this message goes to the LLM output
+        # which the orchestrator relays to the user
+        user_msg = (
+            f"[HUMAN ACTION REQUIRED]\n\n"
+            f"The browser hit a bot protection screen. Please solve it:\n"
+            f"  {auth_url}\n\n"
+            f"1. Click the link above to see the live browser\n"
+            f"2. Solve the captcha / Press & Hold / log in\n"
+            f"3. Click 'Save Cookies & Done' when the real page loads\n\n"
+            f"Waiting for you to finish..."
+        )
+
+        # Poll until the user signals done (via auth-ui button) or page changes
+        max_wait = 180  # 3 minutes for user to solve
+        poll_interval = 2  # check every 2 seconds
+        start = time.time()
+
+        while time.time() - start < max_wait:
+            await asyncio.sleep(poll_interval)
+
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    # Check the human-done signal first (fastest path)
+                    try:
+                        hd = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/human-done")
+                        if hd.status_code == 200 and hd.json().get("done"):
+                            # User clicked "Save Cookies & Done" — page is reloading
+                            # Wait a moment for the page reload to complete
+                            await asyncio.sleep(3)
+                            # Fetch updated state
+                            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state")
+                            r.raise_for_status()
+                            current = r.json()
+                            current_title = current.get("title", "")
+                            current_url = current.get("url", "")
+
+                            elapsed = int(time.time() - start)
+                            print(f">> User signaled done in {elapsed}s — page: {current_title}")
+                            # Fall through to the success handler below
+                            title_changed = True
+                            url_changed = True
+                            still_blocked = False
+                        else:
+                            # Also check page state for changes
+                            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state")
+                            r.raise_for_status()
+                            current = r.json()
+                            current_title = current.get("title", "")
+                            current_url = current.get("url", "")
+                            title_changed = current_title and current_title != initial_title
+                            url_changed = current_url and current_url != initial_url
+                            lower_title = current_title.lower()
+                            elements_text = (current.get("elements", "") or "").lower()
+                            still_blocked = (
+                                "press & hold" in elements_text
+                                or "press and hold" in elements_text
+                                or "just a moment" in lower_title
+                                or "access denied" in lower_title
+                                or "verify you are human" in lower_title
+                                or "access to this page has been denied" in elements_text
+                            )
+                    except Exception:
+                        continue
+
+                if (title_changed or url_changed) and not still_blocked:
+                    elapsed = int(time.time() - start)
+                    print(f">> User completed auth in {elapsed}s — page changed to: {current_title}")
+
+                    # Auto-save cookies for this domain
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            cr = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/cookies")
+                            cr.raise_for_status()
+                            cookies = cr.json().get("cookies", [])
+                            if cookies:
+                                await client.post(
+                                    f"{SUPERBROWSER_URL}/cookies/save",
+                                    json={"cookies": cookies},
+                                )
+                                print(f">> Auto-saved {len(cookies)} cookies after auth")
+                    except Exception:
+                        pass
+
+                    # Return updated page state — worker continues in THIS session
+                    self.s.record_url(current_url)
+                    self.s.record_step("browser_auth_setup", url, f"user solved, now on: {current_url}")
+                    self.s.log_activity("auth_complete", f"{current_url} ({elapsed}s)")
+
+                    # Get full state with elements for the worker to use
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            r = await client.get(
+                                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                                params={"vision": "true"},
+                            )
+                            r.raise_for_status()
+                            data = r.json()
+                        caption = f"[Auth complete — continue in this session]\n"
+                        caption += f"Session: {session_id}\n"
+                        caption += _format_state(data)
+                        if data.get("screenshot") and self.s.screenshot_budget > 0:
+                            self.s.screenshot_budget -= 1
+                            return self.s.build_image_blocks(data["screenshot"], caption)
+                        return caption
+                    except Exception:
+                        return f"[Auth complete] Page is now: {current_title} ({current_url}). Continue using session {session_id}."
+
+            except Exception:
+                pass  # Network errors during polling — just retry
+
+        # Timeout — user didn't solve in time
+        return (
+            f"[Auth timeout — user did not complete within {max_wait}s]\n"
+            f"Auth link was: {auth_url}\n"
+            f"Report this to the orchestrator."
+        )
+
+
 def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
     """Register all browser session tools with a nanobot instance.
 
@@ -1095,6 +1486,9 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserSolveCaptchaTool(),       # stateless
         BrowserAskUserTool(state),
         BrowserCloseTool(state),
+        BrowserSaveCookiesTool(),        # stateless
+        BrowserLoadCookiesTool(),        # stateless
+        BrowserAuthSetupTool(state),     # needs state for session continuity
     ]
     for tool in tools:
         bot._loop.tools.register(tool)

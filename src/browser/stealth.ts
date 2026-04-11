@@ -6,12 +6,20 @@
  * page script runs.
  */
 
-export function getStealthScript(): string {
+export function getStealthScript(isLinux: boolean = false): string {
+  const platform = isLinux ? 'Linux' : 'macOS';
+  const platformVersion = isLinux ? '6.1.0' : '14.5.0';
   return `
 (function () {
-  // 1. Hide navigator.webdriver
+  // 1. Hide navigator.webdriver — use value descriptor (not getter) to look native.
+  // Cloudflare checks: Object.getOwnPropertyDescriptor(navigator, 'webdriver')
+  // A getter-based override is detectable; a value:false matches real Chrome.
+  delete Object.getPrototypeOf(navigator).webdriver;
   Object.defineProperty(navigator, 'webdriver', {
-    get: () => undefined,
+    value: false,
+    configurable: true,
+    enumerable: true,
+    writable: true,
   });
 
   // 2. Spoof window.chrome.runtime
@@ -104,34 +112,34 @@ export function getStealthScript(): string {
     Object.defineProperty(navigator, 'userAgentData', {
       get: () => ({
         brands: [
-          { brand: 'Chromium', version: '130' },
-          { brand: 'Google Chrome', version: '130' },
-          { brand: 'Not_A Brand', version: '24' },
+          { brand: 'Chromium', version: '146' },
+          { brand: 'Google Chrome', version: '146' },
+          { brand: 'Not/A)Brand', version: '8' },
         ],
         mobile: false,
-        platform: 'macOS',
+        platform: '${platform}',
         getHighEntropyValues: () =>
           Promise.resolve({
             architecture: 'x86',
             model: '',
-            platform: 'macOS',
-            platformVersion: '14.5.0',
-            uaFullVersion: '130.0.6723.91',
+            platform: '${platform}',
+            platformVersion: '${platformVersion}',
+            uaFullVersion: '146.0.7680.153',
             fullVersionList: [
-              { brand: 'Chromium', version: '130.0.6723.91' },
-              { brand: 'Google Chrome', version: '130.0.6723.91' },
-              { brand: 'Not_A Brand', version: '24.0.0.0' },
+              { brand: 'Chromium', version: '146.0.7680.153' },
+              { brand: 'Google Chrome', version: '146.0.7680.153' },
+              { brand: 'Not/A)Brand', version: '8.0.0.0' },
             ],
           }),
       }),
     });
   }
 
-  // 10. Screen dimensions consistency (headless often has wrong values)
-  Object.defineProperty(screen, 'width', { get: () => 1920 });
-  Object.defineProperty(screen, 'height', { get: () => 1080 });
-  Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-  Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+  // 10. Screen dimensions consistency (must match viewport/window size)
+  Object.defineProperty(screen, 'width', { get: () => 1440 });
+  Object.defineProperty(screen, 'height', { get: () => 900 });
+  Object.defineProperty(screen, 'availWidth', { get: () => 1440 });
+  Object.defineProperty(screen, 'availHeight', { get: () => 860 });
   Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
   Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
 

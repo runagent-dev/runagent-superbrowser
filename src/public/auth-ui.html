@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SuperBrowser - Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f0f1a;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+    width: 100%;
+    max-width: 1300px;
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  #status {
+    font-size: 13px;
+    color: #888;
+    margin-left: auto;
+    padding: 4px 12px;
+    background: #1a1a2e;
+    border-radius: 12px;
+    border: 1px solid #333;
+  }
+  .status-active { color: #44ee66 !important; border-color: #2a6a3a !important; }
+  .status-typing { color: #ffaa44 !important; border-color: #6a5a2a !important; }
+
+  #browser-container {
+    position: relative;
+    border: 2px solid #2a2a4a;
+    border-radius: 12px;
+    overflow: hidden;
+    max-width: 1300px;
+    width: 100%;
+    background: #000;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    outline: none;
+  }
+  #browser-container.focused { border-color: #667eea; box-shadow: 0 0 0 2px rgba(102,126,234,0.3), 0 8px 32px rgba(0,0,0,0.4); }
+  #browser-view {
+    display: block;
+    width: 100%;
+    height: auto;
+    cursor: crosshair;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #click-indicator {
+    position: absolute;
+    width: 24px;
+    height: 24px;
+    border: 3px solid #ff6b6b;
+    border-radius: 50%;
+    pointer-events: none;
+    display: none;
+    transform: translate(-50%, -50%);
+    animation: clickPulse 0.6s ease-out;
+  }
+  @keyframes clickPulse {
+    0% { transform: translate(-50%, -50%) scale(0.3); opacity: 1; }
+    100% { transform: translate(-50%, -50%) scale(2.5); opacity: 0; }
+  }
+  #loading-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #aaa;
+    font-size: 16px;
+    z-index: 10;
+  }
+  #typing-indicator {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(255,170,68,0.9);
+    color: #000;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 14px;
+    border-radius: 12px;
+    display: none;
+    z-index: 5;
+    pointer-events: none;
+  }
+
+  .bottom-bar {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    width: 100%;
+    max-width: 1300px;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  button {
+    padding: 10px 18px;
+    border: 1px solid #3a3a5e;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: all 0.2s;
+    background: #1e1e36;
+    color: #bbb;
+  }
+  button:hover { background: #2a2a4a; border-color: #555; color: #fff; }
+  button:active { transform: scale(0.97); }
+
+  .btn-done {
+    background: linear-gradient(135deg, #22aa44, #1a8836);
+    color: white;
+    border: none;
+    font-size: 14px;
+    padding: 10px 28px;
+    box-shadow: 0 2px 8px rgba(34, 170, 68, 0.3);
+  }
+  .btn-done:hover { background: linear-gradient(135deg, #28cc50, #22aa44); }
+
+  .btn-delete {
+    background: #3a1a1a;
+    color: #ff6666;
+    border-color: #552222;
+  }
+  .btn-delete:hover { background: #4a2222; color: #ff8888; }
+
+  .instructions {
+    width: 100%;
+    max-width: 1300px;
+    margin-top: 12px;
+    padding: 14px 18px;
+    background: #1a1a2e;
+    border-radius: 10px;
+    border: 1px solid #2a2a4a;
+    font-size: 13px;
+    color: #999;
+    line-height: 1.7;
+  }
+  .instructions strong { color: #ccc; }
+  .instructions .step { color: #667eea; font-weight: 700; }
+  .instructions kbd {
+    background: #2a2a4a;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: monospace;
+    font-size: 12px;
+    color: #ddd;
+  }
+
+  .import-section {
+    width: 100%;
+    max-width: 1300px;
+    margin-top: 12px;
+    border: 1px solid #2a2a4a;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .import-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    background: #1a1a2e;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    color: #aaa;
+    user-select: none;
+  }
+  .import-header:hover { background: #222244; color: #ccc; }
+  #import-body {
+    padding: 12px 16px;
+    background: #12121f;
+  }
+  #cookie-paste {
+    width: 100%;
+    min-height: 120px;
+    padding: 10px 12px;
+    border: 1px solid #3a3a5e;
+    border-radius: 8px;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    resize: vertical;
+    outline: none;
+  }
+  #cookie-paste:focus { border-color: #667eea; }
+  #cookie-paste::placeholder { color: #444; }
+  .import-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+  }
+  .btn-import {
+    background: linear-gradient(135deg, #3366cc, #2255aa);
+    color: white;
+    border: none;
+    padding: 10px 24px;
+    font-size: 14px;
+  }
+  .btn-import:hover { background: linear-gradient(135deg, #4477dd, #3366cc); }
+  #import-status { font-size: 13px; }
+
+  #cookie-status {
+    margin-top: 10px;
+    font-size: 14px;
+    text-align: center;
+    padding: 8px 16px;
+    max-width: 1300px;
+    width: 100%;
+  }
+  .success { color: #44ee66; font-weight: 600; }
+  .error { color: #ff5555; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SuperBrowser Login</h1>
+  <div id="status">Connecting...</div>
+</div>
+
+<div id="browser-container" tabindex="0">
+  <img id="browser-view" alt="" />
+  <div id="click-indicator"></div>
+  <div id="loading-overlay">Loading browser...</div>
+  <div id="typing-indicator">KEYBOARD ACTIVE - typing into browser...</div>
+</div>
+
+<div class="bottom-bar">
+  <div class="actions">
+    <button id="refresh-btn" title="Force refresh screenshot">Refresh</button>
+    <button id="back-btn" title="Go back">Back</button>
+    <button class="btn-delete" id="delete-cookies-btn" title="Delete all saved cookies">Delete Saved Cookies</button>
+  </div>
+  <button class="btn-done" id="done-btn">Save Cookies & Done</button>
+</div>
+
+<div class="instructions">
+  <strong>Option A — Log in here:</strong>
+  <span class="step">1.</span> <strong>Click</strong> on the browser image to interact.
+  <span class="step">2.</span> <strong>Type</strong> on your keyboard — keystrokes go to the browser.
+  <span class="step">3.</span> When logged in, click <strong>Save Cookies & Done</strong>.<br><br>
+  <strong>Option B — Import from your real browser (for Google login):</strong>
+  <span class="step">1.</span> Install <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" style="color:#667eea">Cookie-Editor</a> extension in Chrome.
+  <span class="step">2.</span> Log into the site in your real Chrome browser.
+  <span class="step">3.</span> Click the Cookie-Editor icon → <strong>Export</strong> → copies JSON.
+  <span class="step">4.</span> Paste below and click <strong>Import Cookies</strong>.
+</div>
+
+<div class="import-section">
+  <div class="import-header" id="import-toggle">
+    <span>Import Cookies from Real Browser</span>
+    <span id="import-arrow">&#9660;</span>
+  </div>
+  <div id="import-body" style="display:none;">
+    <textarea id="cookie-paste" placeholder="Paste cookie JSON here...&#10;&#10;Formats supported:&#10;- Cookie-Editor export (recommended)&#10;- EditThisCookie export&#10;- DevTools cookie JSON&#10;- document.cookie string (name=val; name2=val2)"></textarea>
+    <div class="import-actions">
+      <button class="btn-import" id="import-btn">Import & Save Cookies</button>
+      <span id="import-status"></span>
+    </div>
+  </div>
+</div>
+
+<div id="cookie-status"></div>
+
+<script>
+const sessionId = window.location.pathname.split('/auth-ui/')[1];
+const statusEl = document.getElementById('status');
+const browserView = document.getElementById('browser-view');
+const container = document.getElementById('browser-container');
+const clickIndicator = document.getElementById('click-indicator');
+const loadingOverlay = document.getElementById('loading-overlay');
+const typingIndicator = document.getElementById('typing-indicator');
+const cookieStatus = document.getElementById('cookie-status');
+
+let refreshInterval = null;
+let viewportWidth = 1440;
+let viewportHeight = 900;
+let isBusy = false;
+let keyboardActive = false;
+let typingTimeout = null;
+
+// Fetch actual viewport dimensions from the session
+async function fetchViewportSize() {
+  try {
+    const res = await fetch(`/session/${sessionId}/state?vision=false`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.scrollInfo) {
+        // viewportHeight from scrollInfo is the actual browser viewport
+        if (data.scrollInfo.viewportHeight > 0) viewportHeight = data.scrollInfo.viewportHeight;
+      }
+    }
+  } catch {}
+}
+fetchViewportSize();
+
+// ── Screenshot refresh ──
+async function refreshScreenshot() {
+  if (isBusy) return;
+  try {
+    const img = new Image();
+    const src = `/session/${sessionId}/screenshot?t=${Date.now()}`;
+    img.onload = () => {
+      browserView.src = src;
+      loadingOverlay.style.display = 'none';
+      if (!keyboardActive) {
+        statusEl.textContent = 'Connected - click the browser to start';
+        statusEl.className = '';
+      }
+    };
+    img.onerror = () => {
+      statusEl.textContent = 'Session expired - close this tab';
+      statusEl.className = '';
+    };
+    img.src = src;
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+refreshScreenshot();
+refreshInterval = setInterval(refreshScreenshot, 1500);
+
+// ── Helper to run JS in the page context (evaluate endpoint) ──
+async function evalInPage(script) {
+  const res = await fetch(`/session/${sessionId}/evaluate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ script }),
+  });
+  if (!res.ok) {
+    console.error('evaluate failed:', res.status);
+    return null;
+  }
+  return await res.json();
+}
+
+// ── Helper to call Puppeteer script ──
+async function runScript(code, timeout = 10000) {
+  const res = await fetch(`/session/${sessionId}/script`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, timeout }),
+  });
+  if (!res.ok) console.error('script failed:', res.status, await res.text().catch(() => ''));
+  return res.ok;
+}
+
+// ── Type text into the focused field using multiple strategies ──
+async function typeText(text) {
+  // Strategy 1: Use document.execCommand('insertText') — works with React/Google forms
+  const result = await evalInPage(`
+    (function() {
+      var el = document.activeElement;
+      if (!el) return 'no-focus';
+      // Try execCommand first — most compatible with modern frameworks
+      var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
+      if (ok) return 'execCommand-ok';
+      // Fallback: set value directly and fire events
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+        var nativeSetter = Object.getOwnPropertyDescriptor(
+          el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeSetter.call(el, (el.value || '') + ${JSON.stringify(text)});
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'nativeSetter-ok';
+      }
+      return 'unsupported-element:' + el.tagName;
+    })()
+  `);
+  console.log('typeText result:', result);
+
+  // If both DOM methods fail, fall back to Puppeteer keyboard
+  const resultStr = result?.result || '';
+  if (resultStr.includes('no-focus') || resultStr.includes('unsupported')) {
+    console.log('DOM methods failed, trying page.keyboard.type...');
+    await runScript(
+      'await page.keyboard.type(' + JSON.stringify(text) + ', { delay: 30 }); return "kb-ok";',
+      15000
+    );
+  }
+}
+
+// ── Press a special key ──
+async function pressKey(key) {
+  // Use page.keyboard.press for special keys — more reliable than DOM events
+  const ok = await runScript(
+    'await page.keyboard.press(' + JSON.stringify(key) + '); return "ok";',
+    5000
+  );
+  if (!ok) {
+    // Fallback: dispatch key event via evaluate
+    await evalInPage(`
+      var e = new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true });
+      document.activeElement ? document.activeElement.dispatchEvent(e) : document.dispatchEvent(e);
+    `);
+  }
+}
+
+// ── Mouse coordinate mapping ──
+function imgToPage(clientX, clientY) {
+  const rect = browserView.getBoundingClientRect();
+  const imgW = browserView.naturalWidth || viewportWidth;
+  const imgH = browserView.naturalHeight || viewportHeight;
+  return {
+    x: Math.round((clientX - rect.left) * (imgW / rect.width)),
+    y: Math.round((clientY - rect.top) * (imgH / rect.height)),
+  };
+}
+
+// Send a mouse event to the browser session
+async function sendMouse(action, x, y) {
+  await fetch(`/session/${sessionId}/mouse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, x, y }),
+  }).catch(() => {});
+}
+
+// ── Full mouse handling (click, drag, slider, press-and-hold) ──
+let isDragging = false;
+let dragMoveThrottle = null;
+
+browserView.addEventListener('mousedown', async (e) => {
+  e.preventDefault();
+  const { x, y } = imgToPage(e.clientX, e.clientY);
+  isDragging = true;
+
+  // Activate keyboard mode
+  keyboardActive = true;
+  container.classList.add('focused');
+  container.focus();
+  statusEl.textContent = 'Mouse down — drag to slide, release to click';
+  statusEl.className = 'status-active';
+
+  isBusy = true;
+  await sendMouse('down', x, y);
+});
+
+browserView.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  e.preventDefault();
+
+  // Throttle mousemove to avoid flooding the server (~30fps)
+  if (dragMoveThrottle) return;
+  dragMoveThrottle = setTimeout(() => { dragMoveThrottle = null; }, 33);
+
+  const { x, y } = imgToPage(e.clientX, e.clientY);
+  sendMouse('move', x, y);
+});
+
+// mouseup on the whole document (user may release outside the image)
+document.addEventListener('mouseup', async (e) => {
+  if (!isDragging) return;
+  isDragging = false;
+
+  const { x, y } = imgToPage(e.clientX, e.clientY);
+  await sendMouse('up', x, y);
+  isBusy = false;
+
+  statusEl.textContent = 'Keyboard active - type to enter text';
+  statusEl.className = 'status-active';
+  setTimeout(refreshScreenshot, 300);
+});
+
+// Simple click (mousedown + immediate mouseup at same spot) — also show indicator
+browserView.addEventListener('click', async (e) => {
+  e.preventDefault();
+  const { x, y } = imgToPage(e.clientX, e.clientY);
+  const rect = browserView.getBoundingClientRect();
+
+  // Show click indicator
+  clickIndicator.style.left = `${e.clientX - rect.left}px`;
+  clickIndicator.style.top = `${e.clientY - rect.top}px`;
+  clickIndicator.style.display = 'block';
+  setTimeout(() => { clickIndicator.style.display = 'none'; }, 600);
+
+  // The actual click was already handled by mousedown+mouseup,
+  // but fire a server-side click too for reliability (handles pages
+  // that listen for 'click' events specifically)
+  isBusy = true;
+  try {
+    await fetch(`/session/${sessionId}/click`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x, y }),
+    });
+  } catch (err) {}
+  isBusy = false;
+  setTimeout(refreshScreenshot, 300);
+});
+
+// Focus the container on page load
+container.focus();
+
+// ── Direct keyboard forwarding ──
+// Buffer keystrokes and send in batches for performance
+let keyBuffer = '';
+let keyBufferTimer = null;
+
+async function flushKeyBuffer() {
+  if (!keyBuffer) return;
+  const text = keyBuffer;
+  keyBuffer = '';
+  isBusy = true;
+  try {
+    await typeText(text);
+  } catch (err) {
+    console.error('typeText error:', err);
+  }
+  isBusy = false;
+  clearTimeout(window._refreshDebounce);
+  window._refreshDebounce = setTimeout(refreshScreenshot, 600);
+}
+
+container.addEventListener('keydown', async (e) => {
+  if (e.target !== container) return;
+  e.preventDefault();
+
+  // Show typing indicator
+  typingIndicator.style.display = 'block';
+  statusEl.textContent = 'Typing...';
+  statusEl.className = 'status-typing';
+  clearTimeout(typingTimeout);
+  typingTimeout = setTimeout(() => {
+    typingIndicator.style.display = 'none';
+    statusEl.textContent = 'Keyboard active - type to enter text';
+    statusEl.className = 'status-active';
+  }, 2000);
+
+  const key = e.key;
+
+  // For printable characters, buffer and batch-send
+  if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    keyBuffer += key;
+    clearTimeout(keyBufferTimer);
+    // Flush after 150ms of no typing (batches fast typing)
+    keyBufferTimer = setTimeout(flushKeyBuffer, 150);
+    return;
+  }
+
+  // Flush any buffered text before sending special key
+  if (keyBuffer) {
+    clearTimeout(keyBufferTimer);
+    await flushKeyBuffer();
+  }
+
+  // Special keys
+  const keyMap = {
+    'Enter': 'Enter', 'Tab': 'Tab', 'Backspace': 'Backspace',
+    'Delete': 'Delete', 'Escape': 'Escape',
+    'ArrowUp': 'ArrowUp', 'ArrowDown': 'ArrowDown',
+    'ArrowLeft': 'ArrowLeft', 'ArrowRight': 'ArrowRight',
+    'Home': 'Home', 'End': 'End', ' ': 'Space',
+  };
+
+  const puppeteerKey = keyMap[key];
+  if (puppeteerKey) {
+    isBusy = true;
+    try { await pressKey(puppeteerKey); } catch (err) {}
+    isBusy = false;
+    setTimeout(refreshScreenshot, 300);
+    return;
+  }
+
+  // Ctrl+A (select all)
+  if ((e.ctrlKey || e.metaKey) && key === 'a') {
+    isBusy = true;
+    try {
+      await evalInPage(`
+        var el = document.activeElement;
+        if (el && el.select) el.select();
+      `);
+    } catch (err) {}
+    isBusy = false;
+  }
+});
+
+// Keep focus on container when clicking buttons
+document.querySelectorAll('button').forEach(btn => {
+  btn.addEventListener('mousedown', (e) => {
+    // Prevent button click from stealing focus
+    if (btn.id !== 'done-btn' && btn.id !== 'delete-cookies-btn' && btn.id !== 'import-btn') {
+      e.preventDefault();
+    }
+  });
+});
+
+// ── Import cookies toggle ──
+document.getElementById('import-toggle').addEventListener('click', () => {
+  const body = document.getElementById('import-body');
+  const arrow = document.getElementById('import-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = 'block';
+    arrow.innerHTML = '&#9650;';
+  } else {
+    body.style.display = 'none';
+    arrow.innerHTML = '&#9660;';
+  }
+});
+
+// ── Import cookies from paste ──
+document.getElementById('import-btn').addEventListener('click', async () => {
+  const importStatus = document.getElementById('import-status');
+  const raw = document.getElementById('cookie-paste').value.trim();
+  if (!raw) { importStatus.textContent = 'Paste cookies first!'; importStatus.className = 'error'; return; }
+
+  importStatus.textContent = 'Parsing...';
+  importStatus.className = '';
+
+  let cookies = [];
+
+  try {
+    // Try JSON parse first (Cookie-Editor, EditThisCookie, Puppeteer format)
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      cookies = parsed.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || '',
+        path: c.path || '/',
+        expires: c.expirationDate || c.expires || c.expiry || -1,
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? false,
+        sameSite: c.sameSite || 'Lax',
+      }));
+    } else if (parsed.name && parsed.value) {
+      // Single cookie object
+      cookies = [{
+        name: parsed.name,
+        value: parsed.value,
+        domain: parsed.domain || '',
+        path: parsed.path || '/',
+        expires: parsed.expirationDate || parsed.expires || -1,
+        httpOnly: parsed.httpOnly ?? false,
+        secure: parsed.secure ?? false,
+        sameSite: parsed.sameSite || 'Lax',
+      }];
+    }
+  } catch (e) {
+    // Not JSON — try "name=value; name2=value2" format (document.cookie string)
+    const pairs = raw.split(';').map(s => s.trim()).filter(Boolean);
+    for (const pair of pairs) {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx > 0) {
+        cookies.push({
+          name: pair.substring(0, eqIdx).trim(),
+          value: pair.substring(eqIdx + 1).trim(),
+          domain: '', // Will need to be set from current page
+          path: '/',
+          expires: -1,
+          httpOnly: false,
+          secure: false,
+          sameSite: 'Lax',
+        });
+      }
+    }
+
+    // If cookie string format, try to get domain from the browser session
+    if (cookies.length > 0) {
+      try {
+        const stateRes = await evalInPage('location.hostname');
+        const hostname = stateRes?.result || '';
+        if (hostname) {
+          cookies.forEach(c => { if (!c.domain) c.domain = '.' + hostname; });
+        }
+      } catch (e2) {}
+    }
+  }
+
+  if (cookies.length === 0) {
+    importStatus.textContent = 'Could not parse any cookies. Use Cookie-Editor JSON format.';
+    importStatus.className = 'error';
+    return;
+  }
+
+  importStatus.textContent = `Importing ${cookies.length} cookies...`;
+
+  try {
+    // Inject into the browser session
+    const setRes = await fetch(`/session/${sessionId}/cookies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookies }),
+    });
+    if (!setRes.ok) throw new Error(`Inject failed: ${setRes.status}`);
+
+    // Save to disk
+    const saveRes = await fetch('/cookies/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookies }),
+    });
+    if (!saveRes.ok) throw new Error(`Save failed: ${saveRes.status}`);
+    const result = await saveRes.json();
+
+    importStatus.innerHTML = `<span class="success">Imported ${cookies.length} cookies for: ${result.domains.join(', ')}</span>`;
+
+    // Refresh the browser to apply cookies
+    setTimeout(async () => {
+      try {
+        await runScript(`await page.reload({ waitUntil: 'networkidle2', timeout: 15000 }); return 'ok';`, 20000);
+      } catch (e) {}
+      refreshScreenshot();
+    }, 500);
+  } catch (err) {
+    importStatus.textContent = `Error: ${err.message}`;
+    importStatus.className = 'error';
+  }
+});
+
+// ── Button handlers ──
+document.getElementById('refresh-btn').addEventListener('click', () => {
+  refreshScreenshot();
+  container.focus();
+});
+
+document.getElementById('back-btn').addEventListener('click', async () => {
+  try {
+    await runScript(`await page.goBack({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {}); return 'ok';`);
+    setTimeout(refreshScreenshot, 500);
+  } catch (err) {}
+  container.focus();
+});
+
+// ── Delete saved cookies ──
+document.getElementById('delete-cookies-btn').addEventListener('click', async () => {
+  if (!confirm('Delete all saved cookies? You will need to log in again next time.')) return;
+  try {
+    const res = await fetch('/cookies', { method: 'DELETE' });
+    const data = await res.json();
+    cookieStatus.innerHTML = `<span class="success">Deleted ${data.deleted || 0} cookie file(s).</span>`;
+  } catch (err) {
+    cookieStatus.textContent = `Error: ${err.message}`;
+    cookieStatus.className = 'error';
+  }
+});
+
+// ── Save cookies & done ──
+document.getElementById('done-btn').addEventListener('click', async () => {
+  cookieStatus.textContent = 'Saving cookies...';
+  cookieStatus.className = '';
+
+  try {
+    const cookieRes = await fetch(`/session/${sessionId}/cookies`);
+    if (!cookieRes.ok) throw new Error(`Failed to get cookies: ${cookieRes.status}`);
+    const { cookies } = await cookieRes.json();
+
+    if (!cookies || cookies.length === 0) {
+      cookieStatus.textContent = 'No cookies found. Make sure you are logged in first.';
+      cookieStatus.className = 'error';
+      return;
+    }
+
+    const saveRes = await fetch('/cookies/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookies }),
+    });
+    if (!saveRes.ok) throw new Error(`Save failed: ${saveRes.status}`);
+    const result = await saveRes.json();
+
+    // Signal to the server that the user is done (unblocks browser_auth_setup polling)
+    await fetch(`/session/${sessionId}/human-done`, { method: 'POST' }).catch(() => {});
+
+    // Reload the page in the browser session so the worker sees the real content
+    // (not the captcha page). This navigates using the saved cookies.
+    await fetch(`/session/${sessionId}/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expression: 'window.location.reload()' }),
+    }).catch(() => {});
+
+    cookieStatus.innerHTML =
+      `<span class="success">Saved ${cookies.length} cookies for: ${result.domains.join(', ')}</span><br>` +
+      `The browser agent will continue automatically. You can close this tab.`;
+
+    clearInterval(refreshInterval);
+    statusEl.textContent = 'Done - cookies saved & page reloading';
+    statusEl.className = 'status-active';
+  } catch (err) {
+    cookieStatus.textContent = `Error: ${err.message}`;
+    cookieStatus.className = 'error';
+  }
+});
+</script>
+
+</body>
+</html>

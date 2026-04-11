@@ -7,6 +7,8 @@
  */
 
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import os from 'os';
 import puppeteerExtra from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, Page } from 'puppeteer-core';
@@ -30,37 +32,60 @@ export interface BrowserConfig {
 
 const DEFAULT_CONFIG: BrowserConfig = {
   headless: true,
-  viewport: { width: 1280, height: 1100 },
+  viewport: { width: 1440, height: 900 },
   downloadDir: '/tmp/superbrowser/downloads',
   blockAds: true,
   stealth: true,
 };
 
-/** Chrome launch flags for headless automation with enhanced stealth. */
+/**
+ * Chrome launch flags — minimal set following BrowserOS pattern.
+ *
+ * Cloudflare and similar bot detectors fingerprint Chrome flags.
+ * Flags like --disable-blink-features, --excludeSwitches, --disable-infobars
+ * are specifically flagged as automation indicators. We keep only what's
+ * strictly necessary for headless operation in containers.
+ *
+ * When AGGRESSIVE_STEALTH is not 'false' (default: enabled), additional
+ * flags from browser-use are added. The most critical is
+ * --disable-blink-features=AutomationControlled which prevents the
+ * webdriver flag from being set at the browser level (JS-level masking
+ * in stealth.ts is detectable by timing checks).
+ */
 const CHROME_FLAGS = [
-  '--disable-blink-features=AutomationControlled',
-  '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
-  '--disable-setuid-sandbox',
+  // Essential for container/headless operation
   '--no-sandbox',
+  '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
-  '--disable-accelerated-2d-canvas',
-  '--disable-gpu',
+  // Realistic browser behavior (BrowserOS uses these)
   '--no-first-run',
-  '--no-zygote',
-  '--disable-extensions',
-  '--disable-background-networking',
-  '--disable-default-apps',
-  '--disable-sync',
-  '--disable-translate',
-  '--metrics-recording-only',
-  '--mute-audio',
   '--no-default-browser-check',
-  '--enable-features=NetworkService,NetworkServiceInProcess',
+  '--use-mock-keychain',
+  // Reduce noise without looking suspicious
+  '--mute-audio',
+  '--disable-default-apps',
 ];
+
+/** Additional stealth flags ported from browser-use (browser/profile.py). */
+const AGGRESSIVE_STEALTH_FLAGS = [
+  '--disable-blink-features=AutomationControlled',
+  '--disable-features=AutomationControlled,BackForwardCache',
+  '--disable-infobars',
+  '--disable-popup-blocking',
+  '--disable-sync',
+  '--disable-hang-monitor',
+  '--disable-component-update',
+  '--disable-domain-reliability',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-ipc-flooding-protection',
+];
+
+/** Persistent browser profile directory. Set BROWSER_PROFILE env var to persist login sessions. */
+const BROWSER_PROFILE_DIR = process.env.BROWSER_PROFILE || '';
 
 /** Auto-detect Chrome/Chromium binary path. */
 function findChromePath(): string | undefined {
-  const fs = require('fs');
   const candidates = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
@@ -91,6 +116,7 @@ export class BrowserEngine extends EventEmitter {
 
     const args = [
       ...CHROME_FLAGS,
+      ...(process.env.AGGRESSIVE_STEALTH !== 'false' ? AGGRESSIVE_STEALTH_FLAGS : []),
       `--window-size=${this.config.viewport.width},${this.config.viewport.height}`,
     ];
 
@@ -98,8 +124,17 @@ export class BrowserEngine extends EventEmitter {
       args.push(`--proxy-server=${this.config.proxy}`);
     }
 
+    // Persistent browser profile — retains cookies/sessions across restarts
+    // Set BROWSER_PROFILE=/path/to/profile to enable
+    if (BROWSER_PROFILE_DIR) {
+      fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
+      args.push(`--user-data-dir=${BROWSER_PROFILE_DIR}`);
+      console.log(`[engine] Using persistent profile: ${BROWSER_PROFILE_DIR}`);
+    }
+
     const launchOptions: Record<string, unknown> = {
-      headless: this.config.headless,
+      // Use 'new' headless mode — much harder to detect than old headless
+      headless: this.config.headless ? 'new' : false,
       args,
       defaultViewport: this.config.viewport,
       ignoreHTTPSErrors: true,
@@ -135,18 +170,25 @@ export class BrowserEngine extends EventEmitter {
 
     const page = await this.browser.newPage();
 
+    // Detect actual OS for consistent fingerprint (mismatched platform is a detection signal)
+    const isLinux = os.platform() === 'linux';
+    const isMac = os.platform() === 'darwin';
+
     // Inject stealth scripts before any page script
     if (this.config.stealth) {
-      await page.evaluateOnNewDocument(getStealthScript());
-      await page.evaluateOnNewDocument(getPlatformOverrideScript());
+      const platform = isMac ? 'MacIntel' : (isLinux ? 'Linux x86_64' : 'Win32');
+      await page.evaluateOnNewDocument(getStealthScript(isLinux));
+      await page.evaluateOnNewDocument(getPlatformOverrideScript(platform));
     }
 
     // Set viewport
     await page.setViewport(this.config.viewport);
 
-    // Set user agent — use configured value or a realistic default matching stealth script (Chrome 130)
+    // Set user agent — match actual OS for consistent fingerprint
     const ua = this.config.userAgent
-      || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+      || (isLinux
+        ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+        : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
     await page.setUserAgent(ua);
 
     // Setup CDP session for download behavior
@@ -162,6 +204,18 @@ export class BrowserEngine extends EventEmitter {
       page.on('request', (req) => {
         const resourceType = req.resourceType();
         const url = req.url();
+
+        // NEVER block Cloudflare challenge resources — they are required for bypass
+        const cfWhitelist = [
+          /challenges\.cloudflare\.com/,
+          /cloudflare\.com\/cdn-cgi/,
+          /turnstile/,
+          /cf-beacon/,
+        ];
+        if (cfWhitelist.some((p) => p.test(url))) {
+          req.continue().catch(() => {});
+          return;
+        }
 
         // Block common ad/tracker domains and heavy resources
         const blockedTypes = ['media', 'font'];

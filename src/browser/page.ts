@@ -24,6 +24,7 @@ export class PageWrapper {
   private dialogHandlerSetup = false;
   private consoleCollector = new ConsoleCollector();
   private downloadMonitor = new DownloadMonitor();
+  private triedExternalSolver = false;
 
   constructor(
     private page: Page,
@@ -51,37 +52,638 @@ export class PageWrapper {
     // Wait a bit for dynamic content
     await this.waitForIdle(2000).catch(() => {});
 
-    // Auto-wait for Cloudflare challenge if detected
+    // Auto-wait for bot protection challenges
     await this.waitForCloudflare();
+    await this.waitForPerimeterX();
+
+    // Auto-dismiss cookie consent, country selectors, and other overlays.
+    // Run twice with a delay — many SPAs show overlays asynchronously after page load.
+    await this.dismissConsentScreens().catch(() => {});
+    await this.dismissOverlays().catch(() => {});
+    // Second pass after a delay for late-appearing overlays
+    await new Promise(r => setTimeout(r, 2000));
+    await this.dismissConsentScreens().catch(() => {});
+    await this.dismissOverlays().catch(() => {});
   }
 
   /**
-   * Wait for Cloudflare challenge to resolve (auto-detected by page title).
-   * Cloudflare shows "Just a moment..." while verifying the browser.
-   * Most challenges auto-resolve within 5-15 seconds with good stealth.
+   * Wait for Cloudflare challenge to resolve.
+   *
+   * Detection: page title ("Just a moment...") + Turnstile iframe.
+   * Resolution: polls for cf-turnstile-response token in DOM (BrowserOS pattern)
+   * AND checks title change. Timeout 30s (Turnstile can take 10-20s).
    */
-  async waitForCloudflare(maxWait: number = 15000): Promise<boolean> {
+  async waitForCloudflare(maxWait: number = 60000): Promise<boolean> {
+    this.triedExternalSolver = false;
     const title = await this.page.title();
-    const isCfChallenge = title.toLowerCase().includes('just a moment')
-      || title.toLowerCase().includes('checking your browser')
-      || title.toLowerCase().includes('attention required');
+    const titleLower = title.toLowerCase();
+    const isCfTitleChallenge = titleLower.includes('just a moment')
+      || titleLower.includes('checking your browser')
+      || titleLower.includes('attention required')
+      || titleLower.includes('verify you are human')
+      || titleLower.includes('security check');
+
+    // Also check for Turnstile widget in DOM (title may be the site name while CF overlay is present)
+    const hasTurnstileWidget = !isCfTitleChallenge ? await this.page.evaluate(() => {
+      return !!document.querySelector(
+        'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], '
+        + '.cf-turnstile, #challenge-running, #challenge-stage, #challenge-form'
+      );
+    }).catch(() => false) : false;
+
+    const isCfChallenge = isCfTitleChallenge || hasTurnstileWidget;
 
     if (!isCfChallenge) return true; // No challenge detected
 
     console.log('[stealth] Cloudflare challenge detected, waiting for resolution...');
     const start = Date.now();
+    let clickedTurnstile = false;
+
     while (Date.now() - start < maxWait) {
-      await new Promise(r => setTimeout(r, 1500));
-      const currentTitle = await this.page.title();
-      if (!currentTitle.toLowerCase().includes('just a moment')
+      await new Promise(r => setTimeout(r, 1000));
+
+      // Check 1: Turnstile token populated (BrowserOS captcha-waiter pattern)
+      const hasTurnstileToken = await this.page.evaluate(() => {
+        const input = document.querySelector(
+          '[name="cf-turnstile-response"], input[name*="turnstile"]'
+        ) as HTMLInputElement | null;
+        return !!(input && input.value && input.value.length > 10);
+      }).catch(() => false);
+
+      if (hasTurnstileToken) {
+        console.log(`[stealth] Turnstile token found in ${Date.now() - start}ms`);
+        await this.waitForIdle(2000).catch(() => {});
+        return true;
+      }
+
+      // Auto-click Turnstile checkbox if present (BrowserOS uses NopeCHA for this)
+      if (!clickedTurnstile) {
+        try {
+          const clicked = await this.clickTurnstileCheckbox();
+          if (clicked) {
+            clickedTurnstile = true;
+            console.log(`[stealth] Clicked Turnstile checkbox at ${Date.now() - start}ms`);
+            // Give it extra time to process after click
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+          }
+        } catch { /* ignore */ }
+      }
+
+      // If click didn't work after 10s, try full captcha solver chain
+      // (token injection -> AI vision -> 2captcha grid -> manual wait)
+      if (clickedTurnstile && Date.now() - start > 10000 && !this.triedExternalSolver) {
+        this.triedExternalSolver = true;
+        try {
+          const { detectCaptcha, solveCaptchaFull } = await import('./captcha.js');
+          const captchaInfo = await detectCaptcha(this.page);
+          if (captchaInfo) {
+            const apiKey = process.env.CAPTCHA_API_KEY || process.env.TWOCAPTCHA_API_KEY || '';
+            const provider = process.env.CAPTCHA_PROVIDER || '2captcha';
+
+            // Create LLM provider for AI vision solving if API key available
+            let llmProvider = null;
+            const llmApiKey = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+            if (llmApiKey) {
+              const { LLMProvider } = await import('../llm/provider.js');
+              llmProvider = new LLMProvider({
+                apiKey: llmApiKey,
+                model: process.env.LLM_MODEL || 'gpt-4o',
+              });
+            }
+
+            console.log(`[stealth] Attempting captcha solve (provider: ${provider || 'none'}, vision: ${llmProvider ? 'yes' : 'no'})...`);
+            const result = await solveCaptchaFull(
+              this.page,
+              captchaInfo,
+              { provider, apiKey, timeout: Math.max(maxWait - (Date.now() - start), 15000) },
+              llmProvider,
+              'auto',
+            );
+            if (result.solved) {
+              console.log(`[stealth] Captcha solved via ${result.method} at ${Date.now() - start}ms`);
+              await this.waitForIdle(2000).catch(() => {});
+              return true;
+            }
+          }
+        } catch { /* solver is best-effort */ }
+      }
+
+      // Check 2: Title changed (challenge page navigated away)
+      const currentTitle = await this.page.title().catch(() => '');
+      if (currentTitle
+        && !currentTitle.toLowerCase().includes('just a moment')
         && !currentTitle.toLowerCase().includes('checking your browser')
-        && !currentTitle.toLowerCase().includes('attention required')) {
+        && !currentTitle.toLowerCase().includes('attention required')
+        && !currentTitle.toLowerCase().includes('security verification')) {
         console.log(`[stealth] Cloudflare challenge resolved in ${Date.now() - start}ms`);
         await this.waitForIdle(1500).catch(() => {});
         return true;
       }
+
+      // Check 3: URL changed (some CF challenges redirect without title change)
+      const currentUrl = this.page.url();
+      if (currentUrl && !currentUrl.includes('challenges.cloudflare.com')
+        && !currentUrl.includes('/cdn-cgi/challenge-platform')) {
+        const newTitle = await this.page.title().catch(() => '');
+        if (newTitle && !newTitle.toLowerCase().includes('just a moment')) {
+          console.log(`[stealth] Cloudflare challenge resolved via redirect in ${Date.now() - start}ms`);
+          await this.waitForIdle(1500).catch(() => {});
+          return true;
+        }
+      }
     }
     console.log('[stealth] Cloudflare challenge did not resolve within timeout');
+    return false;
+  }
+
+  /**
+   * Wait for PerimeterX/HUMAN Security "Press & Hold" challenge to resolve.
+   *
+   * PerimeterX shows a page with "Please confirm you are a human" and a
+   * "Press & Hold" button (typically #px-captcha or an iframe). The button
+   * requires a sustained mousedown for 4-8 seconds.
+   *
+   * Strategy: detect the challenge, locate the button, simulate a human
+   * press-and-hold with realistic mouse movement and timing.
+   */
+  async waitForPerimeterX(maxWait: number = 30000): Promise<boolean> {
+    // Detect PerimeterX challenge page
+    const pxDetected = await this.page.evaluate(() => {
+      const body = document.body?.innerText?.toLowerCase() || '';
+      const hasPxText = body.includes('press & hold') || body.includes('press and hold');
+      const hasPxElement = !!document.querySelector(
+        '#px-captcha, [data-px-captcha], .px-captcha, '
+        + 'iframe[src*="captcha.px-cdn.net"], iframe[src*="captcha.perimeterx"], '
+        + '[id*="px-captcha"], [class*="px-captcha"]'
+      );
+      const hasHumanCheck = body.includes('confirm you are a human')
+        || body.includes('are you a robot')
+        || body.includes('denied');
+      return (hasPxText || hasPxElement) && hasHumanCheck;
+    }).catch(() => false);
+
+    if (!pxDetected) return true; // No PX challenge
+
+    console.log('[stealth] PerimeterX challenge detected, attempting Press & Hold...');
+    const start = Date.now();
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts && Date.now() - start < maxWait) {
+      attempts++;
+
+      const solved = await this.pressAndHoldChallenge();
+      if (solved) {
+        // Wait for page to transition after successful solve
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Check if challenge is gone
+        const stillBlocked = await this.page.evaluate(() => {
+          const body = document.body?.innerText?.toLowerCase() || '';
+          return body.includes('press & hold') || body.includes('press and hold')
+            || !!document.querySelector('#px-captcha');
+        }).catch(() => false);
+
+        if (!stillBlocked) {
+          console.log(`[stealth] PerimeterX challenge solved in ${Date.now() - start}ms (attempt ${attempts})`);
+          await this.waitForIdle(2000).catch(() => {});
+          return true;
+        }
+      }
+
+      // Wait before retry
+      await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000));
+    }
+
+    console.log('[stealth] PerimeterX challenge did not resolve within timeout');
+    return false;
+  }
+
+  /**
+   * Simulate a human "Press & Hold" action on the PerimeterX captcha button.
+   * Returns true if the action was dispatched.
+   */
+  private async pressAndHoldChallenge(): Promise<boolean> {
+    // Find the Press & Hold target — could be #px-captcha div or an iframe button
+    const target = await this.page.evaluate(() => {
+      // Direct element
+      const pxCaptcha = document.querySelector(
+        '#px-captcha, [data-px-captcha], .px-captcha, [id*="px-captcha"]'
+      );
+      if (pxCaptcha) {
+        const rect = pxCaptcha.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, source: 'direct' };
+        }
+      }
+
+      // Find by text content — look for "Press & Hold" button/div
+      const allElements = document.querySelectorAll('button, div, span, a');
+      for (const el of allElements) {
+        const text = (el.textContent || '').trim();
+        if (/press\s*[&+]\s*hold/i.test(text)) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 20 && rect.height > 20) {
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, source: 'text' };
+          }
+        }
+      }
+
+      // Iframe fallback
+      const iframe = document.querySelector(
+        'iframe[src*="captcha.px-cdn.net"], iframe[src*="perimeterx"], iframe[src*="px-captcha"]'
+      );
+      if (iframe) {
+        const rect = iframe.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, source: 'iframe' };
+        }
+      }
+
+      return null;
+    }).catch(() => null);
+
+    if (!target) {
+      console.log('[stealth] Could not locate Press & Hold button');
+      return false;
+    }
+
+    console.log(`[stealth] Found Press & Hold target (${target.source}) at (${Math.round(target.x)}, ${Math.round(target.y)})`);
+
+    // Human-like approach: move mouse from random position to button
+    const startX = 100 + Math.random() * 300;
+    const startY = target.y - 50 - Math.random() * 150;
+    await this.page.mouse.move(startX, startY);
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+
+    // Cubic Bezier movement to the button
+    const targetX = target.x + (Math.random() - 0.5) * 6;
+    const targetY = target.y + (Math.random() - 0.5) * 6;
+    const steps = 12 + Math.floor(Math.random() * 8);
+    const cp1x = startX + (targetX - startX) * 0.3 + (Math.random() - 0.5) * 25;
+    const cp1y = startY + (targetY - startY) * 0.2 + (Math.random() - 0.5) * 15;
+    const cp2x = startX + (targetX - startX) * 0.7 + (Math.random() - 0.5) * 15;
+    const cp2y = startY + (targetY - startY) * 0.85 + (Math.random() - 0.5) * 10;
+
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const u = 1 - t;
+      const cx = u*u*u*startX + 3*u*u*t*cp1x + 3*u*t*t*cp2x + t*t*t*targetX;
+      const cy = u*u*u*startY + 3*u*u*t*cp1y + 3*u*t*t*cp2y + t*t*t*targetY;
+      await this.page.mouse.move(cx, cy);
+      const speed = Math.sin(t * Math.PI);
+      await new Promise(r => setTimeout(r, 8 + (1 - speed) * 25 + Math.random() * 8));
+    }
+
+    // Brief hesitation before pressing (human-like)
+    await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+
+    // PRESS AND HOLD — PerimeterX requires 4-8 seconds of sustained mousedown
+    const holdDuration = 5000 + Math.random() * 3000; // 5-8 seconds
+    console.log(`[stealth] Pressing and holding for ${Math.round(holdDuration)}ms...`);
+
+    await this.page.mouse.down();
+
+    // During the hold, simulate slight micro-movements (humans aren't perfectly still)
+    const holdStart = Date.now();
+    while (Date.now() - holdStart < holdDuration) {
+      // Tiny jitter (1-2px) every 200-500ms
+      const jitterX = targetX + (Math.random() - 0.5) * 2;
+      const jitterY = targetY + (Math.random() - 0.5) * 2;
+      await this.page.mouse.move(jitterX, jitterY);
+      await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+    }
+
+    await this.page.mouse.up();
+    console.log(`[stealth] Released after ${Date.now() - holdStart}ms hold`);
+
+    // Wait for the page to transition
+    await new Promise(r => setTimeout(r, 3000));
+    return true;
+  }
+
+  /**
+   * Auto-dismiss cookie consent screens, GDPR popups, and privacy notices.
+   *
+   * Detects common consent frameworks (Google, OneTrust, CookieBot, generic GDPR)
+   * and clicks the "Accept all" button. Runs at the page level so the LLM never
+   * sees the consent overlay — zero iterations wasted.
+   *
+   * Returns true if a consent screen was detected and dismissed.
+   */
+  async dismissConsentScreens(timeout: number = 3000): Promise<boolean> {
+    try {
+      const dismissed = await this.page.evaluate(() => {
+        // --- Strategy 1: Known consent button selectors ---
+        const selectorCandidates = [
+          // Google consent
+          'button[jsname="b3VHJd"]',
+          'form[action*="consent"] button',
+          // OneTrust
+          '#onetrust-accept-btn-handler',
+          // CookieBot
+          '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+          '#CybotCookiebotDialogBodyButtonAccept',
+          // Quantcast
+          '.qc-cmp2-summary-buttons button[mode="primary"]',
+          'button[data-testid="GDPR-CTA-accept"]',
+          'button[data-testid="consent-accept"]',
+          // Didomi
+          '#didomi-notice-agree-button',
+          // TrustArc / TrustE
+          '.trustarc-agree-btn', '#truste-consent-button', '#consent_prompt_submit',
+          // Sourcepoint
+          'button[title="Accept All"]', 'button[title="Accept all"]', '.sp_choice_type_11',
+          // Usercentrics
+          '#uc-btn-accept-banner', '[data-testid="uc-accept-all-button"]',
+          // Osano
+          '.osano-cm-accept-all', '.osano-cm-dialog__button--type_accept',
+          // Termly
+          '[data-tid="banner-accept"]', '.t-acceptAllButton',
+          // Iubenda
+          '.iubenda-cs-accept-btn',
+          // Klaro
+          '.cm-btn-accept-all', '.cm-btn-accept',
+          // Complianz (WordPress)
+          '.cmplz-accept', '#cmplz-cookiebanner-container .cmplz-btn.cmplz-accept',
+          // Admiral / generic data-attribute patterns
+          '[data-cy="cookie-banner-accept"]',
+          '[data-action="accept-cookies"]', '[data-cookie-accept]',
+          'button[data-consent="accept"]', '[data-qa="accept-cookies"]',
+          '#accept-all-cookies', '#acceptAllCookies',
+          '.js-accept-cookies', '.js-cookie-accept',
+          // Generic class patterns
+          '.cc-accept', '.cc-btn.cc-dismiss',
+          '#cookie-accept', '#accept-cookies',
+          'button[aria-label="Accept all"]', 'button[aria-label="Accept cookies"]',
+          '.cookie-consent-accept', '.consent-accept',
+        ];
+
+        for (const selector of selectorCandidates) {
+          const el = document.querySelector(selector) as HTMLElement | null;
+          if (el && el.offsetParent !== null) {
+            el.click();
+            return true;
+          }
+        }
+
+        // --- Strategy 2: Find buttons by text content ---
+        const acceptPatterns = [
+          /^accept\s*(all|cookies|&\s*close|and\s*continue|and\s*close)?$/i,
+          /^agree\s*(and\s*(proceed|continue|close))?$/i,
+          /^i\s*(agree|accept|understand)$/i,
+          /^yes,?\s*i\s*(agree|accept|understand)$/i,
+          /^got\s*it$/i,
+          /^ok$/i,
+          /^allow\s*(all)?$/i,
+          /^continue$/i,
+          /^confirm$/i,
+          /^that'?s\s*ok$/i,
+          // German
+          /^alle\s*(cookies\s*)?akzeptieren$/i,
+          /^einverstanden$/i,
+          /^zustimmen$/i,
+          // French
+          /^tout\s*accepter$/i,
+          /^accepter\s*(tout)?$/i,
+          /^j'?accepte$/i,
+          /^continuer$/i,
+          // Spanish
+          /^aceptar\s*(todo|todas)?$/i,
+          // Portuguese
+          /^aceitar\s*(tudo)?$/i,
+          /^aceito$/i,
+          // Italian
+          /^accetta\s*tutti?$/i,
+          /^accetto$/i,
+          // Dutch
+          /^accepteer\s*(alles|alle)?$/i,
+          // Swedish
+          /^godkänn\s*alla$/i,
+          // Polish
+          /^akceptuj\s*wszystkie$/i,
+        ];
+
+        const buttons = Array.from(document.querySelectorAll(
+          'button, a[role="button"], [role="button"], input[type="button"], input[type="submit"]'
+        )) as HTMLElement[];
+
+        for (const btn of buttons) {
+          const text = (btn.textContent || btn.getAttribute('value') || '').trim();
+          if (text.length > 50) continue;
+          for (const pattern of acceptPatterns) {
+            if (pattern.test(text) && btn.offsetParent !== null) {
+              btn.click();
+              return true;
+            }
+          }
+        }
+
+        return false;
+      });
+
+      if (dismissed) {
+        console.log('[consent] Auto-dismissed consent/cookie screen');
+        await new Promise(r => setTimeout(r, 1500));
+        return true;
+      }
+    } catch {
+      // Best-effort
+    }
+    return false;
+  }
+
+  /**
+   * Auto-dismiss non-consent overlays: country/locale selectors, age gates,
+   * newsletter/promo popups, app install banners, notification prompts.
+   *
+   * Runs after dismissConsentScreens to catch overlays it doesn't handle.
+   */
+  async dismissOverlays(timeout: number = 3000): Promise<boolean> {
+    try {
+      const dismissed = await this.page.evaluate(() => {
+        // --- Strategy 1: Known overlay selectors ---
+        const overlayCandidates = [
+          // Newsletter / promo close buttons
+          '.newsletter-popup-close', '.modal-close', '.modal__close',
+          '[data-dismiss="modal"]', '.popup-close', '.popup__close',
+          // App install banners
+          '.smartbanner-close', '.app-banner-close', '#branch-banner-close',
+          // Notification prompts
+          '.notification-dismiss', '#push-notification-decline',
+        ];
+
+        for (const selector of overlayCandidates) {
+          const el = document.querySelector(selector) as HTMLElement | null;
+          if (el && el.offsetParent !== null) {
+            el.click();
+            return 'selector';
+          }
+        }
+
+        // --- Strategy 2: Country/locale selector + Age gate + Promo dismiss ---
+        const overlayPatterns = [
+          // Country/locale selectors
+          /^yes,?\s*(stay|continue|shop)/i,
+          /^stay\s*(on|in)\s/i,
+          /^continue\s*(to|on|in)\s/i,
+          /^shop\s*(in|on|from)\s/i,
+          /^go\s*to\s*.*\s*(site|store|shop)/i,
+          /^confirm\s*(country|location|region)/i,
+          // Age gates
+          /^yes,?\s*i\s*(am|'m)\s*(over|at\s*least|of\s*legal)/i,
+          /^i\s*am\s*(over|at\s*least|of\s*legal)/i,
+          /^enter\s*(site)?$/i,
+          /^yes,?\s*enter$/i,
+          /^verify\s*(my\s*)?age$/i,
+          // Promo / newsletter dismissals
+          /^no,?\s*thanks?$/i,
+          /^not?\s*now$/i,
+          /^maybe\s*later$/i,
+          /^skip$/i,
+          /^not?\s*interested$/i,
+          /^remind\s*me\s*later$/i,
+          /^close$/i,
+          /^dismiss$/i,
+        ];
+
+        const buttons = Array.from(document.querySelectorAll(
+          'button, a[role="button"], [role="button"], input[type="button"], input[type="submit"], a.btn, a.button'
+        )) as HTMLElement[];
+
+        for (const btn of buttons) {
+          const text = (btn.textContent || btn.getAttribute('value') || '').trim();
+          if (text.length > 80) continue;
+          for (const pattern of overlayPatterns) {
+            if (pattern.test(text) && btn.offsetParent !== null) {
+              btn.click();
+              return 'text';
+            }
+          }
+        }
+
+        // --- Strategy 3: Overlay container with close X button ---
+        const overlayContainers = document.querySelectorAll(
+          '[class*="overlay"], [class*="modal"], [class*="popup"], [class*="dialog"], '
+          + '[id*="overlay"], [id*="modal"], [id*="popup"]'
+        );
+        for (const container of overlayContainers) {
+          const el = container as HTMLElement;
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          const zIndex = parseInt(style.zIndex, 10);
+          if (isNaN(zIndex) || zIndex < 10) continue;
+
+          const closeBtn = el.querySelector(
+            '[class*="close"], [aria-label="Close"], [aria-label="close"], '
+            + 'button[class*="dismiss"], .icon-close, .close-icon'
+          ) as HTMLElement | null;
+          if (closeBtn && closeBtn.offsetParent !== null) {
+            closeBtn.click();
+            return 'close-btn';
+          }
+        }
+
+        return null;
+      });
+
+      if (dismissed) {
+        console.log(`[overlay] Auto-dismissed overlay via ${dismissed}`);
+        await new Promise(r => setTimeout(r, 1500));
+        return true;
+      }
+    } catch {
+      // Best-effort
+    }
+    return false;
+  }
+
+  /**
+   * Click the Cloudflare Turnstile checkbox inside its iframe.
+   * Uses trusted CDP mouse events with human-like Bezier movement FIRST,
+   * since Cloudflare checks Event.isTrusted and mouse trail presence.
+   * Falls back to frame.evaluate only if the iframe bounding box can't be found.
+   */
+  private async clickTurnstileCheckbox(): Promise<boolean> {
+    // PRIMARY: Trusted CDP mouse click with human-like Bezier movement.
+    // Cloudflare analyzes mouse trail — a click with no movement = bot.
+    // JS-dispatched clicks (frame.evaluate) lack isTrusted=true and have no mouse trail.
+    const iframeBox = await this.page.evaluate(() => {
+      const iframe = document.querySelector(
+        'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+      );
+      if (!iframe) return null;
+      const rect = iframe.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return null;
+      // Checkbox is in the left portion of the widget
+      return {
+        x: rect.left + 30,
+        y: rect.top + rect.height / 2,
+        width: rect.width,
+        height: rect.height,
+      };
+    }).catch(() => null);
+
+    if (iframeBox) {
+      // Simulate human-like mouse movement: start from a random position, curve to checkbox
+      const startX = 200 + Math.random() * 400;
+      const startY = iframeBox.y - 100 - Math.random() * 200;
+      await this.page.mouse.move(startX, startY);
+      await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
+
+      // Move in steps toward the checkbox (human-like Bezier curve)
+      const targetX = iframeBox.x + (Math.random() - 0.5) * 4; // slight jitter
+      const targetY = iframeBox.y + (Math.random() - 0.5) * 4;
+      const steps = 10 + Math.floor(Math.random() * 8);
+      // Control points for cubic Bezier
+      const cp1x = startX + (targetX - startX) * 0.3 + (Math.random() - 0.5) * 30;
+      const cp1y = startY + (targetY - startY) * 0.1 + (Math.random() - 0.5) * 20;
+      const cp2x = startX + (targetX - startX) * 0.7 + (Math.random() - 0.5) * 20;
+      const cp2y = startY + (targetY - startY) * 0.9 + (Math.random() - 0.5) * 15;
+
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const u = 1 - t;
+        // Cubic Bezier formula
+        const cx = u*u*u*startX + 3*u*u*t*cp1x + 3*u*t*t*cp2x + t*t*t*targetX;
+        const cy = u*u*u*startY + 3*u*u*t*cp1y + 3*u*t*t*cp2y + t*t*t*targetY;
+        await this.page.mouse.move(cx, cy);
+        // Variable speed: slower at start/end (sine easing)
+        const speed = Math.sin(t * Math.PI);
+        await new Promise(r => setTimeout(r, 8 + (1 - speed) * 30 + Math.random() * 10));
+      }
+
+      // Small pause before clicking (humans hesitate slightly)
+      await new Promise(r => setTimeout(r, 50 + Math.random() * 150));
+      // Human-like click: mousedown, hold, mouseup
+      await this.page.mouse.down();
+      await new Promise(r => setTimeout(r, 50 + Math.random() * 30));
+      await this.page.mouse.up();
+      return true;
+    }
+
+    // FALLBACK: Try frame.evaluate if iframe bounding box couldn't be determined
+    // (e.g. iframe is hidden or positioned offscreen). Less reliable due to untrusted events.
+    const frames = this.page.frames();
+    for (const frame of frames) {
+      const url = frame.url();
+      if (!url.includes('challenges.cloudflare.com') && !url.includes('turnstile')) continue;
+
+      const clicked = await frame.evaluate(() => {
+        const checkbox = document.querySelector(
+          'input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, [role="checkbox"]'
+        ) as HTMLElement | null;
+        if (checkbox) {
+          checkbox.click();
+          return true;
+        }
+        return false;
+      }).catch(() => false);
+
+      if (clicked) return true;
+    }
+
     return false;
   }
 
