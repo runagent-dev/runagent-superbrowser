@@ -17,6 +17,8 @@ import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '..
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
 import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull, solveWithVisionGeneric } from '../browser/captcha.js';
+import { captchaWatchdog } from '../browser/captcha-watchdog.js';
+import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
@@ -453,9 +455,6 @@ export function createHttpServer(
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
-      // Auto-detect captcha on the loaded page
-      const captchaInfo = await detectCaptcha(page.getRawPage()).catch(() => null);
-
       res.json({
         sessionId: id,
         url: state.url,
@@ -463,7 +462,6 @@ export function createHttpServer(
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
-        ...(captchaInfo ? { captchaDetected: { type: captchaInfo.type, siteKey: captchaInfo.siteKey } } : {}),
       });
     } catch (err) {
       handleError(res, err);
@@ -491,9 +489,6 @@ export function createHttpServer(
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
-      // Auto-detect captcha on the navigated page
-      const captchaInfo = await detectCaptcha(page.getRawPage()).catch(() => null);
-
       res.json({
         url: state.url,
         title: state.title,
@@ -502,7 +497,6 @@ export function createHttpServer(
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
-        ...(captchaInfo ? { captchaDetected: { type: captchaInfo.type, siteKey: captchaInfo.siteKey } } : {}),
       });
     } catch (err) {
       handleError(res, err);
@@ -530,12 +524,25 @@ export function createHttpServer(
 
     try {
       const useVision = req.query.vision !== 'false';
+      const includeBounds = req.query.bounds === 'true' || req.query.highlight === 'true';
       const state = await page.getState({
         useVision,
         includeConsole: true,
         includeAccessibility: req.query.accessibility === 'true',
         includeCursorElements: req.query.cursor === 'true',
       });
+
+      // Fetch device pixel ratio so the client can scale CSS bounds to
+      // device pixels when drawing bbox overlays on the screenshot.
+      let devicePixelRatio = 1;
+      if (includeBounds) {
+        try {
+          devicePixelRatio = await page.getRawPage().evaluate(() => window.devicePixelRatio || 1);
+        } catch {
+          devicePixelRatio = 1;
+        }
+      }
+
       res.json({
         url: state.url,
         title: state.title,
@@ -545,6 +552,10 @@ export function createHttpServer(
         accessibilityTree: state.accessibilityTree,
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
+        // Optional bbox overlay payload — only included when requested to
+        // keep the normal /state response compact.
+        selectorEntries: includeBounds ? state.selectorEntries : undefined,
+        devicePixelRatio: includeBounds ? devicePixelRatio : undefined,
       });
     } catch (err) {
       handleError(res, err);
@@ -773,6 +784,85 @@ export function createHttpServer(
     }
   });
 
+  /**
+   * Stealth-only "render a URL and return markdown" — the search worker's
+   * fallback when plain `web_fetch` returns a bot-block stub.
+   *
+   * Deliberately does NOT attempt captcha auto-solve: if a captcha survives
+   * the stealth fingerprint (Phase 3.7), we return { blocked: true } so the
+   * search worker can move on to the next source URL rather than burning
+   * solver budget inside a research loop. For pages that truly need captcha
+   * solving, the orchestrator should delegate to `delegate_browser_task`.
+   *
+   * Lightweight: opens a new page on the shared browser, navigates, extracts
+   * markdown, closes. No screenshots, no LLM calls. ~3s per call.
+   */
+  app.post('/fetch/rendered', async (req, res) => {
+    const url: string | undefined = req.body?.url;
+    const timeout: number = Math.min(Math.max(Number(req.body?.timeout) || 20000, 5000), 45000);
+    if (!url || typeof url !== 'string') {
+      res.status(400).json({ error: 'body must include { url: string }' });
+      return;
+    }
+    const urlCheck = validateUrl(url);
+    if (!urlCheck.valid) {
+      res.status(400).json({ error: `Blocked URL: ${urlCheck.error}` });
+      return;
+    }
+
+    let page: PageWrapper | null = null;
+    try {
+      page = await engine.newPage();
+      await page.navigate(url, timeout);
+      const finalUrl = page.getRawPage().url();
+
+      // Quick captcha check — stealth-only path bails rather than solving.
+      const captcha = await detectCaptcha(page.getRawPage()).catch(() => null);
+      if (captcha && !captcha.solved) {
+        const title = await page.getRawPage().title().catch(() => '');
+        res.json({
+          url,
+          finalUrl,
+          blocked: true,
+          reason: `captcha_after_stealth: ${captcha.type}`,
+          title,
+          markdown: '',
+        });
+        return;
+      }
+
+      const markdown = await page.getMarkdownContent();
+      const title = await page.getRawPage().title().catch(() => '');
+
+      // Also flag obviously-thin pages so the caller can treat them as blocked
+      // without a second heuristic pass — length gate is the simplest signal.
+      const blocked = markdown.trim().length < 200;
+      res.json({
+        url,
+        finalUrl,
+        title,
+        markdown: markdown.slice(0, 200_000),
+        blocked,
+        reason: blocked ? 'content_too_thin' : undefined,
+      });
+    } catch (err) {
+      // Navigation/timeout errors surface as 'blocked' rather than 500 so the
+      // search worker can adapt without the orchestrator seeing a hard failure.
+      const message = err instanceof Error ? err.message : String(err);
+      res.json({
+        url,
+        blocked: true,
+        reason: `fetch_error: ${message}`,
+        markdown: '',
+      });
+    } finally {
+      // Always close the short-lived page. Keeps browser footprint minimal.
+      if (page) {
+        try { await page.getRawPage().close(); } catch { /* best-effort */ }
+      }
+    }
+  });
+
   /** Export current page as PDF. */
   app.get('/session/:id/pdf', async (req, res) => {
     const page = getSession(req.params.id);
@@ -836,6 +926,7 @@ export function createHttpServer(
   app.post('/session/:id/captcha/solve', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    const sessionId = req.params.id;
 
     try {
       const captcha = await detectCaptcha(page.getRawPage());
@@ -852,18 +943,75 @@ export function createHttpServer(
 
       const method = req.body.method || 'auto';
 
-      const result = await solveCaptchaFull(
-        page.getRawPage(),
-        captcha,
-        config,
-        llm, // LLM provider for AI vision (may be null)
-        method,
-      );
+      // Snapshot BEFORE — judge uses this for a before/after comparison if
+      // the solver later claims success. Cheap (~25KB JPEG) and skipped if
+      // we have no LLM to run the judge against.
+      const beforeB64 = llm ? await captureJpegB64(page.getRawPage()).catch(() => undefined) : undefined;
 
-      res.json({ ...result, captcha });
+      // Notify watchdog so concurrent tool calls (e.g., the agent firing
+      // browser_click while we're still solving) block instead of racing.
+      captchaWatchdog.notifySolveStarted(sessionId, config.timeout);
+      let result;
+      try {
+        result = await solveCaptchaFull(
+          page.getRawPage(),
+          captcha,
+          config,
+          llm,
+          method,
+        );
+      } finally {
+        // Always unblock waiters, even on exception.
+        captchaWatchdog.notifySolveFinished(sessionId, {
+          outcome: result?.solved ? 'success' : 'failed',
+          vendor: (result as any)?.vendorDetected,
+          detail: (result as any)?.subMethod || result?.error,
+        });
+      }
+
+      // Judge verification (Phase 5.4) — only on reported-success events.
+      // If the independent verifier disagrees, flip solved=false and tag
+      // the result so the caller knows to retry or ask for human help.
+      let judgeVerdict: Awaited<ReturnType<typeof verifyCaptchaSolve>> | undefined;
+      if (result.solved && llm && req.body.judge !== false) {
+        try {
+          const afterB64 = await captureJpegB64(page.getRawPage());
+          judgeVerdict = await verifyCaptchaSolve(llm, {
+            claim: `${(result as any).method || 'auto'}/${(result as any).subMethod || ''} claimed success`,
+            beforeB64,
+            afterB64,
+            captchaType: captcha.type,
+            url: page.getRawPage().url(),
+          });
+          if (!judgeVerdict.verdict) {
+            result = {
+              ...result,
+              solved: false,
+              error: `judge disagreed: ${judgeVerdict.reasoning}`,
+            };
+          }
+        } catch (e) {
+          // Judge failure is non-fatal — keep the solver's verdict.
+          judgeVerdict = {
+            verdict: result.solved,
+            reasoning: `judge errored: ${(e as Error).message}`,
+          };
+        }
+      }
+
+      res.json({ ...result, captcha, judge: judgeVerdict });
     } catch (err) {
+      captchaWatchdog.notifySolveFinished(sessionId, {
+        outcome: 'failed',
+        detail: err instanceof Error ? err.message : String(err),
+      });
       handleError(res, err);
     }
+  });
+
+  /** Poll whether a captcha solve is in progress (for nanobot tool gating). */
+  app.get('/session/:id/captcha/waiting', (req, res) => {
+    res.json({ solving: captchaWatchdog.isSolving(req.params.id) });
   });
 
   /** Solve visual puzzle via screenshot → LLM → execute actions loop. */

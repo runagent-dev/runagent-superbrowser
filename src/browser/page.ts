@@ -24,6 +24,12 @@ export class PageWrapper {
   private dialogHandlerSetup = false;
   private consoleCollector = new ConsoleCollector();
   private downloadMonitor = new DownloadMonitor();
+  /**
+   * Last rendered selectorMap. Used to mark newly-appeared elements in the
+   * next getState() call with `*[n]` — browser-use's signal for "this
+   * element appeared after your previous action".
+   */
+  private priorSelectorMap: Map<number, DOMElementNode> | null = null;
 
   constructor(
     private page: Page,
@@ -116,18 +122,28 @@ export class PageWrapper {
   // --- Element interaction ---
 
   /**
-   * Click an element using 3-tier fallback (from BrowserOS):
-   * 1. CDP Input.dispatchMouseEvent at element center coordinates
-   * 2. Puppeteer page.click() with CSS selector
-   * 3. JS click() via XPath evaluation
+   * Click an element using a 3-tier fallback cascade (from BrowserOS).
+   * Only tiers 1 and 2 produce `event.isTrusted === true`. Tier 3 uses
+   * `el.click()` which sets `isTrusted === false` — trivially detectable
+   * by bot-protection scripts, so it's gated behind `allowUntrustedClick`.
+   *
+   * 1. CDP Input.dispatchMouseEvent at element center coords (isTrusted=true)
+   * 2. Puppeteer page.click() with CSS selector (CDP-backed, isTrusted=true)
+   * 3. JS el.click() via XPath (isTrusted=false — DETECTABLE, opt-in only)
+   *
+   * Pass `allowUntrustedClick: true` only when bot-detection risk is
+   * acceptable (e.g., internal dashboards). The captcha subsystem MUST NOT
+   * allow this — it would instantly fail challenges that sniff isTrusted.
    */
   async clickElement(element: DOMElementNode, options?: {
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
+    /** Allow the JS fallback (isTrusted=false). Default false. */
+    allowUntrustedClick?: boolean;
   }): Promise<void> {
     const selector = element.enhancedCssSelectorForElement();
 
-    // Tier 1: CDP mouse dispatch at computed coordinates
+    // Tier 1: CDP mouse dispatch at computed coordinates (isTrusted=true)
     try {
       const coords = await getElementCenterBySelector(this.page, selector);
       if (coords) {
@@ -143,7 +159,7 @@ export class PageWrapper {
       // Fallthrough
     }
 
-    // Tier 2: Puppeteer click
+    // Tier 2: Puppeteer click (isTrusted=true — Puppeteer dispatches via CDP)
     try {
       await this.page.waitForSelector(selector, { timeout: 5000 });
       await this.page.click(selector);
@@ -153,7 +169,15 @@ export class PageWrapper {
       // Fallthrough
     }
 
-    // Tier 3: JS fallback via XPath
+    // Tier 3: JS fallback via XPath (isTrusted=false). Opt-in only — otherwise
+    // raise so the caller can escalate (e.g., scroll into view, retry Tier 1).
+    if (!options?.allowUntrustedClick) {
+      throw new Error(
+        `clickElement: CDP + Puppeteer click failed for "${selector}"; ` +
+        `refusing JS fallback (isTrusted=false is bot-detectable). ` +
+        `Pass { allowUntrustedClick: true } to opt in, or use clickAt(x,y).`,
+      );
+    }
     if (element.xpath) {
       await this.page.evaluate((xpath: string) => {
         const result = document.evaluate(
@@ -347,7 +371,9 @@ export class PageWrapper {
       includeCursorElements = false,
     } = options;
 
-    const domResult = await buildDomTree(this.page);
+    const domResult = await buildDomTree(this.page, 0, this.priorSelectorMap);
+    // Persist the new map so the NEXT getState() can diff against it.
+    this.priorSelectorMap = domResult.selectorMap;
 
     let screenshot: string | undefined;
     if (useVision) {

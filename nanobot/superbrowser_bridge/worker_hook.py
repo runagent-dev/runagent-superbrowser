@@ -14,6 +14,7 @@ from __future__ import annotations
 from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
+from superbrowser_bridge.loop_detector import LoopDetector
 
 
 class BrowserWorkerHook(AgentHook):
@@ -22,84 +23,63 @@ class BrowserWorkerHook(AgentHook):
     def __init__(self, state: BrowserSessionState, max_iterations: int = 25):
         self.state = state
         self.max_iterations = max_iterations
-        self._stagnation_url: str = ""
-        self._stagnation_count: int = 0
         self._last_budget_warning_at: int = -1  # iteration of last warning
         self._captcha_guidance_given: bool = False
+        self._captcha_solve_attempts: int = 0
+        # Generic loop + stagnation detector (replaces consecutive_click_calls +
+        # ad-hoc _stagnation_url/_stagnation_count logic).
+        self._loop = LoopDetector()
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
         guidance_parts: list[str] = []
 
-        # --- Detect click-screenshot loops ---
-        if self.state.consecutive_click_calls >= 3:
-            guidance_parts.append(
-                "[GUIDANCE: You have used click/type tools "
-                f"{self.state.consecutive_click_calls} times in a row. "
-                "STOP clicking elements one by one. Write ONE browser_run_script "
-                "that batches ALL remaining actions into a single script.]"
-            )
+        # Decrement captcha_mode counter once per iteration. Lets the
+        # screenshot-budget limiter automatically re-engage after solving.
+        self.state.tick_captcha_mode()
 
-        # --- Detect stagnation (same URL, no progress) ---
-        current_url = self.state.current_url
-        if current_url and current_url == self._stagnation_url:
-            self._stagnation_count += 1
-        else:
-            self._stagnation_url = current_url
-            self._stagnation_count = 1
+        # --- Generic action-repetition detection ---
+        # Inspect the last recorded step (added by the tool that just ran)
+        # and feed it to the loop detector.
+        last_step = self.state.step_history[-1] if self.state.step_history else None
+        if last_step:
+            tool = last_step.get("tool") or ""
+            args = {"args_summary": last_step.get("args", "")}
+            action_nudge = self._loop.record_action(tool, args)
+            if action_nudge:
+                guidance_parts.append(action_nudge)
 
-        if self._stagnation_count >= 5:
-            guidance_parts.append(
-                "[GUIDANCE: You have been on the same page for "
-                f"{self._stagnation_count} iterations without extracting data. "
-                "Try a completely different approach: use browser_eval to inspect "
-                "the DOM structure, then write a new browser_run_script with "
-                "different selectors. If the page has the data you need, use "
-                "browser_get_markdown to extract it NOW.]"
+            # Stagnation by (url, page-fingerprint). We proxy "page content"
+            # with the truncated result string; it's good enough to detect
+            # "same page, same elements" unchanged across iterations.
+            stag_nudge = self._loop.record_page_state(
+                last_step.get("url") or "",
+                last_step.get("result") or "",
             )
+            if stag_nudge:
+                guidance_parts.append(stag_nudge)
 
         # --- Iteration budget warnings ---
         iteration = context.iteration
         remaining = self.max_iterations - iteration - 1
 
         if remaining <= int(self.max_iterations * 0.2) and self._last_budget_warning_at != iteration:
-            # Critical: 20% or less remaining
+            # 20% or less remaining — prioritize, don't panic.
             self._last_budget_warning_at = iteration
             guidance_parts.append(
-                f"[GUIDANCE: CRITICAL — only {remaining} iterations left out of "
-                f"{self.max_iterations}. Extract whatever data you have NOW "
-                "using browser_get_markdown and return your results immediately. "
-                "Partial results are better than no results.]"
+                f"[GUIDANCE: {remaining} iterations left out of {self.max_iterations}. "
+                "Prioritize extracting the real data with browser_get_markdown. "
+                "Do NOT fabricate values — if the data cannot be obtained, report it "
+                "honestly via done(success=False).]"
             )
         elif remaining <= int(self.max_iterations * 0.4) and self._last_budget_warning_at != iteration:
-            # Warning: 40% or less remaining
+            # 40% or less remaining
             self._last_budget_warning_at = iteration
             guidance_parts.append(
                 f"[GUIDANCE: {remaining} iterations left out of "
                 f"{self.max_iterations}. Switch to browser_run_script NOW "
                 "to batch all remaining work into one script call.]"
             )
-
-        # --- Detect search-only loop (searching without visiting result pages) ---
-        recent_steps = self.state.step_history[-8:] if len(self.state.step_history) >= 3 else []
-        if recent_steps:
-            google_searches = sum(
-                1 for s in recent_steps
-                if s["tool"] in ("browser_open", "browser_navigate")
-                and "google.com/search" in (s.get("url", "") or "")
-            )
-            non_google_navigations = sum(
-                1 for s in recent_steps
-                if s["tool"] == "browser_navigate"
-                and "google.com" not in (s.get("url", "") or "")
-            )
-            if google_searches >= 3 and non_google_navigations == 0:
-                guidance_parts.append(
-                    f"[GUIDANCE: You have done {google_searches} Google searches "
-                    "without visiting any result pages. STOP searching. Pick the "
-                    "most promising result from your last search and navigate to it "
-                    "using browser_navigate. Read the page with browser_get_markdown.]"
-                )
 
         # --- Detect regression (already handled at tool level, reinforce here) ---
         if self.state.regression_count > 0 and self.state.best_checkpoint_url:
@@ -117,6 +97,23 @@ class BrowserWorkerHook(AgentHook):
                             "on the current page.]"
                         )
                         break
+
+        # --- Detect repeated captcha solve loops ---
+        recent_steps = self.state.step_history[-1:] if self.state.step_history else []
+        for step in recent_steps:
+            if step["tool"] == "browser_solve_captcha":
+                self._captcha_solve_attempts += 1
+                if self._captcha_solve_attempts >= 3:
+                    guidance_parts.append(
+                        "[GUIDANCE: CAPTCHA auto-solve has been attempted "
+                        f"{self._captcha_solve_attempts} times and keeps failing. "
+                        "STOP calling browser_solve_captcha. Instead:\n"
+                        "1. Try browser_run_script with helpers.sleep(15000) "
+                        "to wait for Cloudflare to auto-resolve\n"
+                        "2. If still blocked, report CAPTCHA_UNSOLVED with "
+                        "a description of what you see.\n"
+                        "Do NOT keep retrying browser_solve_captcha.]"
+                    )
 
         # --- Detect verification/captcha pages ---
         if self.state.session_id and not self._captcha_guidance_given:

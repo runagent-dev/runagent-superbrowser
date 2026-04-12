@@ -7,6 +7,7 @@
  */
 
 import type { CDPSession } from 'puppeteer-core';
+import { humanDrag } from './humanize.js';
 
 /** Modifier key bitmask (from BrowserOS keyboard.ts). */
 export const Modifiers = {
@@ -86,7 +87,13 @@ export async function dispatchHover(
 }
 
 /**
- * Dispatch a drag operation: press at start, move to end, release.
+ * Dispatch a drag operation from start to end coordinates.
+ *
+ * Delegates to humanDrag() by default (Bezier path, sigmoid velocity, dwell,
+ * optional overshoot, micro-pauses). Bot-detection scripts on slider/drag
+ * captchas reject straight-line uniform drags, so the humanized path is the
+ * correct default. Set { linear: true } to opt out in contexts where the
+ * old straight-line behavior is needed (e.g., internal UI automation).
  */
 export async function dispatchDrag(
   client: CDPSession,
@@ -94,49 +101,43 @@ export async function dispatchDrag(
   startY: number,
   endX: number,
   endY: number,
-  options?: { steps?: number; delay?: number },
+  options?: {
+    steps?: number;
+    delay?: number;
+    overshoot?: boolean;
+    /** Opt out of humanization for internal (non-stealth-critical) contexts. */
+    linear?: boolean;
+  },
 ): Promise<void> {
-  const steps = options?.steps || 10;
-  const delay = options?.delay || 20;
+  if (!options?.linear) {
+    await humanDrag(client, startX, startY, endX, endY, {
+      steps: options?.steps,
+      overshoot: options?.overshoot,
+    });
+    return;
+  }
 
-  // Move to start
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseMoved',
-    x: startX,
-    y: startY,
-  });
+  const steps = options.steps || 10;
+  const delay = options.delay || 20;
 
+  // Legacy straight-line path — preserved for opt-in callers only.
+  await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: startX, y: startY });
   await sleep(50);
-
-  // Press at start
   await client.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed',
-    x: startX,
-    y: startY,
-    button: 'left',
-    clickCount: 1,
+    type: 'mousePressed', x: startX, y: startY, button: 'left', clickCount: 1,
   });
 
-  // Move in steps to end
   for (let i = 1; i <= steps; i++) {
     const x = startX + ((endX - startX) * i) / steps;
     const y = startY + ((endY - startY) * i) / steps;
     await client.send('Input.dispatchMouseEvent', {
-      type: 'mouseMoved',
-      x: Math.round(x),
-      y: Math.round(y),
-      button: 'left',
+      type: 'mouseMoved', x: Math.round(x), y: Math.round(y), button: 'left',
     });
     await sleep(delay);
   }
 
-  // Release at end
   await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased',
-    x: endX,
-    y: endY,
-    button: 'left',
-    clickCount: 1,
+    type: 'mouseReleased', x: endX, y: endY, button: 'left', clickCount: 1,
   });
 }
 

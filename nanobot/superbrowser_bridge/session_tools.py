@@ -30,6 +30,41 @@ SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
 
+_CAPTCHA_KEYWORDS = (
+    "captcha", "recaptcha", "hcaptcha", "turnstile", "cloudflare",
+    "verify you are human", "prove you are not a robot", "slider puzzle",
+    "click all images", "select all", "drag the", "i'm not a robot",
+)
+_HARD_DOMAINS = (
+    "apartments.com", "zillow.com", "ticketmaster.com", "nytimes.com",
+    "linkedin.com", "instagram.com", "facebook.com",
+)
+# Hash length used to dedupe screenshots when page content changes on same URL.
+_CONTENT_HASH_LEN = 500
+
+
+def _compute_screenshot_budget(
+    task_instruction: str = "",
+    target_url: str = "",
+    is_research: bool = False,
+) -> int:
+    """Task-complexity-aware screenshot budget.
+
+    Base=6. +4 for research tasks, +10 for captcha-suspect tasks, +8 for
+    known-hard domains. Capped at 30 to prevent runaway cost.
+    """
+    budget = 6
+    lower_task = (task_instruction or "").lower()
+    lower_url = (target_url or "").lower()
+    if is_research:
+        budget += 4
+    if any(kw in lower_task for kw in _CAPTCHA_KEYWORDS):
+        budget += 10
+    if any(dom in lower_url for dom in _HARD_DOMAINS):
+        budget += 8
+    return min(budget, 30)
+
+
 class BrowserSessionState:
     """Per-instance state for browser session tools.
 
@@ -37,11 +72,15 @@ class BrowserSessionState:
     This prevents multi-agent setups from sharing globals.
     """
 
-    MAX_SCREENSHOTS = 3
+    # Default budget when no task context is supplied. Use
+    # configure_budget() to switch to complexity-aware allocation.
+    DEFAULT_SCREENSHOT_BUDGET = 6
+    CAPTCHA_MODE_ITERATIONS = 15
     MAX_CLICK_AT = 3
 
     def __init__(self):
-        self.screenshot_budget = self.MAX_SCREENSHOTS
+        self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
+        self.screenshot_budget = self.max_screenshots
         self.vision_calls = 0
         self.text_calls = 0
         self.start_time = 0.0
@@ -60,13 +99,59 @@ class BrowserSessionState:
         self.best_checkpoint_url: str = ""
         self.url_visit_counts: dict[str, int] = {}
         self.regression_count: int = 0
-        self.screenshotted_urls: set[str] = set()
+        # Dedupe key: (normalized_url, hash_of_content) — so a same URL with
+        # changed content (e.g., after clicking "Load more") still allows a new
+        # screenshot. Populated in mark_screenshot_taken().
+        self.screenshotted_keys: set[tuple[str, str]] = set()
         self.last_screenshot_url: str = ""
+        self.last_page_content_hash: str = ""
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
         # Active session ID (set by browser_open)
         self.session_id: str = ""
+
+        # Captcha-mode: when a captcha is detected, disable screenshot dedup
+        # and action-delta rules for CAPTCHA_MODE_ITERATIONS iterations.
+        # Solving a captcha needs fast visual feedback (3+ shots per round).
+        self.captcha_mode: bool = False
+        self.captcha_mode_remaining: int = 0
+
+    # --- budget configuration ---------------------------------------------
+
+    def configure_budget(
+        self,
+        task_instruction: str = "",
+        target_url: str = "",
+        is_research: bool = False,
+    ) -> int:
+        """Set screenshot budget based on task complexity. Returns new budget."""
+        self.max_screenshots = _compute_screenshot_budget(
+            task_instruction=task_instruction,
+            target_url=target_url,
+            is_research=is_research,
+        )
+        self.screenshot_budget = self.max_screenshots
+        return self.max_screenshots
+
+    def enter_captcha_mode(self) -> None:
+        """Relax screenshot limits for the next N iterations.
+
+        Called when browser_detect_captcha returns a captcha. Captcha
+        solving requires multiple screenshots per round (before drag,
+        after drag, verify result) — normal budget would starve it.
+        """
+        self.captcha_mode = True
+        self.captcha_mode_remaining = self.CAPTCHA_MODE_ITERATIONS
+
+    def tick_captcha_mode(self) -> None:
+        """Decrement captcha_mode counter. Call once per agent iteration."""
+        if not self.captcha_mode:
+            return
+        self.captcha_mode_remaining -= 1
+        if self.captcha_mode_remaining <= 0:
+            self.captcha_mode = False
+            self.captcha_mode_remaining = 0
 
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
@@ -117,16 +202,46 @@ class BrowserSessionState:
             return False
         return self.url_visit_counts.get(norm, 0) > 0
 
-    def should_allow_screenshot(self, url: str) -> tuple[bool, str]:
-        """Check if a screenshot should be allowed. Returns (allowed, reason)."""
+    def should_allow_screenshot(
+        self,
+        url: str,
+        content_hash: str = "",
+    ) -> tuple[bool, str]:
+        """Check if a screenshot should be allowed. Returns (allowed, reason).
+
+        In captcha_mode the limiter is relaxed: budget still enforced (hard
+        ceiling), but dedup and "no actions since last shot" are disabled.
+        """
         if self.screenshot_budget <= 0:
             return False, "[Screenshot budget exhausted] Use browser_get_markdown or browser_eval instead."
+        if self.captcha_mode:
+            return True, ""
         if self.actions_since_screenshot == 0:
             return False, "[No actions since last screenshot — reuse previous. Use browser_get_markdown to re-read content.]"
         norm = self._normalize_url(url)
-        if norm and norm in self.screenshotted_urls:
-            return False, f"[Screenshot already exists for this URL. Use browser_get_markdown or browser_eval to read page state instead.]"
+        # Dedupe on (url, content_hash) — if content changed since last shot
+        # at this URL, allow a fresh screenshot.
+        key = (norm, content_hash or "")
+        if norm and key in self.screenshotted_keys:
+            return False, "[Screenshot already exists for this URL + content. Use browser_get_markdown or browser_eval to read page state instead.]"
         return True, ""
+
+    def mark_screenshot_taken(self, url: str, content_hash: str = "") -> None:
+        """Record that a screenshot was taken for (url, content_hash)."""
+        norm = self._normalize_url(url)
+        if norm:
+            self.screenshotted_keys.add((norm, content_hash or ""))
+            self.last_screenshot_url = norm
+            self.last_page_content_hash = content_hash or ""
+
+    @staticmethod
+    def hash_page_content(text: str) -> str:
+        """Short stable hash of page content for dedup keys."""
+        if not text:
+            return ""
+        snippet = text[:_CONTENT_HASH_LEN]
+        import hashlib
+        return hashlib.sha1(snippet.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:
         """Record a step in the structured step history."""
@@ -143,7 +258,14 @@ class BrowserSessionState:
         return self.checkpoints[-1] if self.checkpoints else None
 
     def export_step_history(self) -> str:
-        """Export structured step history and checkpoint to disk."""
+        """Export structured step history and checkpoint to disk.
+
+        Writes TWO formats:
+          - step_history.md  — human-readable markdown log
+          - step_history.json — structured data the orchestrator parses
+            to build domain-keyed captcha learnings and to inject prior
+            context into subsequent tasks.
+        """
         lines = ["## Step History"]
         for i, step in enumerate(self.step_history, 1):
             lines.append(f"{i}. [{step['time']}] {step['tool']}({step['args']}) → {step['result']}")
@@ -167,6 +289,30 @@ class BrowserSessionState:
         with open(step_path, "w") as f:
             f.write(content)
         print(f"  [step history saved: {step_path}]")
+
+        # Structured JSON export for orchestrator consumption.
+        import json as _json_export
+        structured = {
+            "task_id": self.task_id,
+            "sessions_opened": self.sessions_opened,
+            "current_url": self.current_url,
+            "best_checkpoint_url": self.best_checkpoint_url,
+            "regression_count": self.regression_count,
+            "checkpoints": self.checkpoints,
+            "vision_calls": self.vision_calls,
+            "text_calls": self.text_calls,
+            "max_screenshots": self.max_screenshots,
+            "screenshots_used": self.max_screenshots - self.screenshot_budget,
+            "steps": self.step_history,
+            "activity_log": self.activity_log,
+        }
+        json_path = os.path.join(task_dir, "step_history.json")
+        try:
+            with open(json_path, "w") as f:
+                _json_export.dump(structured, f, indent=2, default=str)
+            print(f"  [structured history saved: {json_path}]")
+        except Exception as exc:  # pragma: no cover - best-effort persistence
+            print(f"  [structured history save failed: {exc}]")
 
         # Save checkpoint as JSON for re-delegation
         if self.best_checkpoint_url:
@@ -199,26 +345,26 @@ class BrowserSessionState:
         return (
             f"\n--- Previous activity (DO NOT repeat failed approaches) ---\n"
             f"{lines}\n"
-            f"--- Screenshots remaining: {self.screenshot_budget}/{self.MAX_SCREENSHOTS} | Sessions opened: {self.sessions_opened} ---"
+            f"--- Screenshots remaining: {self.screenshot_budget}/{self.max_screenshots} | Sessions opened: {self.sessions_opened} ---"
         )
 
     def print_summary(self):
         elapsed = time.time() - self.start_time if self.start_time else 0
-        used = self.MAX_SCREENSHOTS - self.screenshot_budget
+        used = self.max_screenshots - self.screenshot_budget
         print(f"\n  [Session Summary]")
         print(f"  Duration: {elapsed:.1f}s | Sessions: {self.sessions_opened}")
-        print(f"  Vision calls: {self.vision_calls} | Text calls: {self.text_calls} | Screenshots: {used}/{self.MAX_SCREENSHOTS}")
+        print(f"  Vision calls: {self.vision_calls} | Text calls: {self.text_calls} | Screenshots: {used}/{self.max_screenshots}")
         est = self.vision_calls * 0.03 + self.text_calls * 0.002
         print(f"  Estimated cost: ~${est:.3f}")
 
     def export_activity_log(self) -> str:
         """Export structured activity log to disk for the orchestrator to read."""
         elapsed = time.time() - self.start_time if self.start_time else 0
-        used = self.MAX_SCREENSHOTS - self.screenshot_budget
+        used = self.max_screenshots - self.screenshot_budget
 
         lines = [
             f"## Browser Worker Activity",
-            f"Duration: {elapsed:.1f}s | Screenshots: {used}/{self.MAX_SCREENSHOTS} | Tool calls: {self.vision_calls + self.text_calls}",
+            f"Duration: {elapsed:.1f}s | Screenshots: {used}/{self.max_screenshots} | Tool calls: {self.vision_calls + self.text_calls}",
             "",
             "### Actions",
         ]
@@ -243,14 +389,38 @@ class BrowserSessionState:
         print(f"  [screenshot saved: {path}]")
         return path
 
-    def build_image_blocks(self, b64: str, caption: str) -> list[dict]:
+    def build_image_blocks(
+        self,
+        b64: str,
+        caption: str,
+        elements_with_bounds: list[dict] | None = None,
+        device_pixel_ratio: float = 1.0,
+    ) -> list[dict]:
+        """Build a vision-message-ready payload (text + image).
+
+        If `elements_with_bounds` is provided, paint dashed bbox overlays +
+        index labels on the screenshot so the LLM can ground on [index]
+        instead of guessing pixel coordinates. Silently falls back to the
+        raw screenshot if PIL is unavailable or overlay fails.
+        """
         self.vision_calls += 1
         self.actions_since_screenshot = 0
         label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
-        self.save_screenshot(b64, label)
+
+        final_b64 = b64
+        if elements_with_bounds:
+            try:
+                from superbrowser_bridge.highlights import build_highlighted_screenshot
+                final_b64 = build_highlighted_screenshot(
+                    b64, elements_with_bounds, device_pixel_ratio,
+                )
+            except Exception:
+                final_b64 = b64
+
+        self.save_screenshot(final_b64, label)
         return [
             {"type": "text", "text": caption},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{final_b64}"}},
         ]
 
     def build_text_only(self, data: dict, prefix: str = "") -> str:
@@ -385,7 +555,10 @@ class BrowserOpenTool(Tool):
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
             if actual_url:
-                self.s.screenshotted_urls.add(self.s._normalize_url(actual_url))
+                self.s.mark_screenshot_taken(
+                    actual_url,
+                    self.s.hash_page_content(data.get("elements", "") or data.get("title", "")),
+                )
             return self.s.build_image_blocks(data["screenshot"], caption)
         return caption
 
@@ -444,7 +617,10 @@ class BrowserNavigateTool(Tool):
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
             if actual_url:
-                self.s.screenshotted_urls.add(self.s._normalize_url(actual_url))
+                self.s.mark_screenshot_taken(
+                    actual_url,
+                    self.s.hash_page_content(data.get("elements", "") or data.get("title", "")),
+                )
             return self.s.build_image_blocks(data["screenshot"], caption)
         return caption
 
@@ -464,26 +640,63 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> Any:
-        allowed, reason = self.s.should_allow_screenshot(self.s.current_url)
+        # Peek current page content so dedup keys on (url, content_hash)
+        # — a reload or DOM change produces a different hash and unblocks.
+        peek_hash = ""
+        try:
+            peek_elements = await _fetch_elements(session_id)
+            peek_hash = BrowserSessionState.hash_page_content(peek_elements)
+        except Exception:
+            pass
+
+        allowed, reason = self.s.should_allow_screenshot(self.s.current_url, peek_hash)
         if not allowed:
             self.s.log_activity("screenshot(BLOCKED)", reason[:60])
             return reason
 
         self.s.screenshot_budget -= 1
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state", params={"vision": "true"})
+            r = await client.get(
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                # bounds=true returns selectorEntries (with x/y/width/height) +
+                # devicePixelRatio so we can draw bbox overlays before the
+                # screenshot goes to the vision LLM.
+                params={"vision": "true", "bounds": "true"},
+            )
             r.raise_for_status()
             data = r.json()
 
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
-            self.s.screenshotted_urls.add(self.s._normalize_url(actual_url))
+            self.s.mark_screenshot_taken(
+                actual_url,
+                self.s.hash_page_content(data.get("elements", "")),
+            )
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
         self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")
         caption = _format_state(data)
         caption += f"\n[Screenshots remaining: {self.s.screenshot_budget}]"
         if data.get("screenshot"):
-            return self.s.build_image_blocks(data["screenshot"], caption)
+            entries = data.get("selectorEntries") or []
+            dpr = float(data.get("devicePixelRatio") or 1.0)
+            # Rename tagName → tag for the overlay (both naming schemes work
+            # but tag is the overlay's canonical key).
+            overlay_elements = [
+                {
+                    "index": e.get("index"),
+                    "tag": e.get("tagName") or e.get("tag"),
+                    "role": e.get("role") or (e.get("attributes") or {}).get("role"),
+                    "bounds": e.get("bounds"),
+                }
+                for e in entries
+                if e.get("bounds") and e.get("index") is not None
+            ]
+            return self.s.build_image_blocks(
+                data["screenshot"],
+                caption,
+                elements_with_bounds=overlay_elements,
+                device_pixel_ratio=dpr,
+            )
         return caption
 
 
@@ -973,8 +1186,8 @@ class BrowserCloseTool(Tool):
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.delete(f"{SUPERBROWSER_URL}/session/{session_id}")
             r.raise_for_status()
-        used = self.s.MAX_SCREENSHOTS - self.s.screenshot_budget
-        return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {used}/{self.s.MAX_SCREENSHOTS}, Regressions: {self.s.regression_count}"
+        used = self.s.max_screenshots - self.s.screenshot_budget
+        return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {used}/{self.s.max_screenshots}, Regressions: {self.s.regression_count}"
 
 
 @tool_parameters(
@@ -1026,6 +1239,9 @@ class BrowserDetectCaptchaTool(Tool):
     name = "browser_detect_captcha"
     description = "Check if the page has a captcha."
 
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
     @property
     def read_only(self) -> bool:
         return True
@@ -1038,7 +1254,15 @@ class BrowserDetectCaptchaTool(Tool):
         captcha = data.get("captcha")
         if not captcha:
             return "No captcha detected."
-        return f"Captcha detected: type={captcha['type']}, siteKey={captcha.get('siteKey', 'N/A')}"
+        # Detecting a captcha triggers captcha_mode: screenshot dedup +
+        # "no-actions-since-last-shot" rules are relaxed so the solver can
+        # take repeated before/after screenshots.
+        self.s.enter_captcha_mode()
+        return (
+            f"Captcha detected: type={captcha['type']}, "
+            f"siteKey={captcha.get('siteKey', 'N/A')} "
+            f"(captcha_mode active for next {self.s.CAPTCHA_MODE_ITERATIONS} iterations)"
+        )
 
 
 @tool_parameters(
@@ -1078,6 +1302,9 @@ class BrowserSolveCaptchaTool(Tool):
     name = "browser_solve_captcha"
     description = "Solve a detected captcha automatically."
 
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
     async def execute(self, session_id: str, method: str | None = None, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
         payload: dict[str, Any] = {}
         if method:
@@ -1090,9 +1317,51 @@ class BrowserSolveCaptchaTool(Tool):
             r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve", json=payload)
             r.raise_for_status()
             data = r.json()
+
+        # Build a structured result the orchestrator can parse — keeps the
+        # method + subMethod + vendor + trace so per-domain captcha learnings
+        # can be written automatically. The LLM sees JSON; a human-readable
+        # summary is injected at the top for quick scanning.
+        summary: str
         if data.get("solved"):
-            return f"Captcha solved via {data.get('method', '?')} ({data.get('attempts', 1)} attempt(s))"
-        return f"Captcha not solved: {data.get('error', 'all methods failed')}"
+            summary = (
+                f"Captcha SOLVED via {data.get('method', '?')}"
+                f"/{data.get('subMethod', '?')} in {data.get('durationMs', 0)}ms "
+                f"({data.get('attempts', 1)} attempt(s))"
+            )
+        else:
+            summary = f"Captcha NOT solved: {data.get('error', 'all methods failed')}"
+
+        # Record the structured method info so orchestrator can learn from it.
+        structured = {
+            "solved": bool(data.get("solved")),
+            "captchaType": data.get("captchaType") or data.get("captcha", {}).get("type"),
+            "vendorDetected": data.get("vendorDetected"),
+            "method": data.get("method"),
+            "subMethod": data.get("subMethod"),
+            "attempts": data.get("attempts"),
+            "totalRounds": data.get("totalRounds"),
+            "durationMs": data.get("durationMs"),
+            "siteKey": data.get("siteKey"),
+            "iframeUrl": data.get("iframeUrl"),
+            "error": data.get("error"),
+        }
+        # Drop None values so the JSON stays compact.
+        structured = {k: v for k, v in structured.items() if v is not None}
+
+        self.s.record_step(
+            "browser_solve_captcha",
+            method or "auto",
+            f"{summary} | {json.dumps(structured, default=str)[:300]}",
+        )
+
+        # The solve freed us from captcha — end captcha_mode so the normal
+        # budget rules resume.
+        if data.get("solved"):
+            self.s.captcha_mode = False
+            self.s.captcha_mode_remaining = 0
+
+        return f"{summary}\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
 
 
 @tool_parameters(
@@ -1152,9 +1421,9 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserDragTool(state),
         BrowserGetMarkdownTool(),        # stateless
         BrowserDialogTool(),             # stateless
-        BrowserDetectCaptchaTool(),      # stateless
+        BrowserDetectCaptchaTool(state),
         BrowserCaptchaScreenshotTool(state),
-        BrowserSolveCaptchaTool(),       # stateless
+        BrowserSolveCaptchaTool(state),
         BrowserAskUserTool(state),
         BrowserCloseTool(state),
     ]

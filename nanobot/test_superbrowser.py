@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ Task: Browse the electronics category and calculate the average price of used smartphones shown in the listings.\nwebsite: https://mercari.com"""
+        """ Task: go to gozayan and tell me about the sylhet five star hotel actual price for 2 nights from 15th of april to 17th of april for one person."""
     )
 
     print(f"Task: {task}")

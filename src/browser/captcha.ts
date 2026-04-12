@@ -39,6 +39,40 @@ export interface CaptchaSolverConfig {
  */
 export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
   return page.evaluate(() => {
+    // --- Cloudflare detection FIRST (Cloudflare pages often embed reCAPTCHA as fallback) ---
+
+    // Cloudflare managed challenge — check page title/body first
+    const pageTitle = document.title.toLowerCase();
+    const isCfPage = pageTitle.includes('just a moment')
+      || pageTitle.includes('checking your browser')
+      || pageTitle.includes('attention required');
+    if (isCfPage) {
+      return { type: 'turnstile' as const, solved: false };
+    }
+
+    // Cloudflare Turnstile widget
+    const turnstileIframe = document.querySelector(
+      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
+    ) as HTMLIFrameElement | null;
+    if (turnstileIframe) {
+      return {
+        type: 'turnstile' as const,
+        iframeSrc: turnstileIframe.src,
+        solved: false,
+      };
+    }
+
+    const turnstileDiv = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]') as HTMLElement | null;
+    if (turnstileDiv) {
+      return {
+        type: 'turnstile' as const,
+        siteKey: turnstileDiv.getAttribute('data-turnstile-sitekey') || turnstileDiv.getAttribute('data-sitekey') || undefined,
+        solved: false,
+      };
+    }
+
+    // --- Standard CAPTCHA detection ---
+
     // reCAPTCHA v2 (checkbox or invisible)
     const recaptchaIframe = document.querySelector(
       'iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]',
@@ -85,27 +119,6 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       };
     }
 
-    // Cloudflare Turnstile
-    const turnstileIframe = document.querySelector(
-      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
-    ) as HTMLIFrameElement | null;
-    if (turnstileIframe) {
-      return {
-        type: 'turnstile' as const,
-        iframeSrc: turnstileIframe.src,
-        solved: false,
-      };
-    }
-
-    const turnstileDiv = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]') as HTMLElement | null;
-    if (turnstileDiv) {
-      return {
-        type: 'turnstile' as const,
-        siteKey: turnstileDiv.getAttribute('data-turnstile-sitekey') || turnstileDiv.getAttribute('data-sitekey') || undefined,
-        solved: false,
-      };
-    }
-
     // Slider CAPTCHA detection (Temu, GeeTest, custom slider puzzles)
     const sliderSelectors = [
       '[class*="slider" i][class*="captcha" i]',
@@ -141,26 +154,15 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       }
     }
 
-    // Generic captcha detection (image captcha, text captcha)
-    const captchaKeywords = [
-      'captcha', 'verify you are human', 'prove you are not a robot',
-      'security check', 'are you a robot', 'bot verification',
-      'verify your identity', 'human verification',
-      'slide to verify', 'drag the slider', 'complete the puzzle',
-      'select all images', 'pick the image', 'please verify',
-      'security verification', 'prove you are human',
-    ];
+    // Generic captcha detection (image captcha, text captcha).
+    // Requires BOTH a keyword hit AND a DOM anchor for an actual captcha widget —
+    // keyword-only matches produce false positives on pages with legitimate copy
+    // like "verify your email" or security policy footers.
+    const captchaKeywords = ['captcha', 'verify you are human', 'prove you are not a robot',
+      'security check', 'are you a robot', 'bot verification'];
     const bodyText = (document.body.innerText || '').toLowerCase();
     for (const keyword of captchaKeywords) {
       if (bodyText.includes(keyword)) {
-        // Try to distinguish slider vs image vs text
-        const hasSlider = document.querySelector(
-          '[class*="slider" i], [class*="slide" i], [class*="drag" i]',
-        );
-        if (hasSlider) {
-          return { type: 'slider' as const, solved: false };
-        }
-
         const captchaImg = document.querySelector(
           'img[src*="captcha"], img[alt*="captcha"], img[id*="captcha"]',
         );
@@ -168,7 +170,6 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
           return { type: 'image' as const, solved: false };
         }
 
-        // Check for image selection (multiple clickable images in a grid)
         const imgGrid = document.querySelectorAll(
           '[class*="verify" i] img, [class*="captcha" i] img',
         );
@@ -176,7 +177,7 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
           return { type: 'visual_puzzle' as const, solved: false };
         }
 
-        return { type: 'text' as const, solved: false };
+        return null;
       }
     }
 
@@ -493,6 +494,62 @@ export interface CaptchaSolveResult {
   method: string;
   attempts: number;
   error?: string;
+}
+
+/**
+ * Click the reCAPTCHA "I'm not a robot" checkbox.
+ * This must be done before the challenge grid appears.
+ * Returns true if the checkbox was found and clicked, or if reCAPTCHA auto-resolved.
+ */
+export async function clickRecaptchaCheckbox(page: Page): Promise<boolean> {
+  // Find the reCAPTCHA anchor iframe (the one with the checkbox)
+  const frames = page.frames();
+  for (const frame of frames) {
+    const url = frame.url();
+    if (url.includes('recaptcha') && (url.includes('anchor') || url.includes('api2/anchor'))) {
+      try {
+        // Click the checkbox inside the anchor frame
+        const checkbox = await frame.$('.recaptcha-checkbox-border, #recaptcha-anchor');
+        if (checkbox) {
+          await checkbox.click();
+          console.log('[captcha] Clicked reCAPTCHA checkbox');
+          // Wait to see if it auto-resolves (good stealth = auto-pass)
+          await new Promise((r) => setTimeout(r, 3000));
+
+          // Check if the checkbox got a checkmark (solved without challenge)
+          const checked = await frame.evaluate(() => {
+            const anchor = document.querySelector('#recaptcha-anchor');
+            return anchor?.getAttribute('aria-checked') === 'true';
+          }).catch(() => false);
+
+          if (checked) {
+            console.log('[captcha] reCAPTCHA auto-resolved after checkbox click');
+            return true;
+          }
+          // Not auto-resolved — challenge grid should now be visible
+          return true;
+        }
+      } catch (err) {
+        console.error('[captcha] Error clicking checkbox:', err);
+      }
+    }
+  }
+
+  // Fallback: try clicking by coordinates on the main page
+  // The reCAPTCHA iframe is usually around 300x78 pixels, checkbox near left
+  const recaptchaIframe = await page.$('iframe[src*="recaptcha"][src*="anchor"]');
+  if (recaptchaIframe) {
+    const box = await recaptchaIframe.boundingBox();
+    if (box) {
+      // Checkbox is at roughly (28, 28) inside the iframe
+      await page.mouse.click(box.x + 28, box.y + 28);
+      console.log('[captcha] Clicked reCAPTCHA checkbox via coordinates');
+      await new Promise((r) => setTimeout(r, 3000));
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -946,7 +1003,7 @@ function parseGridApiResult(result: string, maxTile: number): number[] {
 // ==========================================================================
 
 interface VisionSolveStep {
-  action: 'click' | 'drag' | 'type';
+  action: 'click' | 'drag' | 'type' | 'type_at' | 'key' | 'scroll' | 'wait' | 'done';
   x?: number;
   y?: number;
   startX?: number;
@@ -954,11 +1011,49 @@ interface VisionSolveStep {
   endX?: number;
   endY?: number;
   text?: string;
+  keys?: string[];
+  duration?: number;
+  direction?: string;
+}
+
+/** System prompt for the vision CAPTCHA solver, adapted from ReCAP-Agent. */
+function getVisionSolverSystemPrompt(width: number, height: number): string {
+  return `You are an autonomous GUI agent solving a CAPTCHA challenge. You interact with the page by outputting actions.
+
+# Available Actions (JSON format)
+- click: {"action":"click","x":N,"y":N} — Click at (x,y) coordinates
+- drag: {"action":"drag","startX":N,"startY":N,"endX":N,"endY":N} — Drag from start to end
+- type_at: {"action":"type_at","x":N,"y":N,"text":"..."} — Click at (x,y) then type text
+- type: {"action":"type","text":"..."} — Type text into the focused element
+- key: {"action":"key","keys":["Enter"]} — Press keyboard key(s)
+- scroll: {"action":"scroll","direction":"down"} — Scroll the page
+- wait: {"action":"wait","duration":2} — Wait N seconds
+- done: {"action":"done"} — Signal that the CAPTCHA appears solved
+
+# Rules
+- The viewport is ${width}x${height} pixels. All coordinates are absolute pixels.
+- Click the CENTER of elements, not edges.
+- For slider puzzles: drag the handle (small element on a track) to the target position.
+- For image grids (select matching images): click each correct image tile.
+- For text CAPTCHAs: use type_at to click the input field and type the text you read.
+- For checkboxes ("I'm not a robot"): click the checkbox.
+- For Cloudflare Turnstile: click the checkbox/widget area.
+- Output ONE action per step. Be precise with coordinates.
+
+# Response Format
+First reason briefly about what you see, then output exactly one action.
+\`\`\`
+<think>I see a slider puzzle with a handle at x=100 and a target notch at x=350.</think>
+{"action":"drag","startX":100,"startY":300,"endX":350,"endY":300}
+\`\`\`
+
+Output ONLY the think block and JSON. No other text.`;
 }
 
 /**
  * Solve arbitrary visual challenges using a screenshot-to-LLM-to-action loop.
- * Works for slider puzzles, image selection, rotation, Temu verification, etc.
+ * Inspired by ReCAP-Agent: maintains conversation history, structured prompts,
+ * one action per LLM call, up to maxRounds calls.
  */
 export async function solveWithVisionGeneric(
   page: Page,
@@ -967,150 +1062,105 @@ export async function solveWithVisionGeneric(
 ): Promise<CaptchaSolveResult> {
   let totalAttempts = 0;
 
+  // Get viewport dimensions once
+  const viewport = await page.evaluate(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }));
+
+  // Maintain conversation history across rounds (ReCAP-Agent pattern)
+  const history: { role: 'system' | 'user' | 'assistant'; content: string | Array<{type: string; text?: string; image_url?: {url: string}}>}[] = [
+    { role: 'system', content: getVisionSolverSystemPrompt(viewport.width, viewport.height) },
+  ];
+
   for (let round = 0; round < maxRounds; round++) {
     totalAttempts++;
 
-    // Take full-page screenshot
-    const screenshot = await page.screenshot({
-      type: 'jpeg',
-      quality: 85,
-    }) as Buffer;
+    // Take screenshot
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 85 }) as Buffer;
     const b64Image = screenshot.toString('base64');
 
-    // Get viewport dimensions for coordinate reference
-    const viewport = await page.evaluate(() => ({
-      width: window.innerWidth,
-      height: window.innerHeight,
-    }));
+    // Build user message with screenshot
+    const userPrompt = round === 0
+      ? 'Solve the CAPTCHA shown in this screenshot. Observe carefully and take the next action.'
+      : 'Continue solving. Here is the current state after your last action. Take the next action.';
+
+    history.push({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64Image}` } },
+        { type: 'text', text: userPrompt },
+      ],
+    });
 
     try {
-      const response = await llmProvider.chat([
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: { url: `data:image/jpeg;base64,${b64Image}` },
-            },
-            {
-              type: 'text',
-              text: `This page shows a verification challenge or CAPTCHA. The viewport is ${viewport.width}x${viewport.height} pixels.
+      const response = await llmProvider.chat(
+        history as any,
+        { temperature: 0.1 },
+      );
 
-Analyze the screenshot and determine:
-1. What type of challenge is this? (slider puzzle, image selection, rotation, text input, click target, etc.)
-2. Is the challenge already solved? If so, return {"solved": true, "steps": []}.
-3. What actions are needed to solve it?
+      // Add assistant response to history for context in next round
+      history.push({ role: 'assistant', content: response.content });
 
-Return ONLY valid JSON in this exact format:
-{
-  "solved": false,
-  "challenge_type": "slider|image_select|rotation|text_input|click_target|unknown",
-  "steps": [
-    {"action": "drag", "startX": 100, "startY": 300, "endX": 400, "endY": 300},
-    {"action": "click", "x": 250, "y": 400},
-    {"action": "type", "text": "abc123"}
-  ]
-}
-
-For slider puzzles: identify the slider handle position and where it needs to be dragged to.
-For image selection: click on each image that matches the prompt.
-For click targets: click on the specified target element.
-Coordinates must be in pixels relative to the viewport (${viewport.width}x${viewport.height}).`,
-            },
-          ],
-        },
-      ], { temperature: 0.1 });
-
-      // Parse the LLM response
-      const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+      // Parse the action from the LLM response
+      const jsonMatch = response.content.match(/\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\}/);
       if (!jsonMatch) {
-        console.error('Vision generic: No JSON in LLM response');
+        console.log(`Vision generic round ${totalAttempts}: No action JSON in response`);
         continue;
       }
 
-      let parsed: { solved?: boolean; steps?: VisionSolveStep[] };
+      let step: VisionSolveStep;
       try {
-        parsed = JSON.parse(jsonMatch[0]);
+        step = JSON.parse(jsonMatch[0]);
       } catch {
-        console.error('Vision generic: Failed to parse JSON:', jsonMatch[0].substring(0, 200));
+        console.log(`Vision generic round ${totalAttempts}: Failed to parse action JSON`);
         continue;
       }
 
-      if (parsed.solved) {
-        return { solved: true, method: 'vision_generic', attempts: totalAttempts };
-      }
+      console.log(`Vision generic round ${totalAttempts}: action=${step.action}`);
 
-      if (!parsed.steps || parsed.steps.length === 0) {
-        console.log('Vision generic: No steps returned, checking if page changed');
+      // Check if LLM signals done
+      if (step.action === 'done') {
+        // Verify by checking if captcha is actually gone
+        await new Promise((r) => setTimeout(r, 2000));
+        const stillHasCaptcha = await detectCaptcha(page);
+        if (!stillHasCaptcha) {
+          console.log(`Vision generic: Solved after ${totalAttempts} round(s)`);
+          return { solved: true, method: 'vision_generic', attempts: totalAttempts };
+        }
+        console.log(`Vision generic: LLM said done but captcha still present`);
         continue;
       }
 
-      // Execute each step
-      for (const step of parsed.steps) {
-        try {
-          if (step.action === 'click' && step.x !== undefined && step.y !== undefined) {
-            await page.mouse.click(step.x, step.y);
-            await new Promise((r) => setTimeout(r, 300 + Math.random() * 300));
-          } else if (step.action === 'drag' && step.startX !== undefined && step.startY !== undefined
-                     && step.endX !== undefined && step.endY !== undefined) {
-            // Human-like drag: move to start, press, move slowly, release
-            const steps = 25 + Math.floor(Math.random() * 10);
-            await page.mouse.move(step.startX, step.startY);
-            await page.mouse.down();
-            await new Promise((r) => setTimeout(r, 100 + Math.random() * 100));
+      // Execute the single action
+      try {
+        await executeVisionStep(page, step);
+      } catch (stepErr) {
+        console.error(`Vision generic: Action failed:`, stepErr);
+      }
 
-            const dx = step.endX - step.startX;
-            const dy = step.endY - step.startY;
-            for (let i = 1; i <= steps; i++) {
-              const progress = i / steps;
-              // Add slight easing and jitter for human-like motion
-              const eased = progress < 0.5
-                ? 2 * progress * progress
-                : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-              const jitterX = (Math.random() - 0.5) * 2;
-              const jitterY = (Math.random() - 0.5) * 2;
-              await page.mouse.move(
-                step.startX + dx * eased + jitterX,
-                step.startY + dy * eased + jitterY,
-              );
-              await new Promise((r) => setTimeout(r, 15 + Math.random() * 15));
-            }
-            // Final precise position
-            await page.mouse.move(step.endX, step.endY);
-            await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
-            await page.mouse.up();
-            await new Promise((r) => setTimeout(r, 500));
-          } else if (step.action === 'type' && step.text) {
-            await page.keyboard.type(step.text, { delay: 50 + Math.random() * 50 });
-            await new Promise((r) => setTimeout(r, 300));
-          }
-        } catch (stepErr) {
-          console.error(`Vision generic: Step failed:`, stepErr);
+      // Brief pause after action
+      await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
+
+      // Check if captcha cleared after this action
+      const stillHasCaptcha = await detectCaptcha(page);
+      if (!stillHasCaptcha) {
+        const title = await page.title();
+        const titleBlocked = title.toLowerCase().includes('just a moment')
+          || title.toLowerCase().includes('checking your browser')
+          || title.toLowerCase().includes('attention required');
+        if (!titleBlocked) {
+          console.log(`Vision generic: Challenge cleared after ${totalAttempts} round(s)`);
+          return { solved: true, method: 'vision_generic', attempts: totalAttempts };
         }
       }
+      console.log(`Vision generic: Challenge still present after round ${totalAttempts} (type: ${stillHasCaptcha?.type || 'title-based'})`);
 
-      // Wait for page to settle after actions
-      await new Promise((r) => setTimeout(r, 2000));
-
-      // Check if the page changed (verification cleared)
-      const newTitle = await page.title();
-      const newUrl = page.url();
-      const stillBlocked = await page.evaluate(() => {
-        const bodyText = (document.body.innerText || '').toLowerCase();
-        const blockKeywords = [
-          'captcha', 'verify', 'security check', 'are you a robot',
-          'human verification', 'slide to verify', 'complete the puzzle',
-        ];
-        return blockKeywords.some((k) => bodyText.includes(k));
-      });
-
-      if (!stillBlocked) {
-        console.log(`Vision generic: Challenge appears solved after ${totalAttempts} attempt(s)`);
-        return { solved: true, method: 'vision_generic', attempts: totalAttempts };
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`Vision generic attempt ${totalAttempts} failed:`, msg);
+      console.error(`Vision generic round ${totalAttempts} failed:`, msg);
+      // Add error context to history so LLM knows what happened
+      history.push({ role: 'user', content: `Error executing your action: ${msg}. Try a different approach.` });
       if (totalAttempts >= maxRounds) {
         return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: msg };
       }
@@ -1118,6 +1168,113 @@ Coordinates must be in pixels relative to the viewport (${viewport.width}x${view
   }
 
   return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: 'Max rounds exceeded' };
+}
+
+/**
+ * Execute a single vision solver action on the page.
+ * Supports: click, drag, type, type_at, key, scroll, wait.
+ */
+async function executeVisionStep(page: Page, step: VisionSolveStep): Promise<void> {
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  switch (step.action) {
+    case 'click':
+      if (step.x !== undefined && step.y !== undefined) {
+        await page.mouse.click(step.x, step.y);
+        await delay(200 + Math.random() * 200);
+      }
+      break;
+
+    case 'drag':
+      if (step.startX !== undefined && step.startY !== undefined
+          && step.endX !== undefined && step.endY !== undefined) {
+        // Human-like drag with easing and jitter
+        const dragSteps = 25 + Math.floor(Math.random() * 10);
+        await page.mouse.move(step.startX, step.startY);
+        await page.mouse.down();
+        await delay(80 + Math.random() * 80);
+
+        const dx = step.endX - step.startX;
+        const dy = step.endY - step.startY;
+        for (let i = 1; i <= dragSteps; i++) {
+          const p = i / dragSteps;
+          const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+          await page.mouse.move(
+            step.startX + dx * eased + (Math.random() - 0.5) * 2,
+            step.startY + dy * eased + (Math.random() - 0.5) * 2,
+          );
+          await delay(12 + Math.random() * 12);
+        }
+        await page.mouse.move(step.endX, step.endY);
+        await delay(50 + Math.random() * 80);
+        await page.mouse.up();
+        await delay(400);
+      }
+      break;
+
+    case 'type_at':
+      // Click at coordinates then type — for text CAPTCHAs
+      if (step.x !== undefined && step.y !== undefined && step.text) {
+        await page.mouse.click(step.x, step.y);
+        await delay(200);
+        // Clear any existing text
+        await page.keyboard.down('Control');
+        await page.keyboard.press('a');
+        await page.keyboard.up('Control');
+        await delay(50);
+        await page.keyboard.type(step.text, { delay: 40 + Math.random() * 40 });
+        await delay(200);
+      }
+      break;
+
+    case 'type':
+      if (step.text) {
+        // Try to find and fill an input field first (ReCAP-Agent pattern)
+        const filled = await page.evaluate((text: string) => {
+          const selectors = [
+            'input[type="text"]', 'input:not([type])', 'textarea',
+            'input[id*="captcha"]', 'input[name*="captcha"]',
+            'input[id*="answer"]', 'input[name*="answer"]',
+          ];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel) as HTMLInputElement | null;
+            if (el && el.offsetParent !== null) {
+              el.focus();
+              el.value = text;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              return true;
+            }
+          }
+          return false;
+        }, step.text);
+        if (!filled) {
+          // Fallback to keyboard typing
+          await page.keyboard.type(step.text, { delay: 40 + Math.random() * 40 });
+        }
+        await delay(200);
+      }
+      break;
+
+    case 'key':
+      if (step.keys && step.keys.length > 0) {
+        for (const key of step.keys) {
+          await page.keyboard.press(key as any);
+          await delay(100);
+        }
+      }
+      break;
+
+    case 'scroll': {
+      const deltaY = step.direction === 'up' ? -300 : 300;
+      await page.evaluate((dy: number) => window.scrollBy(0, dy), deltaY);
+      await delay(300);
+      break;
+    }
+
+    case 'wait':
+      await delay((step.duration || 2) * 1000);
+      break;
+  }
 }
 
 /**
@@ -1163,7 +1320,22 @@ export async function solveCaptchaFull(
     return solveWithVisionGeneric(page, llmProvider);
   }
 
-  // Method: auto — try all strategies
+  // Method: auto — delegate to the strategy registry (Phase 3.1).
+  // The registry picks per-type specialized solvers (turnstile_explicit,
+  // slider_drag_feedback, recaptcha_checkbox, etc.) in priority+cost order
+  // and returns a RichSolveResult with method/subMethod/trace/timing so
+  // callers can learn which approach worked per-domain.
+  if (method === 'auto') {
+    const { solveCaptchaViaRegistry } = await import('./captcha/orchestrator.js');
+    const rich = await solveCaptchaViaRegistry(page, captcha, config, llmProvider);
+    if (rich.solved || rich.method !== 'all_strategies_failed') {
+      return rich;
+    }
+    // Only fall through if the registry produced no candidate at all —
+    // preserve the legacy waterfall for unknown captcha types.
+  }
+
+  // Legacy auto waterfall (fallback when the registry has no candidate).
   // 1. Token method (fast, works 95% of the time)
   if (config.provider && config.apiKey && captcha.siteKey) {
     console.log('  Trying token method...');
@@ -1172,6 +1344,26 @@ export async function solveCaptchaFull(
       return { solved: true, method: 'token', attempts: 1 };
     }
     console.log('  Token method failed or rejected');
+  }
+
+  // 1.5. For reCAPTCHA: click the checkbox first (required before grid appears)
+  if (captcha.type === 'recaptcha') {
+    console.log('  Clicking reCAPTCHA checkbox...');
+    const clicked = await clickRecaptchaCheckbox(page);
+    if (clicked) {
+      // Re-check if captcha is still present (might have auto-resolved)
+      const recheckCaptcha = await detectCaptcha(page);
+      if (!recheckCaptcha) {
+        console.log('  reCAPTCHA auto-resolved after checkbox click');
+        return { solved: true, method: 'checkbox_autopass', attempts: 1 };
+      }
+      // Check if the token was populated (solved via checkbox)
+      const tokenFilled = await waitForCaptchaSolution(page, captcha, 3000, 500);
+      if (tokenFilled) {
+        console.log('  reCAPTCHA solved via checkbox click');
+        return { solved: true, method: 'checkbox', attempts: 1 };
+      }
+    }
   }
 
   // 2. AI vision for grid-based CAPTCHAs (reCAPTCHA, hCaptcha image grids)
@@ -1194,7 +1386,10 @@ export async function solveCaptchaFull(
   if (llmProvider) {
     console.log('  Trying generic vision solver...');
     const genericResult = await solveWithVisionGeneric(page, llmProvider);
-    if (genericResult.solved) return genericResult;
+    if (genericResult.solved) {
+      console.log(`  Generic vision solved in ${genericResult.attempts} attempt(s)`);
+      return genericResult;
+    }
     console.log(`  Generic vision failed: ${genericResult.error}`);
   }
 

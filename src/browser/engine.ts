@@ -36,6 +36,14 @@ const DEFAULT_CONFIG: BrowserConfig = {
   stealth: true,
 };
 
+/** Chrome build identity for stealth — must stay in sync with stealth.ts. */
+const CHROME_VERSION = '130.0.6723.91';
+const CHROME_MAJOR = CHROME_VERSION.split('.')[0];
+const DEFAULT_UA =
+  `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ` +
+  `(KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36`;
+const DEFAULT_PLATFORM: 'macOS' | 'Windows' | 'Linux' = 'macOS';
+
 /** Chrome launch flags for headless automation with enhanced stealth. */
 const CHROME_FLAGS = [
   '--disable-blink-features=AutomationControlled',
@@ -65,6 +73,9 @@ const CHROME_FLAGS = [
   '--disable-ipc-flooding-protection',
   '--disable-component-update',
   '--disable-domain-reliability',
+  // Locale consistency — matches navigator.languages in stealth.ts.
+  '--lang=en-US',
+  '--accept-lang=en-US,en;q=0.9',
 ];
 
 /** Auto-detect Chrome/Chromium binary path. */
@@ -144,18 +155,27 @@ export class BrowserEngine extends EventEmitter {
 
     const page = await this.browser.newPage();
 
+    // Per-session seed so canvas/audio fingerprint noise is stable within
+    // a session but differs across sessions.
+    const sessionSeed = Math.floor(Math.random() * 2147483647);
+
     // Inject stealth scripts before any page script
     if (this.config.stealth) {
-      await page.evaluateOnNewDocument(getStealthScript());
+      await page.evaluateOnNewDocument(
+        getStealthScript({
+          sessionSeed,
+          chromeVersion: CHROME_VERSION,
+          platform: DEFAULT_PLATFORM,
+        }),
+      );
       await page.evaluateOnNewDocument(getPlatformOverrideScript());
     }
 
     // Set viewport
     await page.setViewport(this.config.viewport);
 
-    // Set user agent — use configured value or a realistic default matching stealth script (Chrome 130)
-    const ua = this.config.userAgent
-      || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    // Set user agent — derived from CHROME_VERSION so stealth UA hints stay in sync.
+    const ua = this.config.userAgent || DEFAULT_UA;
     await page.setUserAgent(ua);
 
     // Setup CDP session for download behavior
