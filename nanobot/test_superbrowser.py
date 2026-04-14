@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ Task: go to aarong and find me new arrival boishakh fatua for men with its price, color and link. Must be new boishkah fatua."""
+        """ Task: Browse the women's new arrivals section and list the names and prices of the first 5 items displayed.\nwebsite: https://zara.com"""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
