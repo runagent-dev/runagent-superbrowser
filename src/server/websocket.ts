@@ -39,6 +39,7 @@ import type { HumanInputManager, HumanInputRequest } from '../agent/human-input.
 import { validateUrl } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
+import { feedbackBus, type FeedbackEvent } from '../agent/feedback-bus.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -102,6 +103,27 @@ export function attachWebSocketServer(
     session.lastAccessed = Date.now();
 
     sendEvent(ws, 'connected', { sessionId });
+    // Replay current feedback state on connect so the Python bridge
+    // doesn't miss an in-flight captcha/error.
+    const snap = feedbackBus.getState();
+    if (snap.captchaActive) {
+      sendEvent(ws, 'feedback', {
+        kind: 'captcha_active',
+        host: '(snapshot)',
+        strategy: snap.captchaStrategy ?? 'unknown',
+      });
+    }
+    if (snap.errorPage) {
+      sendEvent(ws, 'feedback', { kind: 'error_page', detail: snap.errorPage });
+    }
+
+    // Subscribe this WS to the process-wide feedback bus. Every event
+    // becomes a `feedback` WS message — the Python bridge mirrors state
+    // into a local dict it consults before dispatching tools.
+    const onFeedback = (event: FeedbackEvent) => {
+      sendEvent(ws, 'feedback', event);
+    };
+    feedbackBus.on('event', onFeedback);
 
     // Handle incoming commands
     ws.on('message', async (raw) => {
@@ -117,10 +139,12 @@ export function attachWebSocketServer(
 
     ws.on('close', () => {
       bindings.delete(sessionId);
+      feedbackBus.off('event', onFeedback);
     });
 
     ws.on('error', () => {
       bindings.delete(sessionId);
+      feedbackBus.off('event', onFeedback);
     });
   });
 

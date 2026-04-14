@@ -15,6 +15,7 @@
 
 import type { Page } from 'puppeteer-core';
 import type { LLMProvider } from '../llm/provider.js';
+import { sanitizeImageBuffer } from '../browser/image-safety.js';
 
 export interface JudgeInput {
   /** What the solver claimed. e.g., "reCAPTCHA solved via grid method". */
@@ -124,5 +125,6 @@ export async function verifyCaptchaSolve(
 /** Convenience: capture a screenshot the caller can pass to verifyCaptchaSolve. */
 export async function captureJpegB64(page: Page, quality = 75): Promise<string> {
   const buf = await page.screenshot({ type: 'jpeg', quality, fullPage: false });
-  return Buffer.from(buf).toString('base64');
+  const san = await sanitizeImageBuffer(Buffer.from(buf));
+  return san.buffer.toString('base64');
 }

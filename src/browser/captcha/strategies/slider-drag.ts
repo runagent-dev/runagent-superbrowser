@@ -20,6 +20,7 @@
 import type { Page } from 'puppeteer-core';
 import type { CaptchaInfo } from '../../captcha.js';
 import { humanDrag } from '../../humanize.js';
+import { sanitizeImageBuffer } from '../../image-safety.js';
 import {
   clampToRect,
   parseSliderCoordsStrict,
@@ -135,8 +136,9 @@ async function findHandleAndTargetViaVision(
 ): Promise<Coords | null> {
   if (!ctx.llm) return null;
   const clipOpt = rect ? { clip: rect } : {};
-  const buffer = await ctx.page.screenshot({ type: 'jpeg', quality: 80, fullPage: false, ...clipOpt });
-  const b64 = Buffer.from(buffer).toString('base64');
+  const raw = await ctx.page.screenshot({ type: 'jpeg', quality: 80, fullPage: false, ...clipOpt });
+  const buffer = (await sanitizeImageBuffer(Buffer.from(raw))).buffer;
+  const b64 = buffer.toString('base64');
   ctx.memory.setChallengeHash(
     (await import('../vision-memory.js'))
       .VisionMemory.hashChallenge(
@@ -200,8 +202,9 @@ async function measureAlignment(
 ): Promise<{ aligned: boolean; offsetPx: number }> {
   if (!ctx.llm) return { aligned: false, offsetPx: 0 };
   const clipOpt = rect ? { clip: rect } : {};
-  const buffer = await ctx.page.screenshot({ type: 'jpeg', quality: 80, ...clipOpt });
-  const b64 = Buffer.from(buffer).toString('base64');
+  const raw = await ctx.page.screenshot({ type: 'jpeg', quality: 80, ...clipOpt });
+  const buffer = (await sanitizeImageBuffer(Buffer.from(raw))).buffer;
+  const b64 = buffer.toString('base64');
   const prompt =
     'Look at the slider captcha in this screenshot. Is the handle aligned with the target gap/notch? ' +
     'Respond with a JSON object containing ONLY these two fields: ' +

@@ -15,11 +15,37 @@ import { jsonrepair } from 'jsonrepair';
 import { detectCaptcha } from '../browser/captcha.js';
 import { solveCaptchaViaRegistry } from '../browser/captcha/orchestrator.js';
 import type { HumanInputManager } from './human-input.js';
+import { buildObservation, coordBand, type ActionKind, type StepOutcome, type VisibleChange } from './step-observation.js';
+import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
+import { feedbackBus } from './feedback-bus.js';
 
 // Actions that likely change the page — stop sequence after them
 const PAGE_CHANGING_ACTIONS = new Set([
   'click_element', 'navigate', 'search_google', 'go_back', 'open_tab',
 ]);
+
+/** Map nanobot action names → StepObservation.action kinds. Unknown
+ *  action names simply skip reward emission (best-effort). */
+const ACTION_KIND_MAP: Record<string, ActionKind> = {
+  click_element: 'click',
+  input_text: 'type',
+  scroll: 'scroll',
+  navigate: 'navigate',
+  go_back: 'navigate',
+  open_tab: 'navigate',
+  search_google: 'navigate',
+};
+
+/** Pull out coord hints from action params if present; most actions
+ *  don't have them, but click/scroll sometimes carry x/y fields. */
+function extractCoords(params: unknown): { x: number; y: number } | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const p = params as Record<string, unknown>;
+  const x = typeof p.x === 'number' ? p.x : null;
+  const y = typeof p.y === 'number' ? p.y : null;
+  if (x != null && y != null) return { x, y };
+  return undefined;
+}
 
 /** Per-URL captcha-failure tracking to escalate to human handoff. */
 const FORCE_HANDOFF_AFTER = 2;
@@ -90,6 +116,31 @@ export class NavigatorAgent {
       includeConsole: true,
     });
 
+    // 1a. Error-page short-circuit: if the last navigation landed on
+    // a chrome-error, 4xx body, DNS/TLS failure page, don't bother the
+    // LLM with a broken DOM. Surface the error kind and hand back so
+    // the caller can retry with a different URL or hand off.
+    if (state.errorPage) {
+      const { kind, detail } = state.errorPage;
+      const msg = `Page reached an error state: ${kind} — ${detail}`;
+      console.log(`[navigator] ${msg}`);
+      this.messageManager.addActionResults([
+        {
+          success: false,
+          error: msg,
+          reason: 'unknown',
+          extractedContent: msg,
+          includeInMemory: true,
+        },
+      ]);
+      return {
+        results: [
+          { success: false, error: msg, reason: 'unknown', includeInMemory: true },
+        ],
+        done: false,
+      };
+    }
+
     // 2. Add state to message history
     this.messageManager.addStateMessage(state, this.options.useVision, this.stepInfo);
 
@@ -156,6 +207,47 @@ export class NavigatorAgent {
 
       const result = await this.actionRegistry.execute(name, params, page, state);
       results.push(result);
+
+      // Emit a reward observation. Records per-host/strategy/coord-band
+      // reward into domain-stats so future runs on the same site can bias
+      // toward actions that previously worked. Intentionally cheap: the
+      // record hits the in-memory store and flushes debounced.
+      try {
+        const kind = ACTION_KIND_MAP[name] ?? null;
+        if (kind) {
+          const urlNow = state.url;
+          const outcome: StepOutcome = !result.success
+            ? (result.reason === 'nav_pending' ? 'blocked' : 'error')
+            : 'success';
+          const visibleChange: VisibleChange = PAGE_CHANGING_ACTIONS.has(name)
+            ? 'navigation'
+            : result.success ? 'minor' : 'none';
+          const coords = extractCoords(params);
+          const obs = buildObservation({
+            action: kind,
+            coords,
+            outcome,
+            visibleChange,
+            timestampMs: Date.now(),
+            host: hostKey(urlNow),
+            strategy: 'navigator',
+            target: (params as { selector?: string; index?: number })?.selector ?? String((params as { index?: number })?.index ?? ''),
+          });
+          if (coords) {
+            getDomainStats().recordAction(
+              obs.host,
+              'navigator',
+              coordBand(coords.x, coords.y),
+              obs.reward,
+            );
+          }
+          // Broadcast the reward so the Python side / FeedbackBus
+          // listeners can observe per-action effectiveness in real time.
+          feedbackBus.publish({ kind: 'action_reward', obs });
+        }
+      } catch {
+        // Reward recording is best-effort — never break the action loop.
+      }
 
       if (result.isDone) {
         this.messageManager.addActionResults(results);

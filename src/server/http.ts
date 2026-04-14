@@ -24,6 +24,10 @@ import { runPuppeteerScript } from '../browser/script-runner.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
 import { renderCaptchaViewHtml } from './captcha-ui-html.js';
+import { feedbackBus } from '../agent/feedback-bus.js';
+import { fingerprintMap, invertFingerprintMap, fingerprintElement } from '../browser/fingerprint.js';
+import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
+import { coordBand } from '../agent/step-observation.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -50,8 +54,13 @@ export function createHttpServer(
   });
 
   const limiter = new Limiter(limiterConfig);
+  // Default lifted to 600/min — a single agent run with vision + action
+  // emits easily 3-5 requests/sec. 200 was sized for a standalone HTTP
+  // client, not the nanobot bridge. Loopback traffic bypasses entirely
+  // (see RateLimiter.isLoopback), so this ceiling only matters for
+  // external clients.
   const rateLimiter = new RateLimiter(
-    parseInt(process.env.RATE_LIMIT || '200', 10),
+    parseInt(process.env.RATE_LIMIT || '600', 10),
     60000,
   );
 
@@ -89,6 +98,14 @@ export function createHttpServer(
 
   app.get('/metrics', (_req, res) => {
     res.json(limiter.getMetrics());
+  });
+
+  // --- Feedback state ---
+  // Python bridge polls this before dispatching a browser tool to check
+  // whether a captcha is mid-solve (in which case the tool should be
+  // deferred) or whether the page is stuck on an error state.
+  app.get('/feedback', (_req, res) => {
+    res.json(feedbackBus.getState());
   });
 
   // --- Browser Task (agentic) ---
@@ -597,6 +614,10 @@ export function createHttpServer(
         // keep the normal /state response compact.
         selectorEntries: includeBounds ? state.selectorEntries : undefined,
         devicePixelRatio: includeBounds ? devicePixelRatio : undefined,
+        // Per-index identity fingerprint. Used by the Python bridge to
+        // catch stale-index clicks when the DOM re-renders between
+        // state-fetch and click. Small payload (~16 hex chars × N).
+        fingerprints: fingerprintMap(state.selectorMap),
       });
     } catch (err) {
       handleError(res, err);
@@ -609,14 +630,76 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { index, x, y, button, clickCount } = req.body;
+      const { index, x, y, button, clickCount, expected_fingerprint } = req.body as {
+        index?: number;
+        x?: number;
+        y?: number;
+        button?: 'left' | 'right' | 'middle';
+        clickCount?: number;
+        /** Fingerprint the LLM was targeting (from the last state fetch).
+         *  When provided and index is used, we reject if current[index]
+         *  has a different fingerprint — prevents clicking a different
+         *  element than the LLM intended after a DOM re-render. */
+        expected_fingerprint?: string;
+      };
 
       if (x !== undefined && y !== undefined) {
+        // Reward-band guard: if previous clicks in this 100px cell have
+        // reliably produced nothing (mean reward < 0.1 with ≥3 samples),
+        // reject instead of letting the LLM scatter-click the same dead
+        // zone. Hint at higher-scoring bands when we have them.
+        try {
+          const host = hostKey(await page.getUrl());
+          const stats = getDomainStats();
+          const band = coordBand(x, y);
+          const bandStats = stats.actionBandStats(host, 'navigator', band);
+          if (bandStats && bandStats.n >= 3 && bandStats.mean < 0.1) {
+            const top = stats.topActionBands(host, 'navigator', 3)
+              .filter((b) => b.band !== band && b.mean >= 0.3);
+            const suggestion = top.length > 0
+              ? ` Historically effective zones on this page: ${top.map((b) => `band ${b.band} (mean=${b.mean.toFixed(2)})`).join(', ')}.`
+              : '';
+            res.status(409).json({
+              error: `click_at (${x}, ${y}) lands in a dead zone (mean reward ${bandStats.mean.toFixed(2)} over ${bandStats.n} prior clicks).${suggestion} Re-read elements and pick by [index] instead.`,
+              reason: 'low_reward_band',
+              band,
+              stats: bandStats,
+              suggestions: top,
+            });
+            return;
+          }
+        } catch {
+          // Band lookup is best-effort — never block the click on a
+          // stats read failure.
+        }
         await page.clickAt(x, y, { button, clickCount });
       } else if (index !== undefined) {
         const state = await page.getState({ useVision: false });
         const element = state.selectorMap.get(index);
         if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
+
+        // Stale-index guard: the LLM saw screenshot+elements at time T1;
+        // if the DOM has since shifted, current[index] may point at a
+        // different element. Compare fingerprints and reject with a
+        // structured hint naming the new index of the intended element.
+        if (expected_fingerprint) {
+          const currentFp = fingerprintElement(element);
+          if (currentFp !== expected_fingerprint) {
+            const currentFpMap = fingerprintMap(state.selectorMap);
+            const suggestedIndex = invertFingerprintMap(currentFpMap)[expected_fingerprint];
+            res.status(409).json({
+              error: `Element [${index}] has shifted since last state — the element you intended is ${suggestedIndex !== undefined ? `now at [${suggestedIndex}]` : 'no longer on the page'}.`,
+              reason: 'stale_index',
+              stale_index: index,
+              suggested_index: suggestedIndex,
+              // Echo current mapping so the caller can re-pick rather
+              // than re-fetching state.
+              current_element: `<${element.tagName.toLowerCase()}>${element.getAllTextTillNextClickableElement(2).slice(0, 60)}`,
+            });
+            return;
+          }
+        }
+
         const r = await page.clickElement(element, { button, clickCount });
         if (!r.success) {
           res.status(400).json({
@@ -653,7 +736,9 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { index, text, clear } = req.body;
+      const { index, text, clear, expected_fingerprint } = req.body as {
+        index?: number; text?: string; clear?: boolean; expected_fingerprint?: string;
+      };
       if (index === undefined || !text) {
         res.status(400).json({ error: 'index and text required' });
         return;
@@ -662,6 +747,22 @@ export function createHttpServer(
       const state = await page.getState({ useVision: false });
       const element = state.selectorMap.get(index);
       if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
+
+      if (expected_fingerprint) {
+        const currentFp = fingerprintElement(element);
+        if (currentFp !== expected_fingerprint) {
+          const currentFpMap = fingerprintMap(state.selectorMap);
+          const suggestedIndex = invertFingerprintMap(currentFpMap)[expected_fingerprint];
+          res.status(409).json({
+            error: `Element [${index}] has shifted since last state — retarget to ${suggestedIndex !== undefined ? `[${suggestedIndex}]` : 'a different index'}.`,
+            reason: 'stale_index',
+            stale_index: index,
+            suggested_index: suggestedIndex,
+            current_element: `<${element.tagName.toLowerCase()}>${element.getAllTextTillNextClickableElement(2).slice(0, 60)}`,
+          });
+          return;
+        }
+      }
 
       const r = await page.typeText(element, text, clear !== false);
       if (!r.success) {

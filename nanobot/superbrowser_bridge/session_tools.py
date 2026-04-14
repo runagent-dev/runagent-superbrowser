@@ -8,6 +8,7 @@ to have isolated state in the same process.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import os
@@ -28,6 +29,108 @@ from nanobot.agent.tools.schema import (
 
 SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
+
+
+async def _request_with_backoff(
+    method: str,
+    url: str,
+    *,
+    json: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+    max_retries: int = 3,
+) -> httpx.Response:
+    """POST/GET with jittered backoff on transient errors.
+
+    Retries on 429 (rate-limited) and 503 (service overloaded) with
+    delays roughly [1s, 2s, 4s] + small jitter. Honors the server's
+    Retry-After header when present.
+
+    This exists because a single run of nanobot fires 200-500 tool calls
+    against our TS server — without backoff, a brief burst hitting the
+    per-IP rate limiter would surface as a hard 429 that the LLM mis-
+    classifies as a permanent outage and refuses to retry.
+    """
+    import random
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(max_retries + 1):
+            try:
+                if method.upper() == "GET":
+                    r = await client.get(url, params=params)
+                else:
+                    r = await client.post(url, json=json)
+            except (httpx.ConnectError, httpx.ReadTimeout) as e:
+                last_exc = e
+                if attempt == max_retries:
+                    raise
+                delay = (2 ** attempt) + random.uniform(0, 0.5)
+                print(f"  [net retry {attempt + 1}/{max_retries}] {type(e).__name__}: waiting {delay:.1f}s")
+                await asyncio.sleep(delay)
+                continue
+
+            # Retryable status codes. Honor Retry-After if present.
+            if r.status_code in (429, 503):
+                if attempt == max_retries:
+                    return r  # caller sees the 429 after all retries
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    retry_after_s = float(retry_after) if retry_after else None
+                except ValueError:
+                    retry_after_s = None
+                delay = retry_after_s if retry_after_s is not None else (2 ** attempt) + random.uniform(0, 0.5)
+                # Cap at 10s — Retry-After from a confused server could otherwise block the run.
+                delay = min(10.0, delay)
+                print(f"  [429 retry {attempt + 1}/{max_retries}] waiting {delay:.1f}s")
+                await asyncio.sleep(delay)
+                continue
+
+            return r
+    # Unreachable: loop either returns or raises.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("request retry loop exited without return")
+
+
+async def _fetch_feedback_state() -> dict[str, Any]:
+    """Read the TS-side FeedbackBus snapshot over HTTP.
+
+    Non-fatal on any failure — returns {} so callers fall through to the
+    normal dispatch path (caller stays the same when the signal is down).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            r = await client.get(f"{SUPERBROWSER_URL}/feedback")
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+
+async def _feedback_gate(tool_name: str) -> str | None:
+    """Return a deferred-result string when another subsystem owns the
+    browser right now (active captcha solve). None means `proceed`.
+
+    Used at the top of mutating tools (click/type/scroll/navigate) to
+    keep nanobot from racing the captcha solver — if the gate fires,
+    nanobot gets an observation saying "captcha active, retry after 2s"
+    and yields instead of firing a click that lands on a solved-then-
+    reloaded page.
+    """
+    state = await _fetch_feedback_state()
+    if state.get("captchaActive"):
+        strategy = state.get("captchaStrategy") or "unknown"
+        msg = (
+            f"[feedback] {tool_name} deferred: captcha solve in progress "
+            f"(strategy={strategy}). Retry after ~2000ms; do not issue "
+            f"more actions until you see the captcha_done signal."
+        )
+        print(f"  {msg}")
+        return msg
+    return None
 
 # After this many guard-refused browser_open calls in a single worker run, we
 # stop being polite and abort the worker. The guard's text message is clearly
@@ -140,6 +243,12 @@ class BrowserSessionState:
         self.captcha_mode: bool = False
         self.captcha_mode_remaining: int = 0
         self.captcha_solve_round: int = 0
+
+        # Per-index fingerprint cache. Populated on each /state fetch; read
+        # by click/type tools to send `expected_fingerprint` along with the
+        # request. Lets the TS side reject clicks that would land on a
+        # different element than the LLM originally targeted (stale index).
+        self.element_fingerprints: dict[int, str] = {}
         self.captcha_screenshots_used: int = 0
         # Hard cap on screenshots allowed within captcha mode (across rounds).
         # Kicks in only in captcha mode; the normal budget still caps overall.
@@ -547,6 +656,15 @@ class BrowserSessionState:
             except Exception:
                 final_b64 = b64
 
+        # Clamp the final payload to ≤ 2MB / ≤1568px side. Runs AFTER the
+        # highlight overlay pass so overlay bloat can't tip a 1.8MB raw
+        # screenshot over Gemini's 1.5MB-ish reject threshold.
+        try:
+            from superbrowser_bridge.image_safety import sanitize_image_b64
+            final_b64 = sanitize_image_b64(final_b64)
+        except Exception as e:
+            print(f"  [image-safety: sanitize failed, sending raw: {e}]")
+
         self.save_screenshot(final_b64, label)
         return [
             {"type": "text", "text": caption},
@@ -576,11 +694,16 @@ class BrowserSessionState:
         return result
 
 
-async def _fetch_elements(session_id: str) -> str:
+async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" = None) -> str:
     """Fetch current interactive elements without vision (cheap, no screenshot).
 
     This is the key BrowserOS pattern: every action gets a fresh element snapshot
     so the agent always knows what's on the page without wasting a screenshot.
+
+    If `state` is passed, we ALSO update `state.element_fingerprints` with
+    the fresh per-index fingerprint map. Click/type tools then send the
+    cached fingerprint as `expected_fingerprint` so the TS side can reject
+    stale-index clicks (DOM shifted between state-fetch and click).
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -590,6 +713,11 @@ async def _fetch_elements(session_id: str) -> str:
             )
             r.raise_for_status()
             data = r.json()
+        if state is not None:
+            fps = data.get("fingerprints") or {}
+            if isinstance(fps, dict):
+                # JSON keys come back as strings; coerce to int for direct index lookup.
+                state.element_fingerprints = {int(k): v for k, v in fps.items() if isinstance(v, str)}
         return data.get("elements", "")
     except Exception:
         return ""
@@ -756,10 +884,25 @@ class BrowserOpenTool(Tool):
             payload["enableHumanHandoff"] = True
             payload["humanHandoffBudget"] = self.s.human_handoff_budget
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/create", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/create",
+            json=payload,
+            timeout=45.0,
+        )
+        if r.status_code == 429:
+            # Retries exhausted. Give the LLM a CLEAR hint that this is
+            # transient — otherwise it hallucinates a permanent outage
+            # (observed 2026-04-14 log: "the service is completely
+            # blocking session creation") and gives up entirely.
+            return (
+                "[transient_rate_limit] Browser session service is busy "
+                "(HTTP 429 after retries). This is a temporary rate limit, "
+                "NOT a permanent outage. Wait ~30 seconds and call "
+                "browser_open again. Do not switch to a different strategy."
+            )
+        r.raise_for_status()
+        data = r.json()
 
         actual_url = data.get("url", url or "")
         self.s.session_id = data.get("sessionId", "")
@@ -848,6 +991,9 @@ class BrowserNavigateTool(Tool):
 
     async def execute(self, session_id: str, url: str, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
+        gate = await _feedback_gate("browser_navigate")
+        if gate:
+            return gate
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
 
@@ -925,7 +1071,7 @@ class BrowserScreenshotTool(Tool):
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""
         try:
-            peek_elements = await _fetch_elements(session_id)
+            peek_elements = await _fetch_elements(session_id, self.s)
             peek_hash = BrowserSessionState.hash_page_content(peek_elements)
         except Exception:
             pass
@@ -1002,39 +1148,71 @@ class BrowserClickTool(Tool):
 
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_click([{index}])")
+        gate = await _feedback_gate("browser_click")
+        if gate:
+            return gate
         self.s.consecutive_click_calls += 1
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
+        # Send the fingerprint the LLM was targeting. If the DOM shifted,
+        # the TS side returns 409 + stale_index with a suggested new index.
+        cached_fp = self.s.element_fingerprints.get(index)
+        if cached_fp:
+            payload["expected_fingerprint"] = cached_fp
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json=payload)
+                # 409 = stale-index guard fired. Surface the suggested
+                # index (if any) so the LLM retargets instead of blindly
+                # retrying or falling back to click_at coords.
+                if r.status_code == 409:
+                    info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    stale_msg = info.get("error", "Stale index")
+                    suggested = info.get("suggested_index")
+                    current = info.get("current_element", "")
+                    hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
+                    result = f"[stale_index] {stale_msg} Current [{index}] is {current}.{hint}"
+                    self.s.log_activity(f"click([{index}])(STALE)", f"suggested={suggested}")
+                    await _fetch_elements(session_id, self.s)
+                    return result
+                # 400 = structured TS-side failure (element not found,
+                # not visible, disabled, etc.). Parse it and return an
+                # actionable message to the LLM — crucially, DO NOT fall
+                # back to JS click for these: JS click against a missing
+                # element also fails, and the raw Python exception string
+                # that comes out ('Client error 400 Bad Request for URL')
+                # is un-actionable enough that Gemini will sometimes
+                # return an empty response on the next turn (observed
+                # 2026-04-14). Structured text here prevents that.
+                if r.status_code == 400:
+                    info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    reason = info.get("reason", "unknown")
+                    err = info.get("error", f"click [{index}] failed")
+                    alternatives = info.get("alternatives") or []
+                    await _fetch_elements(session_id, self.s)
+                    self.s.log_activity(f"click([{index}])({reason})", err[:60])
+                    alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
+                    fresh_hint = "\nElements have been re-read above — pick a current [index]."
+                    return (
+                        f"[click_failed:{reason}] {err}"
+                        + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
+                        + fresh_hint
+                    )
                 r.raise_for_status()
                 data = r.json()
+        except httpx.HTTPStatusError as e:
+            # Opaque 4xx/5xx (not 400/409). Usually network-layer.
+            self.s.log_activity(f"click([{index}])(HTTP{e.response.status_code})", str(e)[:60])
+            return (
+                f"[click_failed:http_{e.response.status_code}] {e.response.text[:200] if e.response.text else str(e)[:200]}"
+            )
         except Exception as e:
-            # Fallback: try JS click via eval (BrowserOS pattern: CDP click → JS click fallback)
-            print(f"  [click failed, trying JS fallback: {e}]")
-            try:
-                js_click = f"document.querySelectorAll('[data-index=\"{index}\"], [highlight-index=\"{index}\"]')[0]?.click(); 'clicked via JS'"
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    r = await client.post(
-                        f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
-                        json={"script": js_click},
-                    )
-                    r.raise_for_status()
-                data = r.json()
-                # Fetch state after JS click
-                elements = await _fetch_elements(session_id)
-                self.s.log_activity(f"click([{index}])(JS fallback)", "ok")
-                self.s.record_step("browser_click", f"index={index}(JS)", "JS fallback succeeded")
-                result = f"Clicked [{index}] (JS fallback)"
-                if elements:
-                    result += f"\n\nInteractive elements:\n{elements}"
-                return result
-            except Exception as e2:
-                self.s.log_activity(f"click([{index}])(FAILED)", str(e2)[:60])
-                return f"Click failed: {e}. JS fallback also failed: {e2}"
+            # True transport error (connection refused, timeout). JS
+            # fallback doesn't help here either — the server is down.
+            self.s.log_activity(f"click([{index}])(TRANSPORT)", str(e)[:60])
+            return f"[click_failed:transport] {str(e)[:200]} — browser service unreachable. Retry in a few seconds."
 
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
@@ -1067,6 +1245,15 @@ class BrowserClickAtTool(Tool):
         print(f"\n>> browser_click_at({x}, {y})")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json={"x": x, "y": y})
+            # 409 = reward-band reject. Historical data says this zone
+            # doesn't respond to clicks on this host; surface the hint
+            # so the LLM re-reads elements instead of trying another
+            # nearby coord.
+            if r.status_code == 409:
+                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                err = info.get("error") or "click_at rejected: low-reward zone"
+                self.s.log_activity(f"click_at({x},{y})(BAND_REJECT)", f"band={info.get('band')}")
+                return f"[low_reward_band] {err}"
             r.raise_for_status()
             data = r.json()
         actual_url = data.get("url", self.s.current_url)
@@ -1098,9 +1285,39 @@ class BrowserTypeTool(Tool):
 
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
         print(f'\n>> browser_type([{index}], "{text}")')
+        gate = await _feedback_gate("browser_type")
+        if gate:
+            return gate
         self.s.consecutive_click_calls += 1  # type is also step-by-step
+        payload: dict[str, Any] = {"index": index, "text": text, "clear": clear}
+        cached_fp = self.s.element_fingerprints.get(index)
+        if cached_fp:
+            payload["expected_fingerprint"] = cached_fp
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/type", json={"index": index, "text": text, "clear": clear})
+            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/type", json=payload)
+            if r.status_code == 409:
+                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                suggested = info.get("suggested_index")
+                current = info.get("current_element", "")
+                hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
+                await _fetch_elements(session_id, self.s)
+                return f"[stale_index] Element [{index}] is now {current}.{hint}"
+            # Same structured-400 handling as BrowserClickTool — avoid
+            # surfacing raw 'Client error 400' which empties Gemini's
+            # next turn.
+            if r.status_code == 400:
+                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                reason = info.get("reason", "unknown")
+                err = info.get("error", f"type [{index}] failed")
+                alternatives = info.get("alternatives") or []
+                await _fetch_elements(session_id, self.s)
+                self.s.log_activity(f"type([{index}])({reason})", err[:60])
+                alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
+                return (
+                    f"[type_failed:{reason}] {err}"
+                    + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
+                    + "\nElements have been re-read above — pick a current [index]."
+                )
             r.raise_for_status()
             data = r.json()
         self.s.record_step("browser_type", f'index={index}, text="{text[:30]}"', "ok")
@@ -1133,7 +1350,7 @@ class BrowserKeysTool(Tool):
             data = r.json()
         # Fetch updated elements after key press (e.g., Enter may submit form)
         if not data.get("elements"):
-            elements = await _fetch_elements(session_id)
+            elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
         return self.s.build_text_only(data, f"Sent keys: {keys}")
@@ -1160,6 +1377,9 @@ class BrowserScrollTool(Tool):
 
     async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_scroll({direction or f'{percent}%'})")
+        gate = await _feedback_gate("browser_scroll")
+        if gate:
+            return gate
         payload: dict[str, Any] = {}
         if percent is not None:
             payload["percent"] = percent
@@ -1171,7 +1391,7 @@ class BrowserScrollTool(Tool):
             data = r.json()
         # Fetch updated elements after scroll (new elements may be visible)
         if not data.get("elements"):
-            elements = await _fetch_elements(session_id)
+            elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
@@ -1204,7 +1424,7 @@ class BrowserSelectTool(Tool):
             data = r.json()
         # Fetch updated elements after selection (may trigger form changes)
         if not data.get("elements"):
-            elements = await _fetch_elements(session_id)
+            elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
         return self.s.build_text_only(data, f'Selected "{value}" in [{index}]')
@@ -1286,7 +1506,7 @@ class BrowserRunScriptTool(Tool):
             self.s.log_activity("run_script(FAILED)", error[:100])
             self.s.record_step("browser_run_script", script[:60], f"FAILED: {error[:100]}")
             # Fetch current elements so agent can see what's on the page and fix the script
-            elements = await _fetch_elements(session_id)
+            elements = await _fetch_elements(session_id, self.s)
             tip = "\n[TIP: Fix the script and retry in this SAME session. Do NOT navigate back to the start.]"
             if elements:
                 tip += f"\n\nCurrent interactive elements:\n{elements}"
@@ -1311,7 +1531,7 @@ class BrowserRunScriptTool(Tool):
         self.s.record_checkpoint(self.s.current_url, "", f"run_script(ok, {duration}ms)")
 
         # Auto-include updated elements so agent sees current page state
-        elements = await _fetch_elements(session_id)
+        elements = await _fetch_elements(session_id, self.s)
         if elements:
             parts.append(f"\nInteractive elements:\n{elements}")
 
@@ -1393,7 +1613,7 @@ class BrowserWaitForTool(Tool):
         if result.get("found"):
             self.s.log_activity(f"wait_for({label})", "found")
             # Fetch updated elements
-            elements = await _fetch_elements(session_id)
+            elements = await _fetch_elements(session_id, self.s)
             response = f"Found! Page: {result.get('url', '?')} | Title: {result.get('title', '?')}"
             if elements:
                 response += f"\n\nInteractive elements:\n{elements}"

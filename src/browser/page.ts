@@ -18,6 +18,9 @@ import { ConsoleCollector, type CollectedLog } from './console-collector.js';
 import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
 import type { FailureReason } from '../agent/types.js';
+import { sanitizeImageBuffer } from './image-safety.js';
+import { waitForPageReady, detectErrorPage, type ErrorPage } from './page-readiness.js';
+import { feedbackBus } from '../agent/feedback-bus.js';
 
 /**
  * Structured result of a tool invocation at the browser layer. Designed so
@@ -100,6 +103,21 @@ export class PageWrapper {
    * element appeared after your previous action".
    */
   private priorSelectorMap: Map<number, DOMElementNode> | null = null;
+  /**
+   * Last detected error-page state. Set by navigate(); cleared as soon as
+   * the next navigate/click survives a readiness check. getState() reads
+   * this so the navigator can short-circuit without re-running detection
+   * on every step.
+   */
+  private lastErrorPage: ErrorPage | null = null;
+  /**
+   * Per-session set of URLs we've already seen produce an error page.
+   * When the LLM is confused about a site's URL structure, it tends to
+   * retry the same dead URL several times. Short-circuit on re-nav to
+   * the same URL so the LLM sees the error synthetically without
+   * spending another goto + waitForPageReady + error detection round.
+   */
+  private badUrls: Map<string, ErrorPage> = new Map();
 
   constructor(
     private page: Page,
@@ -113,27 +131,86 @@ export class PageWrapper {
 
   // --- Navigation ---
 
-  async navigate(url: string, timeout: number = 30000): Promise<{ statusCode: number | null; finalUrl: string }> {
+  async navigate(url: string, timeout: number = 30000): Promise<{ statusCode: number | null; finalUrl: string; errorPage?: ErrorPage }> {
     // SSRF protection
     const urlCheck = validateUrl(url);
     if (!urlCheck.valid) {
       throw new Error(`Blocked: ${urlCheck.error}`);
     }
 
+    // URL blocklist short-circuit: if this URL previously produced an
+    // error page, surface that cached result instead of navigating to
+    // the same dead URL. Saves a ~2-8s round trip on LLM retry loops.
+    const cached = this.badUrls.get(url);
+    if (cached) {
+      this.lastErrorPage = cached;
+      feedbackBus.publish({
+        kind: 'error_page',
+        detail: { url, kind: cached.kind, detail: cached.detail },
+      });
+      return { statusCode: null, finalUrl: url, errorPage: cached };
+    }
+
     const response = await this.page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout,
     });
-    // Wait a bit for dynamic content
-    await this.waitForIdle(2000).catch(() => {});
+
+    // Wait for the DOM to stop churning. waitForPageReady replaces the
+    // flat 2s idle — modern SPAs often swap content seconds after DCL,
+    // and the old wait sometimes captured a half-rendered page.
+    await waitForPageReady(this.page, 5000);
+    // Keep the original tiny idle too — some pages commit DOM changes
+    // right at 'complete' as part of their hydration tail.
+    await this.waitForIdle(800).catch(() => {});
 
     // Auto-wait for Cloudflare challenge if detected
     await this.waitForCloudflare();
 
+    const statusCode = response ? response.status() : null;
+
+    // Error-page classification. Populates lastErrorPage so getState()
+    // can surface it; navigator reads it to short-circuit the LLM call.
+    const errorPage = await detectErrorPage(this.page, statusCode);
+    const finalUrl = this.page.url();
+    this.lastErrorPage = errorPage;
+    if (errorPage) {
+      // Remember both the requested URL and the landed URL so either
+      // form short-circuits on retry. Cap the cache — the LLM might
+      // grind out dozens of URL variations and we don't need to hold
+      // them all.
+      if (this.badUrls.size < 128) {
+        this.badUrls.set(url, errorPage);
+        if (finalUrl && finalUrl !== url) this.badUrls.set(finalUrl, errorPage);
+      }
+      feedbackBus.publish({
+        kind: 'error_page',
+        detail: { url: finalUrl, kind: errorPage.kind, detail: errorPage.detail },
+      });
+    } else {
+      // Success — drop any stale entries for this URL (content may have
+      // changed since the last 404).
+      this.badUrls.delete(url);
+      if (finalUrl) this.badUrls.delete(finalUrl);
+      feedbackBus.publish({ kind: 'error_cleared' });
+    }
+
     return {
-      statusCode: response ? response.status() : null,
-      finalUrl: this.page.url(),
+      statusCode,
+      finalUrl,
+      ...(errorPage ? { errorPage } : {}),
     };
+  }
+
+  /** Current error-page state, if any. Cleared on next successful navigate. */
+  getLastErrorPage(): ErrorPage | null {
+    return this.lastErrorPage;
+  }
+
+  /** Clear the error-page flag — caller decided to continue past it. */
+  clearErrorPage(): void {
+    this.lastErrorPage = null;
+    feedbackBus.publish({ kind: 'error_cleared' });
   }
 
   /**
@@ -249,11 +326,16 @@ export class PageWrapper {
   // --- Screenshots ---
 
   async screenshot(quality: number = 70): Promise<Buffer> {
-    return (await this.page.screenshot({
+    const raw = (await this.page.screenshot({
       type: 'jpeg',
       quality,
       fullPage: false,
     })) as Buffer;
+    // Sanitize: caps at MAX_BYTES, strips EXIF/ICC, resizes if >1568px/side.
+    // Cheap no-op when already compact; necessary guard when a site renders
+    // a very tall viewport or when quality=100 is passed.
+    const san = await sanitizeImageBuffer(raw);
+    return san.buffer;
   }
 
   async screenshotBase64(quality: number = 70): Promise<string> {
@@ -709,6 +791,7 @@ export class PageWrapper {
       accessibilityTree,
       pendingDialogs,
       consoleErrors,
+      errorPage: this.lastErrorPage ?? undefined,
     };
   }
 

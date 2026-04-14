@@ -12,7 +12,12 @@
 
 import type { Page, Frame } from 'puppeteer-core';
 import type { LLMProvider } from '../llm/provider.js';
-import { clampToRect, parseTilesStrict, type Rect } from './captcha/validation.js';
+import { clampToRect, parseTilesStrict, captchaRectHash, type Rect } from './captcha/validation.js';
+import { sanitizeImageBuffer } from './image-safety.js';
+import { VisionMemory } from './captcha/vision-memory.js';
+import { tileIndexFromCoord } from './captcha/grid-geometry.js';
+import { getDomainStats, hostKey } from './captcha/domain-stats.js';
+import { buildObservation, coordBand, type StepOutcome as RewardOutcome, type VisibleChange } from '../agent/step-observation.js';
 
 export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'slider' | 'visual_puzzle' | 'unknown';
 
@@ -469,11 +474,12 @@ export async function screenshotCaptchaArea(
 
   if (!rect) return null;
 
-  const screenshot = await page.screenshot({
+  const raw = await page.screenshot({
     type: 'jpeg',
     quality: 90,
     clip: rect,
   }) as Buffer;
+  const screenshot = (await sanitizeImageBuffer(raw)).buffer;
 
   return { screenshot, description: 'Captcha area screenshot for solving' };
 }
@@ -672,11 +678,12 @@ export async function screenshotChallengeGrid(page: Page): Promise<ChallengeGrid
       height: gridInfo.bounds.height,
     };
 
-    const screenshot = await page.screenshot({
+    const rawGridShot = await page.screenshot({
       type: 'jpeg',
       quality: 90,
       clip: clipRect,
     }) as Buffer;
+    const screenshot = (await sanitizeImageBuffer(rawGridShot)).buffer;
 
     return {
       screenshot,
@@ -1076,6 +1083,7 @@ export async function solveWithVisionGeneric(
   page: Page,
   llmProvider: LLMProvider,
   maxRounds: number = 5,
+  memory: VisionMemory = new VisionMemory(),
 ): Promise<CaptchaSolveResult> {
   let totalAttempts = 0;
 
@@ -1094,20 +1102,37 @@ export async function solveWithVisionGeneric(
   ];
 
   // Carries one round's outcome into the next prompt as an observation.
+  // Structured tile/drag memory (`memory`) is layered on top — it
+  // survives round-to-round and tells the LLM which tiles it already
+  // clicked (solves the "AI keeps picking the same wrong tile" pattern).
   let lastObservation: string | null = null;
   let lastDoneRejected = false;
+  const pageUrl = page.url();
+  const host = hostKey(pageUrl);
 
   for (let round = 0; round < maxRounds; round++) {
     totalAttempts++;
 
     const captchaRect = (await findCaptchaRect(page)) ?? initialRect ?? fallbackRect;
 
-    const screenshot = await page.screenshot({
+    const rawCaptchaShot = await page.screenshot({
       type: 'jpeg',
       quality: 85,
       clip: captchaRect,
     }) as Buffer;
+    const screenshot = (await sanitizeImageBuffer(rawCaptchaShot)).buffer;
     const b64Image = screenshot.toString('base64');
+
+    // Reset tile/drag memory if the challenge image changed. Hash fold
+    // includes the URL so same-host captchas don't collide across tabs.
+    memory.setChallengeHash(
+      VisionMemory.hashChallenge(
+        round === 0 ? 'initial' : (lastObservation ?? 'continue'),
+        b64Image,
+        `${pageUrl}|${captchaRect.x},${captchaRect.y}`,
+      ),
+    );
+    const memoryFragment = memory.toPromptFragment();
 
     let userPrompt: string;
     if (round === 0) {
@@ -1127,6 +1152,9 @@ export async function solveWithVisionGeneric(
         `Coords must be inside x=${captchaRect.x}..${captchaRect.x + captchaRect.width}, y=${captchaRect.y}..${captchaRect.y + captchaRect.height}.`;
     } else {
       userPrompt = `Continue solving. Take the next action. Coords inside the captcha rect only.`;
+    }
+    if (memoryFragment) {
+      userPrompt += `\n\n${memoryFragment}`;
     }
     lastDoneRejected = false;
 
@@ -1183,6 +1211,16 @@ export async function solveWithVisionGeneric(
         continue;
       }
 
+      // Pre-action rect hash — used below to decide if the click
+      // actually changed the grid (tile highlighted) or was a no-op
+      // (LLM targeted empty space or a disabled tile).
+      let preHash: string | null = null;
+      try {
+        preHash = await captchaRectHash(page, captchaRect);
+      } catch {
+        // Hash failure is non-fatal — we just can't classify no-op.
+      }
+
       const outcome = await executeVisionStep(page, step, captchaRect);
       if (!outcome.executed) {
         lastObservation = `action rejected: ${outcome.rejectionReason ?? 'unknown'}`;
@@ -1192,7 +1230,71 @@ export async function solveWithVisionGeneric(
 
       await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
 
+      // Post-action rect hash — compare to preHash. Identical ⇒ no-op.
+      let postHash: string | null = null;
+      try {
+        postHash = await captchaRectHash(page, captchaRect);
+      } catch {
+        // Same as above.
+      }
+      const wasNoop = preHash != null && postHash != null && preHash === postHash;
+
+      // Record into VisionMemory so the NEXT round's prompt fragment
+      // tells the LLM which tiles are done / which coords were no-ops.
+      if (step.action === 'click' && outcome.finalX != null && outcome.finalY != null) {
+        if (wasNoop) {
+          memory.recordRejected(
+            `click at (${outcome.finalX},${outcome.finalY})`,
+            'no-op — grid did not change after click',
+          );
+        } else {
+          const tileIdx = tileIndexFromCoord(captchaRect, outcome.finalX, outcome.finalY);
+          if (tileIdx != null) memory.recordTileClick(tileIdx);
+        }
+      } else if (step.action === 'drag'
+        && outcome.finalX != null && outcome.finalY != null
+        && outcome.finalEndX != null && outcome.finalEndY != null) {
+        memory.recordDrag({
+          from: { x: outcome.finalX, y: outcome.finalY },
+          to: { x: outcome.finalEndX, y: outcome.finalEndY },
+          result: wasNoop ? 'missed' : 'unknown',
+        });
+      }
+
       const stillHasCaptcha = await detectCaptcha(page);
+
+      // Emit RL-style reward for this round. Feeds domain-stats'
+      // per-coord-band mean so future runs on this host prefer action
+      // locations that previously worked.
+      try {
+        const x = outcome.finalX ?? 0;
+        const y = outcome.finalY ?? 0;
+        const solved = !stillHasCaptcha;
+        const rewardOutcome: RewardOutcome = solved ? 'success' : wasNoop ? 'noop' : 'partial';
+        const visibleChange: VisibleChange = solved
+          ? 'navigation'
+          : wasNoop ? 'none' : 'minor';
+        const obs = buildObservation({
+          action: step.action === 'drag' ? 'drag' : 'click',
+          coords: step.action === 'drag'
+            ? { x, y, endX: outcome.finalEndX, endY: outcome.finalEndY }
+            : { x, y },
+          outcome: rewardOutcome,
+          visibleChange,
+          timestampMs: Date.now(),
+          host,
+          strategy: 'vision_generic',
+        });
+        getDomainStats().recordAction(
+          host,
+          'vision_generic',
+          coordBand(x, y),
+          obs.reward,
+        );
+      } catch {
+        // Telemetry failure is non-fatal.
+      }
+
       if (!stillHasCaptcha) {
         const title = await page.title();
         const titleBlocked = title.toLowerCase().includes('just a moment')
@@ -1205,13 +1307,14 @@ export async function solveWithVisionGeneric(
       }
 
       // Build the observation for the next round: what landed where, was
-      // it clamped, is the captcha still present.
+      // it clamped, was it a no-op, is the captcha still present.
       const where = step.action === 'drag'
         ? `(${outcome.finalX},${outcome.finalY})→(${outcome.finalEndX},${outcome.finalEndY})`
         : `(${outcome.finalX},${outcome.finalY})`;
       const clampedNote = outcome.clamped ? ' (coords were clamped to widget bounds)' : '';
+      const noopNote = wasNoop ? ' NOTE: the grid did not change after this action — the click likely missed its target.' : '';
       lastObservation =
-        `${step.action} at ${where}${clampedNote}. ` +
+        `${step.action} at ${where}${clampedNote}.${noopNote} ` +
         `Captcha still present (type=${stillHasCaptcha?.type || 'title-based'}).`;
       console.log(`Vision generic round ${totalAttempts}: ${lastObservation}`);
 

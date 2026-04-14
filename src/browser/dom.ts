@@ -201,6 +201,9 @@ export interface PageState extends DOMState {
   consoleErrors?: string[];
   /** Bounds + metadata per indexed interactive element (for bbox overlays). */
   selectorEntries?: SelectorEntry[];
+  /** Present when the current page is an error page (chrome-error, 4xx/5xx with
+   *  error-body text, DNS/TLS failure). Navigator short-circuits on this. */
+  errorPage?: import('./page-readiness.js').ErrorPage;
 }
 
 export interface DialogInfo {

@@ -27,6 +27,7 @@ import { detectCaptcha, type CaptchaInfo } from '../../captcha.js';
 import { captchaWatchdog } from '../../captcha-watchdog.js';
 import { getHandoffLedger } from '../handoff-ledger.js';
 import { hostKey } from '../domain-stats.js';
+import { sanitizeImageBuffer } from '../../image-safety.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types.js';
 
 const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -143,7 +144,8 @@ export const humanHandoffStrategy: CaptchaStrategy = {
     let screenshot: string | undefined;
     try {
       const buf = await ctx.page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
-      screenshot = Buffer.from(buf).toString('base64');
+      const san = await sanitizeImageBuffer(Buffer.from(buf));
+      screenshot = san.buffer.toString('base64');
     } catch {
       // Screenshot is best-effort.
     }

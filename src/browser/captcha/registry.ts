@@ -9,6 +9,7 @@
 import type { CaptchaInfo } from '../captcha.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from './types.js';
 import { getDomainStats, hostKey } from './domain-stats.js';
+import { feedbackBus } from '../../agent/feedback-bus.js';
 
 export class CaptchaStrategyRegistry {
   private strategies: CaptchaStrategy[] = [];
@@ -97,45 +98,60 @@ export class CaptchaStrategyRegistry {
     const trace: RichSolveResult['visionTrace'] = [];
     let lastError: string | undefined;
 
-    for (const { strategy, score } of scored) {
-      if (Date.now() - ctx.startTime > ctx.deadlineMs) {
-        lastError = `solver deadline ${ctx.deadlineMs}ms exceeded`;
-        break;
-      }
-      const stratStart = Date.now();
-      try {
-        const result = await strategy.run(info, ctx);
-        const duration = Date.now() - stratStart;
-        stats.recordOutcome(host, strategy.name, result.solved, duration);
-        trace?.push({
-          round: trace.length,
-          action: { strategy: strategy.name, solved: result.solved, score: Number(score.toFixed(3)) },
-          llmOutput: result.error,
-        });
-        if (result.solved) {
-          return {
-            ...result,
-            method: result.method || strategy.name,
-            captchaType: info.type,
-            durationMs: duration,
-            visionTrace: [...(trace || []), ...(result.visionTrace || [])],
-          };
-        }
-        lastError = result.error || `strategy ${strategy.name} returned solved=false`;
-      } catch (e) {
-        const duration = Date.now() - stratStart;
-        stats.recordOutcome(host, strategy.name, false, duration);
-        lastError = `strategy ${strategy.name} threw: ${(e as Error).message}`;
-      }
-    }
+    // Broadcast captcha-active so the Python bridge can pause other
+    // tool calls for the duration. Emitted once per dispatch; the
+    // individual strategies don't each fire this because that would
+    // spam the bus when the dispatcher falls through strategies.
+    feedbackBus.publish({ kind: 'captcha_active', host, strategy: scored[0].strategy.name });
 
-    return {
-      solved: false,
-      method: 'all_strategies_failed',
-      attempts: scored.length,
-      captchaType: info.type,
-      error: lastError || 'unknown',
-      visionTrace: trace,
-    };
+    try {
+      for (const { strategy, score } of scored) {
+        if (Date.now() - ctx.startTime > ctx.deadlineMs) {
+          lastError = `solver deadline ${ctx.deadlineMs}ms exceeded`;
+          break;
+        }
+        const stratStart = Date.now();
+        try {
+          const result = await strategy.run(info, ctx);
+          const duration = Date.now() - stratStart;
+          stats.recordOutcome(host, strategy.name, result.solved, duration);
+          trace?.push({
+            round: trace.length,
+            action: { strategy: strategy.name, solved: result.solved, score: Number(score.toFixed(3)) },
+            llmOutput: result.error,
+          });
+          if (result.solved) {
+            feedbackBus.publish({ kind: 'captcha_done', host, solved: true, strategy: strategy.name });
+            return {
+              ...result,
+              method: result.method || strategy.name,
+              captchaType: info.type,
+              durationMs: duration,
+              visionTrace: [...(trace || []), ...(result.visionTrace || [])],
+            };
+          }
+          lastError = result.error || `strategy ${strategy.name} returned solved=false`;
+        } catch (e) {
+          const duration = Date.now() - stratStart;
+          stats.recordOutcome(host, strategy.name, false, duration);
+          lastError = `strategy ${strategy.name} threw: ${(e as Error).message}`;
+        }
+      }
+
+      feedbackBus.publish({ kind: 'captcha_done', host, solved: false });
+      return {
+        solved: false,
+        method: 'all_strategies_failed',
+        attempts: scored.length,
+        captchaType: info.type,
+        error: lastError || 'unknown',
+        visionTrace: trace,
+      };
+    } catch (e) {
+      // Safety net: always emit captcha_done so the Python bridge
+      // doesn't get stuck thinking a solve is in progress.
+      feedbackBus.publish({ kind: 'captcha_done', host, solved: false });
+      throw e;
+    }
   }
 }

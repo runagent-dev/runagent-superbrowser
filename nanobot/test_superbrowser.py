@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ Task: Go to gozayaan.com and find the hotel in sylhet for 2 days starting from 18th April 2026 to 20th April 2026. Must be a 5/4 star hotel."""
+        """ Task: go to aarong and find me new arrival boishakh fatua for men with its price, color and link. Must be new boishkah fatua."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

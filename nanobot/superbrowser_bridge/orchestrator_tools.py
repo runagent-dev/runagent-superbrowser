@@ -928,6 +928,9 @@ CRITICAL RULES:
                 if viable_for_search:
                     rewritten = _rewrite_for_search(instructions, url)
                     try:
+                        # Local import to avoid a module-level circular
+                        # dependency between search_tools and orchestrator_tools.
+                        from superbrowser_bridge.search_tools import DelegateSearchTaskTool
                         search_tool = DelegateSearchTaskTool()
                         fallback_result = await search_tool.execute(
                             question=rewritten,
@@ -974,6 +977,7 @@ CRITICAL RULES:
                     print(f"\n>> captcha block on {domain} — falling back to delegate_search_task")
                     rewritten = _rewrite_for_search(instructions, url)
                     try:
+                        from superbrowser_bridge.search_tools import DelegateSearchTaskTool
                         search_tool = DelegateSearchTaskTool()
                         fallback_result = await search_tool.execute(
                             question=rewritten,

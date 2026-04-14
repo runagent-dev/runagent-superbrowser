@@ -78,9 +78,11 @@ export const genericVisionStrategy: CaptchaStrategy = {
       return { solved: false, method: 'generic_vision', attempts: 0, error: 'no LLM' };
     }
 
-    // Attempt 1: primary LLM
+    // Attempt 1: primary LLM. Pass the orchestrator's shared VisionMemory
+    // so the same tile-click / drag / rejection history builds up across
+    // solver strategies on a single captcha attempt (human-like chain).
     try {
-      const r1 = await solveWithVisionGeneric(ctx.page, ctx.llm);
+      const r1 = await solveWithVisionGeneric(ctx.page, ctx.llm, 5, ctx.memory);
       if (r1.solved) {
         return {
           ...r1,
@@ -124,7 +126,7 @@ export const genericVisionStrategy: CaptchaStrategy = {
 
     try {
       const fallback = fallbackProviderFactory();
-      const r2 = await solveWithVisionGeneric(ctx.page, fallback);
+      const r2 = await solveWithVisionGeneric(ctx.page, fallback, 5, ctx.memory);
       if (r2.solved) {
         return {
           ...r2,

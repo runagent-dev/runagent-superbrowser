@@ -29,6 +29,15 @@ export interface StrategyStat {
   avgMs: number;
   lastFailedAt: number;
   consecutiveFails: number;
+  /**
+   * Per-coord-band reward accumulator. Key: `${Math.floor(x/100)}x${Math.floor(y/100)}`.
+   * Value: { n: count, sumReward: sum of reward∈[0,1] }.
+   *
+   * Used to bias future vision clicks toward historically-successful
+   * coordinate bands on the same host (cheap per-site bandit that
+   * outlives a single nanobot run).
+   */
+  actionBands?: Record<string, { n: number; sumReward: number }>;
 }
 
 const COOLDOWN_FAIL_COUNT = 5;
@@ -138,6 +147,80 @@ export class DomainStatsStore {
     if (!s) return false;
     if (s.consecutiveFails < COOLDOWN_FAIL_COUNT) return false;
     return (Date.now() - s.lastFailedAt) < COOLDOWN_DURATION_MS;
+  }
+
+  /**
+   * Record a continuous-reward action outcome for a host/strategy/
+   * coord-band. Complements recordOutcome — that one is binary, this one
+   * is [0,1] and tracks *per-action* effectiveness within a strategy.
+   */
+  recordAction(
+    host: string,
+    strategyName: string,
+    coordBand: string,
+    reward: number,
+  ): void {
+    this.ensureLoaded();
+    const hostStats = (this.data[host] ??= {});
+    const s = (hostStats[strategyName] ??= {
+      tries: 0, wins: 0, avgMs: 0, lastFailedAt: 0, consecutiveFails: 0,
+    });
+    const bands = (s.actionBands ??= {});
+    const b = (bands[coordBand] ??= { n: 0, sumReward: 0 });
+    b.n += 1;
+    b.sumReward += Math.max(0, Math.min(1, reward));
+    this.scheduleFlush();
+  }
+
+  /**
+   * Mean reward for a host/strategy/coord-band. Returns undefined when
+   * there are no observations (caller should fall back to strategy-level
+   * priors or uniform exploration).
+   */
+  actionScore(
+    host: string,
+    strategyName: string,
+    coordBand: string,
+  ): number | undefined {
+    this.ensureLoaded();
+    const b = this.data[host]?.[strategyName]?.actionBands?.[coordBand];
+    if (!b || b.n === 0) return undefined;
+    return b.sumReward / b.n;
+  }
+
+  /**
+   * Richer accessor for a host/strategy/band: mean + sample count.
+   * Callers that want to reject-with-confidence need both (small n means
+   * the low mean is noise). Undefined on zero observations.
+   */
+  actionBandStats(
+    host: string,
+    strategyName: string,
+    coordBand: string,
+  ): { mean: number; n: number } | undefined {
+    this.ensureLoaded();
+    const b = this.data[host]?.[strategyName]?.actionBands?.[coordBand];
+    if (!b || b.n === 0) return undefined;
+    return { mean: b.sumReward / b.n, n: b.n };
+  }
+
+  /**
+   * List coord bands for host+strategy sorted by mean reward desc.
+   * Used to suggest "try clicking here instead" when a reject fires.
+   */
+  topActionBands(
+    host: string,
+    strategyName: string,
+    limit: number = 3,
+  ): Array<{ band: string; mean: number; n: number }> {
+    this.ensureLoaded();
+    const bands = this.data[host]?.[strategyName]?.actionBands;
+    if (!bands) return [];
+    const scored = Object.entries(bands)
+      .filter(([, v]) => v.n > 0)
+      .map(([band, v]) => ({ band, mean: v.sumReward / v.n, n: v.n }))
+      .sort((a, b) => b.mean - a.mean);
+    return scored.slice(0, limit);
   }
 
   /** Test/debug accessor. */

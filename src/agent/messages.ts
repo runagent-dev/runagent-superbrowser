@@ -12,8 +12,23 @@ import { buildStateMessage } from './state.js';
 
 /** Approximate tokens per character. */
 const CHARS_PER_TOKEN = 3;
-/** Approximate token cost for a screenshot image. */
-const IMAGE_TOKEN_COST = 800;
+/**
+ * Token cost for an inline image. Dynamic — roughly bytes/750 for a JPEG
+ * data URI (base64 inflates ~33% so decoded-bytes ~= base64chars*0.75; a
+ * 1MB image ~= 1000 tokens on OpenAI's vision pricing).
+ *
+ * `fallback` keeps the old behavior for external URLs where we can't
+ * measure — was 800 before, keep it as the default.
+ */
+function imageTokenCost(url: string | undefined, fallback = 800): number {
+  if (!url) return fallback;
+  if (!url.startsWith('data:')) return fallback;
+  const comma = url.indexOf(',');
+  if (comma === -1) return fallback;
+  const b64Bytes = url.length - comma - 1;
+  const cost = Math.ceil(b64Bytes / 750);
+  return Math.max(200, Math.min(1600, cost));
+}
 
 export class MessageManager {
   private messages: ChatMessage[] = [];
@@ -173,7 +188,7 @@ export class MessageManager {
           if (block.type === 'text') {
             total += Math.ceil(block.text.length / CHARS_PER_TOKEN);
           } else if (block.type === 'image_url') {
-            total += IMAGE_TOKEN_COST;
+            total += imageTokenCost(block.image_url?.url);
           }
         }
       }

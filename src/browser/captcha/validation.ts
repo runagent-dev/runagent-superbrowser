@@ -16,6 +16,9 @@
  */
 
 import { jsonrepair } from 'jsonrepair';
+import { createHash } from 'crypto';
+import type { Page } from 'puppeteer-core';
+import sharp from 'sharp';
 
 export interface Rect {
   x: number;
@@ -116,6 +119,36 @@ export function parseDragStrict(text: string): {
     out[k] = v;
   }
   return out as { startX: number; startY: number; endX: number; endY: number };
+}
+
+/**
+ * Hash the pixels inside a captcha rect, normalized to 256×256 so
+ * small anti-aliasing jitter or 1px layout shifts don't flip the hash.
+ *
+ * Used to detect "did my click change anything?" — compare pre/post
+ * hashes around an action; identical means the click was a no-op
+ * (LLM hallucinated a tile, target was off-grid, click missed).
+ *
+ * sharp grayscale + resize to 256 removes the color-profile / size
+ * variance that made naive full-resolution SHAs useless — two
+ * pre/post screenshots of the same "unchanged" grid can differ by
+ * a few bytes from JPEG re-encode even when nothing visually moved.
+ */
+export async function captchaRectHash(
+  page: Page,
+  rect: Rect,
+): Promise<string> {
+  const buf = (await page.screenshot({
+    type: 'jpeg',
+    quality: 85,
+    clip: rect,
+  })) as Buffer;
+  const normalized = await sharp(buf)
+    .resize(256, 256, { fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer();
+  return createHash('sha1').update(normalized).digest('hex').slice(0, 16);
 }
 
 /** Shape-check slider-find `{handleX, handleY, targetX, targetY}`. */
