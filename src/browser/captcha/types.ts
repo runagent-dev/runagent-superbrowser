@@ -19,6 +19,13 @@ import type { VisionMemory } from './vision-memory.js';
 
 export interface StrategyContext {
   page: Page;
+  /**
+   * @deprecated Vision-based captcha solving moved to the Python vision
+   * agent (`nanobot/vision_agent/`). No currently-registered strategy
+   * reads this field — it's kept on the type only so `solveCaptchaFull`
+   * can still forward its legacy `llmProvider` parameter without a
+   * downstream signature change. Do not read `ctx.llm` in new strategies.
+   */
   llm?: LLMProvider;
   config: CaptchaSolverConfig;
   /** Accumulates state across vision rounds (tile history, drag attempts). */
@@ -53,6 +60,14 @@ export interface StrategyContext {
    * from SUPERBROWSER_PUBLIC_HOST at the HTTP layer.
    */
   publicBaseUrl?: string;
+  /**
+   * When true, the registry short-circuits after the first non-handoff
+   * strategy fails and jumps straight to human_handoff. Set by the
+   * orchestrator when SUPERBROWSER_CAPTCHA_POLICY=fast_to_human — avoids
+   * banging on the site with 7 consecutive solver pings that get it to
+   * harden against us.
+   */
+  fastToHuman?: boolean;
 }
 
 export interface RichSolveResult extends CaptchaSolveResult {

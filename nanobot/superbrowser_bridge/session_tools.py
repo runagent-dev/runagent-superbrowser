@@ -272,6 +272,14 @@ class BrowserSessionState:
         # 1 by default, overridable via SUPERBROWSER_MAX_HUMAN_HANDOFFS.
         self.human_handoff_budget: int = 1
 
+        # Vision preprocessor bookkeeping. Populated inside
+        # build_tool_result_blocks so tools that don't pass an intent
+        # explicitly inherit the last one used — useful when the brain
+        # fires a chained sequence (navigate → click → verify) with the
+        # same underlying intent.
+        self._last_intent: str = ""
+        self._last_dom_hash: str = ""
+
     # --- budget configuration ---------------------------------------------
 
     def configure_budget(
@@ -628,6 +636,81 @@ class BrowserSessionState:
         print(f"  [screenshot saved: {path}]")
         return path
 
+    async def build_tool_result_blocks(
+        self,
+        b64: str,
+        caption: str,
+        *,
+        intent: str | None = None,
+        url: str | None = None,
+        elements: str | None = None,
+        elements_with_bounds: list[dict] | None = None,
+        device_pixel_ratio: float = 1.0,
+    ) -> list[dict] | str:
+        """Async dispatch between the vision-preprocessor path and the
+        legacy image-blocks path.
+
+        When `VISION_ENABLED=1` the screenshot is sent to the dedicated
+        vision agent (cheap model) and the brain only sees its textual
+        summary + bboxes + flags. Otherwise we fall through to the
+        legacy `build_image_blocks` that embeds the JPEG directly.
+
+        `intent` and `url` are optional hints used solely by the vision
+        path. `elements` is the DOM element listing — hashed as a cache
+        key so a re-screenshot on the same URL with identical DOM hits
+        the cache.
+        """
+        # Lazy import: keeps the vision package optional at import time
+        # so a broken VISION_API_KEY doesn't blow up sessions that never
+        # enable the feature.
+        try:
+            from vision_agent import (
+                dom_hash_of,
+                get_vision_agent,
+                vision_agent_enabled,
+            )
+        except ImportError:
+            vision_agent_enabled = lambda: False  # type: ignore[assignment]
+            get_vision_agent = None  # type: ignore[assignment]
+            dom_hash_of = None  # type: ignore[assignment]
+
+        if vision_agent_enabled() and get_vision_agent is not None:
+            dh = dom_hash_of(elements) if dom_hash_of else ""
+            if dh:
+                self._last_dom_hash = dh
+            if intent:
+                self._last_intent = intent
+            effective_intent = intent or self._last_intent or "observe page"
+            effective_url = url or self.current_url
+            try:
+                agent = get_vision_agent()
+                resp = await agent.analyze(
+                    screenshot_b64=b64,
+                    intent=effective_intent,
+                    session_id=self.session_id,
+                    url=effective_url,
+                    dom_hash=dh or self._last_dom_hash,
+                )
+                self.vision_calls += 1
+                self.actions_since_screenshot = 0
+                label = (caption or "").split("\n")[0][:30].replace(" ", "-")
+                # Still save the raw screenshot locally for debugging —
+                # doesn't leave the box, doesn't reach the brain.
+                self.save_screenshot(b64, label)
+                text = f"{caption}\n\n{resp.as_brain_text()}" if caption else resp.as_brain_text()
+                return [{"type": "text", "text": text}]
+            except Exception as exc:
+                # Never let a vision-layer failure break a tool result —
+                # fall through to the legacy image path.
+                print(f"  [vision-agent: falling back to image blocks — {exc}]")
+
+        return self.build_image_blocks(
+            b64,
+            caption,
+            elements_with_bounds=elements_with_bounds,
+            device_pixel_ratio=device_pixel_ratio,
+        )
+
     def build_image_blocks(
         self,
         b64: str,
@@ -789,6 +872,12 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
         url=StringSchema("URL to open (optional)", nullable=True),
         region=StringSchema("Region code for geo-restricted sites (e.g., 'bd', 'in')", nullable=True),
         proxy=StringSchema("Direct proxy URL (e.g., 'socks5://proxy:1080')", nullable=True),
+        intent=StringSchema(
+            "Optional hint describing what you want from the vision agent "
+            "(e.g. 'check if login is required', 'find search box'). "
+            "Only used when VISION_ENABLED=1.",
+            nullable=True,
+        ),
         required=[],
     )
 )
@@ -806,7 +895,7 @@ class BrowserOpenTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, **kw: Any) -> Any:
+    async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
 
         # --- Idempotency guard ------------------------------------------
@@ -967,7 +1056,13 @@ class BrowserOpenTool(Tool):
                     actual_url,
                     self.s.hash_page_content(data.get("elements", "") or data.get("title", "")),
                 )
-            return self.s.build_image_blocks(data["screenshot"], caption)
+            return await self.s.build_tool_result_blocks(
+                data["screenshot"],
+                caption,
+                intent=intent or "observe opened page",
+                url=actual_url,
+                elements=data.get("elements"),
+            )
         return caption
 
 
@@ -975,6 +1070,12 @@ class BrowserOpenTool(Tool):
     tool_parameters_schema(
         session_id=StringSchema("Session ID from browser_open"),
         url=StringSchema("URL to navigate to"),
+        intent=StringSchema(
+            "Optional hint for the vision agent (e.g. 'verify navigation "
+            "succeeded', 'find sign-up button'). Only used when "
+            "VISION_ENABLED=1.",
+            nullable=True,
+        ),
         required=["session_id", "url"],
     )
 )
@@ -989,7 +1090,7 @@ class BrowserNavigateTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, url: str, **kw: Any) -> Any:
+    async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
         gate = await _feedback_gate("browser_navigate")
         if gate:
@@ -1048,12 +1149,26 @@ class BrowserNavigateTool(Tool):
                     actual_url,
                     self.s.hash_page_content(data.get("elements", "") or data.get("title", "")),
                 )
-            return self.s.build_image_blocks(data["screenshot"], caption)
+            return await self.s.build_tool_result_blocks(
+                data["screenshot"],
+                caption,
+                intent=intent or "verify navigation succeeded",
+                url=actual_url,
+                elements=data.get("elements"),
+            )
         return caption
 
 
 @tool_parameters(
-    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        intent=StringSchema(
+            "Optional hint for the vision agent. Only used when "
+            "VISION_ENABLED=1.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
 )
 class BrowserScreenshotTool(Tool):
     name = "browser_screenshot"
@@ -1066,7 +1181,7 @@ class BrowserScreenshotTool(Tool):
     def read_only(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, **kw: Any) -> Any:
+    async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""
@@ -1118,9 +1233,12 @@ class BrowserScreenshotTool(Tool):
                 for e in entries
                 if e.get("bounds") and e.get("index") is not None
             ]
-            return self.s.build_image_blocks(
+            return await self.s.build_tool_result_blocks(
                 data["screenshot"],
                 caption,
+                intent=intent or "observe page",
+                url=actual_url,
+                elements=data.get("elements"),
                 elements_with_bounds=overlay_elements,
                 device_pixel_ratio=dpr,
             )
@@ -1759,11 +1877,26 @@ class BrowserDetectCaptchaTool(Tool):
         # "no-actions-since-last-shot" rules are relaxed so the solver can
         # take repeated before/after screenshots.
         self.s.enter_captcha_mode()
-        return (
+        # Surface the live-view URL the moment a captcha is detected, not
+        # only when handoff fires. Gives the LLM (and any UI piping tool
+        # output to a human) a link to offer immediately.
+        view_url = data.get("viewUrl") or (
+            f"{os.environ['SUPERBROWSER_PUBLIC_HOST'].rstrip('/')}"
+            f"/session/{session_id}/view"
+            if os.environ.get("SUPERBROWSER_PUBLIC_HOST")
+            else None
+        )
+        lines = [
             f"Captcha detected: type={captcha['type']}, "
             f"siteKey={captcha.get('siteKey', 'N/A')} "
-            f"(captcha_mode active for next {self.s.CAPTCHA_MODE_ITERATIONS} iterations)"
-        )
+            f"(captcha_mode active for next {self.s.CAPTCHA_MODE_ITERATIONS} iterations)",
+        ]
+        if view_url:
+            lines.append(
+                f"Live view for human handoff: {view_url} "
+                f"(open this URL if you decide to hand off to the user)"
+            )
+        return "\n".join(lines)
 
 
 @tool_parameters(
@@ -1787,7 +1920,12 @@ class BrowserCaptchaScreenshotTool(Tool):
                 return "No captcha area found."
             r.raise_for_status()
         b64 = base64.b64encode(r.content).decode()
-        return self.s.build_image_blocks(b64, "Captcha area — analyze to solve")
+        return await self.s.build_tool_result_blocks(
+            b64,
+            "Captcha area — analyze to solve",
+            intent="solve captcha — locate widget + tiles + handles",
+            url=self.s.current_url,
+        )
 
 
 @tool_parameters(
@@ -1807,6 +1945,15 @@ class BrowserSolveCaptchaTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, method: str | None = None, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
+        # Vision-based solve path. Replaces the three deleted TS vision
+        # strategies (recaptcha-ai-grid, slider-drag, generic-vision) with
+        # a single call to our dedicated Python vision agent. When the
+        # brain (or fast-to-human policy) picks method='vision' we run the
+        # full solve loop here and return a structured result without ever
+        # hitting the server's captcha/solve endpoint.
+        if method == "vision":
+            return await self._solve_via_vision(session_id)
+
         payload: dict[str, Any] = {}
         if method:
             payload["method"] = method
@@ -1867,6 +2014,178 @@ class BrowserSolveCaptchaTool(Tool):
             self.s.captcha_mode_remaining = 0
 
         return f"{summary}\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+
+    async def _solve_via_vision(self, session_id: str) -> str:
+        """Python-side captcha solver driven entirely by the vision agent.
+
+        Flow:
+            1. Grab a screenshot + DOM state.
+            2. Ask the vision agent for captcha widget / tiles / handles.
+            3. Click each captcha_tile. For slider_handle, drag to the
+               right edge of the widget.
+            4. Re-screenshot and re-check flags.captcha_present. If still
+               present after one pass, report NOT solved (fast-to-human
+               policy will hand off).
+        """
+        try:
+            from vision_agent import get_vision_agent, vision_agent_enabled
+        except ImportError:
+            return (
+                "Captcha NOT solved: vision_agent package not importable. "
+                "Install / configure the vision agent or use method='auto'."
+            )
+        if not vision_agent_enabled():
+            return (
+                "Captcha NOT solved: method='vision' requires VISION_ENABLED=1. "
+                "Set the env flag and a VISION_API_KEY, or use method='auto'."
+            )
+
+        self.s.captcha_solve_round += 1
+
+        # Fetch screenshot + elements.
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true"},
+            )
+            r.raise_for_status()
+            state = r.json()
+
+        b64 = state.get("screenshot")
+        if not b64:
+            return "Captcha NOT solved: could not fetch screenshot from server."
+
+        agent = get_vision_agent()
+        try:
+            resp = await agent.analyze(
+                screenshot_b64=b64,
+                intent="solve captcha — identify widget, tiles, and handles",
+                session_id=session_id,
+                url=state.get("url", self.s.current_url),
+                dom_hash="",  # force cache miss for this solve attempt
+            )
+        except Exception as exc:
+            return f"Captcha NOT solved: vision call failed ({exc})."
+
+        if not resp.flags.captcha_present and not resp.flags.captcha_widget_bbox:
+            # Vision didn't see a captcha — maybe already cleared.
+            self.s.captcha_mode = False
+            self.s.captcha_mode_remaining = 0
+            return (
+                "Captcha SOLVED via vision/no_widget_visible — the vision "
+                "agent reports no captcha present on the page. If you "
+                "disagree, take a fresh screenshot and retry."
+            )
+
+        tiles = [b for b in resp.bboxes if b.role == "captcha_tile"]
+        handles = [b for b in resp.bboxes if b.role == "slider_handle"]
+        widget = resp.flags.captcha_widget_bbox
+
+        actions: list[str] = []
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Click each tile the vision agent flagged.
+            for tile in tiles:
+                cx, cy = tile.center()
+                try:
+                    await client.post(
+                        f"{SUPERBROWSER_URL}/session/{session_id}/click",
+                        json={"x": cx, "y": cy},
+                    )
+                    actions.append(f"click tile {tile.label!r} @({cx},{cy})")
+                    await asyncio.sleep(0.25)
+                except Exception as exc:
+                    actions.append(f"click tile failed: {exc}")
+
+            # Drag any slider handles to the right edge of their widget
+            # (or the handle bbox + 250px as a fallback).
+            for handle in handles:
+                sx, sy = handle.center()
+                if widget is not None:
+                    ex = widget.x + max(widget.w - 12, 1)
+                    ey = sy
+                else:
+                    ex, ey = sx + 250, sy
+                try:
+                    await client.post(
+                        f"{SUPERBROWSER_URL}/session/{session_id}/drag",
+                        json={"startX": sx, "startY": sy, "endX": ex, "endY": ey, "steps": 30},
+                    )
+                    actions.append(f"drag slider {handle.label!r} {sx},{sy} → {ex},{ey}")
+                    await asyncio.sleep(0.5)
+                except Exception as exc:
+                    actions.append(f"drag slider failed: {exc}")
+
+            # If we didn't find either, try clicking the widget center —
+            # reCAPTCHA "I'm not a robot" checkbox falls through here.
+            if not tiles and not handles and widget is not None:
+                cx, cy = widget.center()
+                try:
+                    await client.post(
+                        f"{SUPERBROWSER_URL}/session/{session_id}/click",
+                        json={"x": cx, "y": cy},
+                    )
+                    actions.append(f"click widget center @({cx},{cy})")
+                    await asyncio.sleep(1.0)
+                except Exception as exc:
+                    actions.append(f"click widget failed: {exc}")
+
+            # Verify.
+            try:
+                vr = await client.get(
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "true"},
+                )
+                vr.raise_for_status()
+                verify_state = vr.json()
+            except Exception as exc:
+                verify_state = {"screenshot": None, "error": str(exc)}
+
+        verify_b64 = verify_state.get("screenshot")
+        solved = False
+        if verify_b64:
+            try:
+                vresp = await agent.analyze(
+                    screenshot_b64=verify_b64,
+                    intent="verify captcha cleared",
+                    session_id=session_id,
+                    url=verify_state.get("url", self.s.current_url),
+                    dom_hash="",
+                )
+                solved = not vresp.flags.captcha_present
+            except Exception:
+                solved = False
+
+        structured = {
+            "solved": solved,
+            "method": "vision",
+            "subMethod": "python_vision_agent",
+            "attempts": 1,
+            "tiles_clicked": len(tiles),
+            "handles_dragged": len(handles),
+            "actions": actions,
+            "provider": resp.provider,
+            "model": resp.model,
+        }
+        self.s.record_step(
+            "browser_solve_captcha",
+            "vision",
+            f"solved={solved} | {json.dumps(structured, default=str)[:300]}",
+        )
+
+        if solved:
+            self.s.captcha_mode = False
+            self.s.captcha_mode_remaining = 0
+            return (
+                f"Captcha SOLVED via vision/python_vision_agent "
+                f"({len(tiles)} tile(s), {len(handles)} handle(s))"
+                f"\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+            )
+        return (
+            f"Captcha NOT solved after one vision-driven attempt. "
+            f"Per fast-to-human policy, call browser_ask_user next."
+            f"\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+        )
 
 
 @tool_parameters(
@@ -2181,13 +2500,17 @@ class BrowserVerifyFactTool(Tool):
         if data.get("screenshot"):
             # Don't let verify-fact screenshots eat the captcha cap (they're
             # not for captcha) nor trigger normal dedup (verification must
-            # see the live page state). We bill it against the vision counter
-            # for cost accounting only.
+            # see the live page state). Route through the same async
+            # vision-preprocessor hook every other screenshot tool uses, so
+            # the brain never sees the raw image when VISION_ENABLED=1.
             self.s.vision_calls += 1
-            return [
-                {"type": "text", "text": caption},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data['screenshot']}"}},
-            ]
+            return await self.s.build_tool_result_blocks(
+                data["screenshot"],
+                caption,
+                intent="verify fact against page",
+                url=data.get("url", self.s.current_url),
+                elements=data.get("elements"),
+            )
         # No screenshot available — still return the caption so the caller
         # can at least reason about the textual state.
         return caption + "\n\n[No screenshot available — verify against browser_get_markdown output.]"

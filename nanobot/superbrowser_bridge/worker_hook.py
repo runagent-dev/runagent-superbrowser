@@ -98,21 +98,34 @@ class BrowserWorkerHook(AgentHook):
                         )
                         break
 
-        # --- Detect repeated captcha solve loops ---
+        # --- One auto-solve attempt, then straight to human ---
+        # Previously this allowed up to 3 solve attempts before nudging the
+        # agent off the loop. That pattern trained sites to fingerprint us
+        # as a bot. Under the fast-to-human policy a single failed auto
+        # solve means pivot to the human: browser_ask_user surfaces the
+        # live view, the user clicks through once, and bot-protection
+        # cookies get persisted by cookie-jar for the next run.
         recent_steps = self.state.step_history[-1:] if self.state.step_history else []
         for step in recent_steps:
             if step["tool"] == "browser_solve_captcha":
                 self._captcha_solve_attempts += 1
-                if self._captcha_solve_attempts >= 3:
+                # Only nudge on a FAILED attempt — successful solves
+                # include "SOLVED" in the result string.
+                result_text = str(step.get("result", ""))
+                solved = "SOLVED" in result_text or '"solved": true' in result_text
+                if not solved and self._captcha_solve_attempts >= 1:
+                    sid = self.state.session_id or "<session_id>"
                     guidance_parts.append(
-                        "[GUIDANCE: CAPTCHA auto-solve has been attempted "
-                        f"{self._captcha_solve_attempts} times and keeps failing. "
-                        "STOP calling browser_solve_captcha. Instead:\n"
-                        "1. Try browser_run_script with helpers.sleep(15000) "
-                        "to wait for Cloudflare to auto-resolve\n"
-                        "2. If still blocked, report CAPTCHA_UNSOLVED with "
-                        "a description of what you see.\n"
-                        "Do NOT keep retrying browser_solve_captcha.]"
+                        "[GUIDANCE: Auto-solve failed once — do NOT retry. "
+                        "Sites fingerprint repeated solver pings as bot activity. "
+                        "Hand off to the human NOW:\n"
+                        f"  browser_ask_user(session_id='{sid}', "
+                        "input_type='captcha', "
+                        "question='Please open the live view URL and "
+                        "click through the captcha — I will detect when "
+                        "it clears and resume.')\n"
+                        "The tool blocks for up to 5 minutes while the "
+                        "user solves. Do NOT call browser_solve_captcha again.]"
                     )
 
         # --- Detect verification/captcha pages ---

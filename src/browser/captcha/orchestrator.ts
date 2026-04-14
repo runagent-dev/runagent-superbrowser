@@ -18,26 +18,40 @@ import { turnstileStrategy } from './strategies/turnstile.js';
 import { tokenExternalStrategy } from './strategies/token-external.js';
 import {
   recaptchaCheckboxStrategy,
-  recaptchaAIGridStrategy,
   recaptchaGridApiStrategy,
 } from './strategies/recaptcha-v2.js';
-import { sliderDragStrategy } from './strategies/slider-drag.js';
-import { genericVisionStrategy } from './strategies/generic-vision.js';
 import { humanHandoffStrategy } from './strategies/human-handoff.js';
 
-/** Build the default registry with all production strategies. */
+/**
+ * Build the default registry with all production strategies.
+ *
+ * Vision-LLM strategies (recaptcha-AI-grid, slider-drag, generic-vision)
+ * were removed — vision now lives in the Python vision agent and is
+ * invoked via `browser_solve_captcha(method='vision')` from nanobot. The
+ * registry here keeps only DOM- or API-level solvers plus human handoff.
+ */
 export function buildDefaultRegistry(): CaptchaStrategyRegistry {
   return new CaptchaStrategyRegistry()
     .register(turnstileStrategy)
     .register(tokenExternalStrategy)
     .register(recaptchaCheckboxStrategy)
-    .register(recaptchaAIGridStrategy)
     .register(recaptchaGridApiStrategy)
-    .register(sliderDragStrategy)
-    .register(genericVisionStrategy)
     // Human handoff is registered LAST and has the lowest priority so it's
     // only dispatched when every automated strategy has declined or failed.
     // It also self-gates on ctx.humanInput presence + budget > 0.
+    .register(humanHandoffStrategy);
+}
+
+/**
+ * Build a trimmed registry for `SUPERBROWSER_CAPTCHA_POLICY=fast_to_human`.
+ * Keeps only the cheap / short-latency automated strategies (turnstile,
+ * 2captcha token, reCAPTCHA checkbox autopass) plus human_handoff.
+ */
+export function buildFastToHumanRegistry(): CaptchaStrategyRegistry {
+  return new CaptchaStrategyRegistry()
+    .register(turnstileStrategy)
+    .register(tokenExternalStrategy)
+    .register(recaptchaCheckboxStrategy)
     .register(humanHandoffStrategy);
 }
 
@@ -64,7 +78,10 @@ export async function solveCaptchaViaRegistry(
     publicBaseUrl?: string;
   },
 ): Promise<RichSolveResult> {
-  const registry = options?.registry ?? buildDefaultRegistry();
+  const policy = process.env.SUPERBROWSER_CAPTCHA_POLICY ?? 'default';
+  const fastToHuman = policy === 'fast_to_human';
+  const registry = options?.registry
+    ?? (fastToHuman ? buildFastToHumanRegistry() : buildDefaultRegistry());
   const ctx = {
     page,
     llm: llmProvider ?? undefined,
@@ -76,6 +93,7 @@ export async function solveCaptchaViaRegistry(
     humanInput: options?.humanInput,
     humanHandoffBudget: options?.humanHandoffBudget,
     publicBaseUrl: options?.publicBaseUrl,
+    fastToHuman,
   };
   return registry.dispatch(captcha, ctx);
 }

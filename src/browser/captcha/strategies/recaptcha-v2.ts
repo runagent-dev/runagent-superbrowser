@@ -1,16 +1,17 @@
 /**
- * reCAPTCHA v2 solver: checkbox click → auto-resolve detection → AI vision grid.
+ * reCAPTCHA v2 solvers — checkbox auto-pass + 2captcha grid API.
  *
- * Splits the old monolithic recaptcha flow into two steps so the orchestrator
- * can measure which sub-method worked (checkbox auto-pass is free; AI grid
- * costs ~0.3c per round).
+ * The old vision-LLM grid strategy (`recaptchaAIGridStrategy`) has been
+ * removed. Vision-based solves now happen in the Python vision agent
+ * (`nanobot/vision_agent/`), invoked via
+ * `browser_solve_captcha(method='vision')` — one unified prompt, cheaper
+ * model, shared prompt with the general page-understanding middleman.
  */
 
 import type { CaptchaInfo } from '../../captcha.js';
 import {
   clickRecaptchaCheckbox,
   detectCaptcha,
-  solveWithAIVision,
   waitForCaptchaSolution,
 } from '../../captcha.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types.js';
@@ -73,41 +74,6 @@ export const recaptchaCheckboxStrategy: CaptchaStrategy = {
       };
     } catch (e) {
       return { solved: false, method: 'recaptcha_checkbox', attempts: 1, error: (e as Error).message };
-    }
-  },
-};
-
-/** Step 2 — solve the image-tile grid challenge with vision LLM. */
-export const recaptchaAIGridStrategy: CaptchaStrategy = {
-  name: 'recaptcha_ai_grid',
-  supportedTypes: ['recaptcha', 'hcaptcha', 'image'],
-  // Demoted: vision-LLM grid solving has been observed at ~99% failure
-  // empirically. Tried below paid solvers — only first when no API key.
-  priority: 50,
-  estimatedCostCents: 3, // ~3c/round for vision LLM on a grid
-  requiresLLM: true,
-  requiresApiKey: false,
-
-  canHandle(info: CaptchaInfo): boolean {
-    return info.type === 'recaptcha' || info.type === 'hcaptcha' || info.type === 'image';
-  },
-
-  async run(info: CaptchaInfo, ctx: StrategyContext): Promise<RichSolveResult> {
-    if (!ctx.llm) {
-      return { solved: false, method: 'recaptcha_ai_grid', attempts: 0, error: 'no LLM' };
-    }
-    const start = Date.now();
-    try {
-      const result = await solveWithAIVision(ctx.page, info, ctx.llm);
-      return {
-        ...result,
-        method: 'recaptcha_ai_grid',
-        subMethod: `grid_rounds=${result.attempts || 1}`,
-        vendorDetected: info.type === 'hcaptcha' ? 'hcaptcha' : 'google',
-        durationMs: Date.now() - start,
-      };
-    } catch (e) {
-      return { solved: false, method: 'recaptcha_ai_grid', attempts: 1, error: (e as Error).message };
     }
   },
 };

@@ -26,9 +26,18 @@ export interface ErrorPageEventDetail {
   detail: string;
 }
 
+export interface AwaitingHumanDetail {
+  sessionId: string;
+  viewUrl: string;
+  captchaType: string;
+  timeoutMs: number;
+  pageUrl: string;
+}
+
 export type FeedbackEvent =
   | { kind: 'captcha_active'; host: string; strategy: string }
   | { kind: 'captcha_done';   host: string; solved: boolean; strategy?: string }
+  | { kind: 'awaiting_human'; detail: AwaitingHumanDetail }
   | { kind: 'error_page';     detail: ErrorPageEventDetail }
   | { kind: 'error_cleared' }
   | { kind: 'action_reward';  obs: StepObservation };
@@ -36,6 +45,7 @@ export type FeedbackEvent =
 export interface FeedbackState {
   captchaActive: boolean;
   captchaStrategy: string | null;
+  awaitingHuman: AwaitingHumanDetail | null;
   errorPage: ErrorPageEventDetail | null;
   lastReward: number | null;
   lastRewardAt: number | null;
@@ -45,6 +55,7 @@ class FeedbackBus extends EventEmitter {
   private state: FeedbackState = {
     captchaActive: false,
     captchaStrategy: null,
+    awaitingHuman: null,
     errorPage: null,
     lastReward: null,
     lastRewardAt: null,
@@ -61,6 +72,11 @@ class FeedbackBus extends EventEmitter {
       case 'captcha_done':
         this.state.captchaActive = false;
         this.state.captchaStrategy = null;
+        // A solve (human or auto) ends the handoff, if any was in flight.
+        this.state.awaitingHuman = null;
+        break;
+      case 'awaiting_human':
+        this.state.awaitingHuman = event.detail;
         break;
       case 'error_page':
         this.state.errorPage = event.detail;
@@ -86,6 +102,7 @@ class FeedbackBus extends EventEmitter {
     this.state = {
       captchaActive: false,
       captchaStrategy: null,
+      awaitingHuman: null,
       errorPage: null,
       lastReward: null,
       lastRewardAt: null,

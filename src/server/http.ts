@@ -16,7 +16,7 @@ import { goto, type NavigationOptions } from '../browser/goto.js';
 import { scrapeElements, setupScrapeDebug, type ScrapeElementSelector } from '../browser/scraper.js';
 import { Limiter } from '../browser/limiter.js';
 import { BrowserError } from '../browser/errors.js';
-import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull, solveWithVisionGeneric } from '../browser/captcha.js';
+import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull } from '../browser/captcha.js';
 import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
@@ -27,6 +27,7 @@ import { renderCaptchaViewHtml } from './captcha-ui-html.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { fingerprintMap, invertFingerprintMap, fingerprintElement } from '../browser/fingerprint.js';
 import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
+import { loadDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
 
 /** Session with TTL tracking. */
@@ -504,6 +505,19 @@ export function createHttpServer(
 
       let navStatusCode: number | null = null;
       if (req.body.url) {
+        // Restore any previously persisted bot-protection cookies for this
+        // (task, domain) BEFORE the first navigation so the site sees a
+        // "verified" request on load and we skip the captcha entirely.
+        // No-op when SUPERBROWSER_COOKIE_JAR!=1 or no entry exists.
+        try {
+          const restored = await loadDomainCookies(page.getRawPage(), req.body.url);
+          if (restored > 0) {
+            process.stderr.write(
+              `[cookie-jar] restored ${restored} cookie(s) for ${hostKey(req.body.url)} ` +
+              `on session ${id}\n`,
+            );
+          }
+        } catch { /* best-effort */ }
         const nav = await page.navigate(req.body.url);
         navStatusCode = nav.statusCode;
       }
@@ -542,6 +556,18 @@ export function createHttpServer(
     }
 
     try {
+      // If the navigation crosses into a domain we previously cleared with
+      // a human, restore those bot-protection cookies first so the site
+      // recognizes us on the way in.
+      try {
+        const restored = await loadDomainCookies(page.getRawPage(), url);
+        if (restored > 0) {
+          process.stderr.write(
+            `[cookie-jar] restored ${restored} cookie(s) for ${hostKey(url)} ` +
+            `on session ${req.params.id} (navigate)\n`,
+          );
+        }
+      } catch { /* best-effort */ }
       const nav = await page.navigate(url);
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
@@ -1173,7 +1199,15 @@ export function createHttpServer(
 
     try {
       const captcha = await detectCaptcha(page.getRawPage());
-      res.json({ captcha });
+      // Surface the live-view URL the moment a captcha is detected, not
+      // only when handoff fires. Downstream callers (nanobot, WhatsApp
+      // bot, CLI logs) can forward it immediately instead of waiting for
+      // auto-solve attempts to chew through the strategy ladder.
+      const publicHost = process.env.SUPERBROWSER_PUBLIC_HOST;
+      const viewUrl = captcha && publicHost
+        ? `${publicHost.replace(/\/$/, '')}/session/${req.params.id}/view`
+        : undefined;
+      res.json({ captcha, viewUrl });
     } catch (err) {
       handleError(res, err);
     }
@@ -1305,27 +1339,11 @@ export function createHttpServer(
     res.json({ solving: captchaWatchdog.isSolving(req.params.id) });
   });
 
-  /** Solve visual puzzle via screenshot → LLM → execute actions loop. */
-  app.post('/session/:id/captcha/solve-visual', async (req, res) => {
-    const page = getSession(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
-
-    if (!llm) {
-      res.status(400).json({ error: 'LLM provider required for visual solving' });
-      return;
-    }
-
-    try {
-      const result = await solveWithVisionGeneric(
-        page.getRawPage(),
-        llm,
-        req.body.maxRounds || 5,
-      );
-      res.json(result);
-    } catch (err) {
-      handleError(res, err);
-    }
-  });
+  // The /session/:id/captcha/solve-visual endpoint was retired along with
+  // `solveWithVisionGeneric`. Screenshot-driven captcha solves now run in
+  // the Python vision agent, invoked via the browser_solve_captcha tool
+  // with method='vision' — see nanobot/vision_agent/ and
+  // nanobot/superbrowser_bridge/session_tools.py::_solve_via_vision.
 
   // --- Human-in-the-loop for /task endpoint ---
 

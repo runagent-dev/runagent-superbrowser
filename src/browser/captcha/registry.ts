@@ -10,6 +10,22 @@ import type { CaptchaInfo } from '../captcha.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from './types.js';
 import { getDomainStats, hostKey } from './domain-stats.js';
 import { feedbackBus } from '../../agent/feedback-bus.js';
+import { saveDomainCookies } from './cookie-jar.js';
+
+/**
+ * Fast-to-human reordering: keep the #1 scored non-handoff candidate at
+ * the front, then move human_handoff to immediately follow it. Everything
+ * else is dropped from consideration by the `autoAttemptsDone >= 1` guard
+ * in dispatch(). We don't mutate the input array.
+ */
+function reorderForFastToHuman<T extends { strategy: CaptchaStrategy; score: number }>(
+  scored: readonly T[],
+): T[] {
+  const handoff = scored.find((s) => s.strategy.name === 'human_handoff');
+  const autos = scored.filter((s) => s.strategy.name !== 'human_handoff');
+  const top = autos.slice(0, 1);
+  return handoff ? [...top, handoff, ...autos.slice(1)] : [...autos];
+}
 
 export class CaptchaStrategyRegistry {
   private strategies: CaptchaStrategy[] = [];
@@ -104,11 +120,30 @@ export class CaptchaStrategyRegistry {
     // spam the bus when the dispatcher falls through strategies.
     feedbackBus.publish({ kind: 'captcha_active', host, strategy: scored[0].strategy.name });
 
+    // Under SUPERBROWSER_CAPTCHA_POLICY=fast_to_human, the orchestrator
+    // sets ctx.fastToHuman. When the first non-handoff strategy fails we
+    // skip any remaining auto strategies and jump straight to human_handoff
+    // — keeps the site from seeing 7 consecutive solver pings that tip it
+    // into "this is a bot" mode.
+    const runOrder = ctx.fastToHuman
+      ? reorderForFastToHuman(scored)
+      : scored;
+    let autoAttemptsDone = 0;
+
     try {
-      for (const { strategy, score } of scored) {
+      for (const { strategy, score } of runOrder) {
         if (Date.now() - ctx.startTime > ctx.deadlineMs) {
           lastError = `solver deadline ${ctx.deadlineMs}ms exceeded`;
           break;
+        }
+        if (
+          ctx.fastToHuman
+          && strategy.name !== 'human_handoff'
+          && autoAttemptsDone >= 1
+        ) {
+          // One auto attempt already failed — skip the rest, let the
+          // human_handoff entry at the end of runOrder take over.
+          continue;
         }
         const stratStart = Date.now();
         try {
@@ -122,6 +157,11 @@ export class CaptchaStrategyRegistry {
           });
           if (result.solved) {
             feedbackBus.publish({ kind: 'captcha_done', host, solved: true, strategy: strategy.name });
+            // Opportunistic cookie save — whenever any strategy clears a
+            // captcha (auto or human), persist the bot-protection cookies
+            // so the next session on the same task+domain doesn't need to
+            // re-solve. Gated internally on SUPERBROWSER_COOKIE_JAR=1.
+            void saveDomainCookies(ctx.page, ctx.page.url()).catch(() => { /* best-effort */ });
             return {
               ...result,
               method: result.method || strategy.name,
@@ -136,6 +176,7 @@ export class CaptchaStrategyRegistry {
           stats.recordOutcome(host, strategy.name, false, duration);
           lastError = `strategy ${strategy.name} threw: ${(e as Error).message}`;
         }
+        if (strategy.name !== 'human_handoff') autoAttemptsDone += 1;
       }
 
       feedbackBus.publish({ kind: 'captcha_done', host, solved: false });

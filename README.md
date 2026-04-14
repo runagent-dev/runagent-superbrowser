@@ -75,10 +75,11 @@ git clone https://github.com/runagent-dev/superbrowser.git
 cd superbrowser
 npm install
 npm run build
+cp .env.example .env     # optional — defaults work for local dev
 npm start
 ```
 
-Server starts on port 3100. No API keys needed for the browser server itself.
+Server starts on port 3100. No API keys needed for the browser server itself — every env var in `.env.example` is optional.
 
 ```bash
 # Take a screenshot

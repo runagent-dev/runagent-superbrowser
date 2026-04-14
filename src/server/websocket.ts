@@ -35,7 +35,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'http';
 import type { PageWrapper } from '../browser/page.js';
-import type { HumanInputManager, HumanInputRequest } from '../agent/human-input.js';
+import type { HumanInputManager } from '../agent/human-input.js';
 import { validateUrl } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
@@ -47,14 +47,16 @@ interface SessionBinding {
   ws: WebSocket;
 }
 
+// Track WebSocket connections per session at module scope so
+// `broadcastToSession` (exported for the HTTP layer) can look up the
+// right client without iterating every open socket.
+const bindings = new Map<string, Set<SessionBinding>>();
+
 export function attachWebSocketServer(
   httpServer: HttpServer,
   getSessions: () => Map<string, { page: PageWrapper; createdAt: number; lastAccessed: number }>,
 ): WebSocketServer {
   const wss = new WebSocketServer({ noServer: true });
-
-  // Track WebSocket connections per session
-  const bindings = new Map<string, SessionBinding>();
 
   // Handle HTTP upgrade to WebSocket
   httpServer.on('upgrade', (req, socket, head) => {
@@ -97,20 +99,29 @@ export function attachWebSocketServer(
     }
 
     const binding: SessionBinding = { page: session.page, ws };
-    bindings.set(sessionId, binding);
+    const sessionSet = bindings.get(sessionId) ?? new Set<SessionBinding>();
+    sessionSet.add(binding);
+    bindings.set(sessionId, sessionSet);
 
     // Touch session
     session.lastAccessed = Date.now();
 
     sendEvent(ws, 'connected', { sessionId });
-    // Replay current feedback state on connect so the Python bridge
-    // doesn't miss an in-flight captcha/error.
+    // Replay current feedback state on connect so a late subscriber (e.g.
+    // a WhatsApp bot reconnecting mid-handoff) catches up on in-flight
+    // captcha / error / awaiting_human state.
     const snap = feedbackBus.getState();
     if (snap.captchaActive) {
       sendEvent(ws, 'feedback', {
         kind: 'captcha_active',
         host: '(snapshot)',
         strategy: snap.captchaStrategy ?? 'unknown',
+      });
+    }
+    if (snap.awaitingHuman) {
+      sendEvent(ws, 'feedback', {
+        kind: 'awaiting_human',
+        detail: snap.awaitingHuman,
       });
     }
     if (snap.errorPage) {
@@ -137,35 +148,35 @@ export function attachWebSocketServer(
       }
     });
 
-    ws.on('close', () => {
-      bindings.delete(sessionId);
+    const cleanup = () => {
+      const set = bindings.get(sessionId);
+      if (set) {
+        set.delete(binding);
+        if (set.size === 0) bindings.delete(sessionId);
+      }
       feedbackBus.off('event', onFeedback);
-    });
-
-    ws.on('error', () => {
-      bindings.delete(sessionId);
-      feedbackBus.off('event', onFeedback);
-    });
+    };
+    ws.on('close', cleanup);
+    ws.on('error', cleanup);
   });
 
   return wss;
 }
 
 /**
- * Broadcast an event to the WebSocket client connected to a session.
- * Called by the executor/event system when something happens.
+ * Broadcast an event to every WebSocket client subscribed to a session.
+ * Uses the module-scoped `bindings` map so the lookup is O(1) and no other
+ * session's clients see the message.
  */
 export function broadcastToSession(
-  wss: WebSocketServer,
+  _wss: WebSocketServer,
   sessionId: string,
   event: string,
   data: unknown,
 ): void {
-  // Find the binding for this session
-  for (const client of wss.clients) {
-    // We need to match by session — use the bindings approach
-    // This is handled internally via the bindings map
-  }
+  const set = bindings.get(sessionId);
+  if (!set) return;
+  for (const b of set) sendEvent(b.ws, event, data);
 }
 
 // --- Internal helpers ---
@@ -388,29 +399,3 @@ async function handleCommand(
   }
 }
 
-/**
- * Create a function that pushes human input requests over WebSocket.
- * Wire this to the HumanInputManager so gateway clients get notified instantly.
- */
-export function createHumanInputBridge(
-  wss: WebSocketServer,
-  sessionId: string,
-  humanInput: HumanInputManager,
-): void {
-  // Poll for pending requests and broadcast
-  // (The HumanInputManager uses a blocking promise pattern,
-  //  so we intercept by checking after requestInput is called)
-  const checkInterval = setInterval(() => {
-    const pending = humanInput.getPendingRequest();
-    if (pending) {
-      for (const client of wss.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          sendEvent(client, 'human_input', pending);
-        }
-      }
-    }
-  }, 500);
-
-  // Cleanup when no longer needed
-  wss.on('close', () => clearInterval(checkInterval));
-}

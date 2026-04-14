@@ -28,6 +28,8 @@ import { captchaWatchdog } from '../../captcha-watchdog.js';
 import { getHandoffLedger } from '../handoff-ledger.js';
 import { hostKey } from '../domain-stats.js';
 import { sanitizeImageBuffer } from '../../image-safety.js';
+import { feedbackBus } from '../../../agent/feedback-bus.js';
+import { saveDomainCookies } from '../cookie-jar.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types.js';
 
 const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -156,20 +158,49 @@ export const humanHandoffStrategy: CaptchaStrategy = {
     }
 
     // Surface to humans through every available channel: bordered banner
-    // on stderr (CLI users) + optional webhook (WhatsApp / Slack / etc.).
+    // on stderr (CLI users) + optional webhook (WhatsApp / Slack / etc.)
+    // + feedbackBus push so any connected WebSocket client gets notified
+    // without polling.
     printHandoffBanner(viewUrl, info.type);
     let pageUrl = '';
     try { pageUrl = ctx.page.url(); } catch { /* page may have closed */ }
+    let pageTitle = '';
+    try { pageTitle = await ctx.page.title(); } catch { /* page may have closed */ }
+
+    if (ctx.sessionId) {
+      feedbackBus.publish({
+        kind: 'awaiting_human',
+        detail: {
+          sessionId: ctx.sessionId,
+          viewUrl,
+          captchaType: info.type,
+          timeoutMs: HANDOFF_TIMEOUT_MS,
+          pageUrl,
+        },
+      });
+    }
+
+    // WhatsApp-ready payload: pre-formatted caption the bot can forward
+    // verbatim, plus explicit MIME so receivers don't have to sniff.
+    let hostname = '';
+    try { hostname = pageUrl ? new URL(pageUrl).hostname : ''; } catch { /* */ }
+    const caption = hostname
+      ? `Captcha on ${hostname} — tap ${viewUrl} to solve (${Math.round(HANDOFF_TIMEOUT_MS / 60000)} min).`
+      : `Captcha needs a human — tap ${viewUrl} to solve (${Math.round(HANDOFF_TIMEOUT_MS / 60000)} min).`;
     void fireHandoffWebhook({
       event: 'human_handoff_required',
       url: viewUrl,
       sessionId: ctx.sessionId,
+      taskId: process.env.SUPERBROWSER_TASK_ID,
       captchaType: info.type,
       pageUrl,
+      pageTitle,
       timeoutMs: HANDOFF_TIMEOUT_MS,
+      caption,
       // Keep the screenshot small in the webhook payload — receivers that
       // only want a thumbnail can upscale; ones that don't can ignore.
       screenshot,
+      screenshotMimeType: screenshot ? 'image/jpeg' : undefined,
     });
 
     const message =
@@ -304,6 +335,13 @@ export const humanHandoffStrategy: CaptchaStrategy = {
           const scope = process.env.SUPERBROWSER_TASK_ID ?? ctx.sessionId ?? domain;
           getHandoffLedger().record(scope, domain);
         } catch { /* ledger is best-effort */ }
+        // The human just proved they're real on this domain — persist the
+        // bot-protection cookies (cf_clearance, datadome, ...) so a later
+        // session on the same task+domain starts already cleared. Gated
+        // internally on SUPERBROWSER_COOKIE_JAR=1.
+        try {
+          await saveDomainCookies(ctx.page, ctx.page.url());
+        } catch { /* best-effort */ }
       }
     }
 
