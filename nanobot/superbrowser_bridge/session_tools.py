@@ -29,6 +29,21 @@ from nanobot.agent.tools.schema import (
 SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
+# After this many guard-refused browser_open calls in a single worker run, we
+# stop being polite and abort the worker. The guard's text message is clearly
+# not getting through to the LLM at this point and continuing would just
+# drain the iteration budget on a no-op loop.
+BLOCKED_BROWSER_OPEN_HARD_STOP = 3
+
+
+class WorkerMustExitError(RuntimeError):
+    """Raised from a tool when the worker must terminate immediately.
+
+    Bubbles up through nanobot's tool runner. Carries a reason string the
+    orchestrator can surface to the user so the failure mode is observable
+    (vs. a silent iteration drain).
+    """
+
 
 _CAPTCHA_KEYWORDS = (
     "captcha", "recaptcha", "hcaptcha", "turnstile", "cloudflare",
@@ -110,12 +125,43 @@ class BrowserSessionState:
         self.consecutive_click_calls: int = 0
         # Active session ID (set by browser_open)
         self.session_id: str = ""
+        # How many times has BrowserOpenTool had to refuse a redundant call?
+        # The guard returns a stern message on the first few; if the LLM keeps
+        # ignoring it past BLOCKED_BROWSER_OPEN_HARD_STOP, we raise to abort
+        # the worker rather than silently drain its iteration budget.
+        self.blocked_browser_open_count: int = 0
 
-        # Captcha-mode: when a captcha is detected, disable screenshot dedup
-        # and action-delta rules for CAPTCHA_MODE_ITERATIONS iterations.
-        # Solving a captcha needs fast visual feedback (3+ shots per round).
+        # Captcha-mode: when a captcha is detected, relax the "no actions since
+        # last screenshot" rule for CAPTCHA_MODE_ITERATIONS iterations. The
+        # per-round counter `captcha_solve_round` is included in the dedup key
+        # so each solve attempt gets its own screenshot allowance — preventing
+        # the blanket bypass that used to let the worker screenshot the same
+        # unchanged captcha 15 times.
         self.captcha_mode: bool = False
         self.captcha_mode_remaining: int = 0
+        self.captcha_solve_round: int = 0
+        self.captcha_screenshots_used: int = 0
+        # Hard cap on screenshots allowed within captcha mode (across rounds).
+        # Kicks in only in captcha mode; the normal budget still caps overall.
+        self.captcha_mode_screenshot_cap: int = 8
+
+        # Network-layer block: set by browser_open/browser_navigate when the
+        # target returns 4xx/5xx. Distinguishes "site blocks automated clients
+        # before any page loads" from "page loaded but interaction failed" —
+        # completely different failure classes needing different remediations
+        # (IP/TLS/proxy vs. selector/timing/captcha).
+        self.network_blocked: bool = False
+        self.last_network_status: int | None = None
+
+        # Human-in-the-loop handoff: when True, the TS server registers a
+        # HumanInputManager for this session AND the captcha orchestrator
+        # will fall back to human handoff after auto-strategies exhaust.
+        # Orchestrator sets this before register_session_tools(). Default
+        # False to preserve no-op behavior for workers that don't opt in.
+        self.human_handoff_enabled: bool = False
+        # Per-session budget — relayed to the TS server which enforces it.
+        # 1 by default, overridable via SUPERBROWSER_MAX_HUMAN_HANDOFFS.
+        self.human_handoff_budget: int = 1
 
     # --- budget configuration ---------------------------------------------
 
@@ -140,9 +186,13 @@ class BrowserSessionState:
         Called when browser_detect_captcha returns a captcha. Captcha
         solving requires multiple screenshots per round (before drag,
         after drag, verify result) — normal budget would starve it.
+        Resets per-round counters so a re-entry doesn't inherit stale
+        dedup state from a previous challenge.
         """
         self.captcha_mode = True
         self.captcha_mode_remaining = self.CAPTCHA_MODE_ITERATIONS
+        self.captcha_solve_round = 0
+        self.captcha_screenshots_used = 0
 
     def tick_captcha_mode(self) -> None:
         """Decrement captcha_mode counter. Call once per agent iteration."""
@@ -209,12 +259,30 @@ class BrowserSessionState:
     ) -> tuple[bool, str]:
         """Check if a screenshot should be allowed. Returns (allowed, reason).
 
-        In captcha_mode the limiter is relaxed: budget still enforced (hard
-        ceiling), but dedup and "no actions since last shot" are disabled.
+        Captcha mode no longer blanket-bypasses dedup. Instead:
+          - actions_since_screenshot check is relaxed (a captcha round might
+            genuinely need multiple vision calls between tool actions)
+          - captcha_solve_round is folded into the dedup key so each solve
+            attempt gets its own allowance
+          - a hard cap (captcha_mode_screenshot_cap) prevents runaway burn
+            even if vision keeps failing
         """
         if self.screenshot_budget <= 0:
             return False, "[Screenshot budget exhausted] Use browser_get_markdown or browser_eval instead."
         if self.captcha_mode:
+            if self.captcha_screenshots_used >= self.captcha_mode_screenshot_cap:
+                return False, (
+                    f"[Captcha-mode screenshot cap hit ({self.captcha_mode_screenshot_cap}). "
+                    "The vision-based solve isn't converging. Call browser_ask_user for human help, "
+                    "or browser_request_help to hand off to a fresh tactic.]"
+                )
+            norm = self._normalize_url(url)
+            key = (norm, f"cap-round-{self.captcha_solve_round}:{content_hash or ''}")
+            if norm and key in self.screenshotted_keys:
+                return False, (
+                    "[Captcha screenshot already taken for this solve round with no change. "
+                    "Call browser_solve_captcha or browser_click a tile — don't re-screenshot the same state.]"
+                )
             return True, ""
         if self.actions_since_screenshot == 0:
             return False, "[No actions since last screenshot — reuse previous. Use browser_get_markdown to re-read content.]"
@@ -227,21 +295,83 @@ class BrowserSessionState:
         return True, ""
 
     def mark_screenshot_taken(self, url: str, content_hash: str = "") -> None:
-        """Record that a screenshot was taken for (url, content_hash)."""
+        """Record that a screenshot was taken for (url, content_hash).
+
+        In captcha mode the key includes the current solve round so each
+        solve attempt gets its own dedup allowance.
+        """
         norm = self._normalize_url(url)
-        if norm:
+        if not norm:
+            return
+        if self.captcha_mode:
+            self.captcha_screenshots_used += 1
+            self.screenshotted_keys.add(
+                (norm, f"cap-round-{self.captcha_solve_round}:{content_hash or ''}")
+            )
+        else:
             self.screenshotted_keys.add((norm, content_hash or ""))
-            self.last_screenshot_url = norm
-            self.last_page_content_hash = content_hash or ""
+        self.last_screenshot_url = norm
+        self.last_page_content_hash = content_hash or ""
 
     @staticmethod
-    def hash_page_content(text: str) -> str:
-        """Short stable hash of page content for dedup keys."""
+    def hash_page_content(text: str, scroll_y: int | None = None) -> str:
+        """Structural fingerprint of a page for screenshot dedup.
+
+        Replaces the old "SHA1 of first 500 chars" scheme, which was both
+        insensitive to real changes (below-fold content, lazy loads) and
+        over-sensitive to benign re-renders (React class-hash churn).
+
+        Input is the `clickableElementsToString()` payload returned by the
+        TS server — one line per interactive element, format roughly:
+          `[0]<button aria-label="Sign in">Sign in</button>`
+
+        Fingerprint inputs:
+          - count of interactive elements (line count)
+          - tag-name histogram (button/input/a/…)
+          - top-N aria-label / placeholder / name values, normalized
+          - scroll-Y bucketed to 100px when supplied
+
+        All inputs are concatenated into a deterministic canonical string,
+        then SHA1-hashed and truncated. Bucketing scroll keeps tiny scroll
+        jitters from invalidating dedup while still distinguishing real
+        scroll positions.
+        """
         if not text:
             return ""
-        snippet = text[:_CONTENT_HASH_LEN]
         import hashlib
-        return hashlib.sha1(snippet.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        import re
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        count = len(lines)
+
+        # Tag histogram — parse `<tag` at the start of each element snippet.
+        tag_counts: dict[str, int] = {}
+        attr_pat = re.compile(r'(?:aria-label|placeholder|name)="([^"]+)"')
+        attr_samples: list[str] = []
+        for ln in lines[:40]:  # cap at 40 to keep bounded
+            m = re.search(r"<([a-zA-Z][a-zA-Z0-9]*)", ln)
+            if m:
+                tag = m.group(1).lower()
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            # Grab first meaningful attribute to anchor identity.
+            a = attr_pat.search(ln)
+            if a:
+                val = a.group(1).strip().lower()
+                # Normalize whitespace + drop digits (React IDs, counters).
+                val = re.sub(r"\s+", " ", val)
+                val = re.sub(r"\d+", "#", val)
+                attr_samples.append(val[:40])
+
+        hist = ",".join(f"{t}:{n}" for t, n in sorted(tag_counts.items()))
+        # Use the first 20 normalized attributes — enough to differentiate
+        # pages, few enough that a single added menu item doesn't flip the hash.
+        attrs = "|".join(attr_samples[:20])
+        scroll_bucket = ""
+        if scroll_y is not None:
+            scroll_bucket = f"s{int(scroll_y) // 100}"
+
+        canonical = f"n={count}|h={hist}|a={attrs}|{scroll_bucket}"
+        return hashlib.sha1(canonical.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:
         """Record a step in the structured step history."""
@@ -465,8 +595,49 @@ async def _fetch_elements(session_id: str) -> str:
         return ""
 
 
-def _format_state(data: dict) -> str:
-    parts = []
+def _build_network_block_message(status_code: int, url: str) -> str:
+    """Structured message when a page returns 4xx/5xx — tells the worker to
+    stop immediately rather than trying interactions on a blocked shell.
+
+    This is distinct from CAPTCHA: CAPTCHA returns 200 + a challenge page.
+    A 403/429/503 means the bot-detection edge refused to serve content at
+    all, so no amount of clicking will help. The right move is to exit the
+    worker via done(success=False) so the orchestrator can route to the
+    search worker or escalate (proxy, TLS fingerprinting, etc.).
+    """
+    reason_hint = {
+        401: "Authentication required — this page needs a logged-in session.",
+        403: "Forbidden — site's bot detection refused at the network layer. No page interaction will help.",
+        404: "Page not found at this URL.",
+        429: "Rate-limited — the site throttled our requests. Different IP may help.",
+        451: "Blocked for legal reasons (geographic restriction likely).",
+        503: "Service unavailable — could be bot detection (Cloudflare/Akamai) or real outage.",
+    }.get(status_code, "Server returned an error status — page content is not usable.")
+    return (
+        f"\n\n[NETWORK_BLOCKED status={status_code} url={url}]\n"
+        f"{reason_hint}\n"
+        f"ACTION: do NOT attempt further interactions. Call "
+        f"done(success=False, final_answer='NETWORK_BLOCKED: HTTP {status_code} at {url}') "
+        f"so the orchestrator can escalate (try a different approach, search worker, or request proxy)."
+    )
+
+
+def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
+    parts: list[str] = []
+    # Leading structured marker that survives tool-result truncation. Even
+    # when maxToolResultChars slices the trailing base64 image apart, these
+    # first ~120 characters stay intact, so the worker's LLM can always see
+    # "the tool succeeded; a session is open" and won't fire a redundant
+    # browser_open.
+    session_id = data.get("sessionId") or (state.session_id if state else "")
+    url = data.get("url") or ""
+    title = (data.get("title") or "").replace('"', "'")[:80]
+    step = state.step_counter if state else 0
+    if session_id or url:
+        parts.append(
+            f'[SESSION_STATE session_id={session_id or "?"} '
+            f'url={url or "?"} title="{title}" step={step}]'
+        )
     if data.get("url"):
         parts.append(f"URL: {data['url']}")
     if data.get("title"):
@@ -509,6 +680,63 @@ class BrowserOpenTool(Tool):
 
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
+
+        # --- Idempotency guard ------------------------------------------
+        # Two paths reach this tool with a live session already:
+        #   1. The worker's LLM is in an amnesia loop (truncated/stripped
+        #      screenshots → can't tell browser_open already ran) and is
+        #      firing it again for the same URL.
+        #   2. The orchestrator pre-seeded self.s.session_id from a
+        #      resumption artifact (orchestrator_tools.py resumption path)
+        #      and the worker's LLM ignored the "DO NOT call browser_open"
+        #      instruction in the prompt.
+        # In both cases creating a second real session is the bug — it
+        # overwrites session_id with a throwaway and discards any progress.
+        # Return a plain-string message (no image blocks, so truncation
+        # can't mangle it) pointing the LLM at the right next tool.
+        if self.s.session_id:
+            self.s.blocked_browser_open_count += 1
+            if self.s.blocked_browser_open_count >= BLOCKED_BROWSER_OPEN_HARD_STOP:
+                raise WorkerMustExitError(
+                    f"browser_open called {self.s.blocked_browser_open_count} "
+                    f"times after the idempotency guard refused it. The LLM "
+                    f"is in a tight loop ignoring the guard message. "
+                    f"Aborting worker to prevent iteration drain. "
+                    f"session_id={self.s.session_id}"
+                )
+            same_url = (
+                not url
+                or self.s._normalize_url(url) == self.s._normalize_url(self.s.current_url)
+            )
+            print(
+                f"\n>> browser_open BLOCKED (session already active: "
+                f"{self.s.session_id}) — refusal #{self.s.blocked_browser_open_count}"
+            )
+            if same_url:
+                return (
+                    f"[SESSION_ALREADY_OPEN session_id={self.s.session_id} "
+                    f"url={self.s.current_url}]\n"
+                    f"A browser session is already active on this URL. "
+                    f"DO NOT call browser_open again — it would discard your "
+                    f"current page.\n"
+                    f"Use one of these instead:\n"
+                    f"  - browser_screenshot(session_id=\"{self.s.session_id}\") "
+                    f"to see the current view\n"
+                    f"  - browser_get_markdown(session_id=\"{self.s.session_id}\") "
+                    f"to read the page text\n"
+                    f"  - browser_click / browser_type to interact\n"
+                    f"  - browser_navigate(session_id=\"{self.s.session_id}\", "
+                    f"url=\"...\") to switch URLs on the same session"
+                )
+            return (
+                f"[WRONG_TOOL session_id={self.s.session_id} current_url={self.s.current_url}]\n"
+                f"You asked to open a different URL ({url}) but a session is "
+                f"already active. Use browser_navigate on the existing session — "
+                f"do NOT call browser_open, which would create a throwaway "
+                f"second session and discard your current page.\n"
+                f"  browser_navigate(session_id=\"{self.s.session_id}\", url=\"{url}\")"
+            )
+
         self.s.reset_per_session()
         self.s.sessions_opened += 1
 
@@ -521,6 +749,12 @@ class BrowserOpenTool(Tool):
             payload["region"] = region
         if proxy:
             payload["proxy"] = proxy
+        # Opt in to human handoff on the TS side. The server instantiates a
+        # HumanInputManager for this session and the captcha orchestrator
+        # can fall back to a human handoff after auto-solve exhausts.
+        if self.s.human_handoff_enabled:
+            payload["enableHumanHandoff"] = True
+            payload["humanHandoffBudget"] = self.s.human_handoff_budget
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/create", json=payload)
@@ -535,8 +769,39 @@ class BrowserOpenTool(Tool):
         self.s.record_step("browser_open", url or "blank", f"session={data.get('sessionId', '?')}")
         self.s.consecutive_click_calls = 0
 
-        caption = _format_state(data)
+        # If human handoff is enabled, print the view URL to stdout so the
+        # user can pre-open it in their browser. The view page polls the
+        # /human-input endpoint and will show a banner the instant the
+        # agent needs help, so having it open beforehand eliminates the
+        # race where the agent blocks for 5 min before the user notices.
+        if self.s.human_handoff_enabled and self.s.session_id:
+            public_host = os.environ.get(
+                "SUPERBROWSER_PUBLIC_HOST", SUPERBROWSER_URL.rstrip("/"),
+            )
+            view_url = f"{public_host}/session/{self.s.session_id}/view"
+            print(
+                f"\n>> [HUMAN HANDOFF ENABLED] Open this URL in your browser "
+                f"and keep it open:\n>>   {view_url}\n>> "
+                f"If the agent needs help, you'll see a banner there."
+            )
+
+        caption = _format_state(data, self.s)
         caption = f"Session: {data['sessionId']}\n{caption}"
+
+        # Network-layer block detection (4xx/5xx). Fast-fails before the worker
+        # wastes iterations on an unresponsive page. 404 is treated as fatal
+        # here (wrong URL) but not a network block per se.
+        status_code = data.get("statusCode")
+        if isinstance(status_code, int):
+            self.s.last_network_status = status_code
+            if status_code >= 400 and status_code != 404:
+                self.s.network_blocked = True
+                caption += _build_network_block_message(status_code, actual_url)
+                self.s.record_step("browser_open", url or "blank", f"NETWORK_BLOCKED status={status_code}")
+                return caption
+            elif status_code == 404:
+                caption += _build_network_block_message(404, actual_url)
+                return caption
 
         # Surface captcha detection from the server
         if data.get("captchaDetected"):
@@ -599,9 +864,25 @@ class BrowserNavigateTool(Tool):
         actual_url = data.get("url", url)
         self.s.log_activity(f"navigate({url})", f"title={data.get('title', '?')}")
         self.s.record_url(actual_url)
-        self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")
 
-        caption = _format_state(data)
+        caption = _format_state(data, self.s)
+
+        # Network-layer block detection — same logic as browser_open. Exit
+        # early so the worker doesn't try to interact with a 403/429 shell.
+        status_code = data.get("statusCode")
+        if isinstance(status_code, int):
+            self.s.last_network_status = status_code
+            if status_code >= 400 and status_code != 404:
+                self.s.network_blocked = True
+                caption += _build_network_block_message(status_code, actual_url)
+                self.s.record_step("browser_navigate", url, f"NETWORK_BLOCKED status={status_code}")
+                return caption
+            elif status_code == 404:
+                caption += _build_network_block_message(404, actual_url)
+                self.s.record_step("browser_navigate", url, f"HTTP 404 at {actual_url}")
+                return caption
+
+        self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")
 
         if regression:
             caption += "\n[WARNING: You already visited this URL. Fix your approach on the CURRENT page instead of going backward. Do NOT restart from the beginning.]"
@@ -674,7 +955,7 @@ class BrowserScreenshotTool(Tool):
             )
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
         self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")
-        caption = _format_state(data)
+        caption = _format_state(data, self.s)
         caption += f"\n[Screenshots remaining: {self.s.screenshot_budget}]"
         if data.get("screenshot"):
             entries = data.get("selectorEntries") or []
@@ -1313,6 +1594,10 @@ class BrowserSolveCaptchaTool(Tool):
             payload["provider"] = provider
         if api_key:
             payload["apiKey"] = api_key
+        # Advance the solve round BEFORE the call so the next screenshot
+        # (which the LLM will take to inspect the result) gets a fresh dedup
+        # allowance distinct from the pre-solve shots.
+        self.s.captcha_solve_round += 1
         async with httpx.AsyncClient(timeout=180.0) as client:
             r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve", json=payload)
             r.raise_for_status()
@@ -1374,22 +1659,383 @@ class BrowserSolveCaptchaTool(Tool):
 )
 class BrowserAskUserTool(Tool):
     name = "browser_ask_user"
-    description = "Ask the user a question and wait for their response."
+    description = (
+        "Ask the user a question and BLOCK until they respond "
+        "(up to 5 minutes). Use for credentials, OTP, confirmation, or "
+        "when you need a human decision. The user replies via the remote "
+        "view UI at /session/<id>/view or any HTTP client. Returns the "
+        "user's reply as a string; on timeout returns a sentinel message "
+        "you can react to."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
 
-    async def execute(self, session_id: str, question: str, input_type: str | None = None, **kw: Any) -> Any:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/state", params={"vision": "true"})
+    async def execute(
+        self,
+        session_id: str,
+        question: str,
+        input_type: str | None = None,
+        **kw: Any,
+    ) -> Any:
+        # Map nanobot-side hint to the TS server's HumanInputType. Default
+        # 'text' is the safest — it accepts free-form replies and the UI's
+        # "Done" button also works against it.
+        valid_types = {
+            "credentials", "captcha", "confirmation", "otp", "card", "text", "choice",
+        }
+        ht = (input_type or "text").lower()
+        if ht not in valid_types:
+            ht = "text"
+
+        # Capture a screenshot to include in the request payload so any UI
+        # listener (not just the live-view poller) can show what page the
+        # agent is stuck on. Best-effort.
+        screenshot_b64 = None
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                sr = await client.get(
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "true"},
+                )
+                sr.raise_for_status()
+                sdata = sr.json()
+            screenshot_b64 = sdata.get("screenshot") or None
+        except Exception:
+            screenshot_b64 = None
+
+        # View URL for the user — the concrete surface where they interact.
+        public_host = os.environ.get(
+            "SUPERBROWSER_PUBLIC_HOST", SUPERBROWSER_URL.rstrip("/"),
+        )
+        view_url = f"{public_host}/session/{session_id}/view"
+        message = (
+            f"{question}\n\n"
+            f"To respond: open {view_url} in your browser. "
+            f"Either interact with the page (for captchas) or click the "
+            f"'Done' button when finished."
+        )
+
+        # Five-minute timeout matches HumanInputManager's default; the TS
+        # server holds the HTTP connection open until the user replies or
+        # the timer fires, so client-side we just wait.
+        timeout_ms = 5 * 60 * 1000
+        self.s.record_step(
+            "browser_ask_user",
+            f"type={ht}",
+            f"view_url={view_url}",
+        )
+        try:
+            async with httpx.AsyncClient(timeout=timeout_ms / 1000 + 10) as client:
+                r = await client.post(
+                    f"{SUPERBROWSER_URL}/session/{session_id}/human-input/ask",
+                    json={
+                        "type": ht,
+                        "message": message,
+                        "screenshot": screenshot_b64,
+                        "timeout": timeout_ms,
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+        except Exception as exc:
+            return (
+                f"[browser_ask_user error: {exc}. "
+                f"User was not asked. Continue without their input "
+                f"or call again.]"
+            )
+
+        if data.get("timedOut"):
+            return (
+                f"[User did not respond within {timeout_ms // 60000} minutes. "
+                f"Proceed without their input or call done(success=False).]"
+            )
+
+        response = data.get("response") or {}
+        if response.get("cancelled"):
+            return "[User cancelled the request. Proceed accordingly.]"
+
+        payload = response.get("data") or {}
+        if not payload:
+            return "[User responded but provided no data.]"
+
+        # Flatten the reply dict into a short readable string for the model.
+        parts = [f"{k}: {v}" for k, v in payload.items()]
+        return f"[User replied] {' | '.join(parts)}"
+
+
+# ── Resumption-handoff helpers ───────────────────────────────────────────
+# When a worker exits (stuck, captcha-blocked, or after browser_request_help),
+# we save enough tactical state that the NEXT worker can resume on the same
+# live Puppeteer session with knowledge of what already failed — instead of
+# spawning a fresh session from the home page.
+#
+# File: /tmp/superbrowser/resumption.json
+# Expiry: 5 minutes (RESUMPTION_TTL_SEC). Past that, the Puppeteer session
+# has likely been GC'd server-side so liveness is doubtful regardless.
+
+RESUMPTION_PATH = "/tmp/superbrowser/resumption.json"
+RESUMPTION_TTL_SEC = 300
+
+
+def _extract_recent_failures(step_history: list[dict], limit: int = 5) -> list[dict]:
+    """Pull the most recent tool steps that look like failures.
+
+    With Priority 1 in place, click/type results include phrases like
+    '(element_covered):' or '(stale_selector):' when the structured reason
+    is set. We match on those plus generic error markers.
+    """
+    out: list[dict] = []
+    markers = ("FAILED", "failed (", "error:", "Script error", "ERROR:", "NOT solved")
+    for step in reversed(step_history):
+        result = str(step.get("result") or "")
+        if any(m in result for m in markers):
+            out.append({
+                "tool": step.get("tool", ""),
+                "args": str(step.get("args", ""))[:160],
+                "result_excerpt": result[:220],
+                "url": step.get("url", ""),
+                "time": step.get("time", ""),
+            })
+        if len(out) >= limit:
+            break
+    return list(reversed(out))
+
+
+def save_resumption_artifact(
+    state: "BrowserSessionState",
+    domain: str,
+    help_reason: str = "",
+    help_failed_tactics: str = "",
+) -> bool:
+    """Write a resumption hint so the next delegation can pick up where we left off.
+
+    Returns True if the artifact was written. Never raises.
+    """
+    try:
+        if not state.session_id or not state.current_url:
+            return False
+        payload = {
+            "session_id": state.session_id,
+            "current_url": state.current_url,
+            "best_checkpoint_url": state.best_checkpoint_url,
+            "domain": domain,
+            "task_id": state.task_id,
+            "recent_failures": _extract_recent_failures(state.step_history),
+            "help_reason": help_reason or "",
+            "help_failed_tactics": help_failed_tactics or "",
+            "written_at": time.time(),
+        }
+        os.makedirs(os.path.dirname(RESUMPTION_PATH), exist_ok=True)
+        with open(RESUMPTION_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"  [resumption artifact saved: session={state.session_id} url={state.current_url}]")
+        return True
+    except OSError as exc:
+        print(f"  [resumption save failed: {exc}]")
+        return False
+
+
+async def load_resumption_artifact(domain: str) -> dict | None:
+    """Read and validate a resumption artifact for the given domain.
+
+    Returns None if the artifact is missing, expired, from a different
+    domain, or the referenced Puppeteer session is no longer alive
+    on the TS server.
+    """
+    if not os.path.exists(RESUMPTION_PATH):
+        return None
+    try:
+        with open(RESUMPTION_PATH) as f:
+            payload = json.load(f)
+    except (ValueError, OSError):
+        return None
+
+    age = time.time() - float(payload.get("written_at", 0) or 0)
+    if age > RESUMPTION_TTL_SEC:
+        try:
+            os.remove(RESUMPTION_PATH)
+        except OSError:
+            pass
+        return None
+    if payload.get("domain") != domain:
+        return None
+
+    sid = payload.get("session_id")
+    if not sid:
+        return None
+
+    # Cheap liveness probe — hit the TS server's session state endpoint.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                f"{SUPERBROWSER_URL}/session/{sid}/state",
+                params={"vision": "false"},
+            )
+        if r.status_code != 200:
+            try:
+                os.remove(RESUMPTION_PATH)
+            except OSError:
+                pass
+            return None
+    except Exception:
+        return None
+
+    return payload
+
+
+def clear_resumption_artifact() -> None:
+    """Remove the resumption artifact (call when a new session successfully supersedes it)."""
+    if os.path.exists(RESUMPTION_PATH):
+        try:
+            os.remove(RESUMPTION_PATH)
+        except OSError:
+            pass
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        claim=StringSchema(
+            "The exact factual claim you're about to report. Include the value, unit, "
+            "and what it refers to. E.g. 'Total price for 2 nights at Agoda Grand Sylhet "
+            "May 3-5 is BDT 14,500' or '5-star hotel count in Sylhet on GoZayaan is 3'."
+        ),
+        required=["session_id", "claim"],
+    )
+)
+class BrowserVerifyFactTool(Tool):
+    """Visual sanity check before reporting an extracted value.
+
+    Takes a fresh screenshot and frames a narrow verification question for
+    the next model turn. The LLM must look at the actual page and say whether
+    it supports the claim. Catches the common failure mode where an extraction
+    script returned null/wrong-element and the model filled in a plausible
+    number downstream.
+
+    Intentionally bypasses normal dedup — verification screenshots are a
+    deliberate, infrequent request and must see the current state.
+    """
+
+    name = "browser_verify_fact"
+    description = (
+        "Visually verify a factual claim against the current page before reporting it. "
+        "Call this with the EXACT value you're about to return. Then look at the "
+        "returned screenshot and answer honestly: does the page actually show this? "
+        "If not, do NOT report the original value — go back and fix your extraction."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, session_id: str, claim: str, **kw: Any) -> Any:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true"},
+            )
             r.raise_for_status()
             data = r.json()
-        caption = f"[Browser needs your input]\n\n{question}"
-        if data.get("url"):
-            caption += f"\nCurrent page: {data['url']}"
+
+        self.s.record_step("browser_verify_fact", claim[:80], "screenshot taken for verification")
+
+        caption = (
+            f"[VERIFY CLAIM]\n"
+            f"Claim under review: {claim}\n\n"
+            f"Look at the screenshot below carefully. In your NEXT reply, respond ONLY "
+            f"with a JSON object of the form:\n"
+            f'  {{"supported": <bool>, "observed_value": "<what you actually see on the page, '
+            f"verbatim, or null if absent>\", "
+            f'"reason": "<one sentence explaining what you saw>"}}\n\n'
+            f"Rules:\n"
+            f"- supported=true only if the claim matches what's visible on the page exactly "
+            f"(values, units, context). A crossed-out price is NOT the current price.\n"
+            f"- If the page shows a DIFFERENT value than the claim, set supported=false "
+            f"and put the real value in observed_value.\n"
+            f"- If the page doesn't show enough to tell, set supported=false with a "
+            f"'cannot verify' reason — do NOT rubber-stamp.\n"
+            f"- After this verify, if supported=false, FIX your extraction and retry. "
+            f"If supported=true, report the claim as your final answer."
+        )
+
         if data.get("screenshot"):
-            return self.s.build_image_blocks(data["screenshot"], caption)
-        return caption
+            # Don't let verify-fact screenshots eat the captcha cap (they're
+            # not for captcha) nor trigger normal dedup (verification must
+            # see the live page state). We bill it against the vision counter
+            # for cost accounting only.
+            self.s.vision_calls += 1
+            return [
+                {"type": "text", "text": caption},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data['screenshot']}"}},
+            ]
+        # No screenshot available — still return the caption so the caller
+        # can at least reason about the textual state.
+        return caption + "\n\n[No screenshot available — verify against browser_get_markdown output.]"
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        reason=StringSchema(
+            "Why you're stuck. Be specific: 'element_covered by cookie banner I can't dismiss', "
+            "'captcha solve failed 3 times', 'selector index keeps shifting'."
+        ),
+        failed_tactics=StringSchema(
+            "Comma-separated list of tactics you already tried. E.g., "
+            "'click [5] twice, scroll-and-retry, switch to XPath selector'."
+        ),
+        required=["reason", "failed_tactics"],
+    )
+)
+class BrowserRequestHelpTool(Tool):
+    """Escape hatch: worker signals 'I'm stuck' with structured context.
+
+    Writes a resumption artifact so the orchestrator can spin up a new
+    worker that RESUMES on the same live Puppeteer session with a
+    different tactic — instead of starting from scratch.
+
+    The worker should call `done(success=False, final_answer=...)` on the
+    next turn after calling this tool.
+    """
+
+    name = "browser_request_help"
+    description = (
+        "Call this when you're stuck and a fresh tactic is needed. "
+        "Writes structured state so the orchestrator can delegate a "
+        "SUCCESSOR worker that resumes on the SAME live browser session "
+        "with knowledge of what failed. "
+        "After calling this tool, call done(success=False) with a short "
+        "explanation — do NOT keep trying the same tactics."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, reason: str, failed_tactics: str, **kw: Any) -> str:
+        # Lazy-import to avoid circular imports with the orchestrator module.
+        from superbrowser_bridge.routing import _domain_from_url
+        domain = _domain_from_url(self.s.current_url) if self.s.current_url else ""
+        saved = save_resumption_artifact(
+            self.s, domain,
+            help_reason=reason,
+            help_failed_tactics=failed_tactics,
+        )
+        self.s.record_step(
+            "browser_request_help",
+            reason[:80],
+            f"saved={saved} session={self.s.session_id}",
+        )
+        hint = (
+            "[HELP REQUESTED] Resumption state saved. "
+            "Now call done(success=False, final_answer='Need different tactic: ...') "
+            "with a ≤30-word summary. "
+            "The orchestrator will delegate a fresh worker that resumes on this "
+            "same browser session with your failed tactics excluded."
+        ) if saved else (
+            "[HELP REQUEST NOT SAVED] session_id or current_url is empty — "
+            "resumption artifact could not be written. Proceed with done(success=False) "
+            "and explain the blocker in final_answer."
+        )
+        return hint
 
 
 def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
@@ -1425,6 +2071,8 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserCaptchaScreenshotTool(state),
         BrowserSolveCaptchaTool(state),
         BrowserAskUserTool(state),
+        BrowserVerifyFactTool(state),
+        BrowserRequestHelpTool(state),
         BrowserCloseTool(state),
     ]
     for tool in tools:

@@ -12,6 +12,7 @@
 
 import type { Page, Frame } from 'puppeteer-core';
 import type { LLMProvider } from '../llm/provider.js';
+import { clampToRect, parseTilesStrict, type Rect } from './captcha/validation.js';
 
 export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'slider' | 'visual_puzzle' | 'unknown';
 
@@ -822,15 +823,19 @@ ${Array.from({ length: grid.rows }, (_, r) =>
   Array.from({ length: grid.cols }, (_, c) => r * grid.cols + c + 1).join(' | ')
 ).join('\n')}
 
-Which tiles contain the target described in the instruction? Return ONLY a JSON array of tile numbers. Example: [1, 4, 7]
-If no tiles match, return an empty array: []`,
+Respond with a JSON object containing ONLY this field:
+  {"tiles": [<int>, ...]}
+where each int is a tile number (1..${totalTiles}) that contains the target.
+Return {"tiles": []} if no tiles match. Do NOT include any other fields or prose.`,
             },
           ],
         },
-      ], { temperature: 0.1 });
+      ], { temperature: 0.1, responseFormat: 'json_object' });
 
-      // Parse the LLM response to extract tile indices
-      const tiles = parseTileIndices(response.content, totalTiles);
+      // Strict JSON parse only — the previous regex fallback scraped any
+      // numeric substring out of the LLM's prose ("try tiles around 45 or
+      // 300"), often clicking wrong tiles on a 9-tile grid.
+      const tiles = parseTilesStrict(response.content, totalTiles);
       if (tiles.length === 0) {
         // No matching tiles — might be wrong, try clicking verify anyway
         await clickVerifyButton(page);
@@ -861,33 +866,6 @@ If no tiles match, return an empty array: []`,
   }
 
   return { solved: false, method: 'ai_vision', attempts: totalAttempts, error: 'Max rounds exceeded' };
-}
-
-/**
- * Parse tile indices from LLM response text.
- * Handles various formats: [1,4,7], "1, 4, 7", "tiles 1, 4, and 7", etc.
- */
-function parseTileIndices(text: string, maxTile: number): number[] {
-  // Try JSON array first
-  const jsonMatch = text.match(/\[[\d\s,]*\]/);
-  if (jsonMatch) {
-    try {
-      const arr = JSON.parse(jsonMatch[0]) as number[];
-      return arr.filter((n) => typeof n === 'number' && n >= 1 && n <= maxTile);
-    } catch {
-      // Fall through to regex
-    }
-  }
-
-  // Extract all numbers from the text
-  const numbers = text.match(/\d+/g);
-  if (numbers) {
-    return numbers
-      .map(Number)
-      .filter((n) => n >= 1 && n <= maxTile);
-  }
-
-  return [];
 }
 
 /**
@@ -1051,9 +1029,48 @@ Output ONLY the think block and JSON. No other text.`;
 }
 
 /**
+ * Find the captcha widget's viewport-relative rect, expanded by ~30px so
+ * the LLM has visual context. Returns null when no widget is on the page —
+ * the caller falls back to the full viewport.
+ */
+async function findCaptchaRect(page: Page): Promise<Rect | null> {
+  return page.evaluate(() => {
+    const selectors = [
+      'iframe[src*="recaptcha"]',
+      'iframe[src*="hcaptcha"]',
+      'iframe[src*="challenges.cloudflare.com"]',
+      'iframe[src*="turnstile"]',
+      '.g-recaptcha', '.h-captcha', '.cf-turnstile',
+      '[class*="slider" i][class*="captcha" i]',
+      '[class*="slide-verify" i]', '[class*="geetest" i]',
+      '[class*="puzzle" i]', '[id*="captcha" i]', '[class*="captcha" i]',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 20) continue;
+      const margin = 30;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const x = Math.max(0, Math.round(r.left - margin));
+      const y = Math.max(0, Math.round(r.top - margin));
+      const right = Math.min(vw, Math.round(r.right + margin));
+      const bottom = Math.min(vh, Math.round(r.bottom + margin));
+      return { x, y, width: right - x, height: bottom - y };
+    }
+    return null;
+  });
+}
+
+/**
  * Solve arbitrary visual challenges using a screenshot-to-LLM-to-action loop.
- * Inspired by ReCAP-Agent: maintains conversation history, structured prompts,
- * one action per LLM call, up to maxRounds calls.
+ *
+ * Closed loop: each round we (1) crop the screenshot to the captcha rect to
+ * stop the LLM from confabulating clicks on unrelated UI, (2) clamp/reject
+ * the action coords against that same rect, (3) feed a one-line observation
+ * of what actually happened back into the next prompt. A "done" claim is
+ * never trusted unless `detectCaptcha` agrees the widget is gone.
  */
 export async function solveWithVisionGeneric(
   page: Page,
@@ -1062,28 +1079,56 @@ export async function solveWithVisionGeneric(
 ): Promise<CaptchaSolveResult> {
   let totalAttempts = 0;
 
-  // Get viewport dimensions once
   const viewport = await page.evaluate(() => ({
     width: window.innerWidth,
     height: window.innerHeight,
   }));
 
-  // Maintain conversation history across rounds (ReCAP-Agent pattern)
+  // Locate the captcha rect once. If the widget moves between rounds we
+  // re-locate; if there's no widget at all we fall back to viewport bounds.
+  const initialRect = await findCaptchaRect(page);
+  const fallbackRect: Rect = { x: 0, y: 0, width: viewport.width, height: viewport.height };
+
   const history: { role: 'system' | 'user' | 'assistant'; content: string | Array<{type: string; text?: string; image_url?: {url: string}}>}[] = [
     { role: 'system', content: getVisionSolverSystemPrompt(viewport.width, viewport.height) },
   ];
 
+  // Carries one round's outcome into the next prompt as an observation.
+  let lastObservation: string | null = null;
+  let lastDoneRejected = false;
+
   for (let round = 0; round < maxRounds; round++) {
     totalAttempts++;
 
-    // Take screenshot
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 85 }) as Buffer;
+    const captchaRect = (await findCaptchaRect(page)) ?? initialRect ?? fallbackRect;
+
+    const screenshot = await page.screenshot({
+      type: 'jpeg',
+      quality: 85,
+      clip: captchaRect,
+    }) as Buffer;
     const b64Image = screenshot.toString('base64');
 
-    // Build user message with screenshot
-    const userPrompt = round === 0
-      ? 'Solve the CAPTCHA shown in this screenshot. Observe carefully and take the next action.'
-      : 'Continue solving. Here is the current state after your last action. Take the next action.';
+    let userPrompt: string;
+    if (round === 0) {
+      userPrompt =
+        `Solve the CAPTCHA in this cropped screenshot.\n` +
+        `The image shows ONLY the captcha widget at viewport pixels ` +
+        `x=${captchaRect.x}..${captchaRect.x + captchaRect.width}, ` +
+        `y=${captchaRect.y}..${captchaRect.y + captchaRect.height}. ` +
+        `All click/drag coordinates you return MUST fall inside that range.`;
+    } else if (lastObservation) {
+      userPrompt =
+        `Observation from your last action: ${lastObservation}\n` +
+        `Here is the current state. ` +
+        (lastDoneRejected
+          ? `You claimed "done" but the captcha is still present — that was a hallucination. Try a different action. `
+          : `Take the next action. `) +
+        `Coords must be inside x=${captchaRect.x}..${captchaRect.x + captchaRect.width}, y=${captchaRect.y}..${captchaRect.y + captchaRect.height}.`;
+    } else {
+      userPrompt = `Continue solving. Take the next action. Coords inside the captcha rect only.`;
+    }
+    lastDoneRejected = false;
 
     history.push({
       role: 'user',
@@ -1098,14 +1143,14 @@ export async function solveWithVisionGeneric(
         history as any,
         { temperature: 0.1 },
       );
-
-      // Add assistant response to history for context in next round
       history.push({ role: 'assistant', content: response.content });
 
-      // Parse the action from the LLM response
-      const jsonMatch = response.content.match(/\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\}/);
+      // Extract the first JSON object from the LLM output. The strict shape
+      // checker below rejects anything that isn't a valid action.
+      const jsonMatch = response.content.match(/\{[\s\S]*?\}/);
       if (!jsonMatch) {
-        console.log(`Vision generic round ${totalAttempts}: No action JSON in response`);
+        lastObservation = 'no JSON action in response';
+        console.log(`Vision generic round ${totalAttempts}: ${lastObservation}`);
         continue;
       }
 
@@ -1113,36 +1158,40 @@ export async function solveWithVisionGeneric(
       try {
         step = JSON.parse(jsonMatch[0]);
       } catch {
-        console.log(`Vision generic round ${totalAttempts}: Failed to parse action JSON`);
+        lastObservation = 'action JSON failed to parse';
+        console.log(`Vision generic round ${totalAttempts}: ${lastObservation}`);
+        continue;
+      }
+      if (typeof step?.action !== 'string') {
+        lastObservation = 'action field missing or not a string';
         continue;
       }
 
       console.log(`Vision generic round ${totalAttempts}: action=${step.action}`);
 
-      // Check if LLM signals done
+      // "done" is never trusted on its own — re-verify with detectCaptcha.
       if (step.action === 'done') {
-        // Verify by checking if captcha is actually gone
         await new Promise((r) => setTimeout(r, 2000));
         const stillHasCaptcha = await detectCaptcha(page);
         if (!stillHasCaptcha) {
           console.log(`Vision generic: Solved after ${totalAttempts} round(s)`);
           return { solved: true, method: 'vision_generic', attempts: totalAttempts };
         }
-        console.log(`Vision generic: LLM said done but captcha still present`);
+        lastObservation = 'done claim rejected — captcha still present';
+        lastDoneRejected = true;
+        console.log(`Vision generic: ${lastObservation}`);
         continue;
       }
 
-      // Execute the single action
-      try {
-        await executeVisionStep(page, step);
-      } catch (stepErr) {
-        console.error(`Vision generic: Action failed:`, stepErr);
+      const outcome = await executeVisionStep(page, step, captchaRect);
+      if (!outcome.executed) {
+        lastObservation = `action rejected: ${outcome.rejectionReason ?? 'unknown'}`;
+        console.log(`Vision generic round ${totalAttempts}: ${lastObservation}`);
+        continue;
       }
 
-      // Brief pause after action
       await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
 
-      // Check if captcha cleared after this action
       const stillHasCaptcha = await detectCaptcha(page);
       if (!stillHasCaptcha) {
         const title = await page.title();
@@ -1154,13 +1203,22 @@ export async function solveWithVisionGeneric(
           return { solved: true, method: 'vision_generic', attempts: totalAttempts };
         }
       }
-      console.log(`Vision generic: Challenge still present after round ${totalAttempts} (type: ${stillHasCaptcha?.type || 'title-based'})`);
+
+      // Build the observation for the next round: what landed where, was
+      // it clamped, is the captcha still present.
+      const where = step.action === 'drag'
+        ? `(${outcome.finalX},${outcome.finalY})→(${outcome.finalEndX},${outcome.finalEndY})`
+        : `(${outcome.finalX},${outcome.finalY})`;
+      const clampedNote = outcome.clamped ? ' (coords were clamped to widget bounds)' : '';
+      lastObservation =
+        `${step.action} at ${where}${clampedNote}. ` +
+        `Captcha still present (type=${stillHasCaptcha?.type || 'title-based'}).`;
+      console.log(`Vision generic round ${totalAttempts}: ${lastObservation}`);
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`Vision generic round ${totalAttempts} failed:`, msg);
-      // Add error context to history so LLM knows what happened
-      history.push({ role: 'user', content: `Error executing your action: ${msg}. Try a different approach.` });
+      lastObservation = `action threw: ${msg}`;
       if (totalAttempts >= maxRounds) {
         return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: msg };
       }
@@ -1170,62 +1228,132 @@ export async function solveWithVisionGeneric(
   return { solved: false, method: 'vision_generic', attempts: totalAttempts, error: 'Max rounds exceeded' };
 }
 
+/** Result of executeVisionStep — feeds the closed-loop observation. */
+interface StepOutcome {
+  /** Action executed (after any clamping). */
+  executed: boolean;
+  /** Why the action was rejected (only when !executed). */
+  rejectionReason?: string;
+  /** Coords actually used after clamping. */
+  clamped?: boolean;
+  finalX?: number;
+  finalY?: number;
+  finalEndX?: number;
+  finalEndY?: number;
+}
+
 /**
  * Execute a single vision solver action on the page.
- * Supports: click, drag, type, type_at, key, scroll, wait.
+ *
+ * Coordinates are clamped to `bounds` (the captcha widget's viewport rect).
+ * Actions whose coords land >20% outside the rect are rejected without
+ * executing — the LLM almost certainly hallucinated them. Returning the
+ * outcome lets the caller feed cause-and-effect back into the next prompt.
  */
-async function executeVisionStep(page: Page, step: VisionSolveStep): Promise<void> {
+async function executeVisionStep(
+  page: Page,
+  step: VisionSolveStep,
+  bounds?: Rect,
+): Promise<StepOutcome> {
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   switch (step.action) {
-    case 'click':
-      if (step.x !== undefined && step.y !== undefined) {
-        await page.mouse.click(step.x, step.y);
-        await delay(200 + Math.random() * 200);
+    case 'click': {
+      if (step.x === undefined || step.y === undefined) {
+        return { executed: false, rejectionReason: 'click missing x/y' };
       }
-      break;
-
-    case 'drag':
-      if (step.startX !== undefined && step.startY !== undefined
-          && step.endX !== undefined && step.endY !== undefined) {
-        // Human-like drag with easing and jitter
-        const dragSteps = 25 + Math.floor(Math.random() * 10);
-        await page.mouse.move(step.startX, step.startY);
-        await page.mouse.down();
-        await delay(80 + Math.random() * 80);
-
-        const dx = step.endX - step.startX;
-        const dy = step.endY - step.startY;
-        for (let i = 1; i <= dragSteps; i++) {
-          const p = i / dragSteps;
-          const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-          await page.mouse.move(
-            step.startX + dx * eased + (Math.random() - 0.5) * 2,
-            step.startY + dy * eased + (Math.random() - 0.5) * 2,
-          );
-          await delay(12 + Math.random() * 12);
+      let x = step.x;
+      let y = step.y;
+      let clamped = false;
+      if (bounds) {
+        const c = clampToRect(x, y, bounds);
+        if (!c) {
+          return {
+            executed: false,
+            rejectionReason: `click coords (${x},${y}) outside captcha rect`,
+          };
         }
-        await page.mouse.move(step.endX, step.endY);
-        await delay(50 + Math.random() * 80);
-        await page.mouse.up();
-        await delay(400);
+        x = c.x; y = c.y; clamped = c.clamped;
       }
-      break;
+      await page.mouse.click(x, y);
+      await delay(200 + Math.random() * 200);
+      return { executed: true, clamped, finalX: x, finalY: y };
+    }
 
-    case 'type_at':
-      // Click at coordinates then type — for text CAPTCHAs
-      if (step.x !== undefined && step.y !== undefined && step.text) {
-        await page.mouse.click(step.x, step.y);
-        await delay(200);
-        // Clear any existing text
-        await page.keyboard.down('Control');
-        await page.keyboard.press('a');
-        await page.keyboard.up('Control');
-        await delay(50);
-        await page.keyboard.type(step.text, { delay: 40 + Math.random() * 40 });
-        await delay(200);
+    case 'drag': {
+      if (step.startX === undefined || step.startY === undefined
+          || step.endX === undefined || step.endY === undefined) {
+        return { executed: false, rejectionReason: 'drag missing coords' };
       }
-      break;
+      let { startX, startY, endX, endY } = step as Required<Pick<VisionSolveStep, 'startX' | 'startY' | 'endX' | 'endY'>>;
+      let clamped = false;
+      if (bounds) {
+        const cs = clampToRect(startX, startY, bounds);
+        const ce = clampToRect(endX, endY, bounds);
+        if (!cs || !ce) {
+          return {
+            executed: false,
+            rejectionReason: `drag endpoints outside captcha rect (start=${startX},${startY} end=${endX},${endY})`,
+          };
+        }
+        startX = cs.x; startY = cs.y;
+        endX = ce.x; endY = ce.y;
+        clamped = cs.clamped || ce.clamped;
+      }
+      const dragSteps = 25 + Math.floor(Math.random() * 10);
+      await page.mouse.move(startX, startY);
+      await page.mouse.down();
+      await delay(80 + Math.random() * 80);
+
+      const dx = endX - startX;
+      const dy = endY - startY;
+      for (let i = 1; i <= dragSteps; i++) {
+        const p = i / dragSteps;
+        const eased = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+        await page.mouse.move(
+          startX + dx * eased + (Math.random() - 0.5) * 2,
+          startY + dy * eased + (Math.random() - 0.5) * 2,
+        );
+        await delay(12 + Math.random() * 12);
+      }
+      await page.mouse.move(endX, endY);
+      await delay(50 + Math.random() * 80);
+      await page.mouse.up();
+      await delay(400);
+      return {
+        executed: true, clamped,
+        finalX: startX, finalY: startY, finalEndX: endX, finalEndY: endY,
+      };
+    }
+
+    case 'type_at': {
+      // Click at coordinates then type — for text CAPTCHAs.
+      if (step.x === undefined || step.y === undefined || !step.text) {
+        return { executed: false, rejectionReason: 'type_at missing x/y/text' };
+      }
+      let x = step.x;
+      let y = step.y;
+      if (bounds) {
+        const c = clampToRect(x, y, bounds);
+        if (!c) {
+          return {
+            executed: false,
+            rejectionReason: `type_at coords (${x},${y}) outside captcha rect`,
+          };
+        }
+        x = c.x; y = c.y;
+      }
+      await page.mouse.click(x, y);
+      await delay(200);
+      // Clear any existing text first.
+      await page.keyboard.down('Control');
+      await page.keyboard.press('a');
+      await page.keyboard.up('Control');
+      await delay(50);
+      await page.keyboard.type(step.text, { delay: 40 + Math.random() * 40 });
+      await delay(200);
+      return { executed: true, finalX: x, finalY: y };
+    }
 
     case 'type':
       if (step.text) {
@@ -1252,8 +1380,9 @@ async function executeVisionStep(page: Page, step: VisionSolveStep): Promise<voi
           await page.keyboard.type(step.text, { delay: 40 + Math.random() * 40 });
         }
         await delay(200);
+        return { executed: true };
       }
-      break;
+      return { executed: false, rejectionReason: 'type missing text' };
 
     case 'key':
       if (step.keys && step.keys.length > 0) {
@@ -1261,25 +1390,31 @@ async function executeVisionStep(page: Page, step: VisionSolveStep): Promise<voi
           await page.keyboard.press(key as any);
           await delay(100);
         }
+        return { executed: true };
       }
-      break;
+      return { executed: false, rejectionReason: 'key missing keys' };
 
     case 'scroll': {
       const deltaY = step.direction === 'up' ? -300 : 300;
       await page.evaluate((dy: number) => window.scrollBy(0, dy), deltaY);
       await delay(300);
-      break;
+      return { executed: true };
     }
 
     case 'wait':
       await delay((step.duration || 2) * 1000);
-      break;
+      return { executed: true };
   }
+  return { executed: false, rejectionReason: 'unknown action' };
 }
 
 /**
  * Full captcha solver orchestrator.
  * Tries methods in order: token → AI vision → vision generic → 2captcha grid.
+ *
+ * `options` are passed through to the registry-backed 'auto' path so the
+ * human-handoff strategy can reach the session's HumanInputManager and
+ * build a view URL.
  */
 export async function solveCaptchaFull(
   page: Page,
@@ -1287,6 +1422,12 @@ export async function solveCaptchaFull(
   config: CaptchaSolverConfig,
   llmProvider?: LLMProvider | null,
   method: string = 'auto',
+  options?: {
+    sessionId?: string;
+    humanInput?: import('../agent/human-input.js').HumanInputManager;
+    humanHandoffBudget?: number;
+    publicBaseUrl?: string;
+  },
 ): Promise<CaptchaSolveResult> {
   console.log(`Solving captcha (type: ${captcha.type}, method: ${method})`);
 
@@ -1327,7 +1468,12 @@ export async function solveCaptchaFull(
   // callers can learn which approach worked per-domain.
   if (method === 'auto') {
     const { solveCaptchaViaRegistry } = await import('./captcha/orchestrator.js');
-    const rich = await solveCaptchaViaRegistry(page, captcha, config, llmProvider);
+    const rich = await solveCaptchaViaRegistry(page, captcha, config, llmProvider, {
+      sessionId: options?.sessionId,
+      humanInput: options?.humanInput,
+      humanHandoffBudget: options?.humanHandoffBudget,
+      publicBaseUrl: options?.publicBaseUrl,
+    });
     if (rich.solved || rich.method !== 'all_strategies_failed') {
       return rich;
     }

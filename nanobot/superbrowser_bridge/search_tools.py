@@ -382,6 +382,39 @@ class DelegateSearchTaskTool(Tool):
                 f"If you're confident search text is enough, re-call with `force=true`."
             )
 
+        # --- Hard block: force=True over a BROWSER classification for clearly
+        # transactional queries. Search will return hedging prose; that's worse
+        # than a failed browser attempt because it pretends success. Only allow
+        # search-with-force when the classifier was search/hybrid in the first
+        # place (force was meant to override a hybrid→browser steer, not a
+        # strong browser signal).
+        if (
+            force
+            and classification["approach"] == "browser"
+            and classification["confidence"] >= 0.8
+            and not kw.get("_fallback_from_browser")  # captcha-rescue bypass
+        ):
+            lower_q = (question or "").lower()
+            transactional_markers = (
+                "price", "pricing", "cost", "rate", "fare", "booking",
+                "availability", "in stock", "tonight", "tomorrow",
+                "next week", "check-in", "checkin", "check in",
+                "-01", "-02", "-03", "-04", "-05", "-06", "-07", "-08", "-09",
+                "-10", "-11", "-12",  # ISO date fragments
+                "january", "february", "march", "april", "may", "june",
+                "july", "august", "september", "october", "november", "december",
+            )
+            if any(m in lower_q for m in transactional_markers):
+                print(f"\n>> delegate_search_task HARD-BLOCKED force=True on transactional query: {classification}")
+                return (
+                    "[FORCE REJECTED] Task contains transactional markers "
+                    "(price/date/availability) — search snippets will not have "
+                    "live values here. `force=True` is NOT a valid override for "
+                    "this class. Call `delegate_browser_task` with a corrective "
+                    "retry instead, including an explicit hypothesis of what to "
+                    "change from the prior failed attempt."
+                )
+
         from nanobot import Nanobot
 
         task_id = uuid.uuid4().hex[:8]

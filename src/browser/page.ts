@@ -17,6 +17,76 @@ import { findCursorInteractiveElements, formatCursorElements } from './cursor-de
 import { ConsoleCollector, type CollectedLog } from './console-collector.js';
 import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
+import type { FailureReason } from '../agent/types.js';
+
+/**
+ * Structured result of a tool invocation at the browser layer. Designed so
+ * the LLM can pick a different tactic on failure without re-screenshotting
+ * to re-diagnose. `tried` records which fallback tiers ran; `alternatives`
+ * names concrete next moves.
+ */
+export interface ToolResult {
+  success: boolean;
+  reason?: FailureReason;
+  tried: string[];
+  alternatives?: string[];
+  error?: string;
+}
+
+/**
+ * Probe an element's interaction-readiness before firing an action.
+ * Runs in-page so the answer is fresh (post-layout, post-reconcile).
+ */
+async function probeElement(
+  page: Page,
+  selector: string,
+): Promise<{
+  found: boolean;
+  visible: boolean;
+  inViewport: boolean;
+  disabled: boolean;
+  covered: boolean;
+  rect: { x: number; y: number; w: number; h: number } | null;
+}> {
+  try {
+    return await page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) {
+        return { found: false, visible: false, inViewport: false, disabled: false, covered: false, rect: null };
+      }
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      const visible = style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && parseFloat(style.opacity || '1') > 0.01
+        && rect.width > 0 && rect.height > 0;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const inViewport = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+      const disabled = (el as HTMLButtonElement).disabled === true
+        || el.getAttribute('aria-disabled') === 'true';
+      let covered = false;
+      if (visible && inViewport) {
+        const cx = Math.round(rect.left + rect.width / 2);
+        const cy = Math.round(rect.top + rect.height / 2);
+        let hit: Element | null = null;
+        try { hit = document.elementFromPoint(cx, cy); } catch { hit = null; }
+        if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) {
+          covered = true;
+        }
+      }
+      return {
+        found: true,
+        visible,
+        inViewport,
+        disabled,
+        covered,
+        rect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+      };
+    }, selector);
+  } catch {
+    return { found: false, visible: false, inViewport: false, disabled: false, covered: false, rect: null };
+  }
+}
 
 export class PageWrapper {
   private cdpClient: CDPSession | null = null;
@@ -43,14 +113,14 @@ export class PageWrapper {
 
   // --- Navigation ---
 
-  async navigate(url: string, timeout: number = 30000): Promise<void> {
+  async navigate(url: string, timeout: number = 30000): Promise<{ statusCode: number | null; finalUrl: string }> {
     // SSRF protection
     const urlCheck = validateUrl(url);
     if (!urlCheck.valid) {
       throw new Error(`Blocked: ${urlCheck.error}`);
     }
 
-    await this.page.goto(url, {
+    const response = await this.page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout,
     });
@@ -59,35 +129,107 @@ export class PageWrapper {
 
     // Auto-wait for Cloudflare challenge if detected
     await this.waitForCloudflare();
+
+    return {
+      statusCode: response ? response.status() : null,
+      finalUrl: this.page.url(),
+    };
   }
 
   /**
-   * Wait for Cloudflare challenge to resolve (auto-detected by page title).
-   * Cloudflare shows "Just a moment..." while verifying the browser.
-   * Most challenges auto-resolve within 5-15 seconds with good stealth.
+   * Wait for a bot-challenge page to resolve.
+   *
+   * Detects Cloudflare / Akamai / Imperva / DataDome / PerimeterX interstitials
+   * and waits for BOTH of:
+   *   (a) the challenge title to clear, AND
+   *   (b) a corresponding challenge cookie to be set (cf_clearance, _abck,
+   *       datadome, incap_ses_*, __cf_bm, reese84).
+   *
+   * Why cookies too: on Akamai (_abck) the page title often flips to the
+   * target content a fraction of a second before the sensor posts and the
+   * clearance cookie lands. Returning on title alone races — the very next
+   * navigation then 403s because the cookie hasn't been recorded. Waiting
+   * for the cookie closes that race.
    */
-  async waitForCloudflare(maxWait: number = 15000): Promise<boolean> {
+  async waitForCloudflare(maxWait: number = 25000): Promise<boolean> {
     const title = await this.page.title();
-    const isCfChallenge = title.toLowerCase().includes('just a moment')
-      || title.toLowerCase().includes('checking your browser')
-      || title.toLowerCase().includes('attention required');
+    const lower = title.toLowerCase();
+    const challengeTitleFragments = [
+      'just a moment',
+      'checking your browser',
+      'attention required',
+      'one more step',           // Cloudflare variant
+      'access denied',           // Akamai / some CF
+      'pardon our interruption', // Imperva Incapsula
+      'please wait',             // DataDome / generic
+    ];
+    const isChallenge = challengeTitleFragments.some((f) => lower.includes(f));
 
-    if (!isCfChallenge) return true; // No challenge detected
+    if (!isChallenge) return true;
 
-    console.log('[stealth] Cloudflare challenge detected, waiting for resolution...');
+    console.log('[stealth] Bot-challenge page detected — waiting for resolution + clearance cookie');
     const start = Date.now();
+
+    // Patterns for the cookies posted by the major edge-protection products.
+    // Matching any one of these after the title clears means the challenge
+    // actually minted a clearance token (not just a title swap).
+    const clearanceCookiePatterns = [
+      /^cf_clearance$/i,     // Cloudflare Managed Challenge
+      /^__cf_bm$/i,          // Cloudflare Bot Management
+      /^_abck$/i,            // Akamai Bot Manager (sensor)
+      /^ak_bmsc$/i,          // Akamai Bot Manager (session)
+      /^datadome$/i,         // DataDome
+      /^incap_ses_/i,        // Imperva Incapsula session
+      /^visid_incap_/i,      // Imperva Incapsula visitor
+      /^reese84$/i,          // Kasada
+      /^px-?.+$/i,           // PerimeterX (px3, px-captcha, etc.)
+    ];
+
+    const hasClearanceCookie = async (): Promise<boolean> => {
+      try {
+        const cookies = await this.page.cookies();
+        return cookies.some((c) =>
+          clearanceCookiePatterns.some((re) => re.test(c.name)),
+        );
+      } catch {
+        return false;
+      }
+    };
+
     while (Date.now() - start < maxWait) {
-      await new Promise(r => setTimeout(r, 1500));
-      const currentTitle = await this.page.title();
-      if (!currentTitle.toLowerCase().includes('just a moment')
-        && !currentTitle.toLowerCase().includes('checking your browser')
-        && !currentTitle.toLowerCase().includes('attention required')) {
-        console.log(`[stealth] Cloudflare challenge resolved in ${Date.now() - start}ms`);
-        await this.waitForIdle(1500).catch(() => {});
-        return true;
+      await new Promise((r) => setTimeout(r, 1500));
+      const currentTitle = (await this.page.title()).toLowerCase();
+      const titleCleared = !challengeTitleFragments.some((f) =>
+        currentTitle.includes(f),
+      );
+
+      if (titleCleared) {
+        // Title cleared. Give the sensor a brief window to post and the
+        // clearance cookie to land before we trust the resolution.
+        if (await hasClearanceCookie()) {
+          console.log(
+            `[stealth] Challenge resolved + clearance cookie present after ${Date.now() - start}ms`,
+          );
+          await this.waitForIdle(1500).catch(() => {});
+          return true;
+        }
+        // Title cleared but no cookie yet — poll a little longer; some
+        // stacks set the cookie up to ~1s after the content paints.
       }
     }
-    console.log('[stealth] Cloudflare challenge did not resolve within timeout');
+
+    // Timed out. If the title cleared but no cookie ever landed, we're
+    // probably on a stealth-bypassed SPA that doesn't use a clearance cookie
+    // — treat as success to avoid false-negative blocking of normal sites.
+    const finalTitle = (await this.page.title()).toLowerCase();
+    const stillChallenged = challengeTitleFragments.some((f) =>
+      finalTitle.includes(f),
+    );
+    if (!stillChallenged) {
+      console.log('[stealth] Title cleared but no clearance cookie seen — treating as resolved');
+      return true;
+    }
+    console.log('[stealth] Bot-challenge did not resolve within timeout');
     return false;
   }
 
@@ -131,67 +273,161 @@ export class PageWrapper {
    * 2. Puppeteer page.click() with CSS selector (CDP-backed, isTrusted=true)
    * 3. JS el.click() via XPath (isTrusted=false — DETECTABLE, opt-in only)
    *
-   * Pass `allowUntrustedClick: true` only when bot-detection risk is
-   * acceptable (e.g., internal dashboards). The captcha subsystem MUST NOT
-   * allow this — it would instantly fail challenges that sniff isTrusted.
+   * Returns a structured ToolResult so callers (and ultimately the LLM) can
+   * choose a different tactic on failure without re-screenshotting just to
+   * re-diagnose. A probe runs before the first click; on covered/off_viewport,
+   * we scroll into view and retry the CDP click once.
    */
   async clickElement(element: DOMElementNode, options?: {
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
     /** Allow the JS fallback (isTrusted=false). Default false. */
     allowUntrustedClick?: boolean;
-  }): Promise<void> {
+  }): Promise<ToolResult> {
     const selector = element.enhancedCssSelectorForElement();
+    const tried: string[] = [];
+
+    const probe = await probeElement(this.page, selector);
+    if (!probe.found) {
+      return {
+        success: false,
+        reason: 'stale_selector',
+        tried,
+        error: `Selector did not match any element: ${selector}`,
+        alternatives: [
+          'Re-read the current interactive elements list — the index may be stale',
+          'Try a different selector (aria-label, text content)',
+        ],
+      };
+    }
+    if (probe.disabled) {
+      return {
+        success: false,
+        reason: 'disabled',
+        tried,
+        error: 'Element is disabled',
+        alternatives: [
+          'Fill required fields before clicking',
+          'Wait for the element to become enabled (browser_wait_for text)',
+        ],
+      };
+    }
+    if (!probe.visible) {
+      return {
+        success: false,
+        reason: 'not_visible',
+        tried,
+        error: 'Element is hidden (display:none, visibility:hidden, or zero-size)',
+        alternatives: [
+          'Trigger the flow that reveals this element (open a menu, expand a section)',
+          'Use a different selector for the visible twin',
+        ],
+      };
+    }
+
+    // Auto-remediate: scroll into view if off-viewport, before any click attempt.
+    if (!probe.inViewport) {
+      try {
+        await this.page.evaluate((sel: string) => {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
+        }, selector);
+        await new Promise((r) => setTimeout(r, 150));
+      } catch { /* scroll is best-effort */ }
+    }
 
     // Tier 1: CDP mouse dispatch at computed coordinates (isTrusted=true)
+    let coverReason: FailureReason | null = null;
     try {
       const coords = await getElementCenterBySelector(this.page, selector);
       if (coords) {
-        const client = await this.getCDPSession();
-        await dispatchClick(client, coords.x, coords.y, {
-          button: options?.button,
-          clickCount: options?.clickCount,
-        });
-        await this.waitForIdle(1500).catch(() => {});
-        return;
+        // Re-check covered after potential scroll.
+        const postScroll = await probeElement(this.page, selector);
+        if (postScroll.covered) {
+          coverReason = 'element_covered';
+          // Fall through to tier 2; sometimes the overlay is intentional and the
+          // real target dispatches on the wrapper.
+        } else {
+          tried.push('cdp');
+          const client = await this.getCDPSession();
+          await dispatchClick(client, coords.x, coords.y, {
+            button: options?.button,
+            clickCount: options?.clickCount,
+          });
+          await this.waitForIdle(1500).catch(() => {});
+          return { success: true, tried };
+        }
       }
     } catch {
       // Fallthrough
     }
 
     // Tier 2: Puppeteer click (isTrusted=true — Puppeteer dispatches via CDP)
+    tried.push('puppeteer');
     try {
       await this.page.waitForSelector(selector, { timeout: 5000 });
       await this.page.click(selector);
       await this.waitForIdle(1500).catch(() => {});
-      return;
-    } catch {
-      // Fallthrough
+      return { success: true, tried };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Tier 3 (JS) gated by allowUntrustedClick — if not allowed, return
+      // a structured failure instead of throwing.
+      if (!options?.allowUntrustedClick) {
+        return {
+          success: false,
+          reason: coverReason ?? 'unknown',
+          tried,
+          error: msg,
+          alternatives: coverReason === 'element_covered'
+            ? [
+              'Dismiss the overlay first (cookie banner, modal close button)',
+              'Try clicking the overlay itself if it IS the target',
+              'Use clickAt(x,y) with coordinates below the overlay',
+            ]
+            : [
+              'Re-read the elements list — the DOM may have shifted',
+              'Wait for network/animation to settle (browser_wait_for text)',
+              'Try a nearby selector (parent button, sibling link)',
+            ],
+        };
+      }
     }
 
-    // Tier 3: JS fallback via XPath (isTrusted=false). Opt-in only — otherwise
-    // raise so the caller can escalate (e.g., scroll into view, retry Tier 1).
-    if (!options?.allowUntrustedClick) {
-      throw new Error(
-        `clickElement: CDP + Puppeteer click failed for "${selector}"; ` +
-        `refusing JS fallback (isTrusted=false is bot-detectable). ` +
-        `Pass { allowUntrustedClick: true } to opt in, or use clickAt(x,y).`,
-      );
+    // Tier 3: JS fallback via XPath (isTrusted=false). Opt-in only.
+    if (element.xpath && options?.allowUntrustedClick) {
+      tried.push('js');
+      try {
+        await this.page.evaluate((xpath: string) => {
+          const result = document.evaluate(
+            xpath, document, null,
+            XPathResult.FIRST_ORDERED_NODE_TYPE, null,
+          );
+          const el = result.singleNodeValue as HTMLElement;
+          if (el) {
+            el.scrollIntoView({ block: 'center' });
+            el.click();
+          }
+        }, element.xpath);
+        await this.waitForIdle(1500).catch(() => {});
+        return { success: true, tried };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          success: false,
+          reason: coverReason ?? 'unknown',
+          tried,
+          error: msg,
+        };
+      }
     }
-    if (element.xpath) {
-      await this.page.evaluate((xpath: string) => {
-        const result = document.evaluate(
-          xpath, document, null,
-          XPathResult.FIRST_ORDERED_NODE_TYPE, null,
-        );
-        const el = result.singleNodeValue as HTMLElement;
-        if (el) {
-          el.scrollIntoView({ block: 'center' });
-          el.click();
-        }
-      }, element.xpath);
-    }
-    await this.waitForIdle(1500).catch(() => {});
+
+    return {
+      success: false,
+      reason: coverReason ?? 'unknown',
+      tried,
+      error: `All click tiers exhausted for ${selector}`,
+    };
   }
 
   /** Click at specific page coordinates (from BrowserOS click_at). */
@@ -262,55 +498,108 @@ export class PageWrapper {
   /**
    * Type text into an element using CDP keyboard dispatch.
    * Smart field clearing: click → Ctrl+A → Backspace (from BrowserOS fill pattern).
+   *
+   * Returns a structured ToolResult. Pre-probes the element; on off-viewport,
+   * scrolls into view before attempting CDP typing.
    */
-  async typeText(element: DOMElementNode, text: string, clear: boolean = true): Promise<void> {
+  async typeText(element: DOMElementNode, text: string, clear: boolean = true): Promise<ToolResult> {
     const selector = element.enhancedCssSelectorForElement();
+    const tried: string[] = [];
+
+    const probe = await probeElement(this.page, selector);
+    if (!probe.found) {
+      return {
+        success: false, reason: 'stale_selector', tried,
+        error: `Selector did not match any element: ${selector}`,
+        alternatives: ['Re-read interactive elements — index may be stale'],
+      };
+    }
+    if (probe.disabled) {
+      return {
+        success: false, reason: 'disabled', tried,
+        error: 'Input is disabled',
+        alternatives: ['Fill prerequisite fields', 'Wait for form unlock'],
+      };
+    }
+    if (!probe.visible) {
+      return {
+        success: false, reason: 'not_visible', tried,
+        error: 'Input is hidden',
+        alternatives: ['Expand the section containing this field first'],
+      };
+    }
+
+    if (!probe.inViewport) {
+      try {
+        await this.page.evaluate((sel: string) => {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
+        }, selector);
+        await new Promise((r) => setTimeout(r, 150));
+      } catch { /* best-effort */ }
+    }
 
     try {
-      // Focus the element by clicking it
       const coords = await getElementCenterBySelector(this.page, selector);
       const client = await this.getCDPSession();
 
       if (coords) {
+        tried.push('cdp');
         await dispatchClick(client, coords.x, coords.y);
         await new Promise((r) => setTimeout(r, 100));
 
-        // Clear existing content (BrowserOS clearField pattern)
         if (clear) {
           await clearField(client, coords.x, coords.y);
           await new Promise((r) => setTimeout(r, 50));
         }
 
-        // Type via CDP keyboard dispatch
         await cdpTypeText(client, text, 30);
-      } else {
-        // Fallback: puppeteer type
-        await this.page.waitForSelector(selector, { timeout: 5000 });
-        if (clear) {
-          await this.page.click(selector, { clickCount: 3 });
-          await this.page.keyboard.press('Backspace');
-        }
-        await this.page.type(selector, text, { delay: 30 });
+        return { success: true, tried };
       }
-    } catch {
-      // Last resort: JS value assignment
+
+      tried.push('puppeteer');
+      await this.page.waitForSelector(selector, { timeout: 5000 });
+      if (clear) {
+        await this.page.click(selector, { clickCount: 3 });
+        await this.page.keyboard.press('Backspace');
+      }
+      await this.page.type(selector, text, { delay: 30 });
+      return { success: true, tried };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // JS fallback only when xpath is known; this path can be bot-detectable
+      // (events are synthesized with isTrusted=false) but is the last resort.
       if (element.xpath) {
-        await this.page.evaluate((xpath: string, inputText: string) => {
-          const result = document.evaluate(
-            xpath, document, null,
-            XPathResult.FIRST_ORDERED_NODE_TYPE, null,
-          );
-          const el = result.singleNodeValue as HTMLInputElement;
-          if (el) {
-            el.scrollIntoView({ block: 'center' });
-            el.focus();
-            el.value = '';
-            el.value = inputText;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        }, element.xpath, text);
+        tried.push('js');
+        try {
+          await this.page.evaluate((xpath: string, inputText: string) => {
+            const result = document.evaluate(
+              xpath, document, null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE, null,
+            );
+            const el = result.singleNodeValue as HTMLInputElement;
+            if (el) {
+              el.scrollIntoView({ block: 'center' });
+              el.focus();
+              el.value = '';
+              el.value = inputText;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, element.xpath, text);
+          return { success: true, tried };
+        } catch (e) {
+          const m2 = e instanceof Error ? e.message : String(e);
+          return {
+            success: false, reason: 'unknown', tried,
+            error: `${msg}; JS fallback failed: ${m2}`,
+          };
+        }
       }
+      return {
+        success: false, reason: 'unknown', tried, error: msg,
+        alternatives: ['Try a different selector', 'Verify field accepts keyboard input'],
+      };
     }
   }
 

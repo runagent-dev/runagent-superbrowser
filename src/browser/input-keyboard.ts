@@ -35,13 +35,27 @@ const MODIFIER_KEYS = new Set(['Control', 'Alt', 'Shift', 'Meta', 'Cmd', 'Comman
 
 /**
  * Type text character by character via CDP key events.
- * Pattern from BrowserOS keyboard.ts.
+ *
+ * Defaults to humanized typing (variable per-keystroke delay 30-120ms,
+ * occasional typo + backspace, longer pauses after punctuation, rare
+ * thinking-delay). Detectors that score keystroke-interval variance
+ * (Keystroke Dynamics) flag uniform `delay=30` as automated.
+ *
+ * Set `{ humanize: false }` to opt out for deterministic internal paths
+ * (e.g., pasting known-good text into a form field).
  */
 export async function typeText(
   client: CDPSession,
   text: string,
   delay: number = 30,
+  options?: { humanize?: boolean },
 ): Promise<void> {
+  // Humanize by default; opt-out preserves the old fixed-cadence path.
+  if (options?.humanize !== false) {
+    const { humanType } = await import('./humanize.js');
+    await humanType(client, text);
+    return;
+  }
   for (const char of text) {
     if (char === '\n' || char === '\r') {
       // Send Enter key

@@ -102,6 +102,13 @@ export class LLMProvider {
         params.temperature = temperature;
       }
 
+      // JSON-mode output: supported by OpenAI (gpt-4+), Anthropic via
+      // OpenAI-compatible endpoint, and most OSS endpoints. Providers that
+      // don't recognize the field ignore it silently, so passing it is safe.
+      if (options?.responseFormat === 'json_object') {
+        params.response_format = { type: 'json_object' };
+      }
+
       const response = await this.client.chat.completions.create(
         params as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
       );

@@ -2,10 +2,31 @@
  * Core agent types and interfaces.
  */
 
+/**
+ * Why a tool failed. Enables the LLM to pick a different tactic
+ * without re-screenshotting to re-diagnose.
+ */
+export type FailureReason =
+  | 'element_not_found'   // selectorMap[index] returned null
+  | 'detached'            // element removed from DOM between read and act
+  | 'not_visible'         // display:none / visibility:hidden / zero-size
+  | 'off_viewport'        // scrolled out; scroll-into-view retry also failed
+  | 'element_covered'     // elementFromPoint returns a different node
+  | 'disabled'            // has disabled attr / aria-disabled
+  | 'stale_selector'      // selector no longer matches
+  | 'nav_pending'         // navigation in flight, action would race
+  | 'unknown';
+
 export interface ActionResult {
   success: boolean;
   extractedContent?: string;
   error?: string;
+  /** Machine-readable failure category (only on !success). */
+  reason?: FailureReason;
+  /** Which fallback tiers were attempted (e.g. ['cdp', 'puppeteer']). */
+  tried?: string[];
+  /** Concrete alternative tactics the LLM should try next. */
+  alternatives?: string[];
   isDone?: boolean;
   includeInMemory?: boolean;
 }

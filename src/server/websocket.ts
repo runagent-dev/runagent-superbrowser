@@ -197,7 +197,16 @@ async function handleCommand(
         const state = await page.getState({ useVision: false });
         const element = state.selectorMap.get(data.index as number);
         if (!element) { sendEvent(ws, 'error', { message: `Element [${data.index}] not found` }); return; }
-        await page.clickElement(element);
+        const r = await page.clickElement(element);
+        if (!r.success) {
+          sendEvent(ws, 'error', {
+            message: r.error ?? 'click failed',
+            reason: r.reason,
+            tried: r.tried,
+            alternatives: r.alternatives,
+          });
+          return;
+        }
       } else {
         sendEvent(ws, 'error', { message: 'index or x,y required' });
         return;
@@ -213,7 +222,16 @@ async function handleCommand(
       const state = await page.getState({ useVision: false });
       const element = state.selectorMap.get(index);
       if (!element) { sendEvent(ws, 'error', { message: `Element [${index}] not found` }); return; }
-      await page.typeText(element, text, data.clear !== false);
+      const r = await page.typeText(element, text, data.clear !== false);
+      if (!r.success) {
+        sendEvent(ws, 'error', {
+          message: r.error ?? 'type failed',
+          reason: r.reason,
+          tried: r.tried,
+          alternatives: r.alternatives,
+        });
+        return;
+      }
       await sendStateEvent(ws, page);
       break;
     }

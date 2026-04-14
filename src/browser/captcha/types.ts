@@ -8,6 +8,7 @@
 
 import type { Page } from 'puppeteer-core';
 import type { LLMProvider } from '../../llm/provider.js';
+import type { HumanInputManager } from '../../agent/human-input.js';
 import type {
   CaptchaInfo,
   CaptchaSolveResult,
@@ -26,6 +27,32 @@ export interface StrategyContext {
   startTime: number;
   /** Max solver wallclock; default 60s. */
   deadlineMs: number;
+  /**
+   * Opaque session identifier. Used by human-handoff to build the view URL
+   * shown to the user and keyed into per-session handoff budget tracking.
+   * Only set when the orchestrator is invoked per-session (HTTP path).
+   */
+  sessionId?: string;
+  /**
+   * Session's per-request human-in-the-loop manager. Present only when the
+   * caller enabled human handoff for this session (via `enableHumanHandoff`
+   * on /session/create). Strategies requiring this MUST check for presence
+   * and gracefully no-op when absent.
+   */
+  humanInput?: HumanInputManager;
+  /**
+   * Number of handoffs still allowed on this session. The human-handoff
+   * strategy decrements this after use so an agent can't mechanical-turk
+   * the user. When 0, the strategy declines to run.
+   */
+  humanHandoffBudget?: number;
+  /**
+   * Public base URL (e.g. "https://browser.example.com") the view UI is
+   * reachable at. If unset, defaults to the server's own origin — fine for
+   * local dev, insufficient when the server is behind a proxy. Populated
+   * from SUPERBROWSER_PUBLIC_HOST at the HTTP layer.
+   */
+  publicBaseUrl?: string;
 }
 
 export interface RichSolveResult extends CaptchaSolveResult {

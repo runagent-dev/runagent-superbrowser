@@ -58,12 +58,22 @@ export class BrowserExecutor {
     private page: PageWrapper,
     private llm: LLMProvider,
     private options: AgentOptions = DEFAULT_OPTIONS,
+    captchaCtx: { sessionId?: string; publicBaseUrl?: string; humanHandoffBudget?: number } = {},
   ) {
     this.humanInput = new HumanInputManager();
     this.actionRegistry = buildDefaultActionRegistry(this.humanInput);
     this.eventManager = new EventManager();
     const messageManager = new MessageManager();
-    this.navigator = new NavigatorAgent(llm, this.actionRegistry, messageManager, options);
+    // Hand the navigator the same humanInput manager + session metadata so
+    // its captcha circuit breaker can route to human handoff with a working
+    // view URL when automated strategies fall through.
+    this.navigator = new NavigatorAgent(llm, this.actionRegistry, messageManager, options, {
+      humanInput: this.humanInput,
+      sessionId: captchaCtx.sessionId,
+      publicBaseUrl: captchaCtx.publicBaseUrl ?? process.env.PUBLIC_BASE_URL,
+      humanHandoffBudget: captchaCtx.humanHandoffBudget
+        ?? Number(process.env.SUPERBROWSER_MAX_HUMAN_HANDOFFS ?? '1'),
+    });
     this.planner = new PlannerAgent(llm);
   }
 

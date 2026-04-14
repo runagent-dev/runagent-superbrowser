@@ -7,14 +7,29 @@ manages site-specific learnings, and never touches browser tools directly.
 
 from __future__ import annotations
 
+import hashlib
 import json as _json
 import os
+import time as _time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+
+# Outer-loop circuit breaker.
+#
+# Keyed by (domain, sha1(instructions)[:12]) so the same task on the same
+# domain is what gets counted — an orchestrator legitimately delegating two
+# different browser tasks against the same site is fine.
+#
+# Each value is (attempt_count, first_seen_ts). Entries older than one hour
+# are treated as stale and reset to 1 on next touch; the orchestrator may
+# have recovered and the user may be retrying something intentional.
+_DELEGATION_ATTEMPTS: dict[str, tuple[int, float]] = {}
+_DELEGATION_MAX_ATTEMPTS = 2
+_DELEGATION_WINDOW_SEC = 60 * 60
 
 from superbrowser_bridge.routing import (
     LEARNINGS_DIR,
@@ -129,6 +144,16 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
 
     last10 = kept[-10:]
     last10_success = sum(1 for a in last10 if a.get("solved"))
+    # Human-handoff flag: if any captcha ever succeeded via the
+    # human_handoff strategy on this domain, record it so future tasks can
+    # auto-enable the handoff path. Existing value is sticky once true
+    # (cheap, and a false negative would silently re-break the flow).
+    any_human_success = any(
+        a.get("solved") and (a.get("method") or "").startswith("human_handoff")
+        for a in kept
+    )
+    needs_human = bool(existing.get("needs_human_handoff")) or any_human_success
+
     summary = {
         "domain": domain,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -137,6 +162,7 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
         "winning_median_ms": None if best_duration == float("inf") else int(best_duration),
         "success_rate_last_10": round(last10_success / len(last10), 3) if last10 else None,
         "cold": cold,
+        "needs_human_handoff": needs_human,
         "per_method": {
             m: {
                 "attempts": b["attempts"],
@@ -157,6 +183,29 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
     return summary
 
 
+def _domain_needs_human_handoff(domain: str) -> bool:
+    """Return True if a prior task on this domain succeeded via human handoff.
+
+    Cheap read on the captcha-learnings JSON. Missing file / malformed
+    JSON / missing field all return False so this is safe to call on
+    first-touch domains.
+    """
+    if not domain:
+        return False
+    try:
+        path = _captcha_learnings_path(domain)
+    except Exception:
+        return False
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except (ValueError, OSError):
+        return False
+    return bool(data.get("needs_human_handoff"))
+
+
 from nanobot.agent.tools.schema import BooleanSchema
 
 
@@ -173,6 +222,15 @@ from nanobot.agent.tools.schema import BooleanSchema
                 "suggests 'search' but you KNOW the task requires real browser interaction."
             ),
             default=False,
+        ),
+        enable_human_handoff=BooleanSchema(
+            description=(
+                "When true (default), if every captcha auto-solve strategy fails, "
+                "pause the agent and surface a view URL so the user can solve the "
+                "captcha themselves. Set to false only for fully-unattended runs "
+                "where a human will not be available to respond."
+            ),
+            default=True,
         ),
         required=["instructions"],
     )
@@ -197,7 +255,63 @@ class DelegateBrowserTaskTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, instructions: str, url: str | None = None, force: bool = False, **kw: Any) -> str:
+    async def execute(
+        self,
+        instructions: str,
+        url: str | None = None,
+        force: bool = False,
+        # Default True so a human can solve captchas the auto-solver fails on.
+        # Pass False only for fully unattended runs.
+        enable_human_handoff: bool = True,
+        **kw: Any,
+    ) -> str:
+        # --- Outer-loop circuit breaker --------------------------------
+        # Before doing anything expensive, check whether this same task
+        # has already been delegated twice and failed both times. A third
+        # attempt would replay the resumption-artifact → inner-loop →
+        # failure cascade that produced the regression. Key by (domain,
+        # task-hash) so unrelated tasks aren't collateral-damaged.
+        _attempt_domain = _domain_from_url(url) if url else ""
+        _dedup_key = (
+            f"{_attempt_domain or 'no-domain'}::"
+            f"{hashlib.sha1(instructions.encode('utf-8')).hexdigest()[:12]}"
+        )
+        _prev = _DELEGATION_ATTEMPTS.get(_dedup_key)
+        _now = _time.time()
+        if _prev is not None and (_now - _prev[1]) > _DELEGATION_WINDOW_SEC:
+            _prev = None  # window expired, treat as fresh
+        _attempts_so_far = _prev[0] if _prev else 0
+        if _attempts_so_far >= _DELEGATION_MAX_ATTEMPTS:
+            # Clear the resumption artifact so whatever task follows this
+            # one starts from a clean slate — the artifact may well be
+            # what's poisoning the loop.
+            try:
+                from superbrowser_bridge.session_tools import clear_resumption_artifact
+                clear_resumption_artifact()
+            except Exception:
+                pass
+            _DELEGATION_ATTEMPTS.pop(_dedup_key, None)
+            print(
+                f"\n>> [DELEGATION_BUDGET_EXHAUSTED domain={_attempt_domain}] "
+                f"refusing third delegation of the same task"
+            )
+            return (
+                f"[DELEGATION_BUDGET_EXHAUSTED domain={_attempt_domain}]\n"
+                f"This task has been delegated to the browser worker "
+                f"{_DELEGATION_MAX_ATTEMPTS} times and failed each time. "
+                f"Further delegations will replay the same failure cascade.\n\n"
+                f"Do NOT call delegate_browser_task again for this task. "
+                f"Either:\n"
+                f"  1. Report the failure to the user with an honest diagnosis "
+                f"(do not fabricate data to fill the gap).\n"
+                f"  2. Call delegate_search_task if the task is viable as "
+                f"public-data search."
+            )
+        _DELEGATION_ATTEMPTS[_dedup_key] = (
+            _attempts_so_far + 1,
+            _prev[1] if _prev else _now,
+        )
+
         # --- Classifier gate (Layer 2) ---------------------------------
         # Run the deterministic classifier BEFORE spawning a worker. If it
         # disagrees with confidence >= 0.7 and the orchestrator hasn't
@@ -218,7 +332,13 @@ class DelegateBrowserTaskTool(Tool):
             )
 
         from nanobot import Nanobot
-        from superbrowser_bridge.session_tools import BrowserSessionState, register_session_tools
+        from superbrowser_bridge.session_tools import (
+            BrowserSessionState,
+            clear_resumption_artifact,
+            load_resumption_artifact,
+            register_session_tools,
+            save_resumption_artifact,
+        )
         from superbrowser_bridge.worker_hook import BrowserWorkerHook
 
         task_id = uuid.uuid4().hex[:8]
@@ -255,6 +375,32 @@ class DelegateBrowserTaskTool(Tool):
             is_research=is_research,
         )
         worker_state.task_id = task_id
+
+        # Resolve the target domain once, up front — used by human-handoff
+        # auto-enable (below), learnings injection (further down), and the
+        # success-outcome recorder at the end. Must be defined before the
+        # handoff-budget logic references it.
+        domain = _domain_from_url(url) if url else None
+
+        # Human handoff: opt in via tool arg OR auto-enable if per-domain
+        # learnings mark this site as "needs_human_handoff=true" (flipped
+        # after any prior task succeeded via the human_handoff captcha
+        # strategy). Per-session budget from SUPERBROWSER_MAX_HUMAN_HANDOFFS.
+        auto_handoff = _domain_needs_human_handoff(domain) if domain else False
+        if enable_human_handoff or auto_handoff:
+            worker_state.human_handoff_enabled = True
+            try:
+                worker_state.human_handoff_budget = max(
+                    0,
+                    int(os.environ.get("SUPERBROWSER_MAX_HUMAN_HANDOFFS", "1")),
+                )
+            except ValueError:
+                worker_state.human_handoff_budget = 1
+            print(
+                f"   [human-handoff enabled: explicit={enable_human_handoff}, "
+                f"auto={auto_handoff}, budget={worker_state.human_handoff_budget}]"
+            )
+
         register_session_tools(worker, worker_state)
 
         # Create mid-session guardrail hook
@@ -266,13 +412,40 @@ class DelegateBrowserTaskTool(Tool):
         # Build the worker prompt with enforced workflow structure
         parts = []
 
+        # Hard rule sits at position 0 of the prompt so it's the first thing
+        # the worker's LLM reads. Previous iteration of the prompt put the
+        # "browser_open(url)" tool listing at the bottom of the Execution
+        # Plan; some models (observed with gemini-3-flash-preview) default
+        # to firing that tool on every turn, spawning a new session each
+        # call and cascading into the outer delegation loop. The text below
+        # is deliberately hedge-free and placed early so models can't miss
+        # it. Reinforced by the hard idempotency guard in BrowserOpenTool.
+        parts.append(
+            "## HARD RULE — READ FIRST\n"
+            "You may call `browser_open` AT MOST ONCE per task. The first "
+            "call returns a session_id. Every later browser tool "
+            "(browser_screenshot, browser_click, browser_type, "
+            "browser_navigate, browser_get_markdown, browser_run_script, …) "
+            "MUST take that session_id and operate on the SAME session. "
+            "A second `browser_open` call is almost always a bug — it "
+            "throws away your progress and spawns a fresh throwaway "
+            "browser.\n"
+            "If a tool result looks empty, a screenshot seems missing, or "
+            "you're unsure what the page looks like, call "
+            "`browser_screenshot(session_id=<id>)` — NEVER `browser_open` — "
+            "to re-ground yourself. The tool will refuse a redundant "
+            "`browser_open` with a [SESSION_ALREADY_OPEN …] message; if "
+            "you see that tag, stop calling `browser_open` immediately and "
+            "switch to the right tool named in the refusal message."
+        )
+
         if url:
             parts.append(f"Target URL: {url}")
 
         parts.append(f"\n## Task\n{instructions}")
 
         # Auto-inject learnings so the worker follows known patterns
-        domain = _domain_from_url(url) if url else None
+        # (`domain` was resolved earlier, before the handoff-budget logic).
         if domain:
             lpath = _learnings_path(domain)
             if os.path.exists(lpath):
@@ -336,6 +509,40 @@ class DelegateBrowserTaskTool(Tool):
             except (ValueError, KeyError):
                 pass
 
+        # --- Sticky-session resumption (Priority 2) ---------------------
+        # If a previous worker on the SAME domain exited stuck within the
+        # last RESUMPTION_TTL_SEC and its Puppeteer session is still alive,
+        # pre-seed the new worker's session_id so it skips browser_open and
+        # resumes on the live page — armed with a list of tactics that
+        # already failed, so it won't repeat them.
+        resumption: dict | None = None
+        if domain:
+            resumption = await load_resumption_artifact(domain)
+        if resumption:
+            worker_state.session_id = resumption["session_id"]
+            worker_state.current_url = resumption.get("current_url", "")
+            worker_state.best_checkpoint_url = resumption.get("best_checkpoint_url", "") or ""
+            failed_lines = [
+                f"- {f['tool']}({f['args']}) → {f['result_excerpt']}"
+                for f in resumption.get("recent_failures", [])
+            ]
+            failed_block = "\n".join(failed_lines) if failed_lines else "(none recorded)"
+            help_reason = resumption.get("help_reason") or ""
+            parts.append(
+                f"\n## RESUMPTION — continue on existing browser session\n"
+                f"A previous worker got stuck and handed off to you.\n\n"
+                f"**Existing session_id**: `{resumption['session_id']}`  "
+                f"(Puppeteer page is LIVE at {resumption.get('current_url', '?')})\n\n"
+                f"**DO NOT call browser_open.** The session already exists. "
+                f"Use the session_id above for every tool call. Start with:\n"
+                f"  1. browser_get_markdown(session_id='{resumption['session_id']}') — see current state\n"
+                f"  2. Pick a DIFFERENT tactic than what failed below\n\n"
+                f"**Tactics that already failed — do NOT repeat them**:\n{failed_block}\n"
+                + (f"\n**Previous worker's explanation**: {help_reason}\n" if help_reason else "")
+                + "\nIf you also get stuck, call browser_request_help with a concrete "
+                "new-tactic suggestion and call done(success=False)."
+            )
+
         # Enforce workflow IN the prompt itself (not just SOUL.md)
         if is_research:
             parts.append("""
@@ -366,36 +573,118 @@ CRITICAL RULES:
 - Return ALL findings with source URLs.
 - NEVER invent, estimate, or guess values. If a data point genuinely cannot be retrieved, say so explicitly and return done(success=False) with a brief honest reason. Fabricated numbers with plausible-sounding disclaimers are a FAILURE.""".format(max_iter=max_iterations))
         else:
-            parts.append("""
-## Required Execution Plan (follow this order)
-Step 1: browser_open(url) — open the target page (returns screenshot + interactive elements list)
-Step 2: Read the elements list from Step 1 — you already have the selectors, no need for a separate browser_eval
-Step 3: browser_run_script — write ONE script that does ALL form filling + submission + data extraction
-  Use the element indices/selectors from Step 1. Use browser_wait_for instead of blind helpers.sleep().
-  For autocomplete: page.type(field, text, {{delay:100}}) then browser_wait_for(text="suggestion") then click suggestion
-Step 4: If script failed, read the error AND the updated elements list in the error response. Fix the script and run browser_run_script again IN THE SAME SESSION — do NOT navigate back to the start
-Step 5: browser_get_markdown or browser_eval — read the results (or just read the elements returned by Step 3)
-Step 6: browser_close
+            # When a resumption artifact pre-seeded the worker's session_id,
+            # `browser_open` is NOT AVAILABLE — calling it would discard the
+            # live page and spawn a new throwaway browser (root cause of the
+            # inner-loop regression). Remove it from the tool list entirely
+            # so the LLM never sees it as an option.
+            if resumption:
+                browser_open_line = (
+                    "- browser_open — NOT AVAILABLE for this task. A browser session is\n"
+                    f"  already active (session_id={resumption['session_id']}). Use that\n"
+                    "  session_id on every tool call. If you call browser_open it will\n"
+                    "  refuse with [SESSION_ALREADY_OPEN …] — that is the signal to\n"
+                    "  switch to browser_screenshot or browser_navigate instead."
+                )
+            else:
+                browser_open_line = (
+                    "- browser_open(url) — opens a session, returns screenshot + elements list.\n"
+                    "  CALL AT MOST ONCE PER TASK. On any subsequent call the tool will\n"
+                    "  refuse with [SESSION_ALREADY_OPEN …] — that is a signal to switch\n"
+                    "  to browser_screenshot / browser_navigate / etc., not to retry."
+                )
 
-KEY FEATURES:
-- Every action (click, type, scroll, run_script) returns updated interactive elements automatically — you don't need screenshots to see what changed
-- browser_wait_for(session_id, text="...", timeout=10) waits for content to appear — MUCH better than helpers.sleep()
-- browser_click has JS fallback if standard click fails
+            parts.append("""
+## Execution Plan
+
+Typical flow: open → (dismiss popups, fill forms, click actions) → extract → verify → close.
+Reading (browser_get_markdown) and interacting can interleave — pick what's
+useful next. The rules below are non-negotiable; the order above is a guide.
+
+Available tools:
+""" + browser_open_line + """
+- browser_click/type/wait_for — single actions, return updated elements.
+- browser_run_script — run an in-page script. Use this for multi-step flows
+  (fill form, submit, wait, read). Use browser_wait_for(text="...") inside
+  or between steps; avoid helpers.sleep() alone.
+- browser_get_markdown — FREE text read of the page. Use liberally.
+- browser_verify_fact(session_id, claim) — visual sanity check before
+  reporting a value. Call this with the EXACT final value.
+- browser_request_help — exit with a structured "stuck" signal for the next
+  worker to pick up with a different tactic (live session is preserved).
+- browser_close — close when done.
+
+EXTRACTION must return a structured object, not a bare value. For a price:
+  {{
+    "value": <number>, "unit": "per_night|total|per_person|...",
+    "currency": "<ISO code>",
+    "context_text": "<the label you saw next to the value on the page>",
+    "selector_used": "<css or aria-label that matched>",
+    "all_candidates": [{{ "value": ..., "label": ... }}, ...]
+  }}
+`all_candidates` is REQUIRED for prices — it exposes crossed-out / "from" /
+with-tax variants so the final answer can disambiguate.
+
+VERIFY before reporting. After extracting, call browser_verify_fact with
+your intended final answer. If it returns supported=false, re-extract with
+a corrected selector; do NOT report the unverified value.
 
 CRITICAL RULES:
-- Prefer browser_run_script for multi-step interactions. Use browser_click/browser_type only for simple one-off actions.
-- If a script fails, FIX IT and retry on the current page. Do NOT navigate backward.
-- You have {max_iter} iterations total. After iteration 15, prefer browser_run_script to batch remaining work. Keep extracting until you have the real data.
-- If you see [GUIDANCE: ...] messages, follow them IMMEDIATELY.
-- NEVER invent, estimate, or guess values. If data genuinely cannot be extracted, return done(success=False) with a brief honest reason. Fabricating plausible numbers is a FAILURE.""".format(max_iter=max_iterations))
+- NEVER invent, estimate, or guess a value. If extraction returns empty,
+  call done(success=False) with an honest reason. Fabrication is a FAILURE.
+- Final answer must quote the exact `value` + `context_text` from the
+  extraction — no paraphrasing, no rounding "$1,234.56" to "around $1,200".
+- If `all_candidates` has multiple prices, say so: "Page showed $X (crossed
+  out) and $Y (selected); reporting $Y."
+- You have {max_iter} iterations. If a script fails, FIX IT and retry on the
+  same page — do NOT navigate backward or browser_open again.
+- If [GUIDANCE: ...] messages appear, follow them IMMEDIATELY.
+- If stuck after 3 tries, call browser_request_help with a concrete new
+  tactic, then call done(success=False).""".format(max_iter=max_iterations))
 
         prompt = "\n".join(parts)
+
+        # Pre-announce the view URL if handoff is enabled — a user pre-opening
+        # it in their browser avoids racing the 5-min block in the solver.
+        if worker_state.human_handoff_enabled:
+            public_host = os.environ.get(
+                "SUPERBROWSER_PUBLIC_HOST", "http://localhost:3100",
+            ).rstrip("/")
+            print(
+                f"\n>> [HUMAN HANDOFF ARMED for this task] "
+                f"If the worker hits a captcha auto-solve can't crack, "
+                f"it will pause and ask the user to solve via:\n"
+                f">>   {public_host}/session/<session_id>/view\n"
+                f">> (session_id is printed when browser_open runs)"
+            )
 
         try:
             result = await worker.run(prompt, session_key=session_key, hooks=[worker_hook])
             content = result.content
 
-            print(f"\n>> Worker result ({len(content)} chars): {content[:200]}...")
+            # Diagnostic: how many browser tool calls did the worker actually
+            # make? If 0, the model refused to try — classify explicitly so
+            # the user-facing reply doesn't blame "technical error" on a bug
+            # that's actually "the LLM chose not to act".
+            steps_taken = len(worker_state.step_history)
+            print(
+                f"\n>> Worker result ({len(content)} chars, "
+                f"{steps_taken} browser tool calls): {content[:200]}..."
+            )
+
+            if steps_taken == 0:
+                # Worker never touched the browser. Make this visible to the
+                # orchestrator so it can tell the user honestly ("the worker
+                # LLM declined to run any tools") instead of generic "technical
+                # error" language that implies a system failure.
+                content = (
+                    f"[WORKER_NO_TOOL_CALLS] The worker model produced "
+                    f"{len(content)} chars of text but called zero browser "
+                    f"tools (browser_open was never invoked). No captcha "
+                    f"could be detected or handed off because no page was "
+                    f"ever loaded. Likely cause: prompt complexity or model "
+                    f"refusal. Worker's own text:\n\n{content}"
+                )
 
             # Read the activity log the worker saved on close
             task_dir = f"/tmp/superbrowser/{task_id}"
@@ -469,17 +758,209 @@ CRITICAL RULES:
                     pass
 
             # Heuristic success: worker returned content that doesn't look
-            # like a pure failure AND captcha didn't block us.
+            # like a pure failure AND captcha didn't block us AND the site
+            # wasn't blocking us at the network layer.
             lower_content = (content or "").lower()
+            net_blocked_early = bool(
+                worker_state.network_blocked
+                or (content and "NETWORK_BLOCKED" in content)
+            )
             looks_failed = (
                 "browser worker failed" in lower_content
                 or "captcha_unsolved" in lower_content
                 or captcha_blocked
+                or net_blocked_early
             )
             success = bool(content) and not looks_failed
 
+            # --- Baseline metrics log (one JSONL line per worker exit) ----
+            # Enables before/after comparison for reliability work. Fields are
+            # all drawn from existing worker state — no new instrumentation.
+            try:
+                # _time is imported at module top; no local re-import needed.
+                metrics_dir = "/tmp/superbrowser"
+                os.makedirs(metrics_dir, exist_ok=True)
+                metrics_path = os.path.join(metrics_dir, "metrics.jsonl")
+                duration_sec = (
+                    _time.time() - worker_state.start_time
+                    if worker_state.start_time else 0.0
+                )
+                screenshots_used = (
+                    worker_state.max_screenshots - worker_state.screenshot_budget
+                )
+                # Classify the block layer so per-domain decisions can rest
+                # on data, not speculation:
+                #   edge       — HTTP 4xx/5xx at the network layer (TLS / IP /
+                #                bot-firewall refused content). Behavioral
+                #                humanization will NOT help here; needs
+                #                TLS/proxy fix.
+                #   challenge  — got through edge but site served a captcha /
+                #                challenge page. Needs captcha solve or
+                #                cookie-jar warm.
+                #   behavioral — page served, but interactions didn't produce
+                #                expected results (empty responses, extracted
+                #                elements missing). Humanization P1-P3 targets
+                #                this class.
+                #   none       — success.
+                if success:
+                    block_layer = "none"
+                elif net_blocked_early:
+                    block_layer = "edge"
+                elif captcha_blocked:
+                    block_layer = "challenge"
+                else:
+                    block_layer = "behavioral"
+                metric = {
+                    "ts": _time.time(),
+                    "task_id": task_id,
+                    "domain": domain or "",
+                    "success": success,
+                    "block_layer": block_layer,
+                    "captcha_blocked": captcha_blocked,
+                    "network_blocked": net_blocked_early,
+                    "network_status": worker_state.last_network_status,
+                    # Humanization level in effect this run. Hardcoded to
+                    # 'light' today (jitter + humanClick + humanScroll via
+                    # defaults; humanType via typeText default). Wire to
+                    # config once per-domain policy lands.
+                    "humanize_level": os.environ.get("SUPERBROWSER_HUMANIZE_LEVEL", "light"),
+                    # Headless mode requested at launch. Lets us diff
+                    # success rates between 'new' vs 'old' vs headful once
+                    # there are enough runs.
+                    "headless_mode": os.environ.get("SUPERBROWSER_HEADLESS_MODE", "new"),
+                    "duration_sec": round(duration_sec, 2),
+                    "screenshots_used": screenshots_used,
+                    "vision_calls": worker_state.vision_calls,
+                    "text_calls": worker_state.text_calls,
+                    "sessions_opened": worker_state.sessions_opened,
+                    "regression_count": worker_state.regression_count,
+                    "step_count": len(worker_state.step_history),
+                    "max_iterations": max_iterations,
+                    "is_research": is_research,
+                }
+                with open(metrics_path, "a") as mf:
+                    mf.write(_json.dumps(metric, default=str) + "\n")
+            except OSError as exc:
+                print(f"  [metrics log append failed: {exc}]")
+
+            # Diagnostic: when we think the worker failed, surface the LAST
+            # successful step's extracted content — if it holds real data that
+            # the final message lost, we have a result-write race (the worker
+            # exited before done() captured the extraction). Purely observational.
+            if not success and os.path.exists(structured_path):
+                try:
+                    with open(structured_path) as f:
+                        diag_struct = _json.load(f)
+                    steps = diag_struct.get("steps", []) or []
+                    last_good = next(
+                        (s for s in reversed(steps)
+                         if s.get("tool") in ("browser_run_script", "browser_eval",
+                                              "browser_get_markdown", "browser_click",
+                                              "browser_type")
+                         and "error" not in str(s.get("result", "")).lower()
+                         and "failed" not in str(s.get("result", "")).lower()),
+                        None,
+                    )
+                    if last_good:
+                        print(
+                            f"  [diag] last_successful_step={last_good.get('tool')} "
+                            f"result={str(last_good.get('result', ''))[:120]}"
+                        )
+                except (ValueError, OSError):
+                    pass
+
             if domain:
                 _record_routing_outcome(domain, "browser", success=success)
+
+            # --- Resumption artifact bookkeeping (Priority 2) --------------
+            # If the worker explicitly requested help via browser_request_help,
+            # the tool already saved a rich artifact — don't overwrite it.
+            # If the worker failed but didn't request help, save a minimal
+            # artifact so the next delegation can still resume.
+            # On success, clear any stale artifact from a prior failed run.
+            # Never save a resumption for network-blocked sessions — resuming
+            # them would just replay the same 4xx/5xx.
+            #
+            # Self-poisoning guard: if this run consumed a resumption artifact
+            # and ALSO failed, saving a new artifact here would just seed the
+            # NEXT delegation with the same broken state (sticky session that
+            # leads the new worker's LLM straight back into the loop). Clear
+            # instead so the next task starts clean.
+            if success:
+                clear_resumption_artifact()
+            elif net_blocked_early:
+                clear_resumption_artifact()
+            elif resumption is not None:
+                # We resumed and still failed. That means the resumption
+                # artifact is the carrier of the bug, not a solution.
+                print(
+                    "\n>> resumption artifact consumed but task still failed "
+                    "— clearing artifact instead of re-saving to stop the "
+                    "self-poisoning loop"
+                )
+                clear_resumption_artifact()
+            else:
+                already_requested_help = any(
+                    s.get("tool") == "browser_request_help"
+                    for s in (worker_state.step_history or [])
+                )
+                if not already_requested_help and domain:
+                    save_resumption_artifact(worker_state, domain)
+
+            # --- Network-layer block fallback (pre-captcha) ----------------
+            # NETWORK_BLOCKED means the site refused at the TLS/edge layer
+            # (403/429/503 etc). No page-interaction trick will fix this;
+            # the only remediations are different IP, different TLS
+            # fingerprint, or giving up and searching public sources.
+            # Route to search worker if viable, same as the captcha path,
+            # but don't re-burn a browser attempt.
+            network_blocked = bool(
+                worker_state.network_blocked
+                or (content and "NETWORK_BLOCKED" in content)
+            )
+            if network_blocked and not kw.get("_network_fallback_done"):
+                print(
+                    f"\n>> network block on {domain} "
+                    f"(status={worker_state.last_network_status}) "
+                    f"— not retrying browser, routing to search"
+                )
+                viable_for_search = classification["approach"] in ("search", "hybrid")
+                if viable_for_search:
+                    rewritten = _rewrite_for_search(instructions, url)
+                    try:
+                        search_tool = DelegateSearchTaskTool()
+                        fallback_result = await search_tool.execute(
+                            question=rewritten,
+                            search_hints=(
+                                f"Originally attempted via browser on {url or domain} "
+                                f"but site returned HTTP {worker_state.last_network_status}. "
+                                f"Use search snippets + public pages."
+                            ),
+                            force=True,
+                            _fallback_from_browser=True,
+                        )
+                        return (
+                            f"[Network-blocked on {domain} "
+                            f"(HTTP {worker_state.last_network_status}) "
+                            f"— auto-fell-back to search]\n\n"
+                            f"{fallback_result}\n\n"
+                            f"[Original browser attempt summary]\n{content[:500]}"
+                        )
+                    except Exception as fallback_exc:
+                        print(f"  [fallback search also failed: {fallback_exc}]")
+                # If search isn't viable, return the blocked result as-is
+                # so the orchestrator sees the distinct signal and can
+                # decide on proxies / human escalation / etc.
+                return (
+                    f"[NETWORK_BLOCKED on {domain} "
+                    f"(HTTP {worker_state.last_network_status})] "
+                    f"The site refused at the network/edge layer. Further browser "
+                    f"attempts from this infrastructure will not succeed without "
+                    f"a different IP or TLS fingerprint. "
+                    f"Consider: (1) residential proxy, (2) different entry point URL, "
+                    f"(3) delegate_search_task for public data only.\n\n"
+                    f"[Original worker output]\n{content[:500]}"
+                )
 
             # --- Layer 3: captcha-triggered search fallback ----------------
             # If the browser worker failed specifically because of a captcha,
@@ -508,12 +989,64 @@ CRITICAL RULES:
                     except Exception as fallback_exc:
                         print(f"  [fallback search also failed: {fallback_exc}]")
 
+            # --- Anti-fabrication guard (in-context reminder) --------------
+            # When the worker failed to retrieve real data, append an explicit
+            # reminder so the orchestrator's NEXT turn — the one where it
+            # writes the user-facing answer — sees it fresh. SOUL.md rules
+            # alone aren't enough; the helpfulness prior is strong and the
+            # rule lives far from the decision point.
+            if not success:
+                failure_class = (
+                    "CAPTCHA_BLOCKED" if captcha_blocked
+                    else "NETWORK_BLOCKED" if net_blocked_early
+                    else "GENERIC_FAILURE"
+                )
+                lower_i = (instructions or "").lower()
+                looks_transactional = any(
+                    m in lower_i for m in (
+                        "price", "cost", "rate", "fare", "booking",
+                        "availability", "in stock", "tonight", "tomorrow",
+                        "check-in", "checkin",
+                        "january", "february", "march", "april", "may",
+                        "june", "july", "august", "september", "october",
+                        "november", "december",
+                    )
+                )
+                if looks_transactional:
+                    content += (
+                        f"\n\n[FABRICATION GUARD — failure_class={failure_class}]\n"
+                        f"The worker did NOT retrieve live data. When you write your "
+                        f"final answer to the user, you MUST NOT include:\n"
+                        f"  - Any specific numeric price (USD, BDT, or otherwise)\n"
+                        f"  - 'Estimated', 'typical', 'market data suggests', 'approximately',\n"
+                        f"    'based on historical', or any hedge wrapping an invented number\n"
+                        f"  - Price ranges presented as factual for this search\n"
+                        f"  - Named prices attached to hotels/products the worker did not\n"
+                        f"    actually read from the live site\n"
+                        f"Instead, say the retrieval failed, name the cause in plain terms, "
+                        f"and offer concrete next steps (try a different site, check "
+                        f"manually, call the hotel). A hedged-sounding invented number is "
+                        f"WORSE than 'I don't know' — the user cannot tell they're fake."
+                    )
+
+            # Reset the outer-loop attempt counter on success so a later
+            # legitimate re-run of the same task isn't counted against the
+            # old budget.
+            if success:
+                _DELEGATION_ATTEMPTS.pop(_dedup_key, None)
+
             return content
 
         except Exception as e:
             if domain:
                 _record_routing_outcome(domain, "browser", success=False)
-            error_msg = f"Browser worker failed: {e}"
+            error_msg = (
+                f"Browser worker failed: {e}\n\n"
+                f"[FABRICATION GUARD] Worker crashed — you have NO live data. "
+                f"Do not invent prices or estimates in your final answer. "
+                f"Report the failure honestly and suggest the user check "
+                f"manually at the source URL."
+            )
             print(f"\n>> Worker error: {error_msg}")
             return error_msg
 

@@ -59,7 +59,11 @@ export function registerFallbackProviderFactory(f: () => LLMProvider): void {
 export const genericVisionStrategy: CaptchaStrategy = {
   name: 'generic_vision',
   supportedTypes: ['slider', 'visual_puzzle', 'image', 'text', 'unknown'],
-  priority: 40,
+  // Last-resort automation: ~99% empirical failure rate on real captchas;
+  // kept as catch-all for `unknown` types but tried after every specialised
+  // strategy and after the paid grid API. Only above human-handoff so the
+  // user isn't asked unnecessarily on novel captcha types.
+  priority: 20,
   estimatedCostCents: 3,
   requiresLLM: true,
   requiresApiKey: false,

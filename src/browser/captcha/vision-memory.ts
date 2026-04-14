@@ -47,13 +47,31 @@ export class VisionMemory {
     }
   }
 
-  /** Hash challenge instruction + image data URL so equivalent grids match. */
-  static hashChallenge(instruction: string, imageBase64: string): string {
+  /**
+   * Hash challenge instruction + full image so different grids never
+   * collide.
+   *
+   * The previous implementation hashed only the first 2KB of base64 for
+   * cost reasons. JPEG headers are largely shared across screenshots of
+   * the same widget taken seconds apart, so two different tile sets would
+   * hash to the same value — and the memory would feed "already-clicked
+   * tiles [1,2,3]" into a brand-new grid, poisoning every subsequent
+   * round.
+   *
+   * `context` (caller-supplied) lets us fold in viewport dims, host URL,
+   * or any other disambiguator so two visually-similar screenshots on
+   * different hosts don't collide either. Hashing the full image adds
+   * ~1ms per round, which is invisible next to the LLM call it precedes.
+   */
+  static hashChallenge(
+    instruction: string,
+    imageBase64: string,
+    context?: string,
+  ): string {
     const h = createHash('sha1');
     h.update(instruction);
-    // Use only first 2KB of image data — enough to distinguish challenges
-    // cheaply without hashing the whole image on every round.
-    h.update(imageBase64.slice(0, 2048));
+    if (context) h.update('|' + context);
+    h.update('|' + imageBase64);
     return h.digest('hex').slice(0, 16);
   }
 

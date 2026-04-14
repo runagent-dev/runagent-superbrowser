@@ -18,7 +18,22 @@ import { PageWrapper } from './page.js';
 puppeteer.use(StealthPlugin() as any);
 
 export interface BrowserConfig {
+  /**
+   * Legacy boolean headless flag. When `true`, old-style headless is used
+   * UNLESS `headlessMode` is also set — prefer `headlessMode` in new code.
+   * Retained for backward compatibility with callers that pass `{headless: false}`.
+   */
   headless: boolean;
+  /**
+   * Controls Chromium's headless mode:
+   *   'new'   — Puppeteer's --headless=new. Runtime matches headful closely;
+   *             fewer detectable signatures than old headless. Default.
+   *   'old'   — Legacy --headless. More detectable; kept for environments
+   *             where 'new' crashes (rare).
+   *   false   — Headful. Requires an X display; use only when running under
+   *             Xvfb or a real desktop session.
+   */
+  headlessMode?: 'new' | 'old' | false;
   viewport: { width: number; height: number };
   userAgent?: string;
   proxy?: string;
@@ -26,14 +41,22 @@ export interface BrowserConfig {
   blockAds: boolean;
   stealth: boolean;
   executablePath?: string;
+  /**
+   * Disable the GPU via --disable-gpu. Default false (GPU enabled). Setting
+   * this to true forces SwiftShader, whose WebGL vendor string is a known
+   * bot signature. Only enable for environments where GPU crashes.
+   */
+  disableGpu?: boolean;
 }
 
 const DEFAULT_CONFIG: BrowserConfig = {
   headless: true,
+  headlessMode: 'new',
   viewport: { width: 1280, height: 1100 },
   downloadDir: '/tmp/superbrowser/downloads',
   blockAds: true,
   stealth: true,
+  disableGpu: false,
 };
 
 /** Chrome build identity for stealth — must stay in sync with stealth.ts. */
@@ -44,15 +67,25 @@ const DEFAULT_UA =
   `(KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36`;
 const DEFAULT_PLATFORM: 'macOS' | 'Windows' | 'Linux' = 'macOS';
 
-/** Chrome launch flags for headless automation with enhanced stealth. */
+/**
+ * Chrome launch flags for headless automation with enhanced stealth.
+ *
+ * GPU: `--disable-gpu` is deliberately OMITTED. Disabling GPU forces
+ * Chromium to render via SwiftShader, whose WebGL UNMASKED_VENDOR is
+ * `"Google Inc. (Google)"` / renderer `"ANGLE (...) SwiftShader ..."` —
+ * a canonical bot-signature string pattern. Real desktop users rarely
+ * run with GPU disabled. For headless environments where GPU must be
+ * off (rare), set `disableGpu: true` on BrowserConfig explicitly.
+ *
+ * `--disable-accelerated-2d-canvas` is likewise OMITTED — it's closely
+ * coupled with `--disable-gpu` in fingerprint impact.
+ */
 const CHROME_FLAGS = [
   '--disable-blink-features=AutomationControlled',
   '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
   '--disable-setuid-sandbox',
   '--no-sandbox',
   '--disable-dev-shm-usage',
-  '--disable-accelerated-2d-canvas',
-  '--disable-gpu',
   '--no-first-run',
   '--no-zygote',
   '--disable-extensions',
@@ -118,8 +151,28 @@ export class BrowserEngine extends EventEmitter {
       args.push(`--proxy-server=${this.config.proxy}`);
     }
 
+    // Opt-in GPU-disable for environments where Chromium can't use a GPU.
+    // Defaults to enabled — disabling GPU forces SwiftShader, a known
+    // bot-signature renderer string.
+    if (this.config.disableGpu) {
+      args.push('--disable-gpu');
+      args.push('--disable-accelerated-2d-canvas');
+    }
+
+    // Resolve headless mode. `headlessMode` takes precedence when set; the
+    // legacy `headless` boolean is honored for callers that still use it.
+    // Puppeteer accepts `true | false | 'new'` (and historically 'chrome').
+    // We map 'old' to `true` (legacy headless), 'new' to the string 'new',
+    // and false to headful.
+    const mode = this.config.headlessMode;
+    let headlessOpt: boolean | 'new';
+    if (mode === 'new') headlessOpt = 'new';
+    else if (mode === 'old') headlessOpt = true;
+    else if (mode === false) headlessOpt = false;
+    else headlessOpt = this.config.headless ? 'new' : false;
+
     const launchOptions: Record<string, unknown> = {
-      headless: this.config.headless,
+      headless: headlessOpt,
       args,
       defaultViewport: this.config.viewport,
       ignoreHTTPSErrors: true,

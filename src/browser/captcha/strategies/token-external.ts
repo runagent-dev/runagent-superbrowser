@@ -13,7 +13,10 @@ import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types
 export const tokenExternalStrategy: CaptchaStrategy = {
   name: 'token_external',
   supportedTypes: ['recaptcha', 'hcaptcha', 'turnstile'],
-  priority: 90,
+  // Sits below recaptcha_checkbox so the cheap auto-pass path runs first,
+  // but above slider/vision/handoff: when the user has paid for 2captcha,
+  // we'd rather burn 3¢ on a high-success solver than thrash vision LLMs.
+  priority: 85,
   estimatedCostCents: 3,
   requiresLLM: false,
   requiresApiKey: true,

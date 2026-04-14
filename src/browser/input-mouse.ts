@@ -7,7 +7,7 @@
  */
 
 import type { CDPSession } from 'puppeteer-core';
-import { humanDrag } from './humanize.js';
+import { humanClick, humanDrag, humanScroll } from './humanize.js';
 
 /** Modifier key bitmask (from BrowserOS keyboard.ts). */
 export const Modifiers = {
@@ -20,7 +20,21 @@ export const Modifiers = {
 export type MouseButton = 'left' | 'right' | 'middle';
 
 /**
- * Dispatch a full click sequence via CDP: moveTo → press → release.
+ * Dispatch a full click sequence via CDP.
+ *
+ * Defaults to humanClick (Bezier mouse path + pre-click hesitation + 1-2px
+ * jitter + human-duration hold). Bot-detection scripts that hash mouse-move
+ * patterns flag straight-teleport clicks; the humanized path is the correct
+ * default.
+ *
+ * Set `{ linear: true }` to opt out for cases where determinism matters:
+ *  - Captcha grid tile clicks that rely on server-mapped pixel centers.
+ *  - Multi-click sequences (clickCount>1) where jitter would miss the target.
+ *  - Modifier-key chords (Ctrl+click, Shift+click) that `humanClick` doesn't
+ *    currently forward.
+ *
+ * When `linear` is set, or when `clickCount>1` / `modifiers` are present,
+ * we fall back to the deterministic teleport-click for correctness.
  */
 export async function dispatchClick(
   client: CDPSession,
@@ -31,6 +45,8 @@ export async function dispatchClick(
     clickCount?: number;
     modifiers?: number;
     delay?: number;
+    /** Opt out of humanization (deterministic teleport click). */
+    linear?: boolean;
   },
 ): Promise<void> {
   const button = options?.button || 'left';
@@ -38,7 +54,17 @@ export async function dispatchClick(
   const modifiers = options?.modifiers || 0;
   const delay = options?.delay || 50;
 
-  // Move to position
+  // humanClick doesn't forward modifiers or clickCount>1. Fall back to the
+  // deterministic path when those are needed or when the caller opted out.
+  const useHumanized = !options?.linear && clickCount === 1 && modifiers === 0;
+
+  if (useHumanized) {
+    await humanClick(client, x, y, { button });
+    return;
+  }
+
+  // Deterministic teleport click — for chord-clicks, double-clicks, or
+  // internal automation paths that opt out via { linear: true }.
   await client.send('Input.dispatchMouseEvent', {
     type: 'mouseMoved',
     x,
@@ -48,7 +74,6 @@ export async function dispatchClick(
 
   await sleep(delay);
 
-  // Press
   await client.send('Input.dispatchMouseEvent', {
     type: 'mousePressed',
     x,
@@ -60,7 +85,6 @@ export async function dispatchClick(
 
   await sleep(delay);
 
-  // Release
   await client.send('Input.dispatchMouseEvent', {
     type: 'mouseReleased',
     x,
@@ -143,6 +167,15 @@ export async function dispatchDrag(
 
 /**
  * Dispatch a mouse wheel scroll.
+ *
+ * Splits a single logical scroll into 3-4 smaller wheel events with gaussian
+ * spacing so timing variance resembles a real trackpad / wheel turn. Single
+ * large mouseWheel events with zero inter-event delay are a canonical bot
+ * signature. Horizontal-scroll (deltaX) falls back to the straight-line
+ * path since humanScroll currently only models vertical cadence.
+ *
+ * Set `{ linear: true }` to opt out — keeps determinism for internal
+ * automation that doesn't need humanization.
  */
 export async function dispatchScroll(
   client: CDPSession,
@@ -150,14 +183,19 @@ export async function dispatchScroll(
   y: number,
   deltaX: number,
   deltaY: number,
+  options?: { linear?: boolean },
 ): Promise<void> {
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseWheel',
-    x,
-    y,
-    deltaX,
-    deltaY,
-  });
+  if (options?.linear || deltaX !== 0 || deltaY === 0) {
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x,
+      y,
+      deltaX,
+      deltaY,
+    });
+    return;
+  }
+  await humanScroll(client, x, y, deltaY);
 }
 
 function sleep(ms: number): Promise<void> {

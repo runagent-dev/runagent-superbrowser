@@ -9,6 +9,7 @@
 
 import type { Page } from 'puppeteer-core';
 import type { LLMProvider } from '../../llm/provider.js';
+import type { HumanInputManager } from '../../agent/human-input.js';
 import type { CaptchaInfo, CaptchaSolverConfig } from '../captcha.js';
 import { CaptchaStrategyRegistry } from './registry.js';
 import type { RichSolveResult } from './types.js';
@@ -22,6 +23,7 @@ import {
 } from './strategies/recaptcha-v2.js';
 import { sliderDragStrategy } from './strategies/slider-drag.js';
 import { genericVisionStrategy } from './strategies/generic-vision.js';
+import { humanHandoffStrategy } from './strategies/human-handoff.js';
 
 /** Build the default registry with all production strategies. */
 export function buildDefaultRegistry(): CaptchaStrategyRegistry {
@@ -32,7 +34,11 @@ export function buildDefaultRegistry(): CaptchaStrategyRegistry {
     .register(recaptchaAIGridStrategy)
     .register(recaptchaGridApiStrategy)
     .register(sliderDragStrategy)
-    .register(genericVisionStrategy);
+    .register(genericVisionStrategy)
+    // Human handoff is registered LAST and has the lowest priority so it's
+    // only dispatched when every automated strategy has declined or failed.
+    // It also self-gates on ctx.humanInput presence + budget > 0.
+    .register(humanHandoffStrategy);
 }
 
 /**
@@ -45,7 +51,18 @@ export async function solveCaptchaViaRegistry(
   captcha: CaptchaInfo,
   config: CaptchaSolverConfig,
   llmProvider?: LLMProvider | null,
-  options?: { registry?: CaptchaStrategyRegistry; deadlineMs?: number },
+  options?: {
+    registry?: CaptchaStrategyRegistry;
+    deadlineMs?: number;
+    /** Session id (used by human_handoff to build the view URL). */
+    sessionId?: string;
+    /** Per-session HumanInputManager (enables the human_handoff strategy). */
+    humanInput?: HumanInputManager;
+    /** Remaining handoffs allowed on this session. */
+    humanHandoffBudget?: number;
+    /** Public base URL of the view UI (e.g. https://browser.example.com). */
+    publicBaseUrl?: string;
+  },
 ): Promise<RichSolveResult> {
   const registry = options?.registry ?? buildDefaultRegistry();
   const ctx = {
@@ -55,6 +72,10 @@ export async function solveCaptchaViaRegistry(
     memory: new VisionMemory(),
     startTime: Date.now(),
     deadlineMs: options?.deadlineMs ?? config.timeout ?? 90000,
+    sessionId: options?.sessionId,
+    humanInput: options?.humanInput,
+    humanHandoffBudget: options?.humanHandoffBudget,
+    publicBaseUrl: options?.publicBaseUrl,
   };
   return registry.dispatch(captcha, ctx);
 }

@@ -103,6 +103,44 @@ export function getStealthScript(opts: StealthOptions = {}): string {
     });
   }
 
+  // 5a. Page-visibility + focus state (DataDome / PerimeterX scoring input).
+  //     These are CONDITIONALLY overridden: if Chromium already reports
+  //     'visible'/true (which headless=new does in most environments), we
+  //     leave them alone — patching correct values only adds an
+  //     override-detection surface (prototype-hijack check). Only override
+  //     if current values would give us away.
+  try {
+    var __docVis = document.visibilityState;
+    var __docFocus = document.hasFocus && document.hasFocus();
+    // Console-log once per page so operators can diagnose from run logs.
+    try { console.debug('[stealth] init visibilityState=' + __docVis + ' hasFocus=' + __docFocus); } catch (e) {}
+    if (__docVis !== 'visible') {
+      Object.defineProperty(Document.prototype, 'visibilityState', {
+        configurable: true, enumerable: true,
+        get: function () { return 'visible'; },
+      });
+      Object.defineProperty(Document.prototype, 'hidden', {
+        configurable: true, enumerable: true,
+        get: function () { return false; },
+      });
+    }
+    if (__docFocus === false) {
+      var __origHasFocus = document.hasFocus ? document.hasFocus.bind(document) : function () { return true; };
+      // Override on Document.prototype so the override is not trivially
+      // detectable via Object.getOwnPropertyDescriptor(document,'hasFocus').
+      try {
+        Document.prototype.hasFocus = function () { return true; };
+      } catch (e) {
+        // Some environments make Document.prototype.hasFocus non-writable;
+        // fall back to instance-level override as a last resort.
+        document.hasFocus = function () { return true; };
+      }
+      // Reference __origHasFocus so tree-shakers don't optimize it out;
+      // it's kept as a safety net if we ever need to call through.
+      void __origHasFocus;
+    }
+  } catch (e) {}
+
   // 6. Spoof WebGL renderer/vendor info
   const getParameterOriginal = WebGLRenderingContext.prototype.getParameter;
   WebGLRenderingContext.prototype.getParameter = function (param) {

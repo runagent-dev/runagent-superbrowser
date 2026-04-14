@@ -22,6 +22,8 @@ import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
+import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
+import { renderCaptchaViewHtml } from './captcha-ui-html.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -407,6 +409,31 @@ export function createHttpServer(
   const sessions = new Map<string, ManagedSession>();
   const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '20', 10);
 
+  // Per-session human-in-the-loop input manager. One per Puppeteer session.
+  // Populated on /session/create, cleaned up on close/expire. Exposed to the
+  // captcha orchestrator (via /session/:id/captcha/solve) and to the Python
+  // browser_ask_user tool (via the endpoints below).
+  const sessionHumanInput = new Map<string, HumanInputManager>();
+
+  // Per-session human-handoff budget. Default 1 per session so the agent
+  // can't mechanical-turk the user repeatedly. Override via env at server
+  // start; per-session override via enableHumanHandoff on /session/create.
+  const DEFAULT_HUMAN_HANDOFF_BUDGET = parseInt(
+    process.env.SUPERBROWSER_MAX_HUMAN_HANDOFFS || '1',
+    10,
+  );
+  const sessionHandoffBudget = new Map<string, number>();
+
+  /** Clean up human-input state for a session id. Idempotent. */
+  function disposeSessionHumanInput(id: string): void {
+    const mgr = sessionHumanInput.get(id);
+    if (mgr) {
+      try { mgr.cancel(); } catch { /* ignore */ }
+      sessionHumanInput.delete(id);
+    }
+    sessionHandoffBudget.delete(id);
+  }
+
   // Session cleanup loop — expire idle and old sessions
   setInterval(() => {
     const now = Date.now();
@@ -416,6 +443,7 @@ export function createHttpServer(
       if (idle || expired) {
         session.page.close().catch(() => {});
         sessions.delete(id);
+        disposeSessionHumanInput(id);
       }
     }
   }, 60000);
@@ -448,8 +476,19 @@ export function createHttpServer(
       const id = `session-${crypto.randomUUID().split('-')[0]}`;
       sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
 
+      // Per-session human-input manager + handoff budget.
+      sessionHumanInput.set(id, new HumanInputManager());
+      const handoffBudget = req.body.enableHumanHandoff
+        ? (typeof req.body.humanHandoffBudget === 'number'
+            ? Math.max(0, Math.floor(req.body.humanHandoffBudget))
+            : DEFAULT_HUMAN_HANDOFF_BUDGET)
+        : 0;
+      sessionHandoffBudget.set(id, handoffBudget);
+
+      let navStatusCode: number | null = null;
       if (req.body.url) {
-        await page.navigate(req.body.url);
+        const nav = await page.navigate(req.body.url);
+        navStatusCode = nav.statusCode;
       }
 
       const wantVision = req.body.vision !== false;
@@ -459,6 +498,7 @@ export function createHttpServer(
         sessionId: id,
         url: state.url,
         title: state.title,
+        statusCode: navStatusCode,
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
@@ -485,13 +525,14 @@ export function createHttpServer(
     }
 
     try {
-      await page.navigate(url);
+      const nav = await page.navigate(url);
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
       res.json({
         url: state.url,
         title: state.title,
+        statusCode: nav.statusCode,
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
@@ -576,7 +617,16 @@ export function createHttpServer(
         const state = await page.getState({ useVision: false });
         const element = state.selectorMap.get(index);
         if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
-        await page.clickElement(element, { button, clickCount });
+        const r = await page.clickElement(element, { button, clickCount });
+        if (!r.success) {
+          res.status(400).json({
+            error: r.error ?? 'click failed',
+            reason: r.reason,
+            tried: r.tried,
+            alternatives: r.alternatives,
+          });
+          return;
+        }
       } else {
         res.status(400).json({ error: 'index or x,y required' });
         return;
@@ -613,7 +663,16 @@ export function createHttpServer(
       const element = state.selectorMap.get(index);
       if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
 
-      await page.typeText(element, text, clear !== false);
+      const r = await page.typeText(element, text, clear !== false);
+      if (!r.success) {
+        res.status(400).json({
+          error: r.error ?? 'type failed',
+          reason: r.reason,
+          tried: r.tried,
+          alternatives: r.alternatives,
+        });
+        return;
+      }
 
       const newState = await page.getState({ useVision: false, includeConsole: true });
       res.json({
@@ -877,6 +936,120 @@ export function createHttpServer(
     }
   });
 
+  // ============================================================
+  // Human-in-the-loop endpoints — per-session.
+  //
+  // - GET  /session/:id/human-input       → returns the pending HumanInputRequest
+  //                                          (or null). Used by the remote view
+  //                                          UI to poll for "anything needed?"
+  // - POST /session/:id/human-input       → user's reply; body is a
+  //                                          HumanInputResponse { id, data, cancelled? }
+  //                                          Releases the waiting requestInput() caller.
+  // - POST /session/:id/human-input/ask   → blocking ask from the SERVER side.
+  //                                          Body: { type, message, options?, fields?, screenshot?, timeout? }
+  //                                          Returns once the user replies (or timeout).
+  //                                          This is what Python browser_ask_user calls.
+  // ============================================================
+
+  /**
+   * Remote view UI. Returns a self-contained HTML page that polls the
+   * screenshot endpoint at 2 FPS and forwards user clicks + typing back
+   * to the live Puppeteer session.
+   *
+   * Auth: the view page is bare HTML with no secrets of its own; the
+   * token (if TOKEN is configured) is injected as a JS constant and
+   * forwarded on every fetch the page makes. Pass ?token=<t> on the URL
+   * when loading the page.
+   */
+  app.get('/session/:id/view', (req, res) => {
+    const sessionId = req.params.id;
+    if (!sessions.has(sessionId)) {
+      res.status(404).type('text/plain').send('Session not found or expired');
+      return;
+    }
+    const token = (req.query.token as string | undefined)
+      || (req.header('authorization')?.replace(/^Bearer\s+/i, ''))
+      || undefined;
+    res.type('text/html').send(renderCaptchaViewHtml({ sessionId, token }));
+  });
+
+  app.get('/session/:id/human-input', (req, res) => {
+    const mgr = sessionHumanInput.get(req.params.id);
+    if (!mgr) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    res.json({ pending: mgr.getPendingRequest() });
+  });
+
+  app.post('/session/:id/human-input', (req, res) => {
+    const mgr = sessionHumanInput.get(req.params.id);
+    if (!mgr) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    const { id, data, cancelled } = req.body || {};
+    if (typeof id !== 'string') {
+      res.status(400).json({ error: 'id (string) is required' });
+      return;
+    }
+    const delivered = mgr.provideInput({
+      id,
+      data: data && typeof data === 'object' ? data : {},
+      cancelled: cancelled === true,
+    });
+    if (!delivered) {
+      res.status(409).json({ error: 'no pending request, or id does not match' });
+      return;
+    }
+    res.json({ success: true });
+  });
+
+  /**
+   * Blocking "ask the user" endpoint. Opens a requestInput on the server,
+   * holds the HTTP connection until the user replies via POST /human-input
+   * (typically from the view UI) or the timeout fires.
+   *
+   * This gives Python (and other external callers) a single RPC:
+   * body → wait → response, without them having to juggle polling.
+   */
+  app.post('/session/:id/human-input/ask', async (req, res) => {
+    const mgr = sessionHumanInput.get(req.params.id);
+    if (!mgr) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    const {
+      type,
+      message,
+      options,
+      fields,
+      screenshot,
+      timeout,
+    } = req.body || {};
+    const validTypes: HumanInputType[] = [
+      'credentials', 'captcha', 'confirmation', 'otp', 'card', 'text', 'choice',
+    ];
+    if (typeof type !== 'string' || !validTypes.includes(type as HumanInputType)) {
+      res.status(400).json({ error: `type must be one of ${validTypes.join(', ')}` });
+      return;
+    }
+    if (typeof message !== 'string' || !message.trim()) {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+    if (mgr.hasPending) {
+      res.status(409).json({ error: 'another human-input request is already pending on this session' });
+      return;
+    }
+    try {
+      const response = await mgr.requestInput(type as HumanInputType, message, {
+        options: Array.isArray(options) ? options : undefined,
+        fields: Array.isArray(fields) ? fields : undefined,
+        screenshot: typeof screenshot === 'string' ? screenshot : undefined,
+        timeout: typeof timeout === 'number' ? timeout : undefined,
+      });
+      if (!response) {
+        res.status(200).json({ timedOut: true });
+        return;
+      }
+      res.json({ response });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Close a session. */
   app.delete('/session/:id', async (req, res) => {
     const page = getSession(req.params.id);
@@ -885,6 +1058,7 @@ export function createHttpServer(
     try {
       await page.close();
       sessions.delete(req.params.id);
+      disposeSessionHumanInput(req.params.id);
       res.json({ success: true });
     } catch (err) {
       handleError(res, err);
@@ -952,6 +1126,12 @@ export function createHttpServer(
       // browser_click while we're still solving) block instead of racing.
       captchaWatchdog.notifySolveStarted(sessionId, config.timeout);
       let result;
+      // Plumb session-scoped human-in-the-loop state into the solver. If
+      // the session was not created with enableHumanHandoff, humanInput
+      // is still passed (the strategy self-gates on budget>0) but the
+      // budget is 0 so the strategy declines cleanly.
+      const humanInput = sessionHumanInput.get(sessionId);
+      const handoffBudget = sessionHandoffBudget.get(sessionId) ?? 0;
       try {
         result = await solveCaptchaFull(
           page.getRawPage(),
@@ -959,8 +1139,18 @@ export function createHttpServer(
           config,
           llm,
           method,
+          {
+            sessionId,
+            humanInput,
+            humanHandoffBudget: handoffBudget,
+            publicBaseUrl: process.env.SUPERBROWSER_PUBLIC_HOST,
+          },
         );
       } finally {
+        // If the solver succeeded via human_handoff, decrement the budget.
+        if ((result as any)?.method === 'human_handoff' && (result as any)?.solved) {
+          sessionHandoffBudget.set(sessionId, Math.max(0, handoffBudget - 1));
+        }
         // Always unblock waiters, even on exception.
         captchaWatchdog.notifySolveFinished(sessionId, {
           outcome: result?.solved ? 'success' : 'failed',

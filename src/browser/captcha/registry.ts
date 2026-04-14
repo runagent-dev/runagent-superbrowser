@@ -8,6 +8,7 @@
 
 import type { CaptchaInfo } from '../captcha.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from './types.js';
+import { getDomainStats, hostKey } from './domain-stats.js';
 
 export class CaptchaStrategyRegistry {
   private strategies: CaptchaStrategy[] = [];
@@ -45,13 +46,20 @@ export class CaptchaStrategyRegistry {
   }
 
   /**
-   * Try candidates in priority order. First success wins.
-   * Each failure is captured in result.error and reported in the trace so
-   * the orchestrator can learn which method actually worked.
+   * Try candidates in priority order, skewed by per-host history.
+   *
+   * Order is computed each dispatch as `score(strategy) = blend(static
+   * priority, beta(wins+1,losses+1))` for the current page's hostname —
+   * strategies that have won here before run earlier; strategies that have
+   * lost ≥5 times in a row are skipped for 30 minutes (cooldown).
+   *
+   * Outcomes (success or failure) are recorded after each run so future
+   * dispatches benefit. The static priority is preserved as the prior so
+   * untried strategies still respect the hand-tuned ladder.
    */
   async dispatch(info: CaptchaInfo, ctx: StrategyContext): Promise<RichSolveResult> {
-    const candidates = await this.candidatesFor(info, ctx);
-    if (candidates.length === 0) {
+    const allCandidates = await this.candidatesFor(info, ctx);
+    if (allCandidates.length === 0) {
       return {
         solved: false,
         method: 'none',
@@ -61,10 +69,35 @@ export class CaptchaStrategyRegistry {
       };
     }
 
+    const stats = getDomainStats();
+    let host = '_unknown';
+    try { host = hostKey(ctx.page.url()); } catch { /* keep _unknown */ }
+
+    // Score each candidate; skip ones in cooldown (but keep human-handoff
+    // selectable — a real user can override any cooldown).
+    const scored = allCandidates
+      .filter((s) => s.name === 'human_handoff' || !stats.isInCooldown(host, s.name))
+      .map((s) => ({
+        strategy: s,
+        // Normalize static priority to ~[0,1] with a soft cap at 100.
+        score: stats.scoreFor(host, s.name, Math.min(1, s.priority / 100)),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (scored.length === 0) {
+      return {
+        solved: false,
+        method: 'all_strategies_in_cooldown',
+        attempts: 0,
+        captchaType: info.type,
+        error: `every candidate strategy is in cooldown on ${host}`,
+      };
+    }
+
     const trace: RichSolveResult['visionTrace'] = [];
     let lastError: string | undefined;
 
-    for (const strategy of candidates) {
+    for (const { strategy, score } of scored) {
       if (Date.now() - ctx.startTime > ctx.deadlineMs) {
         lastError = `solver deadline ${ctx.deadlineMs}ms exceeded`;
         break;
@@ -73,9 +106,10 @@ export class CaptchaStrategyRegistry {
       try {
         const result = await strategy.run(info, ctx);
         const duration = Date.now() - stratStart;
+        stats.recordOutcome(host, strategy.name, result.solved, duration);
         trace?.push({
           round: trace.length,
-          action: { strategy: strategy.name, solved: result.solved },
+          action: { strategy: strategy.name, solved: result.solved, score: Number(score.toFixed(3)) },
           llmOutput: result.error,
         });
         if (result.solved) {
@@ -89,6 +123,8 @@ export class CaptchaStrategyRegistry {
         }
         lastError = result.error || `strategy ${strategy.name} returned solved=false`;
       } catch (e) {
+        const duration = Date.now() - stratStart;
+        stats.recordOutcome(host, strategy.name, false, duration);
         lastError = `strategy ${strategy.name} threw: ${(e as Error).message}`;
       }
     }
@@ -96,7 +132,7 @@ export class CaptchaStrategyRegistry {
     return {
       solved: false,
       method: 'all_strategies_failed',
-      attempts: candidates.length,
+      attempts: scored.length,
       captchaType: info.type,
       error: lastError || 'unknown',
       visionTrace: trace,

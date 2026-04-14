@@ -19,8 +19,9 @@ import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types
 export const recaptchaCheckboxStrategy: CaptchaStrategy = {
   name: 'recaptcha_checkbox',
   supportedTypes: ['recaptcha'],
-  // Higher priority than vision — checkbox is essentially free if stealth works.
-  priority: 85,
+  // Highest priority for reCAPTCHA — checkbox is essentially free if
+  // stealth works, and it routinely auto-passes a real-looking session.
+  priority: 90,
   estimatedCostCents: 0,
   requiresLLM: false,
   requiresApiKey: false,
@@ -80,7 +81,9 @@ export const recaptchaCheckboxStrategy: CaptchaStrategy = {
 export const recaptchaAIGridStrategy: CaptchaStrategy = {
   name: 'recaptcha_ai_grid',
   supportedTypes: ['recaptcha', 'hcaptcha', 'image'],
-  priority: 60,
+  // Demoted: vision-LLM grid solving has been observed at ~99% failure
+  // empirically. Tried below paid solvers — only first when no API key.
+  priority: 50,
   estimatedCostCents: 3, // ~3c/round for vision LLM on a grid
   requiresLLM: true,
   requiresApiKey: false,
@@ -113,7 +116,7 @@ export const recaptchaAIGridStrategy: CaptchaStrategy = {
 export const recaptchaGridApiStrategy: CaptchaStrategy = {
   name: 'recaptcha_grid_api',
   supportedTypes: ['recaptcha', 'hcaptcha', 'image'],
-  priority: 50,
+  priority: 40,
   estimatedCostCents: 5,
   requiresLLM: false,
   requiresApiKey: true,
