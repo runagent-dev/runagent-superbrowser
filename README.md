@@ -8,6 +8,33 @@ SuperBrowser lets any AI agent drive a real Chromium browser through simple HTTP
 
 Self-host it on your own machine, run it in Docker, or deploy it however you want. The browser server itself has no external dependencies beyond Chromium.
 
+---
+
+## Where this is going
+
+The near-term target is the **serverless, stateful browser** — deployed on [RunAgent Cloud](https://runagent.cloud) and controlled from whichever chat app the user already lives in. No new UI to learn, no desktop client, no web console for day-to-day tasks. You send a message, the browser does the work, and when it needs you (captcha, OTP, a decision), it messages you back with a link you tap.
+
+```
+  You on WhatsApp / Telegram / Slack
+          │
+          │   "find me a black dress like this photo, size M, ships to Dhaka"
+          ▼
+  RunAgent Cloud  (serverless, stateful — cold-starts preserve cookies,
+          │       per-task memory, handoff ledger, fingerprint continuity)
+          │
+          ▼
+  SuperBrowser session  →  Zara, H&M, Amazon, Daraz, ...
+          │
+          │   hits a captcha → pushes a "tap to solve" link back to WhatsApp
+          │   you tap once → session resumes on the same cookies
+          ▼
+  Shortlist delivered as a WhatsApp message with images + links
+```
+
+The pieces making this real already live in the repo: cookie jars keyed on `SUPERBROWSER_TASK_ID + domain` so a warm task doesn't need a second solve, a cross-session handoff ledger so the same human isn't asked twice, a `HANDOFF_WEBHOOK_URL` hook so any messaging bridge can forward the live-view URL, and a WebSocket `awaiting_human` event with snapshot replay so late-connecting clients still catch an in-flight handoff. **The server is already "stateful enough" to survive a cold start on the same task** — what's next is the managed deployment + first-party messaging bridges.
+
+---
+
 ```
 Your AI Agent (any framework, any language)
     │
@@ -144,115 +171,38 @@ VISION_API_KEY=<separate key — NOT your brain's key>
 
 ## Usage
 
-### From any language — HTTP
+Four ways to drive the browser — pick whichever fits:
 
 ```python
-import httpx
-
-# Open session
-r = httpx.post("http://localhost:3100/session/create",
-    json={"url": "https://example.com"})
-data = r.json()
-session_id = data["sessionId"]
-elements = data["elements"]
-
-# Interact
-httpx.post(f"http://localhost:3100/session/{session_id}/type",
-    json={"index": 0, "text": "hello world"})
-httpx.post(f"http://localhost:3100/session/{session_id}/click",
-    json={"index": 1})
-
-# Get page as markdown
-r = httpx.get(f"http://localhost:3100/session/{session_id}/markdown")
-
-# Close
-httpx.delete(f"http://localhost:3100/session/{session_id}")
+# 1. HTTP session APIs — any language, any framework
+httpx.post("http://localhost:3100/session/create", json={"url": "https://example.com"})
+httpx.post(f"http://localhost:3100/session/{sid}/click", json={"index": 1})
 ```
-
-### Puppeteer script execution
 
 ```python
-r = httpx.post(f"http://localhost:3100/session/{session_id}/script",
-    headers={"Authorization": "Bearer YOUR_TOKEN"},
-    json={"code": """
-        await page.type('#q', 'openai');
-        await page.keyboard.press('Enter');
-        await page.waitForNavigation();
-        return (await page.$$eval('h3', els => els.map(e => e.textContent))).slice(0, 5);
-    """})
-print(r.json())
-# { "success": true, "result": ["...", "..."], "duration": 2100 }
+# 2. Puppeteer script — one call, full page API
+httpx.post(f"http://localhost:3100/session/{sid}/script",
+    headers={"Authorization": "Bearer TOKEN"},
+    json={"code": "await page.type('#q','...'); await page.click('#go'); return page.title();"})
 ```
-
-One-shot (no session) via `POST /function`:
-
-```python
-r = httpx.post("http://localhost:3100/function",
-    headers={"Authorization": "Bearer YOUR_TOKEN"},
-    json={"url": "https://example.com", "code": "return await page.title();"})
-```
-
-### With nanobot
-
-SuperBrowser ships with [nanobot](https://github.com/HKUDS/nanobot) integration — 25 registered tools that give any nanobot-powered agent full browser control with screenshot (or vision-text) feedback at every step.
 
 ```bash
-# Terminal 1: start SuperBrowser
-npm start
-
-# Terminal 2: run via nanobot
-cd nanobot
-pip install -e .
-python run.py "Go to github.com and find trending Python repos"
+# 3. Autonomous agent — fire-and-forget
+curl -X POST http://localhost:3100/task -d '{"task": "find trending repos on GitHub"}'
 ```
 
-Programmatically:
-
 ```python
+# 4. With nanobot — Python integration, 25 tools, vision preprocessor built in
 from nanobot import Nanobot
 from superbrowser_bridge.tools import register_all_tools
-
 bot = Nanobot.from_config(workspace="nanobot/workspace")
 register_all_tools(bot)
-
-result = await bot.run("Fill the contact form on example.com with name John Doe")
-print(result.content)
+await bot.run("fill the contact form on example.com with name John Doe")
 ```
 
-Tool levels:
-- **`browser_run_script`** — Puppeteer script for complex multi-step automation in a single call
-- **`browser_eval`** — quick DOM-level JavaScript for reads/writes
-- **`browser_click` / `browser_type`** — step-by-step when you want to observe between actions
-- **`browser_solve_captcha(method='vision')`** — Python vision agent reads tiles/handles, clicks them, verifies
-- **`browser_ask_user`** — blocks up to 5 minutes waiting for human input via the live-view UI
+Real-time control + feedback events are also available on `ws://localhost:3100/ws/session/:id`. Connect a WebSocket and you'll receive `awaiting_human` / `captcha_active` / `captcha_done` events — this is the plug point for a chat-app bridge.
 
-### WebSocket real-time control
-
-```javascript
-const ws = new WebSocket('ws://localhost:3100/ws/session/SESSION_ID');
-
-// Send commands
-ws.send(JSON.stringify({ action: 'navigate', data: { url: 'https://example.com' } }));
-ws.send(JSON.stringify({ action: 'click', data: { index: 3 } }));
-
-// Receive state + feedback events
-ws.onmessage = (e) => {
-  const { event, data } = JSON.parse(e.data);
-  if (event === 'feedback' && data.kind === 'awaiting_human') {
-    // Forward data.detail.viewUrl to your user
-  }
-};
-```
-
-### Built-in agent (optional, requires LLM key)
-
-```bash
-echo "OPENAI_API_KEY=sk-..." >> .env
-
-curl -X POST http://localhost:3100/task \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Search Google for latest AI news and extract the top 3 results"}'
-```
+Full request/response shapes for every endpoint are in the [API Reference](#api-reference) below.
 
 ---
 
@@ -409,13 +359,13 @@ New since the initial release:
 
 ## Roadmap
 
-The direction: **SuperBrowser as a delegatable, channel-agnostic browser assistant.**
+The top-of-README vision (serverless + chat-app control) is the guiding star. Concrete near-term items:
 
-- **Messaging-channel front-ends.** The webhook + WebSocket event plumbing is in place today. Next: first-party WhatsApp, Telegram, and Slack bridges that turn "find me a dress like this photo" into a complete browsing session with a human handoff link the user taps inside the chat thread.
-- **Task memory across sessions.** The handoff ledger and cookie jar already persist across session boundaries. Extending to general "what did this user buy last time" task memory is the next step.
-- **Proxy/region stickiness per task.** `cf_clearance` is IP+UA pinned; restoring cookies from a different IP invalidates them. Proxy pinning per `SUPERBROWSER_TASK_ID` will let the jar work across longer time horizons.
-- **CDP screencast live view.** The view UI polls screenshots at 2 FPS today. A WebSocket-backed CDP screencast will take that to 30+ FPS with cursor overlay.
-- **More vision providers.** Native `google-genai` backend for Gemini features the OpenAI-compat endpoint doesn't expose (multi-image batching, structured output schemas).
+- **WhatsApp / Telegram / Slack bridges** — first-party messaging front-ends that consume the existing `HANDOFF_WEBHOOK_URL` + WebSocket `awaiting_human` events. The transport is already in place; what's next is the canned bot.
+- **RunAgent Cloud managed deployment** — stateful-serverless: cookie jar, handoff ledger, and task-scoped resumption survive cold starts. One click to deploy, pay per active session-minute.
+- **Proxy / region stickiness per task** — `cf_clearance` is IP+UA pinned; the cookie jar is only as useful as the proxy that backs it. Pinning proxies per `SUPERBROWSER_TASK_ID` extends jar validity across longer horizons.
+- **CDP screencast live view** — upgrade `/session/:id/view` from 2 FPS screenshot polling to a WebSocket CDP screencast with cursor overlay.
+- **More vision providers** — native `google-genai` backend for Gemini features the OpenAI-compat endpoint doesn't expose (multi-image batching, structured output schemas).
 
 Contributions welcome on any of these — open an issue first if it's a large change.
 
@@ -423,13 +373,12 @@ Contributions welcome on any of these — open an issue first if it's a large ch
 
 ## Deployment
 
-SuperBrowser is designed as middleware. Deploy it however fits your stack:
+SuperBrowser is a stateful HTTP server. Deploy it however fits your stack:
 
 - **Self-hosted** — `npm start` on any machine with Chromium
 - **Docker** — `docker compose up -d`
-- **Kubernetes** — stateless container, one pod per instance (scale horizontally; sessions are in-memory per pod)
-- **Serverless** — fast cold start, ephemeral by design
-- **[RunAgent Cloud](https://runagent.cloud)** — managed deployment as part of the RunAgent super-agent ecosystem (OpenClaw, PicoClaw, ZeroClaw)
+- **Kubernetes** — one pod per instance, horizontal scaling; per-task cookie jar + handoff ledger are on disk (mount a PVC if you want them to survive pod restarts)
+- **[RunAgent Cloud](https://runagent.cloud)** — the target home: stateful-serverless deployment with managed proxy pool, chat-app bridges, and shared jar storage. Part of the RunAgent super-agent ecosystem (OpenClaw, PicoClaw, ZeroClaw).
 
 ---
 
