@@ -657,10 +657,14 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { index, x, y, button, clickCount, expected_fingerprint } = req.body as {
+      const { index, x, y, bbox, button, clickCount, expected_fingerprint } = req.body as {
         index?: number;
         x?: number;
         y?: number;
+        /** Vision-supplied bounding box (CSS pixels). Server snaps to
+         *  the nearest interactive element inside it — preferred over
+         *  raw (x, y) because it eliminates LLM coordinate drift. */
+        bbox?: { x0: number; y0: number; x1: number; y1: number };
         button?: 'left' | 'right' | 'middle';
         clickCount?: number;
         /** Fingerprint the LLM was targeting (from the last state fetch).
@@ -669,6 +673,25 @@ export function createHttpServer(
          *  element than the LLM intended after a DOM re-render. */
         expected_fingerprint?: string;
       };
+
+      if (bbox !== undefined) {
+        // Vision-bbox click: snap to interactive element, dispatch
+        // click at the snapped centre, return the resolved point so
+        // the bridge can log/trace which element actually received
+        // the input.
+        const snap = await page.clickInBbox(bbox, { button, clickCount });
+        const newState = await page.getState({ useVision: false, includeConsole: true });
+        res.json({
+          success: true,
+          url: newState.url,
+          title: newState.title,
+          elements: newState.elementTree.clickableElementsToString(),
+          consoleErrors: newState.consoleErrors,
+          pendingDialogs: newState.pendingDialogs,
+          snap,
+        });
+        return;
+      }
 
       if (x !== undefined && y !== undefined) {
         // Reward-band guard: if previous clicks in this 100px cell have
@@ -752,6 +775,51 @@ export function createHttpServer(
         consoleErrors: newState.consoleErrors,
         pendingDialogs: newState.pendingDialogs,
       });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Push a vision-pass bbox set to live viewers. Called by the Python
+   * bridge fire-and-forget right after the vision agent (Gemini)
+   * returns. Body shape:
+   *   {
+   *     bboxes: [
+   *       { x0, y0, x1, y1, label?, role?, clickable?,
+   *         intent_relevant?, index? },
+   *       ...
+   *     ],
+   *     imageWidth?: number,
+   *     imageHeight?: number,
+   *   }
+   * Coords are CSS pixels (already denormalized from box_2d).
+   */
+  app.post('/session/:id/vision-bboxes', async (req, res) => {
+    if (!getSession(req.params.id)) {
+      res.status(404).json({ error: 'Session not found or expired' });
+      return;
+    }
+    try {
+      const body = req.body as {
+        bboxes?: Array<{
+          x0: number; y0: number; x1: number; y1: number;
+          label?: string; role?: string;
+          clickable?: boolean; intent_relevant?: boolean; index?: number;
+        }>;
+        imageWidth?: number;
+        imageHeight?: number;
+      };
+      const bboxes = Array.isArray(body.bboxes) ? body.bboxes : [];
+      // Lazy import to avoid a circular dep at module load.
+      const { inputEventBus } = await import('../browser/input-events.js');
+      inputEventBus.emitVisionBboxes(
+        req.params.id,
+        bboxes,
+        body.imageWidth,
+        body.imageHeight,
+      );
+      res.json({ ok: true, count: bboxes.length });
     } catch (err) {
       handleError(res, err);
     }

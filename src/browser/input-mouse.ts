@@ -58,7 +58,13 @@ export async function dispatchClick(
 
   // humanClick doesn't forward modifiers or clickCount>1. Fall back to the
   // deterministic path when those are needed or when the caller opted out.
-  const useHumanized = !options?.linear && clickCount === 1 && modifiers === 0;
+  // Env escape hatch: SUPERBROWSER_CLICK_MODE=linear kills humanization
+  // for every click in the process — noticeable speed-up on test runs
+  // where you don't need bot-detection stealth and the pre-click
+  // hesitation (50–150ms) feels laggy during vision-loop debugging.
+  const envLinear = process.env.SUPERBROWSER_CLICK_MODE === 'linear';
+  const useHumanized = !options?.linear && !envLinear
+    && clickCount === 1 && modifiers === 0;
 
   if (useHumanized) {
     await humanClick(client, x, y, { button, sessionId: options?.sessionId });

@@ -87,6 +87,76 @@ def _label_position(box, text_size, viewport) -> tuple[int, int]:
     return (x, y)
 
 
+# Map BBox.role → the tag key used by ELEMENT_COLORS. Lets the SoM
+# overlay reuse the existing color palette so vision-agent-produced
+# bboxes render in the same visual language as DOM-derived ones.
+_ROLE_TO_TAG: dict[str, str] = {
+    "button": "button",
+    "link": "a",
+    "input": "input",
+    "checkbox": "input",
+    "captcha_tile": "button",
+    "captcha_widget": "default",
+    "slider_handle": "input",
+    "image": "default",
+    "text_block": "default",
+    "other": "default",
+}
+
+
+def build_som_screenshot(
+    screenshot_b64: str,
+    bboxes: Sequence[object],
+    image_w: int,
+    image_h: int,
+    *,
+    max_boxes: int = 20,
+) -> str:
+    """Set-of-Marks overlay: paint previous-pass VisionResponse.bboxes on
+    the image so the vision model can re-anchor on its own labels.
+
+    The `[V_n]` label on the overlay matches the index
+    `VisionResponse.as_brain_text()` uses, so the brain's text references
+    line up with what the vision model visually re-identifies. Caps at
+    `max_boxes` to keep the image readable (20 matches `highlights.py`'s
+    aesthetic cap and keeps overlay cost low).
+
+    Returns the input b64 unchanged on any failure (empty bboxes, zero
+    dims, PIL missing) — overlay must never block a vision call.
+    """
+    if not bboxes or image_w <= 0 or image_h <= 0:
+        return screenshot_b64
+    # Rank identically to VisionResponse.as_brain_text: intent_relevant
+    # first, then clickable, then by confidence desc. Keep original
+    # enumeration so ties break deterministically.
+    ranked = sorted(
+        enumerate(bboxes),
+        key=lambda ib: (
+            0 if getattr(ib[1], "intent_relevant", False) else 1,
+            0 if getattr(ib[1], "clickable", False) else 1,
+            -float(getattr(ib[1], "confidence", 0.0) or 0.0),
+            ib[0],
+        ),
+    )[:max_boxes]
+    elements: list[dict[str, object]] = []
+    for v_idx, (_, b) in enumerate(ranked, start=1):
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_w, image_h)  # type: ignore[attr-defined]
+        except Exception:
+            continue
+        role = str(getattr(b, "role", "other") or "other").lower()
+        elements.append({
+            "index": f"V{v_idx}",
+            "tag": _ROLE_TO_TAG.get(role, "default"),
+            "role": role,
+            "bounds": {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0},
+        })
+    if not elements:
+        return screenshot_b64
+    # bounds are already in image-pixel space; no DPR scaling needed.
+    return build_highlighted_screenshot(screenshot_b64, elements, device_pixel_ratio=1.0)
+
+
 def build_highlighted_screenshot(
     screenshot_b64: str,
     elements: Sequence[Mapping[str, object]],

@@ -201,6 +201,69 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
     #success .msg { font-size: 17px; text-align: center; max-width: 320px; }
     .err { color: var(--err); }
     .ok { color: var(--ok); }
+    /* Click-target crosshair: shown for ~600ms after each click so a
+       missed click is visible without diff-ing successive frames. */
+    @keyframes click-pulse {
+      0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.4); }
+      30%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+      100% { opacity: 0; transform: translate(-50%, -50%) scale(2.0); }
+    }
+    .click-target {
+      position: absolute; pointer-events: none; z-index: 6;
+      width: 28px; height: 28px;
+      animation: click-pulse 600ms ease-out forwards;
+    }
+    .click-target.snapped svg circle { stroke: var(--ok); }
+    .click-target.miss   svg circle { stroke: var(--warn); }
+    /* Bounding-box outline drawn at the resolved click site. Pulses
+       once then fades — long enough to register, short enough to clear
+       before the next vision pass. */
+    @keyframes bbox-pulse {
+      0%   { opacity: 0; }
+      20%  { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    .click-bbox {
+      position: absolute; pointer-events: none; z-index: 5;
+      border: 2px solid var(--ok); border-radius: 4px;
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.35) inset;
+      animation: bbox-pulse 800ms ease-out forwards;
+    }
+    .click-bbox.miss { border-color: var(--warn); }
+    /* Vision-pass bboxes — persistent overlay. All detected
+       interactive regions stay visible until the next vision pass
+       replaces them, so the user can read labels and correlate click
+       accuracy with what the model actually detected. Color-coded by
+       role; intent-relevant ones get a thicker border. The .stale class
+       dims the layer after ~5s of no new pass so long-idle sessions don't
+       keep showing a frozen overlay at full opacity. */
+    .vision-bbox {
+      position: absolute; pointer-events: none; z-index: 4;
+      border: 1.5px dashed rgba(255,255,255,0.55);
+      border-radius: 3px;
+      opacity: 0.85;
+      transition: opacity 300ms ease, filter 300ms ease;
+    }
+    .vision-bbox.stale {
+      opacity: 0.45;
+      filter: grayscale(0.4);
+    }
+    .vision-bbox[data-role="button"]        { border-color: rgba(255,107,107,0.9); }
+    .vision-bbox[data-role="link"]          { border-color: rgba(150,206,180,0.9); }
+    .vision-bbox[data-role="input"]         { border-color: rgba(78,205,196,0.95); }
+    .vision-bbox[data-role="checkbox"]      { border-color: rgba(78,205,196,0.95); }
+    .vision-bbox[data-role="captcha_tile"]  { border-color: rgba(255,200,87,0.9); }
+    .vision-bbox[data-role="captcha_widget"]{ border-color: rgba(255,200,87,0.9); }
+    .vision-bbox[data-role="slider_handle"] { border-color: rgba(255,200,87,0.9); }
+    .vision-bbox[data-relevant="1"] { border-width: 3px; }
+    .vision-bbox .vlabel {
+      position: absolute; top: -16px; left: -1px;
+      font: 10px/14px ui-monospace, SFMono-Regular, Consolas, monospace;
+      background: rgba(0,0,0,0.7); color: #fff;
+      padding: 0 4px; border-radius: 3px 3px 0 0;
+      white-space: nowrap; max-width: 180px;
+      overflow: hidden; text-overflow: ellipsis;
+    }
   </style>
 </head>
 <body>
@@ -322,6 +385,126 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
         cursorEl.style.top = py + 'px';
       }
 
+      // --- Coord projection ------------------------------------------
+      // Map a page CSS pixel (vx, vy) to a position inside #screen-wrap
+      // so overlays line up with the rendered <img>. The screen image
+      // can be scaled (CSS) and centered (margin) — both are folded in.
+      function projectPoint(vx, vy) {
+        const rect = screen.getBoundingClientRect();
+        const wrapRect = screenWrap.getBoundingClientRect();
+        const natW = screen.naturalWidth || viewport.width;
+        const natH = screen.naturalHeight || viewport.height;
+        const sx = rect.width / natW;
+        const sy = rect.height / natH;
+        const ox = rect.left - wrapRect.left;
+        const oy = rect.top - wrapRect.top;
+        return { x: vx * sx + ox, y: vy * sy + oy, sx: sx, sy: sy };
+      }
+
+      // --- Click-target crosshair + bbox outline ---------------------
+      // Shown briefly after each click so the user can see *where* the
+      // cursor landed. Green when we snapped to a real interactive
+      // element, amber when we fell back to the raw bbox centre. When
+      // the click came from a vision bbox, the bbox rect is drawn at
+      // the same time so a miss vs a hit is visible at a glance.
+      function showClickTarget(data) {
+        if (!data || typeof data.x !== 'number' || typeof data.y !== 'number') return;
+        const p = projectPoint(data.x, data.y);
+        // Crosshair
+        const el = document.createElement('div');
+        el.className = 'click-target ' + (data.snapped ? 'snapped' : 'miss');
+        el.style.left = p.x + 'px';
+        el.style.top = p.y + 'px';
+        el.innerHTML = '<svg viewBox="0 0 28 28" width="28" height="28">'
+          + '<circle cx="14" cy="14" r="11" fill="none" stroke-width="3"/>'
+          + '<line x1="14" y1="2" x2="14" y2="8" stroke="currentColor" stroke-width="2"/>'
+          + '<line x1="14" y1="20" x2="14" y2="26" stroke="currentColor" stroke-width="2"/>'
+          + '<line x1="2" y1="14" x2="8" y2="14" stroke="currentColor" stroke-width="2"/>'
+          + '<line x1="20" y1="14" x2="26" y2="14" stroke="currentColor" stroke-width="2"/>'
+          + '</svg>';
+        screenWrap.appendChild(el);
+        setTimeout(() => { try { el.remove(); } catch (e) {} }, 650);
+        // Bbox rect (when present)
+        if (data.bbox && typeof data.bbox.x0 === 'number') {
+          const tl = projectPoint(data.bbox.x0, data.bbox.y0);
+          const br = projectPoint(data.bbox.x1, data.bbox.y1);
+          const box = document.createElement('div');
+          box.className = 'click-bbox ' + (data.snapped ? '' : 'miss');
+          box.style.left = tl.x + 'px';
+          box.style.top = tl.y + 'px';
+          box.style.width = Math.max(0, br.x - tl.x) + 'px';
+          box.style.height = Math.max(0, br.y - tl.y) + 'px';
+          screenWrap.appendChild(box);
+          setTimeout(() => { try { box.remove(); } catch (e) {} }, 850);
+        }
+      }
+
+      // --- Vision-pass overlay (persistent) --------------------------
+      // Draws the entire bbox set returned by the vision agent and
+      // KEEPS it on screen. Only replaced when the next vision_bboxes
+      // event arrives. After ~5s of no new event, the .stale class is
+      // added so the layer dims — a visual signal that what you're
+      // looking at is the last pass, not the current one.
+      let visionBboxLayer = null;
+      let visionBboxLayerAt = 0;
+      const VISION_STALE_AFTER_MS = 5000;
+
+      function showVisionBboxes(data) {
+        if (!data || !Array.isArray(data.bboxes)) return;
+        // Replace any prior layer so two overlays don't stack.
+        if (visionBboxLayer) {
+          try { visionBboxLayer.remove(); } catch (e) {}
+          visionBboxLayer = null;
+        }
+        const layer = document.createElement('div');
+        layer.style.position = 'absolute';
+        layer.style.left = '0';
+        layer.style.top = '0';
+        layer.style.right = '0';
+        layer.style.bottom = '0';
+        layer.style.pointerEvents = 'none';
+        layer.style.zIndex = '4';
+        for (const b of data.bboxes) {
+          if (typeof b.x0 !== 'number') continue;
+          const tl = projectPoint(b.x0, b.y0);
+          const br = projectPoint(b.x1, b.y1);
+          const w = Math.max(0, br.x - tl.x);
+          const h = Math.max(0, br.y - tl.y);
+          if (w < 4 || h < 4) continue;
+          const div = document.createElement('div');
+          div.className = 'vision-bbox';
+          div.dataset.role = b.role || 'other';
+          div.dataset.relevant = b.intent_relevant ? '1' : '0';
+          div.style.left = tl.x + 'px';
+          div.style.top = tl.y + 'px';
+          div.style.width = w + 'px';
+          div.style.height = h + 'px';
+          if (b.index || b.label) {
+            const lab = document.createElement('span');
+            lab.className = 'vlabel';
+            const idx = b.index ? '[V' + b.index + '] ' : '';
+            lab.textContent = idx + (b.label || b.role || '');
+            div.appendChild(lab);
+          }
+          layer.appendChild(div);
+        }
+        screenWrap.appendChild(layer);
+        visionBboxLayer = layer;
+        visionBboxLayerAt = Date.now();
+      }
+
+      // Cheap 1 Hz staleness watcher — toggles the .stale class on
+      // every bbox in the current layer so CSS fades them together.
+      // No-op when no layer is mounted.
+      setInterval(function() {
+        if (!visionBboxLayer) return;
+        const stale = (Date.now() - visionBboxLayerAt) > VISION_STALE_AFTER_MS;
+        const children = visionBboxLayer.children || [];
+        for (let i = 0; i < children.length; i++) {
+          children[i].classList.toggle('stale', stale);
+        }
+      }, 1000);
+
       // --- Typing indicator ------------------------------------------
       let typingBuffer = '';
       let typingTimeout = null;
@@ -370,6 +553,12 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
                   break;
                 case 'cursor_move':
                   updateCursor(msg.data.x, msg.data.y);
+                  break;
+                case 'cursor_target':
+                  showClickTarget(msg.data);
+                  break;
+                case 'vision_bboxes':
+                  showVisionBboxes(msg.data);
                   break;
                 case 'keystroke':
                   showKeystroke(msg.data.key);

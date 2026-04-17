@@ -430,7 +430,16 @@ class DelegateBrowserTaskTool(Tool):
         # Research tasks need more iterations: search + visit 3-5 pages + refine
         _research_kw = ("search", "research", "find information", "google", "look up", "investigate")
         is_research = any(k in instructions.lower() for k in _research_kw)
-        max_iterations = 40 if is_research else 25
+        # Caps are env-overridable so a stuck flow can be widened without
+        # a code edit. Defaults sized for the click-accuracy era — tight
+        # enough that a genuinely looping worker still bails out, loose
+        # enough that a clean multi-step flow (login → form → submit →
+        # verify) doesn't time out on its own.
+        max_iterations = (
+            int(os.environ.get("SUPERBROWSER_WORKER_MAX_ITER_RESEARCH") or "75")
+            if is_research
+            else int(os.environ.get("SUPERBROWSER_WORKER_MAX_ITER") or "50")
+        )
 
         print(f"\n>> delegate_browser_task(session={session_key})")
         print(f"   Instructions: {instructions[:120]}...")

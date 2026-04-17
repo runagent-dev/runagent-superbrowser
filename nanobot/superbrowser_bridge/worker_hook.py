@@ -20,7 +20,7 @@ from superbrowser_bridge.loop_detector import LoopDetector
 class BrowserWorkerHook(AgentHook):
     """Injects mid-loop corrective guidance based on worker state."""
 
-    def __init__(self, state: BrowserSessionState, max_iterations: int = 25):
+    def __init__(self, state: BrowserSessionState, max_iterations: int = 50):
         self.state = state
         self.max_iterations = max_iterations
         self._last_budget_warning_at: int = -1  # iteration of last warning

@@ -1,18 +1,25 @@
 """VisionAgent — orchestrates cache + provider + response formatting.
 
 One lazy process-wide singleton. Exposes a single public coroutine:
-    analyze(screenshot_b64, intent, session_id, url, dom_hash) -> VisionResponse
+    analyze(screenshot_b64, intent, session_id, url, dom_hash,
+            image_width, image_height) -> VisionResponse
 
 On provider failure or timeout we return a best-effort fallback response
 (empty bboxes, summary='vision unavailable'). Callers always get a
 VisionResponse back — they should never need to handle exceptions from
 here for the request to recover.
+
+Image dimensions are required to denormalize Gemini's box_2d (in [0, 1000]
+space) back to CSS pixels. If the caller doesn't supply them, the agent
+decodes the base64 screenshot once via PIL to read width/height.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import io
 import json
 import os
 import sys
@@ -24,7 +31,7 @@ from pydantic import ValidationError
 from .cache import CacheKey, VisionCache
 from .prompts import SYSTEM_PROMPT, build_user_prompt, intent_bucket
 from .providers import VisionProvider, select_provider
-from .schemas import PageFlags, VisionResponse
+from .schemas import BBox, PageFlags, VisionResponse
 
 
 def _log(msg: str) -> None:
@@ -43,6 +50,12 @@ class VisionAgent:
     def __init__(self, provider: VisionProvider, cache: VisionCache) -> None:
         self._provider = provider
         self._cache = cache
+        # Per-session record of the bboxes emitted on the PREVIOUS pass.
+        # Used to draw Set-of-Marks anchors onto the next screenshot
+        # before sending it to the model — the model re-identifies its
+        # own labels instead of re-guessing from scratch every round.
+        # Keyed by session_id (or "_" for non-session callers).
+        self._last_response_bboxes: dict[str, list[BBox]] = {}
 
     async def analyze(
         self,
@@ -53,6 +66,9 @@ class VisionAgent:
         url: str,
         dom_hash: str,
         previous_summary: str | None = None,
+        image_width: int | None = None,
+        image_height: int | None = None,
+        task_instruction: str | None = None,
     ) -> VisionResponse:
         start = time.monotonic()
         key: CacheKey = (
@@ -62,12 +78,54 @@ class VisionAgent:
             intent_bucket(intent),
         )
 
+        # Resolve image dims up front — they're required to denormalize
+        # box_2d back to CSS pixels. If the caller didn't pass them, peek
+        # at the PNG/JPEG header via PIL (cheap; the image is already in
+        # memory as base64).
+        if not image_width or not image_height:
+            image_width, image_height = _decode_dims(screenshot_b64)
+
         cached = await self._cache.get(key)
         if cached is not None:
-            return cached
+            # Re-attach dims — cache is process-local so they're typically
+            # the same as last time, but a viewport resize between calls
+            # would invalidate them otherwise. Cached responses skip the
+            # SoM overlay entirely (no provider call means no opportunity
+            # for Gemini to re-anchor on it).
+            _log(
+                f"cache HIT  dom_hash={dom_hash or '-'}  "
+                f"intent={intent_bucket(intent)}  "
+                f"url={(url or '')[:60]}"
+            )
+            return cached.with_image_dims(image_width, image_height)
+        _log(
+            f"cache MISS dom_hash={dom_hash or '-'}  "
+            f"intent={intent_bucket(intent)}  "
+            f"url={(url or '')[:60]}"
+        )
+
+        # Set-of-Marks feedback: overlay the bboxes we emitted on the
+        # previous pass so Gemini can re-anchor visually instead of
+        # re-guessing every element from scratch. Opt-out via
+        # VISION_SOM_OVERLAY=0 for A/B testing. Any failure here falls
+        # through to the raw screenshot — overlay must never block a
+        # vision call.
+        if os.environ.get("VISION_SOM_OVERLAY", "1") != "0":
+            prev = self._last_response_bboxes.get(session_id or "_") or []
+            if prev and image_width > 0 and image_height > 0:
+                try:
+                    from superbrowser_bridge.highlights import build_som_screenshot
+                    screenshot_b64 = build_som_screenshot(
+                        screenshot_b64, prev, image_width, image_height,
+                    )
+                except Exception as exc:
+                    _log(f"SoM overlay failed (non-fatal): {exc!r}")
 
         user_prompt = build_user_prompt(
-            intent=intent, url=url, previous_summary=previous_summary,
+            intent=intent,
+            url=url,
+            previous_summary=previous_summary,
+            task_instruction=task_instruction,
         )
         try:
             raw = await self._provider.chat_with_image(
@@ -83,7 +141,7 @@ class VisionAgent:
                 provider=self._provider.name,
                 model=self._provider.model,
                 reason=f"provider error: {exc}",
-            )
+            ).with_image_dims(image_width, image_height)
 
         parsed, parse_error = _parse_response_with_error(raw.text)
         if parsed is None:
@@ -98,7 +156,7 @@ class VisionAgent:
                 provider=self._provider.name,
                 model=self._provider.model,
                 reason=f"parse: {parse_error}",
-            )
+            ).with_image_dims(image_width, image_height)
 
         parsed.intent = intent
         parsed.cached = False
@@ -106,9 +164,32 @@ class VisionAgent:
         parsed.tokens_used = raw.tokens_used
         parsed.model = raw.model
         parsed.provider = raw.provider
+        parsed.with_image_dims(image_width, image_height)
+
+        # Remember this pass's bboxes so the next screenshot from the
+        # same session gets a SoM overlay. An empty list is stored
+        # deliberately — prevents a stale overlay from lingering after
+        # a pass that saw no interactive elements.
+        self._last_response_bboxes[session_id or "_"] = list(parsed.bboxes)
 
         await self._cache.put(key, parsed)
         return parsed
+
+
+def _decode_dims(screenshot_b64: str) -> tuple[int, int]:
+    """Read (width, height) from a base64-encoded image header.
+
+    Returns (0, 0) if PIL is unavailable or the bytes don't decode — the
+    consumer falls back to showing normalized box_2d in brain text rather
+    than CSS pixels in that case.
+    """
+    try:
+        from PIL import Image  # lazy import; PIL is a transitive dep
+        img = Image.open(io.BytesIO(base64.b64decode(screenshot_b64)))
+        return int(img.width), int(img.height)
+    except Exception as exc:
+        _log(f"_decode_dims failed: {exc!r}")
+        return 0, 0
 
 
 def _parse_response(text: str) -> VisionResponse | None:

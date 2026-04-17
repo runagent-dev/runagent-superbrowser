@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ Task: Browse the women's new arrivals section and list the names and prices of the first 5 items displayed.\\nwebsite: https://zara.com"""
+        """I am staying in Sylhet for three days from 21st April 2026 to 23rd April 2026. I need to find a four star or five star hotel in sylhet with proper price. Website: https://gozayaan.com/	"""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

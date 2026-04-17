@@ -31,6 +31,73 @@ SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
 
+async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
+    """POST denormalized bboxes to the SuperBrowser server so live
+    viewers can flash them on the screencast overlay.
+
+    Fire-and-forget; never raises into the caller. Brain-text indices
+    (`V_n`) come from the same ranking `as_brain_text()` uses so the
+    overlay's labels match what the brain sees.
+    """
+    if not session_id:
+        return
+    iw, ih = getattr(resp, "image_width", 0), getattr(resp, "image_height", 0)
+    if iw <= 0 or ih <= 0:
+        return
+    # Mirror the rank order of as_brain_text() so the overlay's V_n
+    # labels line up with what the brain sees in tool output.
+    ordered = sorted(
+        getattr(resp, "bboxes", []),
+        key=lambda b: (
+            0 if getattr(b, "intent_relevant", False) else 1,
+            0 if getattr(b, "clickable", False) else 1,
+            -getattr(b, "confidence", 0.0),
+        ),
+    )
+    payload_bboxes: list[dict[str, Any]] = []
+    for i, b in enumerate(ordered, start=1):
+        try:
+            x0, y0, x1, y1 = b.to_pixels(iw, ih)
+        except Exception:
+            continue
+        payload_bboxes.append({
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "label": getattr(b, "label", "")[:40],
+            "role": getattr(b, "role", "other"),
+            "clickable": bool(getattr(b, "clickable", False)),
+            "intent_relevant": bool(getattr(b, "intent_relevant", False)),
+            "index": i,
+        })
+    payload = {"bboxes": payload_bboxes, "imageWidth": iw, "imageHeight": ih}
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                f"{SUPERBROWSER_URL}/session/{session_id}/vision-bboxes",
+                json=payload,
+            )
+    except Exception:
+        # Best-effort — overlay is debug visualization, not load-bearing.
+        pass
+
+
+def _read_image_dims(b64: str) -> tuple[int, int]:
+    """Decode (width, height) from a base64-encoded screenshot.
+
+    Used to denormalize Gemini's box_2d coords (in [0, 1000] space)
+    against the actual screenshot dimensions before any click is
+    dispatched. Returns (0, 0) if PIL isn't available or the bytes
+    don't decode — the vision agent then falls back to showing
+    normalized coords in brain text.
+    """
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+        return int(img.width), int(img.height)
+    except Exception:
+        return 0, 0
+
+
 async def _request_with_backoff(
     method: str,
     url: str,
@@ -226,6 +293,18 @@ class BrowserSessionState:
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
+        # Hard guard against the brain re-clicking a target that produced
+        # no DOM change. Cleared by `register_click_attempt` on a fresh
+        # target; incremented when the same target re-fires AND the page
+        # didn't change since the previous click. The guard refuses to
+        # dispatch the (MAX_CONSECUTIVE_SAME_TARGET)th attempt — i.e.
+        # one retry is allowed (some JS buttons genuinely need a second
+        # click), but the third strike returns a structured error so the
+        # brain is forced to switch tactic.
+        self.last_click_target: str = ""
+        self.last_click_dom_hash: str = ""
+        self.consecutive_dead_clicks: int = 0
+        self.MAX_CONSECUTIVE_SAME_TARGET = 3
         # Active session ID (set by browser_open)
         self.session_id: str = ""
         # How many times has BrowserOpenTool had to refuse a redundant call?
@@ -286,6 +365,17 @@ class BrowserSessionState:
         self._last_intent: str = ""
         self._last_dom_hash: str = ""
         self._last_vision_summary: str = ""
+        # Task context stamped by configure_budget() when the orchestrator
+        # spawns a browser worker — piped into the vision prompt so
+        # Gemini knows WHAT the user is trying to do before it picks
+        # which bboxes to emit.
+        self.task_instruction: str = ""
+        self.task_target_url: str = ""
+        # Cached last VisionResponse so browser_click_at can resolve a
+        # vision-index reference (e.g. bbox=V3) back to the original
+        # bbox without re-running the vision pass. Reset whenever a new
+        # screenshot triggers a fresh vision call.
+        self._last_vision_response: Any = None
 
     # --- budget configuration ---------------------------------------------
 
@@ -302,6 +392,13 @@ class BrowserSessionState:
             is_research=is_research,
         )
         self.screenshot_budget = self.max_screenshots
+        # Capture the task context so the vision agent can reason about
+        # what the agent is trying to do on this site when picking which
+        # regions to bbox. "Book a flight on trip.com" → the vision agent
+        # should prioritize departure / destination / date / search
+        # button bboxes, not navbar noise.
+        self.task_instruction = (task_instruction or "")[:500]
+        self.task_target_url = target_url or ""
         return self.max_screenshots
 
     def enter_captcha_mode(self) -> None:
@@ -507,6 +604,55 @@ class BrowserSessionState:
             "time": datetime.now().strftime("%H:%M:%S"),
         })
 
+    def check_dead_click(self, click_target: str) -> str | None:
+        """Pre-flight check before dispatching a click.
+
+        Counts how many times this exact click target has been fired in
+        a row without the page DOM changing in between. Once the count
+        would reach `MAX_CONSECUTIVE_SAME_TARGET`, refuse with a
+        structured error so the brain is forced to pick a different
+        target. Different target OR a DOM change resets the count.
+
+        DOM change is detected via `_last_dom_hash` (set by every state
+        fetch).
+
+        Returns a structured error string when blocking, or None when
+        the click is allowed to proceed.
+        """
+        same_target = (click_target == self.last_click_target)
+        same_dom = (
+            bool(self._last_dom_hash)
+            and self._last_dom_hash == self.last_click_dom_hash
+        )
+        if same_target and same_dom:
+            # Nth consecutive dead attempt at the same target.
+            self.consecutive_dead_clicks += 1
+        else:
+            # Fresh attempt at this target (different target OR page moved).
+            self.consecutive_dead_clicks = 1
+        if self.consecutive_dead_clicks >= self.MAX_CONSECUTIVE_SAME_TARGET:
+            # Reset so the brain picking a new target next round clears
+            # the strike count cleanly.
+            self.consecutive_dead_clicks = 0
+            self.last_click_target = ""
+            return (
+                f"[dead_click_blocked] {click_target} has been clicked "
+                f"{self.MAX_CONSECUTIVE_SAME_TARGET} times in a row with "
+                "no DOM change. The previous clicks did not move the "
+                "page. Switch tactic: pick a different [V_n]/[index], "
+                "try a different role (e.g., the form's submit button "
+                "instead of the input), use browser_run_script to "
+                "simulate the action via JS, or browser_wait_for content "
+                "you expect to appear. Do NOT retry this exact target."
+            )
+        return None
+
+    def register_click_attempt(self, click_target: str) -> None:
+        """Stamp the current click target + DOM hash so the next call to
+        `check_dead_click` can compare against them."""
+        self.last_click_target = click_target
+        self.last_click_dom_hash = self._last_dom_hash
+
     def get_last_checkpoint(self) -> dict | None:
         """Return the most recent checkpoint."""
         return self.checkpoints[-1] if self.checkpoints else None
@@ -691,6 +837,11 @@ class BrowserSessionState:
             effective_url = url or self.current_url
             try:
                 agent = get_vision_agent()
+                # Read screenshot dims off the bytes once — Gemini emits
+                # box_2d in [0, 1000] space; downstream click dispatch
+                # needs the source pixel dims to convert back to viewport
+                # coordinates accurately.
+                img_w, img_h = _read_image_dims(b64)
                 resp = await agent.analyze(
                     screenshot_b64=b64,
                     intent=effective_intent,
@@ -698,14 +849,26 @@ class BrowserSessionState:
                     url=effective_url,
                     dom_hash=dh or self._last_dom_hash,
                     previous_summary=self._last_vision_summary or None,
+                    image_width=img_w,
+                    image_height=img_h,
+                    task_instruction=self.task_instruction or None,
                 )
                 self._last_vision_summary = resp.summary
+                self._last_vision_response = resp
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
                 label = (caption or "").split("\n")[0][:30].replace(" ", "-")
                 # Still save the raw screenshot locally for debugging —
                 # doesn't leave the box, doesn't reach the brain.
                 self.save_screenshot(b64, label)
+                # Fire-and-forget push of detected bboxes to live viewers.
+                # Lets the user see what Gemini "saw" (full set, color-
+                # coded by role) for ~1.5s before the next click. Failure
+                # is non-fatal — vision still works, just no overlay.
+                try:
+                    asyncio.create_task(_push_vision_bboxes(self.session_id, resp))
+                except Exception as exc:
+                    print(f"  [vision-overlay push failed: {exc}]")
                 text = f"{caption}\n\n{resp.as_brain_text()}" if caption else resp.as_brain_text()
                 return [{"type": "text", "text": text}]
             except Exception as exc:
@@ -1307,6 +1470,12 @@ class BrowserClickTool(Tool):
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
+        target_key = f"click[{index}]"
+        dead = self.s.check_dead_click(target_key)
+        if dead:
+            self.s.log_activity(f"click([{index}])(DEAD_CLICK_BLOCKED)", "")
+            return dead
+        self.s.register_click_attempt(target_key)
         self.s.consecutive_click_calls += 1
         payload: dict[str, Any] = {"index": index}
         if button:
@@ -1381,26 +1550,98 @@ class BrowserClickTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
-        x=NumberSchema(description="X coordinate"),
-        y=NumberSchema(description="Y coordinate"),
-        required=["session_id", "x", "y"],
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index (the V_n the vision agent "
+                "labelled this element). When set, the server snaps to "
+                "the interactive element inside that bbox — far more "
+                "accurate than clicking a guessed (x,y)."
+            ),
+            nullable=True,
+        ),
+        x=NumberSchema(description="X coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
+        y=NumberSchema(description="Y coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
+        required=["session_id"],
     )
 )
 class BrowserClickAtTool(Tool):
     name = "browser_click_at"
-    description = "Click at x,y coordinates. LAST RESORT — prefer browser_run_script."
+    description = (
+        "Click using a vision bbox (vision_index=V_n) or raw (x,y) "
+        "coordinates. Prefer vision_index whenever the vision agent "
+        "labelled the target — the server snaps to the actual interactive "
+        "element inside the bbox, eliminating off-by-pixel misses."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
 
-    async def execute(self, session_id: str, x: float, y: float, **kw: Any) -> Any:
+    async def execute(
+        self,
+        session_id: str,
+        vision_index: int | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        **kw: Any,
+    ) -> Any:
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return f"[BLOCKED] browser_click_at used {self.s.click_at_count} times. Use browser_run_script instead."
-        print(f"\n>> browser_click_at({x}, {y})")
+
+        # Build the target key BEFORE resolving the bbox, so the guard
+        # fires on intent (vision_index=V3) not on resolved coords (which
+        # could shift slightly between calls due to anti-aliasing).
+        if vision_index is not None:
+            target_key = f"click_at(V{int(vision_index)})"
+        elif x is not None and y is not None:
+            # Round to a 5px grid — micro-jitter shouldn't escape the guard.
+            target_key = f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
+        else:
+            target_key = "click_at(?)"
+        dead = self.s.check_dead_click(target_key)
+        if dead:
+            self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
+            return dead
+        self.s.register_click_attempt(target_key)
+
+        payload: dict[str, Any]
+        log_target: str
+        if vision_index is not None:
+            resp = self.s._last_vision_response
+            if resp is None:
+                return (
+                    "[click_at_failed:no_vision] No recent vision response "
+                    "to resolve vision_index against. Re-fetch state to "
+                    "trigger a fresh vision pass, or pass raw (x, y)."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[click_at_failed:bad_vision_index] V{vision_index} "
+                    f"is out of range (only {len(resp.bboxes)} bboxes in "
+                    "the last vision response)."
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return (
+                    "[click_at_failed:no_image_dims] Last vision response "
+                    "has no source image dimensions; cannot denormalize "
+                    "box_2d. Re-fetch state."
+                )
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+            log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
+            print(f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1})")
+        else:
+            if x is None or y is None:
+                return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
+            payload = {"x": float(x), "y": float(y)}
+            log_target = f"({x},{y})"
+            print(f"\n>> browser_click_at({x}, {y})")
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json={"x": x, "y": y})
+            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json=payload)
             # 409 = reward-band reject. Historical data says this zone
             # doesn't respond to clicks on this host; surface the hint
             # so the LLM re-reads elements instead of trying another
@@ -1408,15 +1649,27 @@ class BrowserClickAtTool(Tool):
             if r.status_code == 409:
                 info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
                 err = info.get("error") or "click_at rejected: low-reward zone"
-                self.s.log_activity(f"click_at({x},{y})(BAND_REJECT)", f"band={info.get('band')}")
+                self.s.log_activity(f"click_at{log_target}(BAND_REJECT)", f"band={info.get('band')}")
                 return f"[low_reward_band] {err}"
             r.raise_for_status()
             data = r.json()
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
-        self.s.record_step("browser_click_at", f"x={x},y={y}", f"url={actual_url[:60] if actual_url else '?'}")
-        return self.s.build_text_only(data, f"Clicked at ({x}, {y})")
+        snap = data.get("snap")  # {x, y, snapped: bool, target?: str}
+        if snap:
+            snap_note = (
+                f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
+                if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
+            )
+        else:
+            snap_note = ""
+        self.s.record_step(
+            "browser_click_at",
+            log_target,
+            f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
+        )
+        return self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
 
 
 @tool_parameters(

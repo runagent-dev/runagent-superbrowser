@@ -29,7 +29,15 @@ class _Entry:
 
 
 class VisionCache:
-    def __init__(self, *, max_size: int = 200, ttl_s: float = 300.0) -> None:
+    def __init__(self, *, max_size: int = 200, ttl_s: float = 60.0) -> None:
+        # TTL default dropped from 300s → 60s: a 5-minute cache made
+        # long-running agents see identical bboxes across many
+        # iterations when URL + DOM hash didn't change (dynamic content
+        # loads, spinners clearing, lazy-rendered widgets appearing
+        # with the same container DOM). 60s is short enough that a slow
+        # page still refreshes per realistic user pace, long enough
+        # that a chained sequence of tool calls (click → wait → verify)
+        # within the same page state still hits cache.
         self._store: "OrderedDict[CacheKey, _Entry]" = OrderedDict()
         self._max = max_size
         self._ttl = ttl_s
@@ -39,8 +47,16 @@ class VisionCache:
     def from_env(cls) -> "VisionCache":
         return cls(
             max_size=int(os.environ.get("VISION_CACHE_SIZE") or "200"),
-            ttl_s=float(os.environ.get("VISION_CACHE_TTL_SEC") or "300"),
+            ttl_s=float(os.environ.get("VISION_CACHE_TTL_SEC") or "60"),
         )
+
+    async def bust(self, key: CacheKey) -> None:
+        """Force-remove a key so the next `get()` misses and the caller
+        re-runs the vision model. Used by the bridge when the
+        dead-click guard detects the agent is stuck — fresh bboxes may
+        reveal that the previous pass mislabelled the target."""
+        async with self._lock:
+            self._store.pop(key, None)
 
     async def get(self, key: CacheKey) -> VisionResponse | None:
         async with self._lock:

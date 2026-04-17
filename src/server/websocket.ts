@@ -41,7 +41,7 @@ import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
 import { feedbackBus, type FeedbackEvent } from '../agent/feedback-bus.js';
 import { ScreencastManager } from '../browser/screencast.js';
-import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent } from '../browser/input-events.js';
+import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent, type ClickTargetEvent, type VisionBboxesEvent } from '../browser/input-events.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -206,6 +206,30 @@ export function attachWebSocketServer(
 
   inputEventBus.on('keystroke', (evt: KeystrokeEvent) => {
     broadcastToSession(wss, evt.sessionId, 'keystroke', { key: evt.key, type: evt.type });
+  });
+
+  // Click-target events fire once per click after the snap-to-element
+  // resolution. The viewer renders a transient crosshair so a missed
+  // click is visible without diff-ing successive screenshots.
+  inputEventBus.on('click_target', (evt: ClickTargetEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'cursor_target', {
+      x: evt.x,
+      y: evt.y,
+      snapped: evt.snapped,
+      bbox: evt.bbox,
+      target: evt.target,
+    });
+  });
+
+  // Fires after each vision pass — the viewer flashes the full set of
+  // detected bboxes on the live frame for ~1.5s. Lets the user see what
+  // Gemini "saw" so misses can be attributed to vision vs snap.
+  inputEventBus.on('vision_bboxes', (evt: VisionBboxesEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'vision_bboxes', {
+      bboxes: evt.bboxes,
+      imageWidth: evt.imageWidth,
+      imageHeight: evt.imageHeight,
+    });
   });
 
   return wss;

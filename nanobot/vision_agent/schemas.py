@@ -6,23 +6,29 @@ The brain-facing shape is deliberately flat and small:
   - `bboxes`         — list of interactive / notable regions with coords
   - `flags`          — page-state booleans the brain checks cheaply
 
-Coordinates are in CSS pixels of the rendered page (the same coord space
-the existing `browser_click` tool accepts). Providers MUST return integer
-pixel values — we clamp negatives and cast to int defensively on parse.
+Bbox coordinates use Gemini's normalized `box_2d` format:
+  [ymin, xmin, ymax, xmax] integers in [0, 1000], top-left origin,
+  measured against the screenshot dimensions.
+
+Gemini is trained natively in this space and is dramatically more
+accurate here than at arbitrary absolute pixel resolutions. Denormalize
+to CSS pixels via `BBox.to_pixels(image_w, image_h)` at the consumer
+side — `VisionResponse` carries the source image dimensions so brain-
+text rendering and downstream click dispatch produce sub-pixel-correct
+viewport coordinates.
 """
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 
 # Canonical role vocabulary the brain-facing renderer + captcha solver
 # care about. The schema accepts ANY string and coerces to this set —
-# cheap vision models (Gemini Flash especially) invent roles like
-# "cookie_banner" or "modal_button" that we'd rather map to "other"
-# than fail validation over.
+# Gemini occasionally invents roles like "cookie_banner" or "modal_button"
+# that we'd rather map to "other" than fail validation over.
 BBoxRole = Literal[
     "button",
     "link",
@@ -44,7 +50,6 @@ def _coerce_role(value: object) -> str:
     v = value.strip().lower().replace("-", "_").replace(" ", "_")
     if v in _ALLOWED_ROLES:
         return v
-    # Common aliases models emit — keep this small; anything else → other.
     aliases = {
         "btn": "button",
         "anchor": "link",
@@ -64,16 +69,21 @@ def _coerce_role(value: object) -> str:
 
 
 class BBox(BaseModel):
-    """One visible region on the page, usually clickable."""
+    """One visible region on the page, usually clickable.
 
-    # Accept whatever extra keys the model emits — don't fail on them.
+    Coordinates use Gemini's normalized `box_2d` format:
+      [ymin, xmin, ymax, xmax] in [0, 1000], top-left origin.
+
+    Use `to_pixels(image_w, image_h)` to denormalize to CSS pixels.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     label: str = Field(default="", description="Short label — visible text or ARIA name.")
-    x: int = Field(default=0)
-    y: int = Field(default=0)
-    w: int = Field(default=0)
-    h: int = Field(default=0)
+    box_2d: list[int] = Field(
+        default_factory=lambda: [0, 0, 0, 0],
+        description="[ymin, xmin, ymax, xmax] normalized to [0, 1000].",
+    )
     clickable: bool = Field(default=False)
     role: str = Field(
         default="other",
@@ -82,14 +92,26 @@ class BBox(BaseModel):
     confidence: float = Field(default=0.5)
     intent_relevant: bool = Field(default=False)
 
-    @field_validator("x", "y", "w", "h", mode="before")
+    @field_validator("box_2d", mode="before")
     @classmethod
-    def _coerce_int(cls, v: object) -> int:
-        try:
-            i = int(round(float(v)))
-        except (TypeError, ValueError):
-            return 0
-        return max(0, i)
+    def _coerce_box(cls, v: object) -> list[int]:
+        # Accept tuple/list of 4 numbers; clamp each to [0, 1000].
+        if not isinstance(v, (list, tuple)) or len(v) != 4:
+            return [0, 0, 0, 0]
+        out: list[int] = []
+        for x in v:
+            try:
+                i = int(round(float(x)))
+            except (TypeError, ValueError):
+                i = 0
+            out.append(max(0, min(1000, i)))
+        ymin, xmin, ymax, xmax = out
+        # Swap if reversed — models occasionally emit [ymax, xmax, ymin, xmin].
+        if ymax < ymin:
+            ymin, ymax = ymax, ymin
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        return [ymin, xmin, ymax, xmax]
 
     @field_validator("role", mode="before")
     @classmethod
@@ -99,7 +121,6 @@ class BBox(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _coerce_confidence(cls, v: object) -> float:
-        # Models sometimes return "high", "medium", "low" or 0-100 range.
         if isinstance(v, str):
             s = v.strip().lower()
             m = {"high": 0.9, "medium": 0.6, "med": 0.6, "low": 0.3, "none": 0.0}
@@ -136,8 +157,23 @@ class BBox(BaseModel):
             return bool(v)
         return False
 
-    def center(self) -> tuple[int, int]:
-        return (self.x + self.w // 2, self.y + self.h // 2)
+    def to_pixels(self, image_w: int, image_h: int) -> tuple[int, int, int, int]:
+        """Denormalize box_2d to CSS pixel rect (x0, y0, x1, y1)."""
+        ymin, xmin, ymax, xmax = self.box_2d
+        x0 = int(round(xmin / 1000.0 * image_w))
+        y0 = int(round(ymin / 1000.0 * image_h))
+        x1 = int(round(xmax / 1000.0 * image_w))
+        y1 = int(round(ymax / 1000.0 * image_h))
+        # Guarantee non-empty box even if model emitted ymin==ymax.
+        if x1 <= x0:
+            x1 = x0 + 1
+        if y1 <= y0:
+            y1 = y0 + 1
+        return x0, y0, x1, y1
+
+    def center_pixels(self, image_w: int, image_h: int) -> tuple[int, int]:
+        x0, y0, x1, y1 = self.to_pixels(image_w, image_h)
+        return ((x0 + x1) // 2, (y0 + y1) // 2)
 
 
 class PageFlags(BaseModel):
@@ -175,7 +211,6 @@ class PageFlags(BaseModel):
         if v is None:
             return None
         if isinstance(v, bool):
-            # Some models emit `error_banner: false` meaning "no banner".
             return None
         if isinstance(v, str):
             s = v.strip()
@@ -231,6 +266,15 @@ class VisionResponse(BaseModel):
 
     summary: str = Field(default="")
     relevant_text: str = Field(default="")
+    page_type: str = Field(
+        default="other",
+        description=(
+            "Inferred page type — one of captcha_challenge, login_form, "
+            "signup_form, search_results, product_listing, product_detail, "
+            "checkout_form, cart, home_landing, article, map_or_booking, "
+            "dashboard, error_page, other. Used to bias bbox selection."
+        ),
+    )
     bboxes: list[BBox] = Field(default_factory=list)
     flags: PageFlags = Field(default_factory=PageFlags)
     suggested_actions: list[SuggestedAction] = Field(default_factory=list)
@@ -245,15 +289,47 @@ class VisionResponse(BaseModel):
     model: Optional[str] = None
     provider: Optional[str] = None
 
+    # Source image dimensions used to denormalize box_2d to CSS pixels.
+    # Set via `with_image_dims()` after parsing. PrivateAttr keeps these
+    # out of the validation/serialization surface.
+    _image_width: int = PrivateAttr(default=0)
+    _image_height: int = PrivateAttr(default=0)
+
+    def with_image_dims(self, width: int, height: int) -> "VisionResponse":
+        self._image_width = int(width)
+        self._image_height = int(height)
+        return self
+
+    @property
+    def image_width(self) -> int:
+        return self._image_width
+
+    @property
+    def image_height(self) -> int:
+        return self._image_height
+
     @field_validator("summary", "relevant_text", "intent", mode="before")
     @classmethod
     def _coerce_str(cls, v: object) -> str:
         if v is None:
             return ""
         if isinstance(v, list):
-            # Some models return `relevant_text` as a list of strings.
             return " ".join(str(x) for x in v)[:4000]
         return str(v)[:4000]
+
+    @field_validator("page_type", mode="before")
+    @classmethod
+    def _coerce_page_type(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "other"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "captcha_challenge", "login_form", "signup_form", "search_results",
+            "product_listing", "product_detail", "checkout_form", "cart",
+            "home_landing", "article", "map_or_booking", "dashboard",
+            "error_page", "other",
+        }
+        return s if s in allowed else "other"
 
     @field_validator("bboxes", mode="before")
     @classmethod
@@ -261,10 +337,8 @@ class VisionResponse(BaseModel):
         if v is None:
             return []
         if isinstance(v, dict):
-            # Single bbox emitted instead of a list.
             return [v]
         if isinstance(v, list):
-            # Drop non-dict entries rather than fail the whole response.
             return [item for item in v if isinstance(item, dict)]
         return []
 
@@ -291,10 +365,14 @@ class VisionResponse(BaseModel):
 
         Bboxes are ranked intent-relevant first, then clickable, then by
         confidence. The truncation cap stops a 100-element dashboard from
-        blowing the brain's context window.
+        blowing the brain's context window. Pixel coords are computed
+        from `box_2d` using the attached image dimensions; if dims are
+        zero (test fixture without an image), normalized 0-1000 coords
+        are shown instead so the brain can still ground.
         """
         header = (
-            f"[VISION  intent={self.intent}  cached={str(self.cached).lower()}  "
+            f"[VISION  intent={self.intent}  page_type={self.page_type}  "
+            f"cached={str(self.cached).lower()}  "
             f"model={self.model or '?'}  dur={self.duration_ms}ms]"
         )
         flags = self.flags
@@ -308,7 +386,6 @@ class VisionResponse(BaseModel):
         flags_line = "Flags: " + "  ".join(flag_bits)
 
         def _rank(b: BBox) -> tuple[int, int, float]:
-            # Lower tuple sorts first: (!intent_relevant, !clickable, -conf)
             return (
                 0 if b.intent_relevant else 1,
                 0 if b.clickable else 1,
@@ -317,12 +394,19 @@ class VisionResponse(BaseModel):
 
         ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
         elements_lines: list[str] = []
+        iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
             marker = "  ← matches intent" if b.intent_relevant else ""
+            if iw > 0 and ih > 0:
+                x0, y0, x1, y1 = b.to_pixels(iw, ih)
+                coord_text = f"({x0},{y0} → {x1},{y1})"
+            else:
+                ymin, xmin, ymax, xmax = b.box_2d
+                coord_text = f"(box_2d=[{ymin},{xmin},{ymax},{xmax}])"
             elements_lines.append(
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "
-                f"({b.x},{b.y} {b.w}x{b.h})"
+                f"{coord_text}"
                 f"{marker}"
             )
         truncated = (
@@ -351,3 +435,23 @@ class VisionResponse(BaseModel):
                 target = f" -> bbox V{sa.target_bbox_index + 1}" if sa.target_bbox_index is not None else ""
                 parts.append(f"  [P{sa.priority}] {sa.action}{target}: {sa.description}")
         return "\n".join(parts)
+
+    def get_bbox(self, vision_index_1based: int) -> Optional[BBox]:
+        """Look up a bbox by the [V_i] index used in `as_brain_text()`.
+
+        The brain references bboxes as [V1], [V2], ... — same ranking as
+        `as_brain_text()`. Mirror that ordering here so a downstream tool
+        call like browser_click_at(bbox=V3) resolves to the same element
+        the brain saw.
+        """
+        if vision_index_1based < 1:
+            return None
+        ordered = sorted(self.bboxes, key=lambda b: (
+            0 if b.intent_relevant else 1,
+            0 if b.clickable else 1,
+            -b.confidence,
+        ))
+        idx = vision_index_1based - 1
+        if idx >= len(ordered):
+            return None
+        return ordered[idx]
