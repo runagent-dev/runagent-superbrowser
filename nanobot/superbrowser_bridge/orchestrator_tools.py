@@ -15,6 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
@@ -37,6 +39,7 @@ from superbrowser_bridge.routing import (
     _classify_task,
     _domain_from_url,
     _learnings_path,
+    _looks_blocked,
     _preferred_approach,
     _record_routing_outcome,
     _rewrite_for_search,
@@ -206,6 +209,62 @@ def _domain_needs_human_handoff(domain: str) -> bool:
     return bool(data.get("needs_human_handoff"))
 
 
+async def _probe_url(url: str) -> dict:
+    """Lightweight HTTP probe — no browser, no JS rendering.
+
+    Returns a dict with keys: unreachable, blocked, status, error, reason, title.
+    Used by DelegateBrowserTaskTool before spawning an expensive browser worker.
+    """
+    import re as _re_probe
+    result: dict = {
+        "unreachable": False,
+        "blocked": False,
+        "status": 0,
+        "error": "",
+        "reason": "",
+        "title": "",
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            verify=False,  # some sites have self-signed certs
+        ) as client:
+            r = await client.get(url, headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/130.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            })
+            result["status"] = r.status_code
+            if r.status_code >= 500:
+                result["unreachable"] = True
+                result["error"] = f"HTTP {r.status_code}"
+                return result
+            body = r.text[:5000]
+            blocked, reason = _looks_blocked(body)
+            result["blocked"] = blocked
+            result["reason"] = reason
+            # Extract <title> for sanity check
+            title_match = _re_probe.search(
+                r"<title[^>]*>(.*?)</title>", body, _re_probe.IGNORECASE | _re_probe.DOTALL,
+            )
+            if title_match:
+                result["title"] = title_match.group(1).strip()[:200]
+    except httpx.ConnectError as exc:
+        result["unreachable"] = True
+        result["error"] = f"Connection failed: {exc}"
+    except httpx.TimeoutException:
+        result["unreachable"] = True
+        result["error"] = "Connection timed out (10s)"
+    except Exception as exc:
+        result["unreachable"] = True
+        result["error"] = str(exc)[:200]
+    return result
+
+
 from nanobot.agent.tools.schema import BooleanSchema
 
 
@@ -312,6 +371,30 @@ class DelegateBrowserTaskTool(Tool):
             _prev[1] if _prev else _now,
         )
 
+        # --- Pre-validation probe (Layer 1.5) ----------------------------
+        # Before spawning an expensive browser worker, do a lightweight HTTP
+        # probe to verify the URL is reachable and not obviously blocked.
+        # This saves 25+ iterations on dead/wrong URLs.
+        _probe_warning: str | None = None
+        if url:
+            probe = await _probe_url(url)
+            if probe["unreachable"]:
+                print(f"\n>> pre-validation: {url} is unreachable: {probe['error']}")
+                return (
+                    f"[URL_UNREACHABLE] {url} is not reachable: {probe['error']}. "
+                    f"Do NOT delegate to browser — the site is down or the URL "
+                    f"is wrong. Either fix the URL or use delegate_search_task."
+                )
+            if probe["blocked"]:
+                _probe_warning = (
+                    f"\n## Pre-validation Warning\n"
+                    f"HTTP probe returned status {probe['status']} with bot-block "
+                    f"markers: {probe['reason']}. The site may block automated "
+                    f"access. If you hit a captcha, use "
+                    f"browser_solve_captcha(method='auto') immediately — if that "
+                    f"fails the system will auto-escalate to human handoff."
+                )
+
         # --- Classifier gate (Layer 2) ---------------------------------
         # Run the deterministic classifier BEFORE spawning a worker. If it
         # disagrees with confidence >= 0.7 and the orchestrator hasn't
@@ -382,6 +465,13 @@ class DelegateBrowserTaskTool(Tool):
         # handoff-budget logic references it.
         domain = _domain_from_url(url) if url else None
 
+        # Domain pinning: prevent the worker from navigating to unrelated
+        # sites. When the target site blocks the agent, the LLM's
+        # helpfulness bias drives it to find the answer elsewhere (e.g.,
+        # Zara task → Amazon). Pinning stops that at the tool level.
+        if domain and domain != "unknown":
+            worker_state.pinned_domain = domain.replace("www.", "")
+
         # Human handoff: opt in via tool arg OR auto-enable if per-domain
         # learnings mark this site as "needs_human_handoff=true" (flipped
         # after any prior task succeeded via the human_handoff captcha
@@ -441,6 +531,24 @@ class DelegateBrowserTaskTool(Tool):
 
         if url:
             parts.append(f"Target URL: {url}")
+
+        # Domain constraint: tell the worker not to leave the target site.
+        if domain and domain != "unknown":
+            _clean_domain = domain.replace("www.", "")
+            parts.append(
+                f"\n## DOMAIN CONSTRAINT (non-negotiable)\n"
+                f"You MUST only navigate to {_clean_domain} and its subdomains. "
+                f"Google.com is allowed for search-based research tasks only. "
+                f"Do NOT visit other websites to find the answer (e.g., if asked for "
+                f"Zara dress prices, NEVER go to Amazon or other retailers). "
+                f"If {_clean_domain} blocks you with a captcha or security page, "
+                f"solve the captcha or report failure honestly — "
+                f"do NOT try alternative sites."
+            )
+
+        # Inject pre-validation warning if the URL probe detected bot-block markers.
+        if _probe_warning:
+            parts.append(_probe_warning)
 
         parts.append(f"\n## Task\n{instructions}")
 

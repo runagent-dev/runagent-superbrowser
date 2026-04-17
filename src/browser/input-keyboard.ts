@@ -48,12 +48,14 @@ export async function typeText(
   client: CDPSession,
   text: string,
   delay: number = 30,
-  options?: { humanize?: boolean },
+  options?: { humanize?: boolean; sessionId?: string },
 ): Promise<void> {
   // Humanize by default; opt-out preserves the old fixed-cadence path.
+  // Uses humanTypeOrPaste which auto-detects clipboard-worthy inputs
+  // (URLs, emails, long strings) and simulates Ctrl+V for those.
   if (options?.humanize !== false) {
-    const { humanType } = await import('./humanize.js');
-    await humanType(client, text);
+    const { humanTypeOrPaste } = await import('./humanize.js');
+    await humanTypeOrPaste(client, text, { sessionId: options?.sessionId });
     return;
   }
   for (const char of text) {

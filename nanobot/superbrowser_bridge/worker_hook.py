@@ -26,6 +26,8 @@ class BrowserWorkerHook(AgentHook):
         self._last_budget_warning_at: int = -1  # iteration of last warning
         self._captcha_guidance_given: bool = False
         self._captcha_solve_attempts: int = 0
+        self._captcha_escalation_pending: bool = False
+        self._captcha_escalation_turns: int = 0
         # Generic loop + stagnation detector (replaces consecutive_click_calls +
         # ad-hoc _stagnation_url/_stagnation_count logic).
         self._loop = LoopDetector()
@@ -105,15 +107,19 @@ class BrowserWorkerHook(AgentHook):
         # solve means pivot to the human: browser_ask_user surfaces the
         # live view, the user clicks through once, and bot-protection
         # cookies get persisted by cookie-jar for the next run.
+        #
+        # The auto-escalation in BrowserSolveCaptchaTool now handles this
+        # deterministically (no LLM decision needed). This hook is the
+        # backup: if the LLM somehow calls browser_solve_captcha without
+        # auto_escalate, or if it ignores the auto-escalation result.
         recent_steps = self.state.step_history[-1:] if self.state.step_history else []
         for step in recent_steps:
             if step["tool"] == "browser_solve_captcha":
                 self._captcha_solve_attempts += 1
-                # Only nudge on a FAILED attempt — successful solves
-                # include "SOLVED" in the result string.
                 result_text = str(step.get("result", ""))
                 solved = "SOLVED" in result_text or '"solved": true' in result_text
                 if not solved and self._captcha_solve_attempts >= 1:
+                    self._captcha_escalation_pending = True
                     sid = self.state.session_id or "<session_id>"
                     guidance_parts.append(
                         "[GUIDANCE: Auto-solve failed once — do NOT retry. "
@@ -124,8 +130,26 @@ class BrowserWorkerHook(AgentHook):
                         "question='Please open the live view URL and "
                         "click through the captcha — I will detect when "
                         "it clears and resume.')\n"
-                        "The tool blocks for up to 5 minutes while the "
-                        "user solves. Do NOT call browser_solve_captcha again.]"
+                        "The tool blocks while the user solves. "
+                        "Do NOT call browser_solve_captcha again.]"
+                    )
+
+        # If escalation was requested but the LLM didn't call browser_ask_user
+        # on its next turn, escalate the urgency.
+        if self._captcha_escalation_pending:
+            last_tool = (self.state.step_history[-1].get("tool") or "") if self.state.step_history else ""
+            if last_tool == "browser_ask_user":
+                self._captcha_escalation_pending = False
+                self._captcha_escalation_turns = 0
+            elif last_tool != "browser_solve_captcha":
+                self._captcha_escalation_turns += 1
+                if self._captcha_escalation_turns >= 2:
+                    sid = self.state.session_id or "<session_id>"
+                    guidance_parts.append(
+                        f"[MANDATORY: You MUST call browser_ask_user(session_id='{sid}', "
+                        "input_type='captcha', question='Please solve the captcha') NOW. "
+                        "No other actions are allowed until you do. The captcha will NOT "
+                        "resolve itself — a human must solve it.]"
                     )
 
         # --- Detect verification/captcha pages ---

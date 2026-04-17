@@ -78,7 +78,7 @@ export async function solveCaptchaViaRegistry(
     publicBaseUrl?: string;
   },
 ): Promise<RichSolveResult> {
-  const policy = process.env.SUPERBROWSER_CAPTCHA_POLICY ?? 'default';
+  const policy = process.env.SUPERBROWSER_CAPTCHA_POLICY ?? 'fast_to_human';
   const fastToHuman = policy === 'fast_to_human';
   const registry = options?.registry
     ?? (fastToHuman ? buildFastToHumanRegistry() : buildDefaultRegistry());

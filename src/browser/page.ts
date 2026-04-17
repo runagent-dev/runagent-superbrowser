@@ -119,6 +119,11 @@ export class PageWrapper {
    */
   private badUrls: Map<string, ErrorPage> = new Map();
 
+  /** Session ID set by HTTP server on session creation. Threaded through
+   *  to humanize/input-mouse so input events can be broadcast to the
+   *  live view via InputEventBus. */
+  public sessionId?: string;
+
   constructor(
     private page: Page,
     private config: BrowserConfig,
@@ -435,6 +440,7 @@ export class PageWrapper {
           await dispatchClick(client, coords.x, coords.y, {
             button: options?.button,
             clickCount: options?.clickCount,
+            sessionId: this.sessionId,
           });
           await this.waitForIdle(1500).catch(() => {});
           return { success: true, tried };
@@ -518,7 +524,7 @@ export class PageWrapper {
     clickCount?: number;
   }): Promise<void> {
     const client = await this.getCDPSession();
-    await dispatchClick(client, x, y, options);
+    await dispatchClick(client, x, y, { ...options, sessionId: this.sessionId });
     await this.waitForIdle(1000).catch(() => {});
   }
 
@@ -547,7 +553,7 @@ export class PageWrapper {
     options?: { steps?: number },
   ): Promise<void> {
     const client = await this.getCDPSession();
-    await dispatchDrag(client, startX, startY, endX, endY, options);
+    await dispatchDrag(client, startX, startY, endX, endY, { ...options, sessionId: this.sessionId });
   }
 
   /** Scroll within a specific element or the page (from BrowserOS scroll). */
@@ -627,7 +633,7 @@ export class PageWrapper {
 
       if (coords) {
         tried.push('cdp');
-        await dispatchClick(client, coords.x, coords.y);
+        await dispatchClick(client, coords.x, coords.y, { sessionId: this.sessionId });
         await new Promise((r) => setTimeout(r, 100));
 
         if (clear) {
@@ -635,7 +641,7 @@ export class PageWrapper {
           await new Promise((r) => setTimeout(r, 50));
         }
 
-        await cdpTypeText(client, text, 30);
+        await cdpTypeText(client, text, 30, { sessionId: this.sessionId });
         return { success: true, tried };
       }
 

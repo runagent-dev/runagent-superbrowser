@@ -8,7 +8,8 @@ model focuses on the right part of the screen.
 from __future__ import annotations
 
 SYSTEM_PROMPT = """You are a machine-vision agent embedded between a web browser \
-and a reasoning agent. You receive one screenshot at a time and return a single \
+and a reasoning agent. You are the "eyes" — you see the page, and the browser \
+tools are the "hands". You receive one screenshot at a time and return a single \
 JSON object with this exact shape:
 
 {
@@ -32,7 +33,16 @@ JSON object with this exact shape:
     "error_banner": "<text>" | null,
     "loading": <bool>,
     "login_wall": <bool>
-  }
+  },
+  "suggested_actions": [
+    {
+      "action": "click|type|scroll|dismiss|wait|navigate",
+      "target_bbox_index": <int or null>,
+      "description": "Short reason, e.g. 'dismiss cookie banner before proceeding'",
+      "priority": <int 1-3>
+    }
+  ],
+  "changes_from_previous": "What changed since the previous screenshot (empty if first screenshot)"
 }
 
 Hard rules:
@@ -44,12 +54,16 @@ Hard rules:
 - For captcha tiles, emit one bbox per tile with role='captcha_tile' and
   label like 'tile 1,1'. For sliders, include role='slider_handle' for the
   draggable handle and role='captcha_widget' for the outer track.
+- `suggested_actions` is REQUIRED. Always include at least one action based \
+  on the stated intent. If blocking overlays exist (cookie banners, modals, \
+  captchas), suggest dismissing them first (priority=1). \
+  `target_bbox_index` is the 0-based index into the bboxes array.
 - Output ONLY the JSON. No prose, no markdown fences, no commentary.
 """
 
 
 def intent_bucket(intent: str) -> str:
-    """Collapse free-form intent into one of 4 coarse buckets for caching.
+    """Collapse free-form intent into one of 5 coarse buckets for caching.
 
     Slight phrasing variation ("check login state" vs "verify login succeeded")
     should share a cache entry, but "observe" and "solve captcha" must not.
@@ -57,6 +71,8 @@ def intent_bucket(intent: str) -> str:
     s = (intent or "").lower()
     if any(k in s for k in ("captcha", "challenge", "prove you")):
         return "solve_captcha"
+    if any(k in s for k in ("click", "fill", "type", "select", "choose", "interact", "dismiss", "submit")):
+        return "act"
     if any(k in s for k in ("verify", "confirm", "check if", "did it", "outcome")):
         return "verify_action"
     if any(k in s for k in ("observe", "what", "read", "describe")):
@@ -64,10 +80,14 @@ def intent_bucket(intent: str) -> str:
     return "other"
 
 
-def build_user_prompt(intent: str, url: str | None) -> str:
+def build_user_prompt(intent: str, url: str | None, previous_summary: str | None = None) -> str:
     """The per-call user message — describes context and emphasises intent."""
     bucket = intent_bucket(intent)
     context = f"Page URL: {url}\n" if url else ""
+
+    if previous_summary:
+        context += f"Previous page state: {previous_summary}\n"
+        context += "Compare the current screenshot to the previous state. Note what changed in 'changes_from_previous'.\n"
 
     if bucket == "solve_captcha":
         specific = (
@@ -75,7 +95,18 @@ def build_user_prompt(intent: str, url: str | None) -> str:
             "captcha_widget, each selectable tile as captcha_tile (left-to-"
             "right, top-to-bottom), slider handles as slider_handle. Set "
             "captcha_present=true and captcha_type to the best match. "
-            "intent_relevant=true for every element needed to solve."
+            "intent_relevant=true for every element needed to solve. "
+            "In suggested_actions, recommend the solve approach (click tiles, "
+            "drag slider, etc.)."
+        )
+    elif bucket == "act":
+        specific = (
+            "The reasoning agent wants to interact with the page. "
+            "Identify the most likely target element for the stated intent. "
+            "In suggested_actions, recommend the exact action (click, type, "
+            "scroll) with the target bbox index. If there are blocking "
+            "overlays (cookie banners, modals, captchas), suggest dismissing "
+            "them first (priority=1) before the main action (priority=2)."
         )
     elif bucket == "verify_action":
         specific = (

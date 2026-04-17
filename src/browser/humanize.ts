@@ -9,6 +9,12 @@
  */
 
 import type { CDPSession } from 'puppeteer-core';
+import { inputEventBus } from './input-events.js';
+
+/** Optional context for broadcasting input events to the live view. */
+export interface HumanizeContext {
+  sessionId?: string;
+}
 
 /**
  * Move the mouse along a Bezier curve from current position to target.
@@ -21,29 +27,54 @@ export async function humanMouseMove(
   toX: number,
   toY: number,
   steps?: number,
+  context?: HumanizeContext,
 ): Promise<void> {
-  const numSteps = steps || Math.max(10, Math.round(distance(fromX, fromY, toX, toY) / 20));
+  const dist = distance(fromX, fromY, toX, toY);
+  const numSteps = steps || Math.max(10, Math.round(dist / 20));
 
-  // Generate Bezier control points for natural curve
-  const cp1x = fromX + (toX - fromX) * 0.25 + randomOffset(30);
-  const cp1y = fromY + (toY - fromY) * 0.1 + randomOffset(30);
-  const cp2x = fromX + (toX - fromX) * 0.75 + randomOffset(20);
-  const cp2y = fromY + (toY - fromY) * 0.9 + randomOffset(20);
+  // Distance-proportional total travel time: short moves ~100-200ms,
+  // long moves ~500-800ms. Prevents long moves finishing unnaturally fast.
+  const totalMs = Math.max(100, Math.min(800, dist * 0.5 + gaussianInt(50, 30, 0, 150)));
+  const baseDelay = totalMs / numSteps;
+
+  // Generate Bezier control points for natural curve (Gaussian offsets)
+  const cp1x = fromX + (toX - fromX) * 0.25 + gaussianOffset(30);
+  const cp1y = fromY + (toY - fromY) * 0.1 + gaussianOffset(30);
+  const cp2x = fromX + (toX - fromX) * 0.75 + gaussianOffset(20);
+  const cp2y = fromY + (toY - fromY) * 0.9 + gaussianOffset(20);
 
   for (let i = 0; i <= numSteps; i++) {
     const t = i / numSteps;
     const point = cubicBezier(t, fromX, fromY, cp1x, cp1y, cp2x, cp2y, toX, toY);
 
+    const px = Math.round(point.x);
+    const py = Math.round(point.y);
     await client.send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',
-      x: Math.round(point.x),
-      y: Math.round(point.y),
+      x: px,
+      y: py,
     });
+    if (context?.sessionId) inputEventBus.emitMouseMove(context.sessionId, px, py);
 
-    // Variable speed: slower at start and end, faster in middle
+    // Variable speed: slower at start and end, faster in middle.
+    // Delay is derived from distance-proportional baseDelay.
     const speed = Math.sin(t * Math.PI);
-    const delay = Math.max(2, Math.round((1 - speed * 0.7) * 12 + Math.random() * 5));
+    const delay = Math.max(2, Math.round(baseDelay * (1 - speed * 0.5) + Math.random() * (baseDelay * 0.3)));
     await sleep(delay);
+  }
+
+  // Deceleration wobble at target — simulates the hand settling.
+  // 2-3 micro-movements near the final position.
+  const wobbleSteps = 2 + Math.floor(Math.random() * 2);
+  for (let w = 0; w < wobbleSteps; w++) {
+    const wobbleX = toX + gaussianOffset(1.5);
+    const wobbleY = toY + gaussianOffset(1.5);
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.round(wobbleX),
+      y: Math.round(wobbleY),
+    });
+    await sleep(15 + Math.random() * 25);
   }
 }
 
@@ -58,21 +89,23 @@ export async function humanClick(
     fromX?: number;
     fromY?: number;
     button?: 'left' | 'right' | 'middle';
+    sessionId?: string;
   },
 ): Promise<void> {
   const fromX = options?.fromX ?? x + randomOffset(200);
   const fromY = options?.fromY ?? y + randomOffset(150);
   const button = options?.button || 'left';
+  const ctx: HumanizeContext | undefined = options?.sessionId ? { sessionId: options.sessionId } : undefined;
 
   // Move mouse naturally
-  await humanMouseMove(client, fromX, fromY, x, y);
+  await humanMouseMove(client, fromX, fromY, x, y, undefined, ctx);
 
   // Small pause before click (humans hesitate)
   await sleep(50 + Math.random() * 100);
 
-  // Add slight jitter to click position
-  const jitterX = x + randomOffset(2);
-  const jitterY = y + randomOffset(2);
+  // Add slight jitter to click position (Gaussian — most clicks near center)
+  const jitterX = x + gaussianOffset(2);
+  const jitterY = y + gaussianOffset(2);
 
   // Press
   await client.send('Input.dispatchMouseEvent', {
@@ -106,6 +139,7 @@ export async function humanType(
     minDelay?: number;
     maxDelay?: number;
     mistakeRate?: number;
+    sessionId?: string;
   },
 ): Promise<void> {
   const minDelay = options?.minDelay ?? 30;
@@ -126,8 +160,10 @@ export async function humanType(
 
     if (char === '\n') {
       await typeKey(client, 'Enter');
+      if (options?.sessionId) inputEventBus.emitKeystroke(options.sessionId, 'Enter', 'char');
     } else {
       await typeChar(client, char);
+      if (options?.sessionId) inputEventBus.emitKeystroke(options.sessionId, char, 'char');
     }
 
     // Variable delay: longer after spaces and punctuation
@@ -139,7 +175,75 @@ export async function humanType(
     if (Math.random() < 0.05) delay *= 3;
 
     await sleep(delay);
+
+    // Word-level pause: humans think between words, not just chars.
+    // 10% chance of a 200-600ms "thinking between words" pause.
+    if (char === ' ' && i < text.length - 1 && Math.random() < 0.10) {
+      await sleep(200 + Math.random() * 400);
+    }
   }
+}
+
+/**
+ * Type text or paste it if it looks like clipboard content.
+ *
+ * Real humans paste URLs, emails, and long strings rather than typing
+ * them character-by-character. This function detects "paste-like" inputs
+ * and simulates Ctrl+V, falling back to humanType for natural text.
+ */
+export async function humanTypeOrPaste(
+  client: CDPSession,
+  text: string,
+  options?: {
+    minDelay?: number;
+    maxDelay?: number;
+    mistakeRate?: number;
+    sessionId?: string;
+  },
+): Promise<void> {
+  const looksLikePaste =
+    text.length > 40 ||
+    text.includes('://') ||
+    (text.includes('@') && text.includes('.'));
+
+  if (looksLikePaste) {
+    // Set clipboard via CDP and simulate Ctrl+V
+    await client.send('Runtime.evaluate', {
+      expression: `navigator.clipboard.writeText(${JSON.stringify(text)}).catch(() => {
+        // Fallback: use execCommand-compatible input
+        const ta = document.createElement('textarea');
+        ta.value = ${JSON.stringify(text)};
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      })`,
+    });
+    await sleep(80 + Math.random() * 120); // brief pause before pasting
+
+    // Ctrl+V
+    await client.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'Control', code: 'ControlLeft',
+      windowsVirtualKeyCode: 17, modifiers: 2,
+    });
+    await client.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'v', code: 'KeyV',
+      windowsVirtualKeyCode: 86, modifiers: 2,
+    });
+    await sleep(20 + Math.random() * 30);
+    await client.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'v', code: 'KeyV',
+      windowsVirtualKeyCode: 86, modifiers: 2,
+    });
+    await client.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'Control', code: 'ControlLeft',
+      windowsVirtualKeyCode: 17, modifiers: 0,
+    });
+    await sleep(50 + Math.random() * 80);
+    return;
+  }
+
+  await humanType(client, text, options);
 }
 
 /**
@@ -171,6 +275,8 @@ export async function humanDrag(
     steps?: number;
     /** Bezier arc magnitude (fraction of distance, 0=straight line). Default 0.12. */
     arc?: number;
+    /** Session ID for broadcasting positions to live view. */
+    sessionId?: string;
   },
 ): Promise<void> {
   const pressDwell = options?.pressDwellMs ?? gaussianInt(180, 60, 80, 300);
@@ -255,10 +361,10 @@ async function dragAlongPath(
   const perpY = dx;
   const perpLen = Math.sqrt(perpX * perpX + perpY * perpY) || 1;
   const arcMag = dist * options.arc * (Math.random() < 0.5 ? 1 : -1);
-  const cp1x = x0 + dx * 0.33 + (perpX / perpLen) * arcMag + randomOffset(4);
-  const cp1y = y0 + dy * 0.33 + (perpY / perpLen) * arcMag + randomOffset(4);
-  const cp2x = x0 + dx * 0.66 + (perpX / perpLen) * arcMag * 0.7 + randomOffset(4);
-  const cp2y = y0 + dy * 0.66 + (perpY / perpLen) * arcMag * 0.7 + randomOffset(4);
+  const cp1x = x0 + dx * 0.33 + (perpX / perpLen) * arcMag + gaussianOffset(4);
+  const cp1y = y0 + dy * 0.33 + (perpY / perpLen) * arcMag + gaussianOffset(4);
+  const cp2x = x0 + dx * 0.66 + (perpX / perpLen) * arcMag * 0.7 + gaussianOffset(4);
+  const cp2y = y0 + dy * 0.66 + (perpY / perpLen) * arcMag * 0.7 + gaussianOffset(4);
 
   for (let i = 1; i <= numSteps; i++) {
     // Sigmoid-remapped t: slow start, fast middle, slow end (different curve
@@ -332,13 +438,28 @@ export async function humanScroll(
 
     await client.send('Input.dispatchMouseEvent', {
       type: 'mouseWheel',
-      x: x + randomOffset(5),
-      y: y + randomOffset(5),
+      x: x + gaussianOffset(5),
+      y: y + gaussianOffset(5),
       deltaX: 0,
       deltaY,
     });
 
     await sleep(30 + Math.random() * 60);
+  }
+
+  // 20% chance of overshoot + correction for larger scrolls.
+  // Humans often scroll past their target and correct.
+  if (Math.random() < 0.2 && Math.abs(totalDeltaY) > 200) {
+    const overshoot = Math.round(totalDeltaY * (0.05 + Math.random() * 0.1));
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x, y, deltaX: 0, deltaY: overshoot,
+    });
+    await sleep(100 + Math.random() * 200);
+    // Correct back
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x, y, deltaX: 0, deltaY: -overshoot,
+    });
+    await sleep(50 + Math.random() * 80);
   }
 }
 
@@ -367,6 +488,19 @@ function distance(x1: number, y1: number, x2: number, y2: number): number {
   return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
 }
 
+/**
+ * Gaussian-distributed random offset (Box-Muller). 95% of values
+ * fall within ±range. Much more human-like than uniform distribution
+ * — real motor errors cluster near zero with rare large deviations.
+ */
+function gaussianOffset(range: number): number {
+  const u1 = Math.max(Math.random(), 1e-9);
+  const u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return z * (range / 2); // 2 sigma = range → 95% within ±range
+}
+
+/** @deprecated Use gaussianOffset for human-like distribution. */
 function randomOffset(range: number): number {
   return (Math.random() - 0.5) * 2 * range;
 }

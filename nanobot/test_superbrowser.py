@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ Task: Browse the list of active Q&A communities on https://stackexchange.com and list the names of the top 5 communities by current activity.\nwebsite: https://stackexchange.com"""
+        """ Task: Browse the women's new arrivals section and list the names and prices of the first 5 items displayed.\\nwebsite: https://zara.com"""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

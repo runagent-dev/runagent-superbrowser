@@ -185,6 +185,45 @@ class PageFlags(BaseModel):
         return str(v)[:500]
 
 
+class SuggestedAction(BaseModel):
+    """An action the vision agent recommends based on the page state.
+
+    Unlike bboxes (which describe what's visible), suggested_actions say
+    what to DO — e.g., "dismiss cookie banner at bbox V3 first".
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: str = Field(
+        default="wait",
+        description="click|type|scroll|dismiss|wait|navigate",
+    )
+    target_bbox_index: Optional[int] = Field(
+        default=None,
+        description="0-based index into the bboxes array.",
+    )
+    description: str = Field(default="")
+    priority: int = Field(default=3, ge=1, le=3)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _coerce_action(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "wait"
+        s = v.strip().lower()
+        valid = {"click", "type", "scroll", "dismiss", "wait", "navigate"}
+        return s if s in valid else "wait"
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _coerce_priority(cls, v: object) -> int:
+        try:
+            p = int(v)
+        except (TypeError, ValueError):
+            return 3
+        return max(1, min(3, p))
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -194,6 +233,11 @@ class VisionResponse(BaseModel):
     relevant_text: str = Field(default="")
     bboxes: list[BBox] = Field(default_factory=list)
     flags: PageFlags = Field(default_factory=PageFlags)
+    suggested_actions: list[SuggestedAction] = Field(default_factory=list)
+    changes_from_previous: str = Field(
+        default="",
+        description="What changed since the previous screenshot.",
+    )
     intent: str = Field(default="observe")
     cached: bool = False
     duration_ms: int = 0
@@ -223,6 +267,24 @@ class VisionResponse(BaseModel):
             # Drop non-dict entries rather than fail the whole response.
             return [item for item in v if isinstance(item, dict)]
         return []
+
+    @field_validator("suggested_actions", mode="before")
+    @classmethod
+    def _coerce_actions(cls, v: object) -> list[dict]:
+        if v is None:
+            return []
+        if isinstance(v, dict):
+            return [v]
+        if isinstance(v, list):
+            return [item for item in v if isinstance(item, dict)]
+        return []
+
+    @field_validator("changes_from_previous", mode="before")
+    @classmethod
+    def _coerce_changes(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:1000]
 
     def as_brain_text(self, max_bboxes: int = 30) -> str:
         """Render into a compact text block the nanobot brain consumes.
@@ -274,6 +336,8 @@ class VisionResponse(BaseModel):
             f"Summary: {self.summary}",
             flags_line,
         ]
+        if self.changes_from_previous:
+            parts.append(f"Changes: {self.changes_from_previous}")
         if self.relevant_text:
             parts.append(f"Visible text: {self.relevant_text}")
         if elements_lines:
@@ -281,4 +345,9 @@ class VisionResponse(BaseModel):
             parts.extend(elements_lines)
             if truncated:
                 parts.append(truncated)
+        if self.suggested_actions:
+            parts.append("Suggested actions:")
+            for sa in sorted(self.suggested_actions, key=lambda a: a.priority):
+                target = f" -> bbox V{sa.target_bbox_index + 1}" if sa.target_bbox_index is not None else ""
+                parts.append(f"  [P{sa.priority}] {sa.action}{target}: {sa.description}")
         return "\n".join(parts)

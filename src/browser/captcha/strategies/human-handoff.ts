@@ -32,7 +32,9 @@ import { feedbackBus } from '../../../agent/feedback-bus.js';
 import { saveDomainCookies } from '../cookie-jar.js';
 import type { CaptchaStrategy, RichSolveResult, StrategyContext } from '../types.js';
 
-const HANDOFF_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const HANDOFF_TIMEOUT_MS = parseInt(
+  process.env.SUPERBROWSER_HANDOFF_TIMEOUT_MS || '180000', 10,
+); // 3 minutes default, configurable
 const POLL_INTERVAL_MS = 2000;
 
 /**
@@ -221,10 +223,41 @@ export const humanHandoffStrategy: CaptchaStrategy = {
 
     // Poll the page for captcha clearance. This is the primary success
     // signal — the user just clicks the captcha, and we detect it gone.
+    let reminderSent = false;
     const pollPromise = (async (): Promise<RichSolveResult> => {
       while (!settled && (Date.now() - start) < HANDOFF_TIMEOUT_MS) {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         if (settled) break;
+
+        // Halfway reminder: re-fire webhook + feedbackBus so the user
+        // gets a second notification if they missed the first.
+        const elapsed = Date.now() - start;
+        if (!reminderSent && elapsed >= HANDOFF_TIMEOUT_MS / 2) {
+          reminderSent = true;
+          process.stderr.write(`[human-handoff] Reminder: captcha still needs solving — ${viewUrl}\n`);
+          void fireHandoffWebhook({
+            event: 'human_handoff_reminder',
+            url: viewUrl,
+            sessionId: ctx.sessionId,
+            captchaType: info.type,
+            remainingMs: HANDOFF_TIMEOUT_MS - elapsed,
+            caption: `Reminder: captcha on ${hostname || 'page'} still unsolved — ${viewUrl}`,
+          });
+          if (ctx.sessionId) {
+            feedbackBus.publish({
+              kind: 'awaiting_human',
+              detail: {
+                sessionId: ctx.sessionId,
+                viewUrl,
+                captchaType: info.type,
+                timeoutMs: HANDOFF_TIMEOUT_MS - elapsed,
+                pageUrl,
+                reminder: true,
+              },
+            });
+          }
+        }
+
         try {
           const current = await detectCaptcha(ctx.page);
           if (!current) {

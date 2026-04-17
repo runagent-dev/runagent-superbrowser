@@ -47,6 +47,8 @@ export async function dispatchClick(
     delay?: number;
     /** Opt out of humanization (deterministic teleport click). */
     linear?: boolean;
+    /** Session ID for broadcasting to live view. */
+    sessionId?: string;
   },
 ): Promise<void> {
   const button = options?.button || 'left';
@@ -59,7 +61,7 @@ export async function dispatchClick(
   const useHumanized = !options?.linear && clickCount === 1 && modifiers === 0;
 
   if (useHumanized) {
-    await humanClick(client, x, y, { button });
+    await humanClick(client, x, y, { button, sessionId: options?.sessionId });
     return;
   }
 
@@ -131,12 +133,15 @@ export async function dispatchDrag(
     overshoot?: boolean;
     /** Opt out of humanization for internal (non-stealth-critical) contexts. */
     linear?: boolean;
+    /** Session ID for broadcasting to live view. */
+    sessionId?: string;
   },
 ): Promise<void> {
   if (!options?.linear) {
     await humanDrag(client, startX, startY, endX, endY, {
       steps: options?.steps,
       overshoot: options?.overshoot,
+      sessionId: options?.sessionId,
     });
     return;
   }

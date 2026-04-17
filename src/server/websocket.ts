@@ -40,6 +40,8 @@ import { validateUrl } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
 import { feedbackBus, type FeedbackEvent } from '../agent/feedback-bus.js';
+import { ScreencastManager } from '../browser/screencast.js';
+import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent } from '../browser/input-events.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -51,6 +53,12 @@ interface SessionBinding {
 // `broadcastToSession` (exported for the HTTP layer) can look up the
 // right client without iterating every open socket.
 const bindings = new Map<string, Set<SessionBinding>>();
+
+// --- Screencast streaming ---
+const screencasts = new Map<string, ScreencastManager>();
+/** Per-session throttle for cursor_move broadcasts (30 FPS = 33ms). */
+const lastCursorBroadcast = new Map<string, number>();
+const CURSOR_THROTTLE_MS = 33;
 
 export function attachWebSocketServer(
   httpServer: HttpServer,
@@ -107,6 +115,23 @@ export function attachWebSocketServer(
     session.lastAccessed = Date.now();
 
     sendEvent(ws, 'connected', { sessionId });
+
+    // --- Start screencast for this viewer ---
+    const bindingId = `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    let screencastMgr = screencasts.get(sessionId);
+    if (!screencastMgr) {
+      screencastMgr = new ScreencastManager(
+        () => session.page.getCDPSession(),
+        (data, ts) => {
+          broadcastToSession(wss, sessionId, 'screencast_frame', { data, ts });
+        },
+      );
+      screencasts.set(sessionId, screencastMgr);
+    }
+    screencastMgr.addViewer(bindingId).catch((err) => {
+      console.error(`[ws] screencast addViewer failed: ${(err as Error).message}`);
+    });
+
     // Replay current feedback state on connect so a late subscriber (e.g.
     // a WhatsApp bot reconnecting mid-handoff) catches up on in-flight
     // captcha / error / awaiting_human state.
@@ -155,9 +180,32 @@ export function attachWebSocketServer(
         if (set.size === 0) bindings.delete(sessionId);
       }
       feedbackBus.off('event', onFeedback);
+      // Remove this viewer from screencast — stops CDP stream if last viewer.
+      const mgr = screencasts.get(sessionId);
+      if (mgr) {
+        mgr.removeViewer(bindingId).catch(() => {});
+        if (mgr.viewerCount === 0) {
+          screencasts.delete(sessionId);
+        }
+      }
     };
     ws.on('close', cleanup);
     ws.on('error', cleanup);
+  });
+
+  // --- Input event forwarding (mouse + keyboard) -------------------------
+  // Subscribe once globally. Each event carries a sessionId, so we route
+  // to the correct session's viewers via broadcastToSession.
+  inputEventBus.on('mouse_move', (evt: MouseMoveEvent) => {
+    // Throttle to ~30 FPS per session to avoid overwhelming WS clients.
+    const last = lastCursorBroadcast.get(evt.sessionId) ?? 0;
+    if (evt.ts - last < CURSOR_THROTTLE_MS) return;
+    lastCursorBroadcast.set(evt.sessionId, evt.ts);
+    broadcastToSession(wss, evt.sessionId, 'cursor_move', { x: evt.x, y: evt.y });
+  });
+
+  inputEventBus.on('keystroke', (evt: KeystrokeEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'keystroke', { key: evt.key, type: evt.type });
   });
 
   return wss;
@@ -391,6 +439,19 @@ async function handleCommand(
       await page.close();
       sendEvent(ws, 'closed', { sessionId });
       ws.close(1000, 'Session closed');
+      break;
+    }
+
+    // --- Screencast pause/resume (sent by view page on visibilitychange) ---
+    case 'screencast_pause': {
+      const mgr = screencasts.get(sessionId);
+      // We don't have bindingId here, so use a generic pause
+      if (mgr) mgr.removeViewer(`pause-${sessionId}`).catch(() => {});
+      break;
+    }
+    case 'screencast_resume': {
+      const mgr = screencasts.get(sessionId);
+      if (mgr) mgr.addViewer(`pause-${sessionId}`).catch(() => {});
       break;
     }
 

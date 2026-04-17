@@ -52,6 +52,7 @@ class VisionAgent:
         session_id: str,
         url: str,
         dom_hash: str,
+        previous_summary: str | None = None,
     ) -> VisionResponse:
         start = time.monotonic()
         key: CacheKey = (
@@ -65,7 +66,9 @@ class VisionAgent:
         if cached is not None:
             return cached
 
-        user_prompt = build_user_prompt(intent=intent, url=url)
+        user_prompt = build_user_prompt(
+            intent=intent, url=url, previous_summary=previous_summary,
+        )
         try:
             raw = await self._provider.chat_with_image(
                 screenshot_b64=screenshot_b64,

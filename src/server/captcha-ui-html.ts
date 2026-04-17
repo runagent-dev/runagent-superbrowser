@@ -217,8 +217,15 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
 
   <div id="screen-wrap">
     <img id="screen" alt="Live browser view" />
+    <div id="cursor-overlay" style="display:none; position:absolute; pointer-events:none; z-index:5; transition:left 33ms linear,top 33ms linear;">
+      <svg width="20" height="20" viewBox="0 0 20 20">
+        <path d="M0,0 L0,16 L4.5,12 L8,19 L10.5,18 L7,11 L12,11 Z"
+              fill="rgba(79,140,255,0.9)" stroke="#fff" stroke-width="1"/>
+      </svg>
+    </div>
   </div>
 
+  <div id="typing-indicator" style="display:none; padding:4px 14px; font-size:13px; color:var(--accent); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; text-align:center;"></div>
   <div id="status"></div>
 
   <div class="actions">
@@ -248,10 +255,7 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
       const SESSION_ID = ${JSON.stringify(sessionId)};
       const TOKEN = ${JSON.stringify(safeToken)};
 
-      // Polling cadence — bumped from 2 FPS to 4 FPS for snappier feel
-      // without significantly increasing server load. Future work: replace
-      // with /session/:id/screencast WebSocket for ~15 FPS smooth video.
-      const REFRESH_MS = 250;
+      const REFRESH_MS = 250;  // Fallback polling cadence (4 FPS)
       const HUMAN_POLL_MS = 1200;
 
       const qsToken = TOKEN ? ('&token=' + encodeURIComponent(TOKEN)) : '';
@@ -260,6 +264,8 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
       const $ = (id) => document.getElementById(id);
       const screen = $('screen');
       const screenWrap = $('screen-wrap');
+      const cursorEl = $('cursor-overlay');
+      const typingEl = $('typing-indicator');
       const instructEl = $('instruct');
       const instructMsg = $('instruct-msg');
       const instructLabel = $('instruct-label');
@@ -274,7 +280,8 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
 
       let viewport = { width: 1280, height: 1100 };
 
-      // --- Screenshot refresh ----------------------------------------
+      // --- Screenshot refresh (HTTP polling fallback) ----------------
+      let pollInterval = null;
       function refresh() {
         screen.src = '/session/' + SESSION_ID + '/screenshot?_=' + Date.now() + qsToken;
       }
@@ -285,8 +292,125 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
       screen.addEventListener('error', () => {
         statusEl.innerHTML = '<span class="err">screenshot fetch failed (session closed?)</span>';
       });
-      setInterval(refresh, REFRESH_MS);
+      // Start polling immediately; WebSocket will stop it once connected.
+      pollInterval = setInterval(refresh, REFRESH_MS);
       refresh();
+
+      // --- Blob URL frame setter (avoids data URI overhead at 15 FPS) ---
+      let prevBlobUrl = null;
+      function setScreenFrame(base64Data) {
+        const binary = atob(base64Data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        screen.src = url;
+        if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
+        prevBlobUrl = url;
+      }
+
+      // --- Cursor overlay --------------------------------------------
+      function updateCursor(vx, vy) {
+        const rect = screen.getBoundingClientRect();
+        const wrapRect = screenWrap.getBoundingClientRect();
+        const natW = screen.naturalWidth || viewport.width;
+        const natH = screen.naturalHeight || viewport.height;
+        const px = (vx / natW) * rect.width + (rect.left - wrapRect.left);
+        const py = (vy / natH) * rect.height + (rect.top - wrapRect.top);
+        cursorEl.style.display = 'block';
+        cursorEl.style.left = px + 'px';
+        cursorEl.style.top = py + 'px';
+      }
+
+      // --- Typing indicator ------------------------------------------
+      let typingBuffer = '';
+      let typingTimeout = null;
+      function showKeystroke(key) {
+        if (key === 'Backspace') {
+          typingBuffer = typingBuffer.slice(0, -1);
+        } else if (key === 'Enter') {
+          typingBuffer += '\\u23CE';
+        } else if (key.length === 1) {
+          typingBuffer += key;
+        }
+        if (typingBuffer.length > 40) typingBuffer = '...' + typingBuffer.slice(-37);
+        typingEl.textContent = 'typing: ' + typingBuffer;
+        typingEl.style.display = 'block';
+        clearTimeout(typingTimeout);
+        typingTimeout = setTimeout(() => {
+          typingEl.style.display = 'none';
+          typingBuffer = '';
+        }, 2000);
+      }
+
+      // --- WebSocket streaming (upgrades from polling when available) --
+      let ws = null;
+      let wsConnected = false;
+
+      function connectWebSocket() {
+        try {
+          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const wsUrl = proto + '//' + location.host + '/ws/session/' + SESSION_ID
+            + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+          ws = new WebSocket(wsUrl);
+
+          ws.onopen = () => {
+            wsConnected = true;
+            statusEl.textContent = 'streaming live';
+            // Stop HTTP polling — WS screencast is now the frame source.
+            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+          };
+
+          ws.onmessage = (evt) => {
+            try {
+              const msg = JSON.parse(evt.data);
+              switch (msg.event) {
+                case 'screencast_frame':
+                  setScreenFrame(msg.data.data);
+                  break;
+                case 'cursor_move':
+                  updateCursor(msg.data.x, msg.data.y);
+                  break;
+                case 'keystroke':
+                  showKeystroke(msg.data.key);
+                  break;
+                case 'feedback':
+                  // Could handle captcha/error events here in the future
+                  break;
+              }
+            } catch {}
+          };
+
+          ws.onclose = () => {
+            wsConnected = false;
+            cursorEl.style.display = 'none';
+            // Fall back to HTTP polling
+            if (!pollInterval) {
+              pollInterval = setInterval(refresh, REFRESH_MS);
+              refresh();
+            }
+            statusEl.textContent = 'reconnecting...';
+            setTimeout(connectWebSocket, 2000);
+          };
+
+          ws.onerror = () => { ws.close(); };
+        } catch {
+          // WebSocket not supported or blocked — polling continues.
+        }
+      }
+      connectWebSocket();
+
+      // --- Visibility API: pause/resume screencast -------------------
+      document.addEventListener('visibilitychange', () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (document.hidden) {
+          ws.send(JSON.stringify({ action: 'screencast_pause' }));
+        } else {
+          ws.send(JSON.stringify({ action: 'screencast_resume' }));
+          // Immediate refresh in case we missed frames while hidden.
+          if (!pollInterval) refresh();
+        }
+      });
 
       // --- Tap → click forwarding with pulse feedback -----------------
       function showPulse(clientX, clientY) {

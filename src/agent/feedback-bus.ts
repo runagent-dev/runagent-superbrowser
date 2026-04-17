@@ -32,6 +32,8 @@ export interface AwaitingHumanDetail {
   captchaType: string;
   timeoutMs: number;
   pageUrl: string;
+  /** True when this is a reminder notification (halfway through timeout). */
+  reminder?: boolean;
 }
 
 export type FeedbackEvent =

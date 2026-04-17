@@ -272,6 +272,12 @@ class BrowserSessionState:
         # 1 by default, overridable via SUPERBROWSER_MAX_HUMAN_HANDOFFS.
         self.human_handoff_budget: int = 1
 
+        # Domain pinning: when set, BrowserNavigateTool rejects URLs
+        # outside this domain (+ subdomains) and a small safe-list
+        # (google.com, etc.). Prevents the worker LLM from hallucinating
+        # to alternative sites when the target blocks it.
+        self.pinned_domain: str = ""
+
         # Vision preprocessor bookkeeping. Populated inside
         # build_tool_result_blocks so tools that don't pass an intent
         # explicitly inherit the last one used — useful when the brain
@@ -279,6 +285,7 @@ class BrowserSessionState:
         # same underlying intent.
         self._last_intent: str = ""
         self._last_dom_hash: str = ""
+        self._last_vision_summary: str = ""
 
     # --- budget configuration ---------------------------------------------
 
@@ -690,7 +697,9 @@ class BrowserSessionState:
                     session_id=self.session_id,
                     url=effective_url,
                     dom_hash=dh or self._last_dom_hash,
+                    previous_summary=self._last_vision_summary or None,
                 )
+                self._last_vision_summary = resp.summary
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
                 label = (caption or "").split("\n")[0][:30].replace(" ", "-")
@@ -1095,6 +1104,35 @@ class BrowserNavigateTool(Tool):
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
+
+        # --- Domain-pinning guard -----------------------------------------
+        # When pinned_domain is set, only allow navigation to the target
+        # domain (+ subdomains) and a small safe-list. Prevents the worker
+        # LLM from visiting alternative sites when the target blocks it.
+        if self.s.pinned_domain:
+            from urllib.parse import urlparse as _urlparse
+            _SAFE_DOMAINS = ("google.com", "googleapis.com", "gstatic.com", "google.co")
+            try:
+                _target_host = (_urlparse(url).hostname or "").lower().replace("www.", "")
+            except Exception:
+                _target_host = ""
+            _pinned = self.s.pinned_domain
+            _is_pinned = _target_host == _pinned or _target_host.endswith("." + _pinned)
+            _is_safe = any(
+                _target_host == sd or _target_host.endswith("." + sd)
+                for sd in _SAFE_DOMAINS
+            )
+            if _target_host and not _is_pinned and not _is_safe:
+                self.s.record_step("browser_navigate", url, f"BLOCKED: outside pinned domain {_pinned}")
+                print(f"   [DOMAIN_PINNED] blocked navigation to {_target_host} (pinned={_pinned})")
+                return (
+                    f"[DOMAIN_PINNED] Navigation to {url} is BLOCKED. "
+                    f"You MUST stay on {_pinned} (and its subdomains). "
+                    f"Do NOT visit other sites to find the answer. "
+                    f"If {_pinned} is blocking you, call browser_solve_captcha or "
+                    f"browser_ask_user, or report failure via done(success=False)."
+                )
+
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
 
@@ -2012,6 +2050,53 @@ class BrowserSolveCaptchaTool(Tool):
         if data.get("solved"):
             self.s.captcha_mode = False
             self.s.captcha_mode_remaining = 0
+            return f"{summary}\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+
+        # --- Auto-escalation to human handoff (deterministic) -------------
+        # When auto-solve fails AND human handoff is enabled, immediately
+        # POST to the human-input endpoint instead of returning to the LLM
+        # and hoping it calls browser_ask_user. This removes the LLM
+        # decision loop from the critical captcha→human path.
+        if self.s.human_handoff_enabled and self.s.human_handoff_budget > 0:
+            print(f"   [auto-escalation] captcha auto-solve failed, requesting human handoff")
+            self.s.human_handoff_budget -= 1
+            try:
+                handoff_timeout = int(os.environ.get("SUPERBROWSER_HANDOFF_TIMEOUT_MS", "180000")) / 1000
+                async with httpx.AsyncClient(timeout=handoff_timeout + 10) as hclient:
+                    hr = await hclient.post(
+                        f"{SUPERBROWSER_URL}/session/{session_id}/human-input/ask",
+                        json={
+                            "type": "captcha",
+                            "message": (
+                                "Auto-solve failed for captcha. Please open the live view URL "
+                                "and click through the challenge — the agent will detect when "
+                                "it clears and resume automatically."
+                            ),
+                        },
+                    )
+                    if hr.status_code == 200:
+                        hdata = hr.json()
+                        if hdata.get("cancelled") or hdata.get("timeout"):
+                            human_result = "Human handoff timed out or was cancelled."
+                        else:
+                            human_result = "Human solved the captcha. Resuming task."
+                            self.s.captcha_mode = False
+                            self.s.captcha_mode_remaining = 0
+                    else:
+                        human_result = f"Human handoff request failed (HTTP {hr.status_code})."
+            except Exception as exc:
+                human_result = f"Human handoff request error: {exc}"
+
+            self.s.record_step(
+                "browser_solve_captcha",
+                "auto_escalation",
+                human_result,
+            )
+            return (
+                f"{summary}\n\n"
+                f"[AUTO-ESCALATION] {human_result}\n\n"
+                f"Result JSON:\n{json.dumps(structured, indent=2, default=str)}"
+            )
 
         return f"{summary}\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
 

@@ -492,6 +492,7 @@ export function createHttpServer(
       await page.enableConsoleCapture();
 
       const id = `session-${crypto.randomUUID().split('-')[0]}`;
+      page.sessionId = id;
       sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
 
       // Per-session human-input manager + handoff budget.
