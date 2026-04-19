@@ -418,10 +418,23 @@ _BLOCK_MARKERS = [
 def _looks_blocked(content: str) -> tuple[bool, str]:
     """Heuristic: does this HTTP response look like a bot-block stub?
 
-    Returns (blocked, reason). Called on web_fetch output by the search
-    worker's guardrail hook to decide whether to nudge the worker into
-    retrying with the stealth-browser fallback.
+    Returns (blocked, reason). Preferred path is the typed detector in
+    `superbrowser_bridge.antibot.bot_detect` (Akamai/CF/DataDome/
+    PerimeterX/Kasada-aware). If that module fails to import (minimal
+    installs), fall back to the legacy marker/visible-text check.
+
+    Callers that need the typed verdict (with block_class, etc.) should
+    use `looks_blocked_typed` below.
     """
+    try:
+        from superbrowser_bridge.antibot.bot_detect import detect
+        v = detect(content or "")
+        if v.blocked:
+            return True, v.reason or v.klass
+        return False, ""
+    except Exception:
+        pass
+    # Legacy path.
     if not content:
         return True, "empty_response"
     text = content.strip()
@@ -431,8 +444,6 @@ def _looks_blocked(content: str) -> tuple[bool, str]:
     for marker in _BLOCK_MARKERS:
         if marker in lower:
             return True, f"marker:{marker}"
-    # Strip scripts/styles then HTML tags — proxy for whether the page has
-    # ACTUAL readable text or just a loading shell (JS-only SPAs).
     stripped = _re.sub(
         r"<script[\s\S]*?</script>|<style[\s\S]*?</style>",
         "", text, flags=_re.IGNORECASE,
@@ -442,6 +453,22 @@ def _looks_blocked(content: str) -> tuple[bool, str]:
     if len(visible) < 200:
         return True, f"no_visible_text:{len(visible)}"
     return False, ""
+
+
+def looks_blocked_typed(content: str, status_code: int | None = None) -> dict:
+    """Return a typed block verdict: {blocked, klass, reason}.
+
+    Callers in the orchestrator use this to choose which tier to try
+    next. `klass` is one of akamai/cloudflare/perimeterx/datadome/
+    imperva/sucuri/kasada/generic/empty/rate_limited/structural/''.
+    """
+    try:
+        from superbrowser_bridge.antibot.bot_detect import detect
+        v = detect(content or "", status_code)
+        return {"blocked": v.blocked, "klass": v.klass, "reason": v.reason}
+    except Exception:
+        blocked, reason = _looks_blocked(content)
+        return {"blocked": blocked, "klass": "generic" if blocked else "", "reason": reason}
 
 
 def _rewrite_for_search(instructions: str, url: str | None) -> str:
@@ -471,14 +498,19 @@ def _record_routing_outcome(
     approach: str,
     success: bool,
     used_rendered: bool = False,
+    *,
+    tier: int | None = None,
+    block_class: str = "",
 ) -> None:
     """Increment per-domain counters after a delegation finishes.
 
     `used_rendered` flags search runs that needed to fall back to the
     stealth-browser render path. A domain where search always needs
-    rendering is essentially a browser task in disguise — the preference
-    resolver uses this counter to deprioritize search for such domains
-    even when its raw success rate looks fine.
+    rendering is essentially a browser task in disguise.
+
+    When `tier` is set, also update the antibot tier ledger:
+      tier_outcomes: {"<tier>": "success"|"fail:<class>"}
+      lowest_successful_tier: <int>
     """
     if not domain or domain == "unknown":
         return
@@ -489,6 +521,9 @@ def _record_routing_outcome(
         "browser_success": 0, "browser_fail": 0,
         "search_success": 0, "search_fail": 0,
         "search_needed_render": 0,
+        "tier_outcomes": {},
+        "lowest_successful_tier": None,
+        "block_class": "",
         "last_updated": None,
     }
     if os.path.exists(path):
@@ -499,17 +534,58 @@ def _record_routing_outcome(
                 data.update(loaded)
         except (ValueError, OSError):
             pass
+    # Legacy counters (kept so _preferred_approach continues to work).
     key = f"{approach}_{'success' if success else 'fail'}"
     if key in data:
         data[key] = int(data.get(key, 0)) + 1
     if used_rendered:
         data["search_needed_render"] = int(data.get("search_needed_render", 0)) + 1
+    # Tier-aware ledger.
+    if tier is not None:
+        outcomes = data.get("tier_outcomes") or {}
+        if not isinstance(outcomes, dict):
+            outcomes = {}
+        outcomes[str(tier)] = (
+            "success" if success
+            else (f"fail:{block_class}" if block_class else "fail")
+        )
+        data["tier_outcomes"] = outcomes
+        if success:
+            cur = data.get("lowest_successful_tier")
+            if cur is None or int(tier) < int(cur):
+                data["lowest_successful_tier"] = int(tier)
+        if block_class:
+            data["block_class"] = block_class
     data["last_updated"] = datetime.now(timezone.utc).isoformat()
     try:
         with open(path, "w") as f:
             _json.dump(data, f, indent=2)
     except OSError:
         pass
+
+
+def choose_starting_tier(domain: str) -> int:
+    """Return the lowest tier known to succeed on this domain, else 0.
+
+    Used by the orchestrator to skip tiers that have reliably failed in
+    the past and jump straight to the cheapest working one.
+    """
+    if not domain or domain == "unknown":
+        return 0
+    path = _routing_path(domain)
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except (ValueError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    lst = data.get("lowest_successful_tier")
+    if isinstance(lst, int) and 0 <= lst <= 5:
+        return lst
+    return 0
 
 
 def _preferred_approach(domain: str) -> dict | None:

@@ -1264,11 +1264,21 @@ class SaveLearningTool(Tool):
 def register_orchestrator_tools(bot: "Nanobot") -> None:
     """Register orchestrator-specific tools (delegation + learnings + search)."""
     from superbrowser_bridge.search_tools import register_search_tools
+    from superbrowser_bridge.antibot import (
+        FetchArchiveTool,
+        FetchAutoTool,
+        FetchImpersonateTool,
+        FetchUndetectedTool,
+    )
 
     tools = [
         DelegateBrowserTaskTool(),
         CheckLearningsTool(),
         SaveLearningTool(),
+        FetchAutoTool(),
+        FetchImpersonateTool(),
+        FetchUndetectedTool(),
+        FetchArchiveTool(),
     ]
     for tool in tools:
         bot._loop.tools.register(tool)

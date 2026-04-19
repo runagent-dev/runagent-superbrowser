@@ -31,6 +31,9 @@ class BrowserWorkerHook(AgentHook):
         # Generic loop + stagnation detector (replaces consecutive_click_calls +
         # ad-hoc _stagnation_url/_stagnation_count logic).
         self._loop = LoopDetector()
+        # Tier-auto-escalation: fires at most once per session to avoid
+        # loop-cascading the LLM into repeated escalations.
+        self._auto_escalated: bool = False
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -195,6 +198,46 @@ class BrowserWorkerHook(AgentHook):
                     "method='auto') to solve it. "
                     "Do NOT report LOGIN REQUIRED for bot protection "
                     "pages.]"
+                )
+
+        # --- Tier auto-escalation (t1 → t3) -----------------------------
+        # Fires when a t1 tool flagged network_blocked OR vision detected a
+        # captcha. Surfaces a crisp, directive guidance block telling the LLM
+        # to call browser_escalate next. We do NOT call browser_escalate from
+        # the hook itself — tool dispatch stays under the LLM's control so
+        # the tool call appears in the transcript and the brain can react to
+        # the return value. One-shot per session.
+        if (
+            not self._auto_escalated
+            and self.state.session_id
+            and self.state.backend == "t1"
+        ):
+            should_escalate = False
+            reason = ""
+            if self.state.network_blocked:
+                should_escalate = True
+                reason = f"network_blocked:HTTP_{self.state.last_network_status or '?'}"
+            else:
+                last_vision = getattr(self.state, "_last_vision_response", None)
+                flags = getattr(last_vision, "flags", None)
+                if flags is not None and bool(getattr(flags, "captcha_present", False)):
+                    should_escalate = True
+                    ct = getattr(flags, "captcha_type", None)
+                    reason = f"vision_captcha:{ct or 'unspecified'}"
+
+            if should_escalate:
+                self._auto_escalated = True
+                sid = self.state.session_id
+                guidance_parts.append(
+                    "[AUTO_ESCALATION_ADVISED] Tier 1 (Puppeteer) hit "
+                    f"anti-bot protection ({reason}). "
+                    f"Call browser_escalate(session_id='{sid}', reason='{reason}') "
+                    "NOW. This migrates the session to Tier 3 (undetected "
+                    "Chromium) preserving cookies + URL. The returned "
+                    "new_session_id is what all subsequent browser_* tools "
+                    "must use. Do NOT retry on the current session — Akamai-"
+                    "class protections will not relent on the same IP+TLS "
+                    "fingerprint."
                 )
 
         # --- Inject guidance into the last tool result message ---

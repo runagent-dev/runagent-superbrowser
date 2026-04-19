@@ -333,24 +333,24 @@ class VisionResponse(BaseModel):
 
     @field_validator("bboxes", mode="before")
     @classmethod
-    def _coerce_bboxes(cls, v: object) -> list[dict]:
+    def _coerce_bboxes(cls, v: object) -> list:
         if v is None:
             return []
-        if isinstance(v, dict):
+        if isinstance(v, (dict, BaseModel)):
             return [v]
         if isinstance(v, list):
-            return [item for item in v if isinstance(item, dict)]
+            return [item for item in v if isinstance(item, (dict, BaseModel))]
         return []
 
     @field_validator("suggested_actions", mode="before")
     @classmethod
-    def _coerce_actions(cls, v: object) -> list[dict]:
+    def _coerce_actions(cls, v: object) -> list:
         if v is None:
             return []
-        if isinstance(v, dict):
+        if isinstance(v, (dict, BaseModel)):
             return [v]
         if isinstance(v, list):
-            return [item for item in v if isinstance(item, dict)]
+            return [item for item in v if isinstance(item, (dict, BaseModel))]
         return []
 
     @field_validator("changes_from_previous", mode="before")
@@ -434,6 +434,16 @@ class VisionResponse(BaseModel):
             for sa in sorted(self.suggested_actions, key=lambda a: a.priority):
                 target = f" -> bbox V{sa.target_bbox_index + 1}" if sa.target_bbox_index is not None else ""
                 parts.append(f"  [P{sa.priority}] {sa.action}{target}: {sa.description}")
+        # Captcha auto-escalation: if vision flagged a captcha, surface an
+        # imperative block so the worker LLM doesn't try to click through it.
+        if getattr(flags, "captcha_present", False):
+            ct = flags.captcha_type or "unknown"
+            parts.append(
+                f"[CAPTCHA_DETECTED type={ct}] Call "
+                f"browser_solve_captcha(method='auto') NOW — do NOT attempt "
+                f"to click the captcha widget manually via the bboxes above. "
+                f"If auto-solve fails, browser_ask_user for a human handoff."
+            )
         return "\n".join(parts)
 
     def get_bbox(self, vision_index_1based: int) -> Optional[BBox]:

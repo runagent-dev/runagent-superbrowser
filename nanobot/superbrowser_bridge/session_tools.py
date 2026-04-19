@@ -31,6 +31,217 @@ SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
 
+# --- Tier 3 (patchright) HTTP-shaped shim -----------------------------------
+#
+# Sessions whose IDs start with `t3-` are served by the in-process
+# `T3SessionManager` instead of the TS server. Intercepting here means all
+# 21 existing tools work unchanged — they still call _request_with_backoff;
+# this helper just peels off t3-routed URLs and returns a response-shaped
+# object the tool code can call .json() / .status_code / .text on.
+
+class _T3Response:
+    """Minimal httpx.Response stand-in for t3 dispatches."""
+
+    def __init__(self, payload: Any, status_code: int = 200, content: bytes = b""):
+        self._payload = payload
+        self.status_code = status_code
+        self.content = content or (payload if isinstance(payload, bytes) else b"")
+        self.headers: dict[str, str] = {}
+        self.text = ""
+        if isinstance(payload, bytes):
+            # Binary response (screenshot). Advertise as JPEG so callers
+            # that key off content-type treat it correctly.
+            self.headers["content-type"] = "image/jpeg"
+        elif isinstance(payload, str):
+            self.text = payload
+            self.headers["content-type"] = "text/plain"
+        elif isinstance(payload, (dict, list)):
+            try:
+                self.text = json.dumps(payload)
+                self.headers["content-type"] = "application/json"
+            except Exception:
+                self.text = ""
+
+    def json(self) -> Any:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if 400 <= self.status_code < 600:
+            raise httpx.HTTPStatusError(
+                f"t3 {self.status_code}", request=None, response=None,  # type: ignore[arg-type]
+            )
+
+
+def _is_t3_url(url: str) -> bool:
+    return "/session/t3-" in url
+
+
+async def _t3_dispatch_from_http(
+    method: str, url: str, *, json_body: dict[str, Any] | None,
+) -> _T3Response:
+    """Parse the t3-routed URL + body and call T3SessionManager."""
+    from superbrowser_bridge.antibot import interactive_session as _t3
+
+    # Split path. Expected forms:
+    #   /session/t3-<uuid>             -> DELETE (close)
+    #   /session/t3-<uuid>/<verb>      -> GET or POST
+    path = url.split(SUPERBROWSER_URL, 1)[-1].split("?", 1)[0]
+    parts = [p for p in path.split("/") if p]
+    # parts: ["session", "t3-<uuid>", "<verb>?"]
+    if len(parts) < 2 or not parts[1].startswith("t3-"):
+        return _T3Response({"error": "bad t3 url"}, status_code=400)
+    sid = parts[1]
+    verb = parts[2] if len(parts) >= 3 else None
+    body = dict(json_body or {})
+
+    mgr = _t3.default()
+    try:
+        if verb is None:
+            # DELETE /session/<sid>
+            if method.upper() == "DELETE":
+                res = await mgr.close(sid)
+                return _T3Response(res)
+            return _T3Response({"error": "no verb"}, status_code=400)
+
+        if verb == "navigate":
+            url_to = body.get("url", "")
+            data = await mgr.navigate(sid, url_to, timeout_s=body.get("timeout_s", 45.0))
+            return _T3Response(data)
+
+        if verb == "state":
+            data = await mgr.state(sid, use_vision=bool(body.get("vision", False)))
+            return _T3Response(data)
+
+        if verb == "screenshot":
+            png = await mgr.screenshot(sid)
+            return _T3Response(png, content=png)
+
+        if verb == "markdown":
+            md = await mgr.get_markdown(sid)
+            return _T3Response({"content": md})
+
+        if verb == "click":
+            if "bbox" in body or ("x" in body and "y" in body):
+                x = float(body.get("x", body.get("bbox", {}).get("x0", 0)))
+                y = float(body.get("y", body.get("bbox", {}).get("y0", 0)))
+                bbox = body.get("bbox")
+                data = await mgr.click_at(sid, x, y, bbox=bbox)
+            else:
+                data = await mgr.click(sid, int(body["index"]))
+            return _T3Response(data)
+
+        if verb == "type":
+            data = await mgr.type(
+                sid,
+                int(body["index"]),
+                body.get("text", ""),
+                clear=bool(body.get("clear", True)),
+            )
+            return _T3Response(data)
+
+        if verb == "keys":
+            data = await mgr.keys(sid, list(body.get("keys", [])))
+            return _T3Response(data)
+
+        if verb == "scroll":
+            data = await mgr.scroll(
+                sid,
+                direction=body.get("direction"),
+                percent=body.get("percent"),
+            )
+            return _T3Response(data)
+
+        if verb == "drag":
+            data = await mgr.drag(
+                sid,
+                float(body.get("startX", 0)), float(body.get("startY", 0)),
+                float(body.get("endX", 0)), float(body.get("endY", 0)),
+                steps=int(body.get("steps", 20)),
+            )
+            return _T3Response(data)
+
+        if verb == "select":
+            data = await mgr.select(sid, int(body["index"]), body.get("value", ""))
+            return _T3Response(data)
+
+        if verb == "evaluate":
+            data = await mgr.evaluate(sid, body.get("script", ""))
+            return _T3Response({"result": data})
+
+        if verb == "script":
+            data = await mgr.run_script(sid, body.get("code", ""))
+            return _T3Response(data)
+
+        if verb == "wait-for" or verb == "wait_for":
+            data = await mgr.wait_for(
+                sid,
+                selector=body.get("selector"),
+                timeout_s=float(body.get("timeout", 10.0)),
+            )
+            return _T3Response(data)
+
+        # Captcha verbs — map URL shapes like /captcha/detect, /captcha/solve,
+        # /captcha/screenshot to the antibot.captcha module.
+        if verb == "captcha":
+            sub = parts[3] if len(parts) >= 4 else ""
+            from superbrowser_bridge.antibot import captcha as _cap
+            if sub == "detect":
+                info = await _cap.detect(mgr, sid)
+                return _T3Response({
+                    "captcha": {
+                        "present": info.present,
+                        "type": info.type,
+                        "site_key": info.site_key,
+                        "widget_bbox": info.widget_bbox,
+                        "widget_selector": info.widget_selector,
+                        "frame_url": info.frame_url,
+                        "notes": info.notes,
+                    },
+                })
+            if sub == "screenshot":
+                info = await _cap.detect(mgr, sid)
+                data = await _cap.widget_screenshot(mgr, sid, info)
+                return _T3Response(data)
+            if sub == "solve":
+                info = await _cap.detect(mgr, sid)
+                if not info.present:
+                    return _T3Response({
+                        "solved": True, "method": "none",
+                        "note": "no captcha detected at solve time",
+                    })
+                method = (body.get("method") or "auto").lower()
+                if method in ("auto", "token") and info.type in (
+                    "recaptcha-v2", "hcaptcha", "turnstile",
+                ):
+                    res = await _cap.solve_token(mgr, sid, info)
+                    if res.get("solved"):
+                        return _T3Response(res)
+                if method in ("auto", "slider") and info.type == "slider":
+                    res = await _cap.solve_slider(mgr, sid, info)
+                    if res.get("solved") or method == "slider":
+                        return _T3Response(res)
+                if method in ("auto", "vision"):
+                    res = await _cap.solve_vision(mgr, sid, info)
+                    return _T3Response(res)
+                return _T3Response({
+                    "solved": False, "method": method,
+                    "error": f"no applicable strategy for {info.type}",
+                })
+
+        # Verbs that don't yet have a t3 equivalent (dialog, human-input).
+        return _T3Response(
+            {"error": f"t3 verb '{verb}' not yet implemented"},
+            status_code=501,
+        )
+    except KeyError as exc:
+        return _T3Response({"error": f"session {exc} not found"}, status_code=404)
+    except Exception as exc:
+        return _T3Response(
+            {"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            status_code=500,
+        )
+
+
 async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
     """POST denormalized bboxes to the SuperBrowser server so live
     viewers can flash them on the screencast overlay.
@@ -118,6 +329,11 @@ async def _request_with_backoff(
     per-IP rate limiter would surface as a hard 429 that the LLM mis-
     classifies as a permanent outage and refuses to retry.
     """
+    # Intercept t3 session URLs — route to the in-process patchright manager
+    # instead of the TS server.
+    if _is_t3_url(url):
+        return await _t3_dispatch_from_http(method, url, json_body=json)
+
     import random
     last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -125,6 +341,8 @@ async def _request_with_backoff(
             try:
                 if method.upper() == "GET":
                     r = await client.get(url, params=params)
+                elif method.upper() == "DELETE":
+                    r = await client.delete(url)
                 else:
                     r = await client.post(url, json=json)
             except (httpx.ConnectError, httpx.ReadTimeout) as e:
@@ -175,6 +393,72 @@ async def _fetch_feedback_state() -> dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _schedule_vision_prefetch(
+    state: "BrowserSessionState", session_id: str,
+) -> None:
+    """Fire a background vision_agent.analyze() so the next
+    `browser_screenshot` call finds cached bboxes instead of waiting 3-8s
+    for Gemini. Fire-and-forget: errors are swallowed.
+
+    Called from the success path of mutating tools (click, type, scroll,
+    navigate). Uses the same cache key as the sync path so the real
+    screenshot call hits cache.
+    """
+    try:
+        from vision_agent import (  # type: ignore[import-not-found]
+            dom_hash_of,
+            get_vision_agent,
+            vision_agent_enabled,
+        )
+    except ImportError:
+        return
+    if not vision_agent_enabled() or get_vision_agent is None:
+        return
+    if not session_id:
+        return
+
+    async def _run() -> None:
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true", "bounds": "true"},
+                timeout=15.0,
+            )
+            if r.status_code != 200:
+                return
+            data = r.json()
+            b64 = data.get("screenshot")
+            if not b64:
+                return
+            agent = get_vision_agent()
+            img_w, img_h = _read_image_dims(b64)
+            elements = data.get("elements", "")
+            dh = dom_hash_of(elements) if dom_hash_of else ""
+            resp = await agent.analyze(
+                screenshot_b64=b64,
+                intent=state._last_intent or "observe page",
+                session_id=session_id,
+                url=data.get("url", "") or state.current_url,
+                dom_hash=dh,
+                previous_summary=state._last_vision_summary or None,
+                image_width=img_w,
+                image_height=img_h,
+                task_instruction=state.task_instruction or None,
+            )
+            state._last_vision_response = resp
+            state._last_vision_summary = resp.summary
+            state._last_dom_hash = dh or state._last_dom_hash
+            state.vision_calls += 1
+        except Exception as exc:
+            print(f"  [vision prefetch failed: {exc}]")
+
+    try:
+        asyncio.create_task(_run())
+    except Exception:
+        pass
 
 
 async def _feedback_gate(tool_name: str) -> str | None:
@@ -375,7 +659,29 @@ class BrowserSessionState:
         # vision-index reference (e.g. bbox=V3) back to the original
         # bbox without re-running the vision pass. Reset whenever a new
         # screenshot triggers a fresh vision call.
-        self._last_vision_response: Any = None
+        # Typed as the actual schema when available, falls back to Any
+        # so the import stays lazy for environments without vision_agent.
+        try:
+            from nanobot.vision_agent.schemas import VisionResponse as _VR  # noqa: F401
+            self._last_vision_response: Optional["_VR"] = None  # type: ignore[assignment]
+        except Exception:
+            self._last_vision_response: Any = None  # type: ignore[assignment]
+
+        # Dead-type guard state. Tracks the last browser_type call so we can
+        # reject a second identical type to the same index — the pattern
+        # that produces "khulnakhulna, bangladesh" when the LLM misses an
+        # autocomplete dropdown and re-types the full phrase.
+        self.last_type_index: int = -1
+        self.last_type_text: str = ""
+        self.last_type_at: float = 0.0
+
+    @property
+    def backend(self) -> str:
+        """Tier of the active session. `t3` for patchright (undetected
+        Chromium), `t1` for Puppeteer via the TS server. Derived from
+        session_id prefix.
+        """
+        return "t3" if self.session_id.startswith("t3-") else "t1"
 
     # --- budget configuration ---------------------------------------------
 
@@ -961,13 +1267,14 @@ async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" =
     stale-index clicks (DOM shifted between state-fetch and click).
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={"vision": "false"},
-            )
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            params={"vision": "false"},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         if state is not None:
             fps = data.get("fingerprints") or {}
             if isinstance(fps, dict):
@@ -1050,6 +1357,15 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
             "Only used when VISION_ENABLED=1.",
             nullable=True,
         ),
+        tier=StringSchema(
+            "Which anti-bot tier to open the session on. "
+            "'auto' (default) reads per-domain learnings and picks t1 or t3. "
+            "'t1' forces the TS Puppeteer backend. "
+            "'t3' forces the in-process patchright (undetected Chromium) "
+            "backend — required for Akamai/DataDome/PerimeterX targets.",
+            enum=("auto", "t1", "t3"),
+            nullable=True,
+        ),
         required=[],
     )
 )
@@ -1057,7 +1373,9 @@ class BrowserOpenTool(Tool):
     name = "browser_open"
     description = (
         "Open a new browser session. Returns a screenshot and interactive elements. "
-        "For geo-restricted sites, pass region='bd' (Bangladesh), 'in' (India), etc."
+        "For geo-restricted sites, pass region='bd' (Bangladesh), 'in' (India), etc. "
+        "Pass tier='t3' for hardened anti-bot sites (Akamai/DataDome/PerimeterX); "
+        "'auto' reads the learning system."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1067,8 +1385,23 @@ class BrowserOpenTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, **kw: Any) -> Any:
+    async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, tier: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
+
+        # --- Tier selection ---------------------------------------------
+        # 'auto' reads per-domain learnings; explicit 't1'/'t3' forces it.
+        chosen_tier = (tier or "auto").lower()
+        if chosen_tier == "auto":
+            try:
+                from urllib.parse import urlparse as _urlparse
+                from superbrowser_bridge.routing import choose_starting_tier
+                host = _urlparse(url or "").hostname or ""
+                learned = choose_starting_tier(host) if host else 0
+                # Tier ≥ 3 → open directly on t3. Tier 4 isn't interactive;
+                # we still open on t3 and let the vision loop decide.
+                chosen_tier = "t3" if learned >= 3 else "t1"
+            except Exception:
+                chosen_tier = "t1"
 
         # --- Idempotency guard ------------------------------------------
         # Two paths reach this tool with a live session already:
@@ -1129,41 +1462,59 @@ class BrowserOpenTool(Tool):
         self.s.reset_per_session()
         self.s.sessions_opened += 1
 
-        print(f"\n>> browser_open(url={url}, region={region}) [session #{self.s.sessions_opened}, screenshots left: {self.s.screenshot_budget}]")
+        print(f"\n>> browser_open(url={url}, region={region}, tier={chosen_tier}) [session #{self.s.sessions_opened}, screenshots left: {self.s.screenshot_budget}]")
 
-        payload: dict[str, Any] = {}
-        if url:
-            payload["url"] = url
-        if region:
-            payload["region"] = region
-        if proxy:
-            payload["proxy"] = proxy
-        # Opt in to human handoff on the TS side. The server instantiates a
-        # HumanInputManager for this session and the captcha orchestrator
-        # can fall back to a human handoff after auto-solve exhausts.
-        if self.s.human_handoff_enabled:
-            payload["enableHumanHandoff"] = True
-            payload["humanHandoffBudget"] = self.s.human_handoff_budget
+        if chosen_tier == "t3":
+            # Route directly to the in-process patchright manager. Bypasses the
+            # TS server entirely — the resulting t3-session-<uuid> session_id
+            # is detected by the _request_with_backoff interceptor for all
+            # subsequent tool calls on this session.
+            from superbrowser_bridge.antibot import interactive_session as _t3mgr
+            try:
+                data = await _t3mgr.default().open(
+                    url,
+                    task_id=self.s.task_id,
+                    timeout_s=45.0,
+                )
+            except Exception as exc:
+                return (
+                    f"[t3_open_failed] Could not open Tier-3 undetected "
+                    f"Chromium session: {type(exc).__name__}: {str(exc)[:200]}"
+                )
+        else:
+            payload: dict[str, Any] = {}
+            if url:
+                payload["url"] = url
+            if region:
+                payload["region"] = region
+            if proxy:
+                payload["proxy"] = proxy
+            # Opt in to human handoff on the TS side. The server instantiates a
+            # HumanInputManager for this session and the captcha orchestrator
+            # can fall back to a human handoff after auto-solve exhausts.
+            if self.s.human_handoff_enabled:
+                payload["enableHumanHandoff"] = True
+                payload["humanHandoffBudget"] = self.s.human_handoff_budget
 
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/create",
-            json=payload,
-            timeout=45.0,
-        )
-        if r.status_code == 429:
-            # Retries exhausted. Give the LLM a CLEAR hint that this is
-            # transient — otherwise it hallucinates a permanent outage
-            # (observed 2026-04-14 log: "the service is completely
-            # blocking session creation") and gives up entirely.
-            return (
-                "[transient_rate_limit] Browser session service is busy "
-                "(HTTP 429 after retries). This is a temporary rate limit, "
-                "NOT a permanent outage. Wait ~30 seconds and call "
-                "browser_open again. Do not switch to a different strategy."
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/create",
+                json=payload,
+                timeout=45.0,
             )
-        r.raise_for_status()
-        data = r.json()
+            if r.status_code == 429:
+                # Retries exhausted. Give the LLM a CLEAR hint that this is
+                # transient — otherwise it hallucinates a permanent outage
+                # (observed 2026-04-14 log: "the service is completely
+                # blocking session creation") and gives up entirely.
+                return (
+                    "[transient_rate_limit] Browser session service is busy "
+                    "(HTTP 429 after retries). This is a temporary rate limit, "
+                    "NOT a permanent outage. Wait ~30 seconds and call "
+                    "browser_open again. Do not switch to a different strategy."
+                )
+            r.raise_for_status()
+            data = r.json()
 
         actual_url = data.get("url", url or "")
         self.s.session_id = data.get("sessionId", "")
@@ -1178,16 +1529,31 @@ class BrowserOpenTool(Tool):
         # /human-input endpoint and will show a banner the instant the
         # agent needs help, so having it open beforehand eliminates the
         # race where the agent blocks for 5 min before the user notices.
+        #
+        # For t3 sessions, the live viewer is served by the Python-side
+        # aiohttp server (default :3101), NOT the TS server (:3100). The
+        # browser_open call starts it on demand so the URL is live when
+        # the user clicks it.
         if self.s.human_handoff_enabled and self.s.session_id:
-            public_host = os.environ.get(
-                "SUPERBROWSER_PUBLIC_HOST", SUPERBROWSER_URL.rstrip("/"),
-            )
-            view_url = f"{public_host}/session/{self.s.session_id}/view"
-            print(
-                f"\n>> [HUMAN HANDOFF ENABLED] Open this URL in your browser "
-                f"and keep it open:\n>>   {view_url}\n>> "
-                f"If the agent needs help, you'll see a banner there."
-            )
+            if chosen_tier == "t3":
+                try:
+                    from superbrowser_bridge.antibot import t3_viewer as _v
+                    await _v.ensure_started()
+                    view_url = _v.view_url(self.s.session_id)
+                except Exception as exc:
+                    print(f"  [t3 viewer failed to start: {exc}]")
+                    view_url = ""
+            else:
+                public_host = os.environ.get(
+                    "SUPERBROWSER_PUBLIC_HOST", SUPERBROWSER_URL.rstrip("/"),
+                )
+                view_url = f"{public_host}/session/{self.s.session_id}/view"
+            if view_url:
+                print(
+                    f"\n>> [HUMAN HANDOFF ENABLED] Open this URL in your browser "
+                    f"and keep it open:\n>>   {view_url}\n>> "
+                    f"If the agent needs help, you'll see a banner there."
+                )
 
         caption = _format_state(data, self.s)
         caption = f"Session: {data['sessionId']}\n{caption}"
@@ -1274,26 +1640,51 @@ class BrowserNavigateTool(Tool):
         # LLM from visiting alternative sites when the target blocks it.
         if self.s.pinned_domain:
             from urllib.parse import urlparse as _urlparse
+            # Safe-list = OAuth + CDN only. google.com stays on the list
+            # (OAuth flow needs `accounts.google.com`, `accounts.youtube.com`,
+            # etc.) but SEARCH paths on it are blocked below — observed
+            # 2026-04-19: LLM would pivot to google.com/search whenever
+            # the real target was slow, turning every task into a Google
+            # scrape that 429'd and poisoned the session.
             _SAFE_DOMAINS = ("google.com", "googleapis.com", "gstatic.com", "google.co")
             try:
-                _target_host = (_urlparse(url).hostname or "").lower().replace("www.", "")
+                _parsed = _urlparse(url)
+                _target_host = (_parsed.hostname or "").lower().replace("www.", "")
+                _target_path = _parsed.path or ""
+                _target_query = _parsed.query or ""
             except Exception:
                 _target_host = ""
+                _target_path = ""
+                _target_query = ""
             _pinned = self.s.pinned_domain
             _is_pinned = _target_host == _pinned or _target_host.endswith("." + _pinned)
             _is_safe = any(
                 _target_host == sd or _target_host.endswith("." + sd)
                 for sd in _SAFE_DOMAINS
             )
-            if _target_host and not _is_pinned and not _is_safe:
-                self.s.record_step("browser_navigate", url, f"BLOCKED: outside pinned domain {_pinned}")
-                print(f"   [DOMAIN_PINNED] blocked navigation to {_target_host} (pinned={_pinned})")
+            # Block Google Search as an escape hatch — `google.com/search`,
+            # `google.com/?q=`, `google.com/images`, etc. The LLM must stay
+            # on the pinned domain even when it's frustrated.
+            _is_google = _target_host == "google.com" or _target_host.endswith(".google.com") or _target_host.endswith(".google.co")
+            _looks_like_search = _is_google and (
+                _target_path.startswith("/search")
+                or _target_path.startswith("/images")
+                or _target_path.startswith("/maps")
+                or "q=" in _target_query
+            )
+            if _target_host and (not (_is_pinned or _is_safe) or _looks_like_search):
+                reason = "search_escape" if _looks_like_search else "outside_pin"
+                self.s.record_step("browser_navigate", url, f"BLOCKED: {reason} (pinned={_pinned})")
+                print(f"   [DOMAIN_PINNED] blocked navigation to {_target_host}{_target_path} ({reason}, pinned={_pinned})")
                 return (
                     f"[DOMAIN_PINNED] Navigation to {url} is BLOCKED. "
                     f"You MUST stay on {_pinned} (and its subdomains). "
-                    f"Do NOT visit other sites to find the answer. "
-                    f"If {_pinned} is blocking you, call browser_solve_captcha or "
-                    f"browser_ask_user, or report failure via done(success=False)."
+                    f"Do NOT pivot to Google Search or other sites when the "
+                    f"target is slow or annoying — fix the problem on "
+                    f"{_pinned} itself. If {_pinned} is hard-blocked, call "
+                    f"browser_escalate (to Tier 3) or browser_solve_captcha "
+                    f"or browser_ask_user, or report failure via "
+                    f"done(success=False)."
                 )
 
         self.s.actions_since_screenshot += 1
@@ -1304,10 +1695,14 @@ class BrowserNavigateTool(Tool):
         if regression:
             self.s.regression_count += 1
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/navigate", json={"url": url})
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/navigate",
+            json={"url": url},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         actual_url = data.get("url", url)
         self.s.log_activity(f"navigate({url})", f"title={data.get('title', '?')}")
@@ -1331,6 +1726,9 @@ class BrowserNavigateTool(Tool):
                 return caption
 
         self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")
+        # Prefetch vision so the LLM's next browser_screenshot finds the
+        # bboxes already cached.
+        _schedule_vision_prefetch(self.s, session_id)
 
         if regression:
             caption += "\n[WARNING: You already visited this URL. Fix your approach on the CURRENT page instead of going backward. Do NOT restart from the beginning.]"
@@ -1398,16 +1796,17 @@ class BrowserScreenshotTool(Tool):
             return reason
 
         self.s.screenshot_budget -= 1
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                # bounds=true returns selectorEntries (with x/y/width/height) +
-                # devicePixelRatio so we can draw bbox overlays before the
-                # screenshot goes to the vision LLM.
-                params={"vision": "true", "bounds": "true"},
-            )
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            # bounds=true returns selectorEntries (with x/y/width/height) +
+            # devicePixelRatio so we can draw bbox overlays before the
+            # screenshot goes to the vision LLM.
+            params={"vision": "true", "bounds": "true"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
@@ -1487,46 +1886,44 @@ class BrowserClickTool(Tool):
             payload["expected_fingerprint"] = cached_fp
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json=payload)
-                # 409 = stale-index guard fired. Surface the suggested
-                # index (if any) so the LLM retargets instead of blindly
-                # retrying or falling back to click_at coords.
-                if r.status_code == 409:
-                    info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                    stale_msg = info.get("error", "Stale index")
-                    suggested = info.get("suggested_index")
-                    current = info.get("current_element", "")
-                    hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
-                    result = f"[stale_index] {stale_msg} Current [{index}] is {current}.{hint}"
-                    self.s.log_activity(f"click([{index}])(STALE)", f"suggested={suggested}")
-                    await _fetch_elements(session_id, self.s)
-                    return result
-                # 400 = structured TS-side failure (element not found,
-                # not visible, disabled, etc.). Parse it and return an
-                # actionable message to the LLM — crucially, DO NOT fall
-                # back to JS click for these: JS click against a missing
-                # element also fails, and the raw Python exception string
-                # that comes out ('Client error 400 Bad Request for URL')
-                # is un-actionable enough that Gemini will sometimes
-                # return an empty response on the next turn (observed
-                # 2026-04-14). Structured text here prevents that.
-                if r.status_code == 400:
-                    info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                    reason = info.get("reason", "unknown")
-                    err = info.get("error", f"click [{index}] failed")
-                    alternatives = info.get("alternatives") or []
-                    await _fetch_elements(session_id, self.s)
-                    self.s.log_activity(f"click([{index}])({reason})", err[:60])
-                    alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
-                    fresh_hint = "\nElements have been re-read above — pick a current [index]."
-                    return (
-                        f"[click_failed:{reason}] {err}"
-                        + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
-                        + fresh_hint
-                    )
-                r.raise_for_status()
-                data = r.json()
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/click",
+                json=payload,
+                timeout=30.0,
+            )
+            # 409 = stale-index guard fired. Surface the suggested
+            # index (if any) so the LLM retargets instead of blindly
+            # retrying or falling back to click_at coords.
+            if r.status_code == 409:
+                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                stale_msg = info.get("error", "Stale index")
+                suggested = info.get("suggested_index")
+                current = info.get("current_element", "")
+                hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
+                result = f"[stale_index] {stale_msg} Current [{index}] is {current}.{hint}"
+                self.s.log_activity(f"click([{index}])(STALE)", f"suggested={suggested}")
+                await _fetch_elements(session_id, self.s)
+                return result
+            # 400 = structured TS-side failure (element not found,
+            # not visible, disabled, etc.). Parse and return an
+            # actionable message to the LLM.
+            if r.status_code == 400:
+                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                reason = info.get("reason", "unknown")
+                err = info.get("error", f"click [{index}] failed")
+                alternatives = info.get("alternatives") or []
+                await _fetch_elements(session_id, self.s)
+                self.s.log_activity(f"click([{index}])({reason})", err[:60])
+                alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
+                fresh_hint = "\nElements have been re-read above — pick a current [index]."
+                return (
+                    f"[click_failed:{reason}] {err}"
+                    + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
+                    + fresh_hint
+                )
+            r.raise_for_status()
+            data = r.json()
         except httpx.HTTPStatusError as e:
             # Opaque 4xx/5xx (not 400/409). Usually network-layer.
             self.s.log_activity(f"click([{index}])(HTTP{e.response.status_code})", str(e)[:60])
@@ -1544,6 +1941,7 @@ class BrowserClickTool(Tool):
             self.s.record_url(actual_url)
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
         self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(data, f"Clicked [{index}]")
 
 
@@ -1640,19 +2038,23 @@ class BrowserClickAtTool(Tool):
             log_target = f"({x},{y})"
             print(f"\n>> browser_click_at({x}, {y})")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/click", json=payload)
-            # 409 = reward-band reject. Historical data says this zone
-            # doesn't respond to clicks on this host; surface the hint
-            # so the LLM re-reads elements instead of trying another
-            # nearby coord.
-            if r.status_code == 409:
-                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                err = info.get("error") or "click_at rejected: low-reward zone"
-                self.s.log_activity(f"click_at{log_target}(BAND_REJECT)", f"band={info.get('band')}")
-                return f"[low_reward_band] {err}"
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/click",
+            json=payload,
+            timeout=30.0,
+        )
+        # 409 = reward-band reject. Historical data says this zone
+        # doesn't respond to clicks on this host; surface the hint
+        # so the LLM re-reads elements instead of trying another
+        # nearby coord.
+        if r.status_code == 409:
+            info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            err = info.get("error") or "click_at rejected: low-reward zone"
+            self.s.log_activity(f"click_at{log_target}(BAND_REJECT)", f"band={info.get('band')}")
+            return f"[low_reward_band] {err}"
+        r.raise_for_status()
+        data = r.json()
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
@@ -1669,6 +2071,7 @@ class BrowserClickAtTool(Tool):
             log_target,
             f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
         )
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
 
 
@@ -1697,40 +2100,165 @@ class BrowserTypeTool(Tool):
         gate = await _feedback_gate("browser_type")
         if gate:
             return gate
+
+        # --- Dead-type guard --------------------------------------------
+        # The LLM's most destructive misread: type "khulna" → autocomplete
+        # dropdown appears → LLM doesn't notice → retypes "khulna,
+        # Bangladesh" → field now reads "khulnakhulna, Bangladesh". Catch
+        # the second identical-ish type and force the LLM to inspect the
+        # dropdown before retyping.
+        now_ts = time.time()
+        if (
+            index == self.s.last_type_index
+            and self.s.last_type_text
+            and (now_ts - self.s.last_type_at) < 12.0
+        ):
+            last_lower = self.s.last_type_text.lower()
+            cur_lower = text.lower()
+            # Consider it a dead-type if: the new text starts with the old
+            # text, OR the new text is a superset of the old (contains it),
+            # OR it's exactly the same.
+            duplicative = (
+                cur_lower == last_lower
+                or cur_lower.startswith(last_lower)
+                or last_lower in cur_lower
+            )
+            if duplicative:
+                self.s.record_step(
+                    "browser_type",
+                    f"index={index}, text={text[:30]!r}",
+                    "DEAD_TYPE: refused (autocomplete likely)",
+                )
+                return (
+                    f"[DEAD_TYPE_REJECTED] Refused to re-type into [{index}]. "
+                    f"You already typed {self.s.last_type_text!r} into this "
+                    f"field seconds ago. Typing again WILL concatenate "
+                    f"(producing garbage like \"{self.s.last_type_text}{text}\"). "
+                    f"An autocomplete dropdown probably appeared — take a "
+                    f"browser_screenshot, then browser_click the right "
+                    f"suggestion (or browser_keys ArrowDown+Enter). Only "
+                    f"retype if you pass clear=true AND the field is empty."
+                )
+
         self.s.consecutive_click_calls += 1  # type is also step-by-step
         payload: dict[str, Any] = {"index": index, "text": text, "clear": clear}
         cached_fp = self.s.element_fingerprints.get(index)
         if cached_fp:
             payload["expected_fingerprint"] = cached_fp
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/type", json=payload)
-            if r.status_code == 409:
-                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                suggested = info.get("suggested_index")
-                current = info.get("current_element", "")
-                hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
-                await _fetch_elements(session_id, self.s)
-                return f"[stale_index] Element [{index}] is now {current}.{hint}"
-            # Same structured-400 handling as BrowserClickTool — avoid
-            # surfacing raw 'Client error 400' which empties Gemini's
-            # next turn.
-            if r.status_code == 400:
-                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                reason = info.get("reason", "unknown")
-                err = info.get("error", f"type [{index}] failed")
-                alternatives = info.get("alternatives") or []
-                await _fetch_elements(session_id, self.s)
-                self.s.log_activity(f"type([{index}])({reason})", err[:60])
-                alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
-                return (
-                    f"[type_failed:{reason}] {err}"
-                    + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
-                    + "\nElements have been re-read above — pick a current [index]."
-                )
-            r.raise_for_status()
-            data = r.json()
-        self.s.record_step("browser_type", f'index={index}, text="{text[:30]}"', "ok")
-        return self.s.build_text_only(data, f'Typed "{text}" into [{index}]')
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/type",
+            json=payload,
+            timeout=30.0,
+        )
+        if r.status_code == 409:
+            info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            suggested = info.get("suggested_index")
+            current = info.get("current_element", "")
+            hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
+            await _fetch_elements(session_id, self.s)
+            return f"[stale_index] Element [{index}] is now {current}.{hint}"
+        # Same structured-400 handling as BrowserClickTool — avoid
+        # surfacing raw 'Client error 400' which empties Gemini's
+        # next turn.
+        if r.status_code == 400:
+            info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            reason = info.get("reason", "unknown")
+            err = info.get("error", f"type [{index}] failed")
+            alternatives = info.get("alternatives") or []
+            await _fetch_elements(session_id, self.s)
+            self.s.log_activity(f"type([{index}])({reason})", err[:60])
+            alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
+            return (
+                f"[type_failed:{reason}] {err}"
+                + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
+                + "\nElements have been re-read above — pick a current [index]."
+            )
+        r.raise_for_status()
+        data = r.json()
+
+        # Record last-type state so the dead-type guard fires next time.
+        self.s.last_type_index = index
+        self.s.last_type_text = text
+        self.s.last_type_at = time.time()
+
+        # --- Post-type autocomplete dropdown scan -----------------------
+        # Probe the page for newly-appeared autocomplete suggestions. If
+        # we find any, surface them inline so the LLM picks one instead
+        # of re-typing the full phrase.
+        suggestions: list[dict] = []
+        try:
+            scan_js = """
+            (() => {
+              const seen = new Set();
+              const out = [];
+              const selectors = [
+                '[role="listbox"] [role="option"]',
+                '[role="combobox"] + * li',
+                '.autocomplete-suggestions li, .autocomplete li',
+                'ul.suggestions li, .suggestions li',
+                '.MuiAutocomplete-listbox li',
+                '[aria-live] li',
+                '.dropdown-menu.show li, .dropdown-menu[style*="display: block"] li',
+                '.ui-autocomplete li',
+                '[class*="autocomplete"][class*="option"]',
+                '[class*="suggestion"] li, [class*="suggestions"] li',
+              ];
+              for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 30 || r.height < 10) return;
+                  if (r.top > window.innerHeight * 1.5) return;
+                  const txt = (el.innerText || el.textContent || '').trim();
+                  if (!txt || txt.length > 120 || seen.has(txt)) return;
+                  seen.add(txt);
+                  out.push({
+                    text: txt,
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2),
+                  });
+                });
+              }
+              return out.slice(0, 8);
+            })();
+            """
+            sr = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                json={"script": scan_js},
+                timeout=5.0,
+            )
+            if sr.status_code == 200:
+                body = sr.json()
+                got = body.get("result") if isinstance(body, dict) else None
+                if isinstance(got, list):
+                    suggestions = [s for s in got if isinstance(s, dict) and s.get("text")]
+        except Exception as exc:
+            print(f"  [dropdown scan failed: {exc}]")
+
+        self.s.record_step(
+            "browser_type",
+            f'index={index}, text="{text[:30]}"',
+            f"ok ({len(suggestions)} suggestions)" if suggestions else "ok",
+        )
+
+        caption = f'Typed "{text}" into [{index}]'
+        if suggestions:
+            caption += (
+                f"\n\nAutocomplete suggestions visible ({len(suggestions)}):"
+            )
+            for i, s in enumerate(suggestions, start=1):
+                caption += f"\n  {i}. {s['text']!r} → browser_click_at(x={s['x']}, y={s['y']})"
+            caption += (
+                "\nDO NOT browser_type again into this field — pick a "
+                "suggestion above via browser_click_at or use browser_keys "
+                "(ArrowDown + Enter) to select the first one."
+            )
+
+        # Prefetch vision so next screenshot call finds bboxes cached.
+        _schedule_vision_prefetch(self.s, session_id)
+
+        return self.s.build_text_only(data, caption)
 
 
 @tool_parameters(
@@ -1753,15 +2281,20 @@ class BrowserKeysTool(Tool):
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
         print(f"\n>> browser_keys({keys})")
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/keys", json={"keys": keys})
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+            json={"keys": keys},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         # Fetch updated elements after key press (e.g., Enter may submit form)
         if not data.get("elements"):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(data, f"Sent keys: {keys}")
 
 
@@ -1794,16 +2327,21 @@ class BrowserScrollTool(Tool):
             payload["percent"] = percent
         else:
             payload["direction"] = direction or "down"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/scroll", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/scroll",
+            json=payload,
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         # Fetch updated elements after scroll (new elements may be visible)
         if not data.get("elements"):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(data, action)
 
 
@@ -1827,10 +2365,14 @@ class BrowserSelectTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, value: str, **kw: Any) -> Any:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/select", json={"index": index, "value": value})
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/select",
+            json={"index": index, "value": value},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         # Fetch updated elements after selection (may trigger form changes)
         if not data.get("elements"):
             elements = await _fetch_elements(session_id, self.s)
@@ -1857,10 +2399,14 @@ class BrowserEvalTool(Tool):
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
         print(f"\n>> browser_eval({script[:60]}...)")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/evaluate", json={"script": script})
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": script},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         result = data.get("result")
         result_str = json.dumps(result, indent=2, ensure_ascii=False)[:5000] if isinstance(result, (dict, list)) else str(result)[:5000]
         self.s.log_activity(f"eval({script[:40]}...)", result_str[:60])
@@ -1903,10 +2449,14 @@ class BrowserRunScriptTool(Tool):
             payload["timeout"] = timeout
 
         client_timeout = max(120.0, (timeout or 60000) / 1000 + 10)
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/script", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/script",
+            json=payload,
+            timeout=client_timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         self.s.actions_since_screenshot += 1
 
@@ -2006,13 +2556,14 @@ class BrowserWaitForTool(Tool):
             """
 
         client_timeout = max(30.0, timeout_s + 10)
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            r = await client.post(
-                f"{SUPERBROWSER_URL}/session/{session_id}/script",
-                json={"code": script, "timeout": timeout_s * 1000 + 5000},
-            )
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/script",
+            json={"code": script, "timeout": timeout_s * 1000 + 5000},
+            timeout=client_timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         if not data.get("success"):
             self.s.log_activity(f"wait_for({label})", f"script error: {data.get('error', '?')[:60]}")
@@ -2030,9 +2581,18 @@ class BrowserWaitForTool(Tool):
         else:
             self.s.log_activity(f"wait_for({label})", f"timeout after {timeout_s}s")
             return (
-                f"Not found after {timeout_s}s. "
+                f"Not found after {timeout_s}s (selector/text did NOT match). "
+                f"This is a RENDERING-SPEED or SELECTOR issue — NOT a network "
+                f"block. DO NOT escalate to Tier 3.\n"
                 f"Page: {result.get('url', '?')} | Title: {result.get('title', '?')}\n"
-                f"Page preview: {result.get('bodyPreview', 'N/A')}"
+                f"Page preview: {result.get('bodyPreview', 'N/A')}\n"
+                f"Next steps:\n"
+                f"  - browser_screenshot to see the actual rendered state.\n"
+                f"  - Retry browser_wait_for with a longer timeout (20-30s) "
+                f"or a different selector (e.g. try 'form', 'button[type=submit]' "
+                f"instead of generic 'input').\n"
+                f"  - browser_run_script with `return document.body.innerText.length` "
+                f"to confirm the page has actually rendered content."
             )
 
 
@@ -2048,10 +2608,13 @@ class BrowserGetMarkdownTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/markdown")
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         return data.get("content", "No content extracted")[:10000]
 
 
@@ -2071,9 +2634,13 @@ class BrowserDialogTool(Tool):
         payload: dict[str, Any] = {"accept": accept}
         if text:
             payload["text"] = text
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/dialog", json=payload)
-            r.raise_for_status()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/dialog",
+            json=payload,
+            timeout=10.0,
+        )
+        r.raise_for_status()
         return f"Dialog {'accepted' if accept else 'dismissed'}"
 
 
@@ -2093,9 +2660,14 @@ class BrowserCloseTool(Tool):
         self.s.print_summary()
         self.s.export_activity_log()
         self.s.export_step_history()
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.delete(f"{SUPERBROWSER_URL}/session/{session_id}")
-            r.raise_for_status()
+        # Route through _request_with_backoff so t3 sessions get intercepted
+        # and dispatched to the in-process patchright manager.
+        r = await _request_with_backoff(
+            "DELETE",
+            f"{SUPERBROWSER_URL}/session/{session_id}",
+            timeout=10.0,
+        )
+        r.raise_for_status()
         used = self.s.max_screenshots - self.s.screenshot_budget
         return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {used}/{self.s.max_screenshots}, Regressions: {self.s.regression_count}"
 
@@ -2130,10 +2702,14 @@ class BrowserDragTool(Tool):
         if steps is not None:
             payload["steps"] = steps
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/drag", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/drag",
+            json=payload,
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         self.s.record_step("browser_drag", f"({startX},{startY})->({endX},{endY})", data.get("url", ""))
         caption = f"Dragged from ({startX},{startY}) to ({endX},{endY})"
@@ -2157,12 +2733,25 @@ class BrowserDetectCaptchaTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/detect")
-            r.raise_for_status()
-            data = r.json()
+        # Route through _request_with_backoff so t3 sessions go to the
+        # in-process patchright captcha detector, not the TS server.
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/captcha/detect",
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         captcha = data.get("captcha")
         if not captcha:
+            return "No captcha detected."
+        # Normalize across tiers: t3 returns {present: bool, type: ...};
+        # TS may return a different shape where absence is represented as
+        # falsy. Either way, bail if nothing is active.
+        if isinstance(captcha, dict) and (
+            captcha.get("present") is False
+            or captcha.get("type") in ("none", None, "")
+        ):
             return "No captcha detected."
         # Detecting a captcha triggers captcha_mode: screenshot dedup +
         # "no-actions-since-last-shot" rules are relaxed so the solver can
@@ -2170,13 +2759,23 @@ class BrowserDetectCaptchaTool(Tool):
         self.s.enter_captcha_mode()
         # Surface the live-view URL the moment a captcha is detected, not
         # only when handoff fires. Gives the LLM (and any UI piping tool
-        # output to a human) a link to offer immediately.
-        view_url = data.get("viewUrl") or (
-            f"{os.environ['SUPERBROWSER_PUBLIC_HOST'].rstrip('/')}"
-            f"/session/{session_id}/view"
-            if os.environ.get("SUPERBROWSER_PUBLIC_HOST")
-            else None
-        )
+        # output to a human) a link to offer immediately. For t3 sessions
+        # this is the Python viewer port; for t1 it's the TS server.
+        view_url: str | None = None
+        if self.s.backend == "t3":
+            try:
+                from superbrowser_bridge.antibot import t3_viewer as _v
+                await _v.ensure_started()
+                view_url = _v.view_url(session_id)
+            except Exception:
+                view_url = None
+        else:
+            view_url = data.get("viewUrl") or (
+                f"{os.environ['SUPERBROWSER_PUBLIC_HOST'].rstrip('/')}"
+                f"/session/{session_id}/view"
+                if os.environ.get("SUPERBROWSER_PUBLIC_HOST")
+                else None
+            )
         lines = [
             f"Captcha detected: type={captcha['type']}, "
             f"siteKey={captcha.get('siteKey', 'N/A')} "
@@ -2205,12 +2804,20 @@ class BrowserCaptchaScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> Any:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/screenshot")
-            if r.status_code == 404:
-                return "No captcha area found."
-            r.raise_for_status()
-        b64 = base64.b64encode(r.content).decode()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/captcha/screenshot",
+            timeout=10.0,
+        )
+        if r.status_code == 404:
+            return "No captcha area found."
+        r.raise_for_status()
+        # t3 returns a dict with image_base64; t1 returns raw JPEG bytes.
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        if isinstance(body, dict) and body.get("image_base64"):
+            b64 = body["image_base64"]
+        else:
+            b64 = base64.b64encode(r.content).decode()
         return await self.s.build_tool_result_blocks(
             b64,
             "Captcha area — analyze to solve",
@@ -2256,10 +2863,14 @@ class BrowserSolveCaptchaTool(Tool):
         # (which the LLM will take to inspect the result) gets a fresh dedup
         # allowance distinct from the pre-solve shots.
         self.s.captcha_solve_round += 1
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            r = await client.post(f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve",
+            json=payload,
+            timeout=180.0,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         # Build a structured result the orchestrator can parse — keeps the
         # method + subMethod + vendor + trace so per-domain captcha learnings
@@ -2381,13 +2992,14 @@ class BrowserSolveCaptchaTool(Tool):
         self.s.captcha_solve_round += 1
 
         # Fetch screenshot + elements.
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={"vision": "true"},
-            )
-            r.raise_for_status()
-            state = r.json()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            params={"vision": "true"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        state = r.json()
 
         b64 = state.get("screenshot")
         if not b64:
@@ -2555,6 +3167,49 @@ class BrowserAskUserTool(Tool):
         input_type: str | None = None,
         **kw: Any,
     ) -> Any:
+        # Tier-3 path: spin up the Python live viewer and return its URL
+        # as a hint to the LLM. The actual blocking "wait for user" is
+        # simpler on t3 — we poll for a state change on the captcha
+        # widget and resume when it clears. For now, return the URL and a
+        # short wait loop so the user has ~3 min to interact.
+        if self.s.backend == "t3":
+            try:
+                from superbrowser_bridge.antibot import t3_viewer as _v
+                from superbrowser_bridge.antibot import captcha as _cap
+                from superbrowser_bridge.antibot import interactive_session as _t3mgr
+
+                await _v.ensure_started()
+                view = _v.view_url(session_id)
+                print(f"\n[HUMAN HANDOFF — t3] Open {view} in your browser.")
+                # Poll every 3s for up to 5 min for the captcha to clear.
+                mgr = _t3mgr.default()
+                import asyncio as _asyncio
+                import time as _time
+                deadline = _time.time() + 5 * 60
+                cleared = False
+                while _time.time() < deadline:
+                    await _asyncio.sleep(3.0)
+                    try:
+                        info = await _cap.detect(mgr, session_id)
+                    except Exception:
+                        continue
+                    if not info.present:
+                        cleared = True
+                        break
+                if cleared:
+                    return (
+                        f"[human_handoff_cleared] Captcha / verification "
+                        f"cleared via human at {view}. Resuming."
+                    )
+                return (
+                    f"[human_handoff_timeout] No state change detected after "
+                    f"5 min at {view}. You can call browser_ask_user again or "
+                    f"proceed with done(success=False)."
+                )
+            except Exception as exc:
+                print(f"[t3 human handoff error: {exc}]")
+                return f"[browser_ask_user_t3_error: {exc}. Cannot proceed.]"
+
         # Map nanobot-side hint to the TS server's HumanInputType. Default
         # 'text' is the safest — it accepts free-form replies and the UI's
         # "Done" button also works against it.
@@ -2570,13 +3225,14 @@ class BrowserAskUserTool(Tool):
         # agent is stuck on. Best-effort.
         screenshot_b64 = None
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                sr = await client.get(
-                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                    params={"vision": "true"},
-                )
-                sr.raise_for_status()
-                sdata = sr.json()
+            sr = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true"},
+                timeout=10.0,
+            )
+            sr.raise_for_status()
+            sdata = sr.json()
             screenshot_b64 = sdata.get("screenshot") or None
         except Exception:
             screenshot_b64 = None
@@ -2742,13 +3398,14 @@ async def load_resumption_artifact(domain: str) -> dict | None:
     if not sid:
         return None
 
-    # Cheap liveness probe — hit the TS server's session state endpoint.
+    # Cheap liveness probe — hit whichever backend owns this session.
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(
-                f"{SUPERBROWSER_URL}/session/{sid}/state",
-                params={"vision": "false"},
-            )
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{sid}/state",
+            params={"vision": "false"},
+            timeout=5.0,
+        )
         if r.status_code != 200:
             try:
                 os.remove(RESUMPTION_PATH)
@@ -2806,13 +3463,14 @@ class BrowserVerifyFactTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, claim: str, **kw: Any) -> Any:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={"vision": "true"},
-            )
-            r.raise_for_status()
-            data = r.json()
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            params={"vision": "true"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
 
         self.s.record_step("browser_verify_fact", claim[:80], "screenshot taken for verification")
 
@@ -2919,6 +3577,206 @@ class BrowserRequestHelpTool(Tool):
         return hint
 
 
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID to escalate"),
+        reason=StringSchema(
+            "Short reason for escalation (logged into per-domain learnings).",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserEscalateTool(Tool):
+    """Migrate a Tier-1 session to Tier-3 (undetected Chromium).
+
+    Exports the current URL + cookies + localStorage + sessionStorage
+    from the t1 session, closes it, opens a fresh t3 session with those
+    pre-loaded, navigates back to the same URL. From the LLM's POV the
+    session_id changes; all subsequent tool calls route transparently to
+    the new backend.
+
+    Typically fired by the worker hook when `network_blocked=True` or
+    vision detects a captcha; can also be called explicitly when the LLM
+    wants to pre-emptively route through undetected Chromium.
+    """
+
+    name = "browser_escalate"
+    description = (
+        "Escalate a Tier-1 session to Tier-3 (undetected Chromium for "
+        "Akamai/DataDome/PerimeterX). Preserves URL + cookies + "
+        "localStorage. Form state resets — re-fill any in-progress inputs. "
+        "One-way within a task. Returns the new t3 session_id."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, session_id: str, reason: str | None = None, force: bool = False, **kw: Any) -> str:
+        if self.s.backend == "t3":
+            return (
+                f"[already_t3] Session {session_id} is already on Tier 3 "
+                f"(backend={self.s.backend}). No escalation needed."
+            )
+        if not self.s.session_id or self.s.session_id != session_id:
+            return (
+                f"[session_mismatch] Requested session_id={session_id}, "
+                f"active session_id={self.s.session_id}. Not escalating."
+            )
+
+        # --- Validation: refuse to escalate a session that isn't blocked ---
+        # Observed failure mode (2026-04-19): the LLM calls
+        # `browser_escalate(reason="403 Forbidden")` when browser_wait_for
+        # merely TIMED OUT on a slow-rendering SPA — no 403 ever occurred.
+        # The escalation then tears down the t1 session, reopens on t3, and
+        # the t3 session re-encounters the same slow page, chaining more
+        # spurious guesses. Refuse escalation unless we have concrete
+        # evidence the session is blocked.
+        last_status = self.s.last_network_status
+        has_evidence = (
+            bool(self.s.network_blocked)
+            or (last_status is not None and last_status >= 400 and last_status != 404)
+        )
+        # Also accept evidence from vision: if the last vision pass flagged
+        # a captcha, escalation is justified.
+        vresp = getattr(self.s, "_last_vision_response", None)
+        vflags = getattr(vresp, "flags", None) if vresp is not None else None
+        if vflags is not None and bool(getattr(vflags, "captcha_present", False)):
+            has_evidence = True
+
+        if not has_evidence and not force:
+            self.s.record_step(
+                "browser_escalate", session_id,
+                f"REFUSED: no block evidence (status={last_status}, "
+                f"network_blocked={self.s.network_blocked}, reason={reason!r})",
+            )
+            return (
+                f"[escalate_rejected] Session {session_id} is NOT actually "
+                f"blocked. network_blocked={self.s.network_blocked}, "
+                f"last_status={last_status or 'OK'}, url={self.s.current_url}. "
+                f"The reason you gave ({reason!r}) is not reflected in any "
+                f"tool output. Common cause: a slow-rendering SPA timing out "
+                f"browser_wait_for. DO NOT confabulate failure reasons.\n"
+                f"Instead:\n"
+                f"  - browser_screenshot to see the actual page state.\n"
+                f"  - browser_wait_for with a longer timeout (e.g. 20-30s) "
+                f"or a different selector that matches what actually renders.\n"
+                f"  - browser_run_script to inspect document.readyState / "
+                f"document.body.innerHTML.length.\n"
+                f"If you truly observe HTTP 4xx/5xx, 'Access Denied', a "
+                f"visible captcha widget, or bot-wall prose in a screenshot, "
+                f"call this tool again with force=true."
+            )
+
+        # --- 1. Snapshot state from the t1 session ---------------------
+        t1_url = self.s.current_url or ""
+        cookies: list[dict] = []
+        local_storage: dict[str, str] = {}
+        session_storage: dict[str, str] = {}
+
+        try:
+            ev = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                json={"script": (
+                    "(() => ({"
+                    "localStorage: Object.fromEntries(Object.entries(localStorage)),"
+                    "sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),"
+                    "url: location.href,"
+                    "}))()"
+                )},
+                timeout=15.0,
+            )
+            if ev.status_code == 200:
+                data = ev.json()
+                result = data.get("result") if isinstance(data, dict) else None
+                if isinstance(result, dict):
+                    local_storage = result.get("localStorage") or {}
+                    session_storage = result.get("sessionStorage") or {}
+                    if not t1_url:
+                        t1_url = result.get("url") or ""
+        except Exception as exc:
+            print(f"  [escalate] localStorage export failed: {exc}")
+
+        try:
+            ck = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/script",
+                json={"code": "return await page.cookies();"},
+                timeout=15.0,
+            )
+            if ck.status_code == 200:
+                payload = ck.json()
+                if isinstance(payload, dict):
+                    out = payload.get("output") or []
+                    if isinstance(out, list):
+                        cookies = [c for c in out if isinstance(c, dict)]
+        except Exception as exc:
+            print(f"  [escalate] cookie export failed: {exc}")
+
+        # --- 2. Close the t1 session ------------------------------------
+        try:
+            await _request_with_backoff(
+                "DELETE",
+                f"{SUPERBROWSER_URL}/session/{session_id}",
+                timeout=10.0,
+            )
+        except Exception as exc:
+            print(f"  [escalate] t1 close failed (ignored): {exc}")
+
+        # --- 3. Record tier-1 failure in the learning system ------------
+        try:
+            from urllib.parse import urlparse as _urlparse
+            from superbrowser_bridge.routing import _record_routing_outcome
+            host = _urlparse(t1_url).hostname or ""
+            if host:
+                _record_routing_outcome(
+                    host, "browser", False, tier=1,
+                    block_class="escalated:" + (reason or "unspecified"),
+                )
+        except Exception:
+            pass
+
+        # --- 4. Open a fresh t3 session with imported state -------------
+        from superbrowser_bridge.antibot import interactive_session as _t3mgr
+        try:
+            import_state = {
+                "cookies": cookies,
+                "localStorage": local_storage,
+                "sessionStorage": session_storage,
+            }
+            data = await _t3mgr.default().open(
+                t1_url or None,
+                task_id=self.s.task_id,
+                import_state=import_state,
+                timeout_s=45.0,
+            )
+        except Exception as exc:
+            return (
+                f"[escalate_failed] Tier-3 open failed: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
+
+        new_sid = data.get("sessionId", "")
+        self.s.session_id = new_sid
+        self.s.network_blocked = False
+        self.s.consecutive_click_calls = 0
+        # Legacy idempotency guard sees a fresh session.
+        self.s.blocked_browser_open_count = 0
+        self.s.log_activity(f"escalate(t1->t3 reason={reason or '?'})", f"new_sid={new_sid}")
+        self.s.record_step("browser_escalate", t1_url, f"reason={reason or 'unspecified'} new_sid={new_sid}")
+
+        return (
+            f"[escalated_to_t3] Session migrated to Tier 3 (undetected "
+            f"Chromium). new_session_id={new_sid} url={data.get('url', t1_url)} "
+            f"cookies_imported={len(cookies)} localStorage_keys={len(local_storage)} "
+            f"reason={reason or 'unspecified'}\n"
+            f"IMPORTANT: form inputs were reset during escalation. Re-fill any "
+            f"in-progress form before submitting. All subsequent browser_* "
+            f"tools use the new session_id transparently."
+        )
+
+
 def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
     """Register all browser session tools with a nanobot instance.
 
@@ -2954,6 +3812,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserAskUserTool(state),
         BrowserVerifyFactTool(state),
         BrowserRequestHelpTool(state),
+        BrowserEscalateTool(state),       # NEW — t1 → t3 migration
         BrowserCloseTool(state),
     ]
     for tool in tools:
