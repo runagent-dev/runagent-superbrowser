@@ -139,6 +139,27 @@ async def _t3_dispatch_from_http(
             )
             return _T3Response(data)
 
+        if verb == "type-at" or verb == "type_at":
+            data = await mgr.type_at(
+                sid,
+                float(body.get("x", 0)),
+                float(body.get("y", 0)),
+                body.get("text", ""),
+                clear=bool(body.get("clear", True)),
+                target_label=str(body.get("label", "")),
+            )
+            return _T3Response(data)
+
+        if verb == "fix-text-at" or verb == "fix_text_at":
+            data = await mgr.fix_text_at(
+                sid,
+                float(body.get("x", 0)),
+                float(body.get("y", 0)),
+                body.get("text", ""),
+                target_label=str(body.get("label", "")),
+            )
+            return _T3Response(data)
+
         if verb == "keys":
             data = await mgr.keys(sid, list(body.get("keys", [])))
             return _T3Response(data)
@@ -393,6 +414,80 @@ async def _fetch_feedback_state() -> dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+# --- Atomic field-correction JS (tier-agnostic) -------------------------------
+# Runs inside /evaluate on either t1 (TS server) or t3 (patchright) to do the
+# full probe-write-verify cycle in a single synchronous tick. No intermediate
+# empty state where a framework re-render could race. Placeholders
+# __TARGET_X__ / __TARGET_Y__ / __TARGET_TEXT__ get string-replaced by the
+# Python caller with JSON-literal values.
+_ATOMIC_FIX_TEXT_JS = """
+(() => {
+  const x = __TARGET_X__, y = __TARGET_Y__, target = __TARGET_TEXT__;
+  const el = document.elementFromPoint(x, y);
+  if (!el) return {ok: false, reason: 'no_element'};
+  const tag = el.tagName.toLowerCase();
+  const isInput = tag === 'input' || tag === 'textarea';
+  const isEditable = !!el.isContentEditable;
+  if (!isInput && !isEditable) {
+    return {ok: false, reason: 'not_input', tag};
+  }
+  if (isInput) {
+    const t = (el.getAttribute('type') || 'text').toLowerCase();
+    if (['file','checkbox','radio','hidden','submit','button',
+         'image','reset','range','color'].includes(t)) {
+      return {ok: false, reason: 'non_text_input', tag, input_type: t};
+    }
+  }
+  const before = isInput ? (el.value || '') : (el.innerText || '');
+  if (before === target) {
+    return {ok: true, before, after: target, changed: false, tag};
+  }
+  try { el.focus(); } catch (_) {}
+  try {
+    if (isInput) {
+      const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype
+                                       : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) {
+        desc.set.call(el, target);
+        el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: target}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+      } else {
+        el.value = target;
+      }
+    } else if (isEditable) {
+      el.innerText = target;
+      el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+    }
+  } catch (e) {
+    return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag};
+  }
+  const after = isInput ? (el.value || '') : (el.innerText || '');
+  return {ok: after === target, before, after, changed: before !== after, tag};
+})()
+"""
+
+
+def _diff_text(a: str, b: str) -> str:
+    """Human-readable diff summary for a → b text change."""
+    if a == b:
+        return "no change"
+    p = 0
+    while p < len(a) and p < len(b) and a[p] == b[p]:
+        p += 1
+    suf = 0
+    while (suf < len(a) - p and suf < len(b) - p
+           and a[len(a) - 1 - suf] == b[len(b) - 1 - suf]):
+        suf += 1
+    old_mid = a[p:len(a) - suf]
+    new_mid = b[p:len(b) - suf]
+    if not old_mid and new_mid:
+        return f"inserted {new_mid!r} at position {p}"
+    if old_mid and not new_mid:
+        return f"removed {old_mid!r} at position {p}"
+    return f"replaced {old_mid!r} with {new_mid!r} at position {p}"
 
 
 def _schedule_vision_prefetch(
@@ -2066,6 +2161,7 @@ class BrowserClickAtTool(Tool):
             )
         else:
             snap_note = ""
+
         self.s.record_step(
             "browser_click_at",
             log_target,
@@ -2073,6 +2169,337 @@ class BrowserClickAtTool(Tool):
         )
         _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index (the V_n the vision agent "
+                "labelled this input). Preferred over (x, y) whenever "
+                "the vision agent has pointed at the field."
+            ),
+            nullable=True,
+        ),
+        x=NumberSchema(
+            description="X coordinate (CSS pixel). Ignored when vision_index is set.",
+            nullable=True,
+        ),
+        y=NumberSchema(
+            description="Y coordinate (CSS pixel). Ignored when vision_index is set.",
+            nullable=True,
+        ),
+        text=StringSchema("Text to type into the field at that point."),
+        clear=BooleanSchema(
+            description=(
+                "Clear the field's existing value before typing (default: true). "
+                "Uses React/Vue-aware clear so controlled components replace "
+                "properly instead of appending."
+            ),
+            default=True,
+        ),
+        required=["session_id", "text"],
+    )
+)
+class BrowserTypeAtTool(Tool):
+    """Type at a vision bbox (V_n) or (x, y) coordinate. The bbox analogue
+    of `browser_type(index, text)`.
+
+    Checks the field's current value before typing — three outcomes the
+    LLM sees in the return:
+      - `skip_match`: field already contains the target text; no change.
+      - `cleared_and_typed`: field had different content, cleared + typed.
+      - `typed_into_empty`: field was empty, typed directly.
+
+    Prefer this over `browser_click_at(V_n)` + `browser_keys([...])`,
+    which appends at the cursor and turns `old|` + typing `new` into
+    `oldnew` instead of `new`.
+    """
+
+    name = "browser_type_at"
+    description = (
+        "Type text into the input at a vision bbox (vision_index=V_n) or "
+        "(x, y) coords. Probes the field's current value first and clears "
+        "it (React-safe) before typing. Replaces click_at + keys for "
+        "bbox-targeted typing — no more concatenation bugs."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        text: str,
+        vision_index: int | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        clear: bool = True,
+        **kw: Any,
+    ) -> Any:
+        if text is None:
+            text = ""
+
+        # Resolve target point: vision_index first, then (x, y).
+        target_x: float
+        target_y: float
+        label: str
+        if vision_index is not None:
+            resp = self.s._last_vision_response
+            if resp is None:
+                return (
+                    "[type_at_failed:no_vision] No recent vision response "
+                    "to resolve vision_index against. Take a screenshot "
+                    "first, or pass raw (x, y)."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[type_at_failed:bad_vision_index] V{vision_index} "
+                    f"is out of range (only {len(resp.bboxes)} bboxes in "
+                    "the last vision response)."
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return (
+                    "[type_at_failed:no_image_dims] Last vision response "
+                    "has no source image dimensions; cannot denormalize "
+                    "box_2d. Take a fresh screenshot."
+                )
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            target_x = (x0 + x1) / 2
+            target_y = (y0 + y1) / 2
+            label = f"V{vision_index}"
+            print(f"\n>> browser_type_at(V{vision_index}, text={text[:30]!r})")
+        elif x is not None and y is not None:
+            target_x = float(x)
+            target_y = float(y)
+            label = f"({int(target_x)},{int(target_y)})"
+            print(f"\n>> browser_type_at(({x},{y}), text={text[:30]!r})")
+        else:
+            return "[type_at_failed:bad_args] Provide either vision_index or both x and y."
+
+        # Route through /evaluate (works on both t1 and t3) rather than
+        # through a dedicated /type-at endpoint (t3-only). Mechanism is
+        # identical to browser_fix_text_at: atomic probe → native-setter
+        # write → dispatched input/change events → confirm-read.
+        import json as _json
+        atomic_js = _ATOMIC_FIX_TEXT_JS.replace(
+            "__TARGET_X__", str(float(target_x))
+        ).replace(
+            "__TARGET_Y__", str(float(target_y))
+        ).replace(
+            "__TARGET_TEXT__", _json.dumps(text)
+        )
+        ev = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": atomic_js},
+            timeout=30.0,
+        )
+        ev.raise_for_status()
+        payload_body = ev.json()
+        result = (
+            payload_body.get("result") if isinstance(payload_body, dict) else None
+        ) or {}
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = (result or {}).get("reason", "unknown") if isinstance(result, dict) else "bad_shape"
+            return f"[type_at_failed:{reason}] at {label}. detail={result}"
+
+        before = str(result.get("before", "") or "")
+        after = str(result.get("after", "") or "")
+        changed = bool(result.get("changed"))
+
+        if not changed:
+            caption = (
+                f"Field at {label} already contained {text!r} — no typing "
+                f"needed. Proceed to next action."
+            )
+        elif before:
+            caption = (
+                f'Typed "{text}" at {label} (replaced existing '
+                f'{before!r}).'
+            )
+        else:
+            caption = f'Typed "{text}" at {label}.'
+
+        self.s.record_step(
+            "browser_type_at",
+            f"{label}, text={text[:30]!r}",
+            "skip_match" if not changed else ("cleared_and_typed" if before else "typed_into_empty"),
+        )
+        _schedule_vision_prefetch(self.s, session_id)
+        synthetic_data = {
+            "success": True,
+            "before": before,
+            "after": after,
+            "changed": changed,
+        }
+        return self.s.build_text_only(synthetic_data, caption)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index for the input to correct. "
+                "Preferred over (x, y) when vision labelled the field."
+            ),
+            nullable=True,
+        ),
+        x=NumberSchema(description="X coord; used only when vision_index absent.", nullable=True),
+        y=NumberSchema(description="Y coord; used only when vision_index absent.", nullable=True),
+        text=StringSchema(
+            "The EXACT final text the field should contain after the fix. "
+            "This is the target state, not a diff or an instruction — give "
+            "the corrected spelling / value verbatim."
+        ),
+        required=["session_id", "text"],
+    )
+)
+class BrowserFixTextAtTool(Tool):
+    """Set a text field to an exact target value in one atomic step.
+
+    Human-like correction pathway: when you've noticed a typo or stale
+    content ('dahka', 'old search', leftover default), call this with the
+    CORRECT final text. The tool reads the current value, computes the
+    minimal diff for logging, then writes the target with the React/Vue
+    safe native-setter + input/change events — no intermediate empty
+    state where a race could concatenate.
+
+    Prefer this over click_at → clear → type_at when fixing a typo:
+    surgical, single-call, deterministic.
+    """
+
+    name = "browser_fix_text_at"
+    description = (
+        "Atomically set an input / textarea / contenteditable to a target "
+        "text value. Reads the current content, reports the diff, writes "
+        "the correction in one step. Use this to fix typos or replace "
+        "stale field values without multi-step click + clear + retype."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        text: str,
+        vision_index: int | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        **kw: Any,
+    ) -> Any:
+        if text is None:
+            text = ""
+
+        # Resolve target point.
+        if vision_index is not None:
+            resp = self.s._last_vision_response
+            if resp is None:
+                return (
+                    "[fix_text_at_failed:no_vision] No recent vision response "
+                    "to resolve vision_index against. Take a screenshot first "
+                    "or pass raw (x, y)."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[fix_text_at_failed:bad_vision_index] V{vision_index} "
+                    f"out of range (only {len(resp.bboxes)} bboxes)."
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return "[fix_text_at_failed:no_image_dims] take a fresh screenshot."
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            target_x = (x0 + x1) / 2
+            target_y = (y0 + y1) / 2
+            label = f"V{vision_index}"
+        elif x is not None and y is not None:
+            target_x = float(x)
+            target_y = float(y)
+            label = f"({int(target_x)},{int(target_y)})"
+        else:
+            return "[fix_text_at_failed:bad_args] Provide vision_index or (x, y)."
+
+        print(f"\n>> browser_fix_text_at({label}, target={text[:40]!r})")
+
+        # Run the whole probe-write-verify cycle inside ONE /evaluate
+        # call. /evaluate works on both t1 (TS server) and t3 (patchright
+        # intercept), whereas a dedicated /fix-text-at endpoint only
+        # exists on t3. Doing the full op in a single evaluate is also
+        # race-free: elementFromPoint → native setter → confirm-read all
+        # happen within one synchronous JS tick.
+        import json as _json
+        atomic_js = _ATOMIC_FIX_TEXT_JS.replace(
+            "__TARGET_X__", str(float(target_x))
+        ).replace(
+            "__TARGET_Y__", str(float(target_y))
+        ).replace(
+            "__TARGET_TEXT__", _json.dumps(text)
+        )
+        ev = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": atomic_js},
+            timeout=20.0,
+        )
+        ev.raise_for_status()
+        payload = ev.json()
+        result = (
+            payload.get("result") if isinstance(payload, dict) else None
+        ) or {}
+        if not isinstance(result, dict):
+            return f"[fix_text_at_failed] unexpected evaluate shape: {type(result).__name__}"
+
+        if not result.get("ok"):
+            return (
+                f"[fix_text_at_failed:{result.get('reason','unknown')}] at "
+                f"{label}. detail={result}"
+            )
+
+        before = str(result.get("before", "") or "")
+        after = str(result.get("after", "") or "")
+        changed = bool(result.get("changed"))
+        diff = _diff_text(before, after) if changed else "no change"
+
+        if not changed:
+            caption = (
+                f"Field at {label} already contained {text!r} — no change "
+                f"needed. Proceed."
+            )
+        else:
+            caption = (
+                f"Fixed {label}: {before!r} → {after!r}\n"
+                f"Edit: {diff}"
+            )
+
+        self.s.record_step(
+            "browser_fix_text_at",
+            f"{label}, target={text[:30]!r}",
+            diff,
+        )
+        _schedule_vision_prefetch(self.s, session_id)
+        # Wrap result in the same shape build_text_only expects.
+        synthetic_data = {
+            "success": True,
+            "before": before,
+            "after": after,
+            "changed": changed,
+            "diff": diff,
+        }
+        return self.s.build_text_only(synthetic_data, caption)
 
 
 @tool_parameters(
@@ -2242,7 +2669,25 @@ class BrowserTypeTool(Tool):
             f"ok ({len(suggestions)} suggestions)" if suggestions else "ok",
         )
 
-        caption = f'Typed "{text}" into [{index}]'
+        # Surface pre-type inspection info so the LLM knows whether we
+        # actually changed the field. `pretype_action` is one of
+        # `typed_into_empty` (field was empty), `cleared_and_typed`
+        # (existing value replaced), or `skip_match` (field already
+        # contained target text — no change).
+        pre_action = data.get("pretype_action") if isinstance(data, dict) else None
+        pre_value = data.get("pretype_value") if isinstance(data, dict) else None
+        if pre_action == "skip_match":
+            caption = (
+                f'Field [{index}] already contained {text!r} — no typing '
+                f'needed. Proceed to next action.'
+            )
+        elif pre_action == "cleared_and_typed":
+            caption = (
+                f'Typed "{text}" into [{index}] '
+                f'(cleared existing {pre_value!r} first)'
+            )
+        else:
+            caption = f'Typed "{text}" into [{index}]'
         if suggestions:
             caption += (
                 f"\n\nAutocomplete suggestions visible ({len(suggestions)}):"
@@ -3796,6 +4241,8 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserScreenshotTool(state),
         BrowserClickTool(state),
         BrowserClickAtTool(state),
+        BrowserTypeAtTool(state),
+        BrowserFixTextAtTool(state),
         BrowserTypeTool(state),
         BrowserKeysTool(state),
         BrowserScrollTool(state),

@@ -21,10 +21,37 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote as _url_unquote, urlparse
 
 from patchright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
+
+
+def _proxy_to_playwright(url: Optional[str]) -> Optional[dict]:
+    """Split a `scheme://user:pass@host:port` proxy URL into the dict
+    shape playwright expects: {server, username, password}. Playwright
+    does NOT parse inline auth from `server`; passing a URL that
+    contains `user:pass@` results in HTTP 407 because only the
+    `scheme://host:port` portion is extracted and the credentials are
+    dropped. Observed on Oxylabs datacenter pool 2026-04-19.
+    """
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if not p.hostname:
+        return None
+    scheme = p.scheme or "http"
+    host = p.hostname
+    port = f":{p.port}" if p.port else ""
+    out: dict = {"server": f"{scheme}://{host}{port}"}
+    if p.username:
+        out["username"] = _url_unquote(p.username)
+    if p.password:
+        out["password"] = _url_unquote(p.password)
+    return out
 
 from . import cookie_jar, proxy_tiers, warmup
 from . import content as _content
@@ -74,7 +101,19 @@ class T3SessionManager:
             headless = os.environ.get("T3_HEADLESS", "1") != "0"
             self._browser = await self._pw.chromium.launch(
                 headless=headless,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=[
+                    # Existing canonical stealth flag.
+                    "--disable-blink-features=AutomationControlled",
+                    # Reduce site-isolation signals that Cloudflare's JS reads
+                    # to tell headless Chromium apart from a real Chrome build.
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                    # Suppress first-run / default-browser prompts that delay
+                    # page navigation and leave telltale console output.
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    # Keep GPU ON — disabling it is itself a headless tell.
+                ],
             )
             # Start a janitor that closes idle/aged sessions. Survives the
             # lifetime of the worker process.
@@ -139,7 +178,7 @@ class T3SessionManager:
 
         if proxy is None:
             proxy = proxy_tiers.default().pick(domain)
-        launch_proxy = {"server": proxy} if proxy else None
+        launch_proxy = _proxy_to_playwright(proxy)
 
         # Pin a real Chrome UA on the HTTP layer — patchright's stealth only
         # patches JS-side `navigator.userAgent`, the actual `User-Agent` HTTP
@@ -163,7 +202,29 @@ class T3SessionManager:
             proxy=launch_proxy,
             user_agent=ua,
         )
-        stealth = Stealth(navigator_user_agent_override=ua)
+        # Conservative playwright-stealth surface. Keep UA, webdriver,
+        # languages, permissions, plugins, WebGL, sec-ch-ua patches on —
+        # these are read by Cloudflare IUAM and benefit from spoofing.
+        # Leave chrome_csi / chrome_load_times / chrome_app / chrome_runtime
+        # OFF: over-patching chrome.* globals is itself a detection vector
+        # (observed 2026-04-19 on gozayaan.com, which 403'd with the full
+        # set but loads clean with this trimmed set).
+        stealth = Stealth(
+            navigator_user_agent_override=ua,
+            navigator_webdriver=True,
+            navigator_languages=True,
+            navigator_permissions=True,
+            navigator_plugins=True,
+            navigator_vendor=True,
+            navigator_platform=True,
+            navigator_hardware_concurrency=True,
+            navigator_user_agent_data=True,
+            webgl_vendor=True,
+            hairline=True,
+            iframe_content_window=True,
+            media_codecs=True,
+            sec_ch_ua=True,
+        )
         await stealth.apply_stealth_async(context)
 
         # Replay cached bot-protection cookies for this domain.
@@ -220,6 +281,21 @@ class T3SessionManager:
 
         if url:
             nav = await self._goto_with_warmup(sid, url, timeout_s)
+            # One retry on hard Cloudflare block: if we still see a
+            # challenge title and no clearance cookie landed, rebuild the
+            # context with a fresh UA (+ demote proxy tier) and try once
+            # more. Single retry, bounded cost.
+            still_blocked = await self._cf_still_blocked(sid, nav)
+            if still_blocked:
+                try:
+                    await self._rebuild_context_for_retry(
+                        sid, domain, viewport, import_state,
+                    )
+                    nav = await self._goto_with_warmup(sid, url, timeout_s)
+                    nav["retry_used"] = True
+                except Exception as exc:
+                    logger.debug("retry with fresh context failed: %s", exc)
+                    nav.setdefault("block_class", "cloudflare")
         else:
             nav = {"url": "about:blank", "status": 0, "title": ""}
 
@@ -229,6 +305,99 @@ class T3SessionManager:
             **nav,
             **{k: v for k, v in state.items() if k not in nav},
         }
+
+    async def _cf_still_blocked(self, sid: str, nav: dict) -> bool:
+        """True if the page still looks like a Cloudflare challenge page.
+        Title is the ground truth — cookie presence is NOT sufficient to
+        declare cleared (stale cf_clearance values from the jar get
+        replayed onto a new session, but CF may still reject them and
+        render the challenge). If the browser is showing us "Just a
+        moment...", we are blocked, cookie or not.
+        """
+        title = (nav.get("title") or "").lower()
+        if (
+            "just a moment" in title
+            or "one moment" in title
+            or "verifying" in title
+            or "attention required" in title
+        ):
+            return True
+        return False
+
+    async def _rebuild_context_for_retry(
+        self,
+        sid: str,
+        domain: str,
+        viewport: tuple[int, int],
+        import_state: Optional[dict],
+    ) -> None:
+        """Close and recreate the session's context with a different UA
+        and a demoted proxy tier. Used as a one-shot retry on hard CF
+        blocks. Preserves the session_id so the LLM's subsequent calls
+        keep routing to the same slot."""
+        from .headers import for_profile, random_profile
+        s = self._sessions.get(sid)
+        if s is None:
+            raise KeyError(f"session not found: {sid}")
+        # Demote the proxy tier for this domain so the next attempt may
+        # pick a stricter pool (residential if configured).
+        try:
+            proxy_tiers.default().demote(domain)
+        except Exception:
+            pass
+        new_proxy = proxy_tiers.default().pick(domain)
+        launch_proxy = _proxy_to_playwright(new_proxy)
+        # Pick a fresh UA profile distinct from the previous one.
+        old_profile = os.environ.get("T3_UA_PROFILE")
+        try:
+            profile = random_profile()
+            if old_profile and profile == old_profile:
+                profile = random_profile()
+            new_ua = for_profile(profile)["User-Agent"]
+        except Exception:
+            new_ua = s.ua
+        # Close the old context + page.
+        try:
+            await s.context.close()
+        except Exception:
+            pass
+        # Build a fresh context.
+        new_context = await self._browser.new_context(
+            viewport={"width": viewport[0], "height": viewport[1]},
+            locale="en-US",
+            timezone_id="America/New_York",
+            proxy=launch_proxy,
+            user_agent=new_ua,
+        )
+        stealth = Stealth(
+            navigator_user_agent_override=new_ua,
+            navigator_webdriver=True,
+            navigator_languages=True,
+            navigator_permissions=True,
+            navigator_plugins=True,
+            navigator_vendor=True,
+            navigator_platform=True,
+            navigator_hardware_concurrency=True,
+            navigator_user_agent_data=True,
+            webgl_vendor=True,
+            hairline=True,
+            iframe_content_window=True,
+            media_codecs=True,
+            sec_ch_ua=True,
+        )
+        await stealth.apply_stealth_async(new_context)
+        if domain:
+            cached = cookie_jar.load_cookies(domain, current_ua=new_ua)
+            if cached:
+                await new_context.add_cookies([
+                    {"name": k, "value": v, "url": f"https://{domain}/"}
+                    for k, v in cached.items()
+                ])
+        new_page = await new_context.new_page()
+        s.context = new_context
+        s.page = new_page
+        s.ua = new_ua
+        s.proxy = new_proxy
 
     async def _goto_with_warmup(
         self, sid: str, url: str, timeout_s: float
@@ -307,41 +476,104 @@ class T3SessionManager:
             pass
 
         # If we landed on a self-clearing challenge (Cloudflare "Just a
-        # moment", DataDome auto-verify, basic Akamai IUAM) give the JS a
-        # few extra seconds to run and stamp clearance cookies before we
-        # hand control back. Detected by title + presence of challenge
-        # cookie names. Polls for up to 12s with 1s intervals; exits as
-        # soon as a clearance cookie shows up.
+        # moment", DataDome auto-verify, basic Akamai IUAM) give the JS
+        # time to run and stamp clearance cookies before we hand control
+        # back. Detected by title + presence of challenge cookie names.
+        # Defaults to 30s (configurable via T3_CF_WAIT_S). Mouse motion +
+        # occasional wheel scroll fires during the poll loop to look
+        # human while the challenge JS is scoring us.
+        import random as _rng
+        origin_challenge_url = s.page.url
         try:
             challenge_cookie_names = {
                 "cf_clearance", "__cf_bm", "datadome", "_abck",
                 "ak_bmsc", "incap_ses_", "reese84",
             }
-            deadline = time.time() + 12.0
+            wait_s = float(os.environ.get("T3_CF_WAIT_S") or 30.0)
+            deadline = time.time() + wait_s
+            iteration = 0
             while time.time() < deadline:
-                title_now = await s.page.title()
-                body_snippet = await s.page.evaluate(
+                iteration += 1
+                title_now = (await s.page.title() or "").lower()
+                body_snippet = (await s.page.evaluate(
                     "() => (document.body ? document.body.innerText.slice(0, 400) : '').toLowerCase()"
-                )
+                )) or ""
                 looks_challenge = (
-                    "just a moment" in title_now.lower()
-                    or "verifying" in (body_snippet or "")
-                    or "security check" in (body_snippet or "")
-                    or "performing" in (body_snippet or "")
-                    or "checking your browser" in (body_snippet or "")
+                    "just a moment" in title_now
+                    or "verifying" in body_snippet
+                    or "security check" in body_snippet
+                    or "performing" in body_snippet
+                    or "checking your browser" in body_snippet
+                    or "one moment" in body_snippet
+                    or "verify you are human" in body_snippet
                 )
-                if not looks_challenge:
+                current_url = s.page.url
+                url_changed = current_url and current_url != origin_challenge_url
+                # Exit fast: page no longer looks like a challenge AND either
+                # URL redirected away OR the title changed meaningfully.
+                if not looks_challenge and (url_changed or iteration > 1):
                     break
                 cookies_now = await s.context.cookies()
                 names = {c.get("name", "") for c in cookies_now}
                 if names & challenge_cookie_names:
-                    # Clearance cookie landed but page still rendering the
-                    # interstitial — give it one more second for the redirect.
-                    await asyncio.sleep(1.0)
+                    # Clearance landed — give the redirect a beat to finish.
+                    await asyncio.sleep(1.2)
                     break
+                # Humanize during the wait: small mouse moves + occasional
+                # wheel. Cloudflare's sensor counts mousemove + wheel events
+                # when deciding whether to clear automatically.
+                try:
+                    await s.page.mouse.move(
+                        _rng.randint(150, 900),
+                        _rng.randint(120, 600),
+                    )
+                    if iteration % 3 == 0:
+                        await s.page.mouse.wheel(0, _rng.randint(120, 320))
+                except Exception:
+                    pass
                 await asyncio.sleep(1.0)
         except Exception as exc:
             logger.debug("challenge-wait loop: %s", exc)
+
+        # If the page still shows a challenge after the wait, see whether
+        # a Cloudflare Turnstile iframe is present and try to auto-solve
+        # via the existing token-solver path. Requires CAPTCHA_API_KEY.
+        turnstile_info: dict[str, Any] = {}
+        try:
+            current_title = (await s.page.title() or "").lower()
+            still_challenge = (
+                "just a moment" in current_title
+                or "verifying" in current_title
+                or "one moment" in current_title
+            )
+            if still_challenge:
+                from .captcha import detect as _cap_detect
+                from .captcha import solve_token as _cap_solve
+                info = await _cap_detect(self, sid)
+                if info.present and info.type == "turnstile" and info.site_key:
+                    turnstile_info = {
+                        "site_key": info.site_key,
+                        "frame_url": info.frame_url,
+                        "widget_selector": info.widget_selector,
+                    }
+                    if os.environ.get("CAPTCHA_API_KEY"):
+                        try:
+                            res = await _cap_solve(self, sid, info)
+                        except Exception as exc:
+                            logger.debug("turnstile solve raised: %s", exc)
+                            res = {"solved": False, "error": str(exc)[:120]}
+                        turnstile_info["solve_result"] = res
+                        if res and res.get("solved"):
+                            # Wait up to 10s more for cf_clearance to land.
+                            end = time.time() + 10.0
+                            while time.time() < end:
+                                cks = await s.context.cookies()
+                                names = {c.get("name", "") for c in cks}
+                                if "cf_clearance" in names:
+                                    break
+                                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.debug("turnstile autosolve guard: %s", exc)
 
         await self._save_domain_cookies(sid, url)
         title = ""
@@ -349,7 +581,33 @@ class T3SessionManager:
             title = await s.page.title()
         except Exception:
             pass
-        return {"url": s.page.url, "status": status, "title": title, "statusCode": status}
+        result: dict[str, Any] = {
+            "url": s.page.url, "status": status, "title": title, "statusCode": status,
+        }
+        # If the page STILL looks like a Cloudflare interstitial after the
+        # wait + optional autosolve, mark the result so the caller can
+        # choose to escalate (residential proxy, human handoff) instead of
+        # retrying more tools on a dead session. Title is authoritative:
+        # any stale cf_clearance value from the jar may be replayed onto
+        # the fresh session but CF can still reject it and show the
+        # challenge — in which case we ARE blocked despite the cookie.
+        lower_title = title.lower()
+        if (
+            "just a moment" in lower_title
+            or "one moment" in lower_title
+            or "attention required" in lower_title
+            or "verifying" in lower_title
+        ):
+            result["block_class"] = "cloudflare"
+            if status in (0, 200):
+                result["status"] = 403
+                result["statusCode"] = 403
+        if turnstile_info:
+            # Surface the Turnstile context to the caller so the LLM can
+            # decide to call browser_solve_captcha when no API key is set
+            # or auto-solve didn't clear.
+            result["turnstile"] = turnstile_info
+        return result
 
     async def _save_domain_cookies(self, sid: str, url: str) -> None:
         s = self._get(sid)
@@ -708,6 +966,154 @@ class T3SessionManager:
             "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3],
         })
 
+    async def fix_text_at(
+        self,
+        sid: str,
+        x: float,
+        y: float,
+        target_text: str,
+        *,
+        target_label: str = "",
+    ) -> dict[str, Any]:
+        """Atomically set the field at (x, y) to `target_text`, regardless
+        of what it contained before. No intermediate state — the field
+        either HAS the target text or the tool failed. React/Vue safe
+        (uses the native value setter + dispatches the events a real
+        keystroke would).
+
+        This is the correction path: when the LLM realises it typed
+        'dahka' into the city field and wants 'dhaka', it calls
+        fix_text_at with target_text='dhaka'. The response includes a
+        diff summary so the brain sees what actually changed.
+        """
+        s = self._get(sid)
+        cx = float(x)
+        cy = float(y)
+        label = target_label or f"({int(cx)},{int(cy)})"
+        js = """
+        ({x, y, target}) => {
+          const el = document.elementFromPoint(x, y);
+          if (!el) return {ok: false, reason: 'no_element'};
+          const tag = el.tagName.toLowerCase();
+          const isInput = tag === 'input' || tag === 'textarea';
+          const isEditable = !!el.isContentEditable;
+          if (!isInput && !isEditable) {
+            return {ok: false, reason: 'not_input', tag};
+          }
+          if (isInput) {
+            const t = (el.getAttribute('type') || 'text').toLowerCase();
+            if (['file','checkbox','radio','hidden','submit','button',
+                 'image','reset','range','color'].includes(t)) {
+              return {ok: false, reason: 'non_text_input', tag, input_type: t};
+            }
+          }
+          const before = isInput ? (el.value || '') : (el.innerText || '');
+          if (before === target) {
+            return {ok: true, before, after: target, changed: false, tag};
+          }
+          // Focus first so framework components don't discard the change.
+          el.focus();
+          try {
+            if (isInput) {
+              const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype
+                                                : HTMLInputElement.prototype;
+              const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+              if (desc && desc.set) {
+                desc.set.call(el, target);
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: target}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+              } else {
+                el.value = target;
+              }
+            } else if (isEditable) {
+              el.innerText = target;
+              el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+            }
+          } catch (e) {
+            return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before};
+          }
+          const after = isInput ? (el.value || '') : (el.innerText || '');
+          return {ok: after === target, before, after, changed: before !== after, tag};
+        }
+        """
+        try:
+            result = await s.page.evaluate(js, {"x": cx, "y": cy, "target": target_text})
+        except Exception as exc:
+            return {"success": False, "error": f"evaluate failed: {str(exc)[:200]}"}
+
+        if not isinstance(result, dict):
+            return {"success": False, "error": "unexpected evaluate return shape"}
+
+        if not result.get("ok"):
+            return {
+                "success": False,
+                "error": result.get("reason", "unknown"),
+                "detail": result,
+                "label": label,
+            }
+
+        before = result.get("before", "") or ""
+        after = result.get("after", "") or ""
+        changed = bool(result.get("changed"))
+
+        # Diff description: find common prefix / suffix and report the edit.
+        def _diff(a: str, b: str) -> str:
+            if a == b:
+                return "no change"
+            # common prefix
+            p = 0
+            while p < len(a) and p < len(b) and a[p] == b[p]:
+                p += 1
+            # common suffix (not overlapping with prefix)
+            suf = 0
+            while (suf < len(a) - p and suf < len(b) - p
+                   and a[len(a) - 1 - suf] == b[len(b) - 1 - suf]):
+                suf += 1
+            old_mid = a[p:len(a) - suf]
+            new_mid = b[p:len(b) - suf]
+            if not old_mid and new_mid:
+                return f"inserted {new_mid!r} at position {p}"
+            if old_mid and not new_mid:
+                return f"removed {old_mid!r} at position {p}"
+            return f"replaced {old_mid!r} with {new_mid!r} at position {p}"
+
+        diff = _diff(before, after)
+        st = await self.state(sid)
+        return {
+            "success": True,
+            "elements": st["elements"],
+            "before": before,
+            "after": after,
+            "changed": changed,
+            "diff": diff,
+            "label": label,
+        }
+
+    async def type_at(
+        self,
+        sid: str,
+        x: float,
+        y: float,
+        text: str,
+        *,
+        clear: bool = True,
+        bbox: Optional[dict] = None,
+        target_label: str = "",
+    ) -> dict[str, Any]:
+        """Type at a given (x, y) coordinate with the same pre-probe +
+        React-aware clear logic as `type(index)`. The bbox-based analogue
+        of `type(index)`: targets the element at `elementFromPoint(x, y)`
+        rather than looking up via the DOM indexer's numbering.
+
+        Used by browser_type_at to support the vision → bbox → type loop
+        without falling back to click_at + keys (which appends to existing
+        content instead of replacing it).
+        """
+        cx = float(x)
+        cy = float(y)
+        label = target_label or f"({int(cx)},{int(cy)})"
+        return await self._type_at_coords(sid, cx, cy, text, clear=clear, label=label)
+
     async def type(
         self, sid: str, index: int, text: str, *, clear: bool = True,
     ) -> dict[str, Any]:
@@ -718,17 +1124,126 @@ class T3SessionManager:
         bbox = target.get("bbox") or [0, 0, 0, 0]
         cx = (bbox[0] + bbox[2]) / 2
         cy = (bbox[1] + bbox[3]) / 2
+        return await self._type_at_coords(
+            sid, cx, cy, text, clear=clear, label=f"[{index}]",
+        )
+
+    async def _type_at_coords(
+        self,
+        sid: str,
+        cx: float,
+        cy: float,
+        text: str,
+        *,
+        clear: bool = True,
+        label: str = "",
+    ) -> dict[str, Any]:
         s = self._get(sid)
+        # Pre-type probe: read the field's CURRENT value before deciding
+        # what to do. Three cases:
+        #   1. field already contains `text` → skip the type entirely
+        #      (rare but it happens on retry loops).
+        #   2. field is empty → just type, no clear needed.
+        #   3. field has something different → React/Vue-aware clear, then
+        #      type. Naive `Ctrl+A + Delete` doesn't clear controlled
+        #      components because framework state re-hydrates the value
+        #      milliseconds later.
+        current_value = ""
+        try:
+            probe = await s.page.evaluate(
+                """({x, y}) => {
+                  const el = document.elementFromPoint(x, y);
+                  if (!el) return null;
+                  if ('value' in el && el.value !== undefined) return {v: el.value};
+                  if (el.isContentEditable) return {v: el.innerText || ''};
+                  return {v: (el.textContent || '').trim()};
+                }""",
+                {"x": cx, "y": cy},
+            )
+            if isinstance(probe, dict):
+                current_value = str(probe.get("v", "") or "")
+        except Exception as exc:
+            logger.debug("type pre-probe failed: %s", exc)
+
+        if current_value == text and current_value != "":
+            st = await self.state(sid)
+            return {
+                "success": True,
+                "elements": st["elements"],
+                "note": f"field {label} already contains target text ({len(text)} chars); skipped typing",
+                "pretype_value": current_value,
+                "pretype_action": "skip_match",
+            }
+
         try:
             await s.page.mouse.click(cx, cy)
-            if clear:
+            # Tiny settle pause — some components rely on focus-change to
+            # open their dropdown / clear placeholder state.
+            await asyncio.sleep(0.08)
+            if clear and current_value:
+                # Three-layer clear: native setter (React/Vue-safe) +
+                # Ctrl+A/Delete keystroke (standard inputs) + Select-All
+                # via triple-click as a further fallback for rich-text.
+                await s.page.evaluate(
+                    """({x, y}) => {
+                      const el = document.elementFromPoint(x, y);
+                      if (!el) return false;
+                      try {
+                        // React-controlled inputs: use the native value
+                        // setter so React's onChange observer fires.
+                        let proto = null;
+                        if (el.tagName === 'TEXTAREA') proto = HTMLTextAreaElement.prototype;
+                        else if (el.tagName === 'INPUT') proto = HTMLInputElement.prototype;
+                        if (proto) {
+                          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                          if (desc && desc.set) {
+                            desc.set.call(el, '');
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                          } else {
+                            el.value = '';
+                          }
+                        } else if (el.isContentEditable) {
+                          el.textContent = '';
+                          el.dispatchEvent(new Event('input', {bubbles: true}));
+                        }
+                      } catch (_) {}
+                      return true;
+                    }""",
+                    {"x": cx, "y": cy},
+                )
+                # Also hit Ctrl+A + Delete as a belt-and-braces for
+                # non-framework inputs (plain HTML forms).
                 await s.page.keyboard.press("Control+a")
                 await s.page.keyboard.press("Delete")
+                # Verify the clear worked. If not, try triple-click select +
+                # delete once more.
+                try:
+                    after_clear = await s.page.evaluate(
+                        """({x, y}) => {
+                          const el = document.elementFromPoint(x, y);
+                          if (!el) return '';
+                          if ('value' in el) return el.value || '';
+                          return el.textContent || '';
+                        }""",
+                        {"x": cx, "y": cy},
+                    )
+                    if after_clear:
+                        await s.page.mouse.click(cx, cy, click_count=3)
+                        await s.page.keyboard.press("Delete")
+                except Exception:
+                    pass
             await s.page.keyboard.type(text, delay=30)
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
         st = await self.state(sid)
-        return {"success": True, "elements": st["elements"]}
+        action = "cleared_and_typed" if current_value else "typed_into_empty"
+        return {
+            "success": True,
+            "elements": st["elements"],
+            "pretype_value": current_value,
+            "pretype_action": action,
+        }
 
     async def keys(self, sid: str, keys: list[str]) -> dict[str, Any]:
         s = self._get(sid)

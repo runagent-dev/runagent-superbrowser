@@ -45,7 +45,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """go to aarong bangladesh and find me five men sandals  with proper price. use browser tools"""
+        """go to amazon uk and search philips trimmers and give me price. Use browser tools"""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
