@@ -2,28 +2,70 @@
 
 ![SuperBrowser logo](assets/icons/futuristic-runner-search-logo.png)
 
-**A headless browser built for AI agents — with a real human in the loop when it matters.**
+**A headless browser built for AI agents — that doesn't lie, doesn't give up, and knows when to ask a human.**
 
-SuperBrowser lets any AI agent drive a real Chromium browser through simple HTTP APIs. Open a session, take a screenshot, click a button, fill a form, run a Puppeteer script — every action returns state so your agent always knows what's on screen. When the agent hits a wall (captcha, OTP, weird modal), it hands off to a human through a live-view URL, the human clicks once, and the agent resumes on the same session.
+SuperBrowser lets any AI agent drive a real Chromium browser through simple HTTP APIs. But the part that matters isn't the APIs — it's what sits underneath them. A **tier-transparent anti-bot pipeline** (Puppeteer → undetected Chromium → archive) that auto-escalates when a site blocks you, a **vision + bbox + click** loop the agent reasons over instead of raw pixels, and a set of **hallucination guards** that refuse to let the agent fabricate failures, retype into the same field, or pivot to Google Search when the target gets hard.
 
-Self-host it on your own machine, run it in Docker, or deploy it however you want. The browser server itself has no external dependencies beyond Chromium.
+You keep your agent. SuperBrowser keeps it honest.
+
+---
+
+## What makes this exceptional
+
+Most headless browsers give you a `page.goto()` and call it a day. Anti-bot? "Use residential proxies." Captchas? "Integrate 2captcha." Vision? "Feed screenshots to GPT-4V." That's not automation — that's a bill of materials.
+
+SuperBrowser owns the hard parts:
+
+**The anti-bot ladder, built from scratch.**
+Five tiers in one surface. The agent doesn't pick the tier — it calls `fetch_auto` or `browser_open(tier="auto")` and SuperBrowser reads the per-domain learning, runs the cheapest working tier, and escalates automatically on detected blocks. No commercial unlockers, no framework dependencies. Patterns ported from crawl4ai and crawlee-python, **re-implemented in-repo so you own the pipeline**.
+
+```
+Tier 0  Direct HTTP (httpx + Jina Reader)                 $0       0.3s   — naive
+Tier 1  Puppeteer + 17-patch stealth + cookie jar         $0.005   3–8s   — CF Managed Challenge, JS SPAs
+Tier 2  curl_cffi (Chrome TLS/JA3) + session pool         $0       1s     — TLS gating, moderate CF, header blocks
+Tier 3  patchright (undetected Chromium) + stealth        $0       5–15s  — Akamai BM, DataDome, PerimeterX, Kasada
+Tier 4  Wayback CDX archive                               $0       1–3s  — stale fallback when live blocked
+Tier 5  Human handoff (live view)                         user     —      — anything
+```
+
+Seamless escalation: when Tier 1 hits a 403, `browser_escalate` exports cookies + localStorage + URL to a fresh Tier 3 patchright session and the LLM's next `browser_click`, `browser_type`, `browser_screenshot` all work transparently on the new backend. **Same tool surface, either backend.**
+
+**A typed block classifier that actually classifies.**
+Every response passes through a detector that names the protection: Akamai reference-numbers, Cloudflare cf_chl challenge forms, PerimeterX `_pxAppId`, DataDome captcha delivery domains, Kasada SDK, Imperva Incapsula, Sucuri firewall. The agent sees `block_class="akamai"` not "something went wrong." Learnings are recorded per domain per tier — `lowest_successful_tier` tells the next run exactly where to start.
+
+**Vision that the brain reasons over, not pays for.**
+Gemini is called once per screenshot; the brain (Claude, GPT, whatever) sees `[V1] button "Sign in" (450,200 → 650,260) ← matches intent` — a ranked, intent-relevant, coordinate-stable bbox list. `browser_click_at(vision_index="V1")` resolves the label to the actual interactive element via DOM snapping, not guessed pixels. Vision is **prefetched** in the background after every click/type/scroll/navigate, so the next screenshot returns instantly from cache instead of waiting 3–8 s for a fresh Gemini call.
+
+**Guards that stop the three most destructive LLM failure modes.**
+
+1. **Dead-type refusal.** LLM types "khulna" → dropdown appears → LLM misses it → tries to type "khulna, Bangladesh" → field becomes `khulnakhulnabangladesh`. SuperBrowser catches the second type to the same field within 12 s, rejects it, and returns the live autocomplete suggestions inline with exact click coordinates. No more concatenation garbage.
+
+2. **Evidence-based escalation.** LLM calls `browser_escalate(reason="403 Forbidden")` after a `browser_wait_for` timeout even though no 403 ever happened. SuperBrowser validates: if `network_blocked=False`, no observed 4xx/5xx, and no captcha flagged by vision, the escalation is refused with a message telling the agent to take a screenshot or extend the wait timeout. **The LLM can't fabricate a failure the tools didn't see.**
+
+3. **Search-escape blocking.** When the target site is auto-pinned (gozayaan.com, louisvuitton.com, whatever), SuperBrowser blocks any navigation to `google.com/search`, `/images`, `/maps` — the "let me check Google" detour the LLM uses when a site is annoying. OAuth and CDN traffic on Google stays allowed; search does not. The agent stays on the target domain and solves the problem there.
+
+**Human-in-the-loop that survives cold starts.**
+A live-view URL the human opens in their own browser, 2 FPS screencast with click forwarding, works across both Tier 1 (TS server on :3100) and Tier 3 (Python aiohttp on :3101). Bot-protection cookies (`cf_clearance`, `_abck`, `ak_bmsc`, `datadome`) persist to a shared jar scoped by task + domain — when the human clears the challenge, the next task doesn't re-prompt them. Webhook hook for WhatsApp / Slack / Telegram bridges. Handoff ledger prevents double-prompting the same user on the same domain within 15 minutes.
+
+**Navigate that doesn't trip sensors.**
+Cold `page.goto()` with no Referer, no mouse motion, and two identical GETs within 2 s is a textbook bot signature. SuperBrowser's navigate sets a proper Referer (previous URL as the implicit click-through), adds small humanizing jitter, skips warmup when the target IS the homepage (was firing two identical navs in a row), and pins a real Chrome UA on the HTTP layer (patchright only patched JS-side `navigator.userAgent` — the actual header still leaked `HeadlessChrome`). After navigation, a challenge-wait loop gives Cloudflare "Just a moment" and DataDome auto-verify interstitials a chance to clear before we return.
 
 ---
 
 ## Where this is going
 
-The near-term target is the **serverless, stateful browser** — deployed on [RunAgent Cloud](https://runagent.cloud) and controlled from whichever chat app the user already lives in. No new UI to learn, no desktop client, no web console for day-to-day tasks. You send a message, the browser does the work, and when it needs you (captcha, OTP, a decision), it messages you back with a link you tap.
+The near-term target is the **serverless, stateful browser** — deployed on [RunAgent Cloud](https://runagent.cloud) and controlled from whichever chat app the user already lives in. No new UI to learn. You send a message, the browser does the work, and when it needs you (captcha, OTP, a decision), it messages you back with a link you tap.
 
 ```
   You on WhatsApp / Telegram / Slack
           │
           │   "find me a black dress like this photo, size M, ships to Dhaka"
           ▼
-  RunAgent Cloud  (serverless, stateful — cold-starts preserve cookies,
-          │       per-task memory, handoff ledger, fingerprint continuity)
+  RunAgent Cloud  (stateful-serverless — cookies, memory, handoff ledger,
+          │       fingerprint continuity survive cold starts)
           │
           ▼
-  SuperBrowser session  →  Zara, H&M, Amazon, Daraz, ...
+  SuperBrowser  →  any site, auto-escalating through the tier ladder
           │
           │   hits a captcha → pushes a "tap to solve" link back to WhatsApp
           │   you tap once → session resumes on the same cookies
@@ -31,40 +73,7 @@ The near-term target is the **serverless, stateful browser** — deployed on [Ru
   Shortlist delivered as a WhatsApp message with images + links
 ```
 
-The pieces making this real already live in the repo: cookie jars keyed on `SUPERBROWSER_TASK_ID + domain` so a warm task doesn't need a second solve, a cross-session handoff ledger so the same human isn't asked twice, a `HANDOFF_WEBHOOK_URL` hook so any messaging bridge can forward the live-view URL, and a WebSocket `awaiting_human` event with snapshot replay so late-connecting clients still catch an in-flight handoff. **The server is already "stateful enough" to survive a cold start on the same task** — what's next is the managed deployment + first-party messaging bridges.
-
----
-
-```
-Your AI Agent (any framework, any language)
-    │
-    │  ── Step-by-step control ──────────────────────────────────
-    ├── POST /session/create   { url: "https://..." }
-    ├── POST /session/:id/click, /type, /scroll, /navigate
-    ├── GET  /session/:id/state
-    │
-    │  ── Puppeteer script execution ────────────────────────────
-    ├── POST /session/:id/script  { code: "await page.type(...); ..." }
-    │
-    │  ── Autonomous agent ──────────────────────────────────────
-    ├── POST /task  { task: "Find trending repos on GitHub" }
-    │
-    │  ── Human handoff (built in) ──────────────────────────────
-    ├── GET  /session/:id/view        → live-view URL, human solves here
-    ├── POST /session/:id/human-input → any client can reply
-    └── ws   /ws/session/:id          → push "awaiting_human" events
-```
-
----
-
-## Why SuperBrowser
-
-- **Works on sites that block bots.** Stealth plugin, CDP-level input, human-like mouse curves, per-domain fingerprint continuity, bot-protection cookie persistence across sessions — `cf_clearance` and friends ride along the next time you visit a site a human already cleared.
-- **Fast-to-human captcha policy.** When auto-solve fails (at most once under `SUPERBROWSER_CAPTCHA_POLICY=fast_to_human`), the agent immediately surfaces a live-view URL. The human clicks through in their own browser, the agent detects the clearance and resumes on the same session. No more scripted retries that trip site hardening.
-- **Cheap vision, expensive brain.** Screenshots are preprocessed by a dedicated Python vision agent (OpenAI / OpenRouter / Gemini) that converts each image into a text summary + bounding boxes. Your expensive reasoning model never pays image tokens. ~60–80% cost drop on observational iterations.
-- **Three levels of control.** Step-by-step HTTP APIs for careful agents, full Puppeteer script execution for complex flows, or fire-and-forget autonomous tasks via `/task`.
-- **WebSocket events for gateways.** Every session exposes a WebSocket that pushes `captcha_active` / `awaiting_human` / `captcha_done` events, with snapshot replay on connect — drop it behind a WhatsApp, Slack, or Discord bot without polling.
-- **Safe by default.** SSRF guards, URL firewall, prompt-injection detection, sensitive-data redaction, per-IP rate limiting, token auth, session auto-expiry.
+Every piece of this already exists: tier-aware learnings persist per domain, the cookie jar is keyed on `SUPERBROWSER_TASK_ID + domain`, the handoff ledger is cross-session, `HANDOFF_WEBHOOK_URL` lets any messenger bridge receive handoff events, and the WebSocket pushes `awaiting_human` with snapshot replay for late subscribers. What's next is the managed cloud deployment and first-party messaging bridges.
 
 ---
 
@@ -73,335 +82,144 @@ Your AI Agent (any framework, any language)
 ```bash
 git clone https://github.com/runagent-dev/superbrowser.git
 cd superbrowser
-npm install
-npm run build
+npm install && npm run build
 cp .env.example .env     # optional — defaults work for local dev
-npm start
+npm start                # TS server on :3100
 ```
 
-Server starts on port 3100. No API keys needed for the browser server itself — every env var in `.env.example` is optional.
+For the Python tier + vision loop (nanobot integration):
+
+```bash
+cd nanobot
+pip install -e .
+patchright install chromium     # one-time browser install
+```
 
 ```bash
 # Take a screenshot
 curl -X POST http://localhost:3100/screenshot \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}' \
-  --output screenshot.jpg
+  -d '{"url": "https://example.com"}' --output shot.jpg
 
-# Open a persistent session
+# Open a session
 curl -X POST http://localhost:3100/session/create \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.google.com"}'
 ```
 
-### Docker
+Or with Docker:
 
 ```bash
 docker compose up -d
 ```
 
----
-
-## Features
-
-### Browser Engine
-- Headless Chromium with `puppeteer-extra-stealth`
-- CDP mouse and keyboard dispatch with 3-tier element coordinate resolution
-- Anti-detection: webdriver masking, plugin spoofing, WebGL override, permission patching
-- Human-like interaction: Bezier mouse movement, variable typing speed, micro-pauses
-- Request interception, ad blocking, proxy and region selection
-- Dialog handling, file upload, PDF export, download monitoring
-
-### Puppeteer Script Execution
-- Write full Puppeteer scripts and execute them with the real `page` object
-- Full API: `page.goto`, `page.click`, `page.type`, `page.waitForSelector`, `page.keyboard`, `page.mouse`, `page.evaluate`, everything
-- Helpers: `helpers.sleep(ms)`, `helpers.log(...)`, `helpers.screenshot(path?)`
-- Available via HTTP (`/function`, `/session/:id/script`), WebSocket, agent actions, and nanobot tools
-
-### DOM Intelligence
-- Interactive-element indexing: `[0]<input placeholder="Search"> [1]<button>Go`
-- Accessibility-tree fallback for complex/ARIA-heavy pages
-- Cursor-interactive detection (finds clickable divs that ARIA misses)
-- DOM history tracking: hash-based element identity survives mutations
-- Clean markdown content extraction
-
-### Captcha, Reinvented
-- Built-in solvers: Cloudflare Turnstile (DOM-level), reCAPTCHA checkbox auto-pass, 2captcha/anti-captcha token + grid API
-- **Fast-to-human policy** (`SUPERBROWSER_CAPTCHA_POLICY=fast_to_human`): one auto attempt, then immediate handoff
-- **Per-domain cookie jar** (`SUPERBROWSER_COOKIE_JAR=1`): persists `cf_clearance`, `__cf_bm`, `datadome`, Akamai and Imperva cookies scoped by task+domain; UA-pinned; 7-day TTL
-- **15-min handoff ledger**: if the human solved the same domain recently, don't re-prompt them
-- **Live-view UI**: self-contained HTML page, 2 FPS screenshot feed + click/type forwarding — works on any phone browser
-
-### Human-in-the-Loop
-- `/session/:id/view` — live browser view the human opens in their own browser
-- `POST /session/:id/human-input/ask` — blocking RPC any agent can call for credentials/OTP/confirm
-- WebSocket push of `awaiting_human` events with snapshot replay for late subscribers
-- `HANDOFF_WEBHOOK_URL` env — fire a custom webhook when a human is needed (WhatsApp/Slack/Discord-ready payload with caption + screenshot)
-
-### Vision Preprocessor (new)
-Nanobot's brain never sees raw screenshots when this is enabled. A dedicated Python vision agent converts each image into `{summary, relevant_text, bboxes, flags}` text that the brain reasons over.
-
-```
-VISION_ENABLED=1
-VISION_PROVIDER=openai        # or openrouter | gemini
-VISION_MODEL=gpt-4o-mini      # or openai/gpt-4o-mini | gemini-2.0-flash-exp
-VISION_API_KEY=<separate key — NOT your brain's key>
-```
-
-- Provider-agnostic — same openai SDK routes to OpenAI, OpenRouter, or Gemini's OpenAI-compat endpoint
-- Intent hints per tool call (`intent="verify add-to-cart succeeded"`) for task-aware prompts
-- TTL-bounded LRU cache keyed on `(session_id, url, dom_hash, intent_bucket)` — ~40% hit rate on chained tool calls
-- Lenient pydantic validators: unknown roles, categorical confidences, missing flags all coerce cleanly
-- Fall-soft: any provider/parse failure falls back to legacy image blocks automatically
-
-### Security
-- Token-based auth (optional, via `TOKEN`)
-- SSRF protection: blocks localhost, private IPs, cloud metadata, `file://`
-- URL firewall with allow/deny lists, dangerous-protocol blocking
-- Prompt-injection detection, task-override blocking, SSN/credit-card redaction
-- Per-IP rate limiting, session auto-expiry (30 min idle, 2 hr max), concurrent session cap
-
-### Built-in Agent (optional)
-- Dual-agent loop: Navigator executes actions, Planner validates progress
-- 33 browser actions with Zod schema validation (includes `run_script`)
-- Context-overflow handling with automatic message compaction
-- Step-history recording for debugging and task replay
-- Typed error hierarchy: `AuthError`, `UrlBlockedError`, `ScriptTimeoutError`, `MaxStepsError`
+The technical reference (every endpoint, every config env var, every tool schema) will live in a separate docs site. This README is the pitch; that's the manual.
 
 ---
 
-## Usage
+## Using it with an AI agent
 
-Four ways to drive the browser — pick whichever fits:
+Four ways in; pick whichever fits.
 
 ```python
-# 1. HTTP session APIs — any language, any framework
+# 1. HTTP APIs — any language, any framework
 httpx.post("http://localhost:3100/session/create", json={"url": "https://example.com"})
 httpx.post(f"http://localhost:3100/session/{sid}/click", json={"index": 1})
 ```
 
 ```python
-# 2. Puppeteer script — one call, full page API
+# 2. Full Puppeteer script — one call, real page object
 httpx.post(f"http://localhost:3100/session/{sid}/script",
-    headers={"Authorization": "Bearer TOKEN"},
     json={"code": "await page.type('#q','...'); await page.click('#go'); return page.title();"})
 ```
 
+```python
+# 3. Nanobot integration — the full stack (tier ladder, vision, guards, handoff)
+from nanobot import Nanobot
+from superbrowser_bridge.tools import register_all_tools
+
+bot = Nanobot.from_config(workspace="nanobot/workspace")
+register_all_tools(bot)
+await bot.run("find 4-star hotels in Khulna on gozayaan.com, check-in April 23")
+```
+
 ```bash
-# 3. Autonomous agent — fire-and-forget
+# 4. Autonomous agent built in — fire and forget
 curl -X POST http://localhost:3100/task -d '{"task": "find trending repos on GitHub"}'
 ```
 
-```python
-# 4. With nanobot — Python integration, 25 tools, vision preprocessor built in
-from nanobot import Nanobot
-from superbrowser_bridge.tools import register_all_tools
-bot = Nanobot.from_config(workspace="nanobot/workspace")
-register_all_tools(bot)
-await bot.run("fill the contact form on example.com with name John Doe")
-```
-
-Real-time control + feedback events are also available on `ws://localhost:3100/ws/session/:id`. Connect a WebSocket and you'll receive `awaiting_human` / `captcha_active` / `captcha_done` events — this is the plug point for a chat-app bridge.
-
-Full request/response shapes for every endpoint are in the [API Reference](#api-reference) below.
+Real-time events on `ws://localhost:3100/ws/session/:id` — subscribe from a chat-app bridge and you'll receive `awaiting_human` / `captcha_active` / `captcha_done` with snapshot replay.
 
 ---
 
-## API Reference
+## Architecture at a glance
 
-### Sessions
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/session/create` | Open session (returns screenshot + elements + viewUrl hints) |
-| POST | `/session/:id/navigate` | Navigate to URL (restores per-domain cookies if jar enabled) |
-| GET | `/session/:id/screenshot` | JPEG screenshot |
-| GET | `/session/:id/state` | DOM tree + screenshot + console errors |
-| POST | `/session/:id/click` | Click by index or x,y |
-| POST | `/session/:id/type` | Type text |
-| POST | `/session/:id/keys` | Send keys (`Enter`, `Tab`, `Control+a`) |
-| POST | `/session/:id/scroll` | Scroll up/down/percent |
-| POST | `/session/:id/drag` | Mouse drag (useful for slider captchas) |
-| POST | `/session/:id/select` | Pick dropdown option |
-| POST | `/session/:id/evaluate` | Run JavaScript in page context |
-| POST | `/session/:id/script` | Run full Puppeteer script (requires `TOKEN`) |
-| POST | `/session/:id/dialog` | Handle alert/confirm/prompt |
-| GET | `/session/:id/markdown` | Page content as markdown |
-| GET | `/session/:id/pdf` | Page as PDF |
-| GET | `/session/:id/captcha/detect` | Returns `{captcha, viewUrl}` — viewUrl is always surfaced when captcha present |
-| POST | `/session/:id/captcha/solve` | Run strategy registry (turnstile, 2captcha, checkbox, human-handoff) |
-| DELETE | `/session/:id` | Close session |
-| GET | `/sessions` | List active sessions |
-
-### Human-in-the-loop
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/session/:id/view` | Self-contained HTML live-view UI |
-| GET | `/session/:id/human-input` | Poll pending request |
-| POST | `/session/:id/human-input` | Submit reply (`{id, data, cancelled?}`) |
-| POST | `/session/:id/human-input/ask` | Server-side blocking ask (used by `browser_ask_user`) |
-
-### Utility
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/screenshot`, `/pdf`, `/content`, `/scrape` | One-shot convenience endpoints |
-| POST | `/function` | Execute Puppeteer script (requires `TOKEN`) |
-| POST | `/task` | Autonomous agent task (requires LLM key) |
-| GET | `/task/:id/history` | Step-by-step execution history |
-| GET | `/health`, `/metrics` | Liveness + metrics |
-| WS  | `/ws/session/:id` | Real-time control + `feedback` events |
-
----
-
-## Configuration
-
-### Core server
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3100` | HTTP + WebSocket port |
-| `TOKEN` | — | Bearer auth for protected endpoints |
-| `HEADLESS` | `true` | Headless mode |
-| `PUPPETEER_EXECUTABLE_PATH` | — | Custom Chromium binary |
-| `MAX_SESSIONS` | `20` | Concurrent session cap |
-| `RATE_LIMIT` | `200` | Requests per IP per minute |
-| `TASK_TIMEOUT` | `300000` | Max agent task duration (ms) |
-| `SUPERBROWSER_PUBLIC_HOST` | — | Public base URL of the view UI (e.g. `https://browser.example.com`). Required when the server is behind a proxy. |
-
-### Captcha + human handoff
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CAPTCHA_PROVIDER` | — | `2captcha` or `anticaptcha` |
-| `CAPTCHA_API_KEY` | — | Solver API key |
-| `SUPERBROWSER_CAPTCHA_POLICY` | — | Set to `fast_to_human` for one-shot-then-human |
-| `SUPERBROWSER_MAX_HUMAN_HANDOFFS` | `1` | Per-session handoff budget |
-| `SUPERBROWSER_COOKIE_JAR` | — | Set to `1` to persist bot-protection cookies per task+domain |
-| `SUPERBROWSER_COOKIE_JAR_PATH` | `~/.superbrowser/cookie-jar/` | Override jar directory |
-| `SUPERBROWSER_TASK_ID` | — | Scope key for cookie jar + handoff ledger |
-| `HANDOFF_WEBHOOK_URL` | — | Webhook fired on human handoff (WhatsApp/Slack bridge) |
-
-### Vision preprocessor
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VISION_ENABLED` | — | `1` to enable Python vision middleman |
-| `VISION_PROVIDER` | `openai` | `openai`, `openrouter`, or `gemini` |
-| `VISION_MODEL` | — | Provider-native model id (e.g. `gpt-4o-mini`) |
-| `VISION_API_KEY` | — | Separate from brain's key |
-| `VISION_BASE_URL` | — | Optional baseURL override |
-| `VISION_CACHE_SIZE` | `200` | LRU entries |
-| `VISION_CACHE_TTL_SEC` | `300` | Cache TTL |
-| `VISION_MAX_TOKENS` | `1500` | Response cap |
-| `VISION_MAX_BBOXES` | `30` | Truncate long bbox lists ranked by intent relevance |
-| `VISION_TIMEOUT_MS` | `8000` | Hard timeout per call |
-
-### Built-in agent (optional)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | Required only for `/task` endpoint |
-| `LLM_MODEL` | `gpt-4o` | Only for `/task` |
-
----
-
-## Project Structure
+SuperBrowser is two processes that share a session ID namespace:
 
 ```
-src/
-├── browser/            # Engine, CDP, stealth, DOM, input, captcha, humanize,
-│                       # script-runner, guardrails, firewall, dom-history
-│   └── captcha/
-│       ├── strategies/ # turnstile, token-external, recaptcha-checkbox,
-│       │               # recaptcha-grid-api, human-handoff
-│       ├── cookie-jar.ts       # per-domain bot-protection cookie persistence
-│       ├── handoff-ledger.ts   # 15-min cross-session "don't re-prompt" memory
-│       └── orchestrator.ts     # strategy registry with fast-to-human short-circuit
-├── agent/              # Navigator, Planner, actions, prompts, executor,
-│                       # events, errors, human-input, feedback bus
-├── llm/                # OpenAI-compatible provider (used by built-in /task agent)
-├── server/             # HTTP API, WebSocket + feedback bridge, MCP, auth
-└── utils/              # Logger, tokens, images
-
-nanobot/
-├── superbrowser_bridge/
-│   ├── tools.py              # 8 high-level nanobot tools
-│   ├── session_tools.py      # 17 step-by-step tools (incl. run_script, captcha)
-│   └── worker_hook.py        # loop guidance, fast-to-human enforcement
-├── vision_agent/             # Python vision preprocessor
-│   ├── providers/            # openai, openrouter, gemini (OpenAI-compat endpoint)
-│   ├── schemas.py            # BBox, PageFlags, VisionResponse (pydantic)
-│   ├── prompts.py            # system + intent-bucketed user prompts
-│   ├── cache.py              # TTL-bounded LRU
-│   └── client.py             # VisionAgent orchestrator
-└── workspace/SOUL.md         # nanobot agent personality + instructions
+┌──────────────────────────────────────────────────────────────────┐
+│  TS server (Node) — port 3100                                    │
+│   • Puppeteer engine + 17-patch stealth                          │
+│   • Per-session HTTP API (click/type/screenshot/...)             │
+│   • Tier 1 interactive sessions                                  │
+│   • Live-view UI for Tier 1 human handoff                        │
+└──────────────────────────────────────────────────────────────────┘
+                             │
+                             │  shared cookie jar on disk
+                             │
+┌──────────────────────────────────────────────────────────────────┐
+│  Python bridge (nanobot/superbrowser_bridge) — worker process    │
+│   • antibot/ — tier-aware routing, block classifier, proxy tiers │
+│   • interactive_session.py — Tier 3 patchright session manager   │
+│   • HTTP intercept in session_tools → routes t3-* session IDs    │
+│   • t3_viewer on :3101 — live view for Tier 3 human handoff      │
+│   • vision_agent — Gemini bbox labeling + prefetch + cache       │
+│   • worker_hook — dead-type guard, evidence-based escalation,    │
+│                    auto-escalation on block, domain pinning      │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Architecture
-
-SuperBrowser stitches together patterns from three production browser-automation codebases, written from scratch:
-
-- **[browserless](https://github.com/browserless/browserless)** — stealth, CDP sessions, request interception, goto utility, concurrency limiter, Puppeteer script execution
-- **[BrowserOS](https://github.com/anthropics/browseros)** — CDP input dispatch, element coordinate resolution, accessibility tree, cursor detection, console collector
-- **[nanobrowser](https://github.com/nicepkg/nanobrowser)** — Navigator+Planner agent loop, DOM element indexing, screenshot feedback, extraction protocol, action schemas, security guardrails, URL firewall, DOM history tracking, error hierarchy
-
-New since the initial release:
-
-- **Fast-to-human captcha policy** — one auto attempt, immediate handoff, cookie persistence, ledger-backed re-prompt avoidance
-- **Python vision preprocessor** — cheap-model middleman so the brain never pays image tokens
-- **WebSocket feedback bridge** — `captcha_active` / `awaiting_human` / `captcha_done` events with replay-on-connect
-- **Webhook-based handoff notification** — plug any messenger bot into `HANDOFF_WEBHOOK_URL`
+Session IDs: `session-<uuid>` = Tier 1 (TS owns it). `t3-session-<uuid>` = Tier 3 (Python owns it). Every `browser_*` tool transparently routes based on prefix — the agent calls the same tool either way.
 
 ---
 
-## Roadmap
+## Running it in production
 
-The top-of-README vision (serverless + chat-app control) is the guiding star. Concrete near-term items:
+SuperBrowser is a stateful HTTP server. Deploy how it fits your stack:
 
-- **WhatsApp / Telegram / Slack bridges** — first-party messaging front-ends that consume the existing `HANDOFF_WEBHOOK_URL` + WebSocket `awaiting_human` events. The transport is already in place; what's next is the canned bot.
-- **RunAgent Cloud managed deployment** — stateful-serverless: cookie jar, handoff ledger, and task-scoped resumption survive cold starts. One click to deploy, pay per active session-minute.
-- **Proxy / region stickiness per task** — `cf_clearance` is IP+UA pinned; the cookie jar is only as useful as the proxy that backs it. Pinning proxies per `SUPERBROWSER_TASK_ID` extends jar validity across longer horizons.
-- **CDP screencast live view** — upgrade `/session/:id/view` from 2 FPS screenshot polling to a WebSocket CDP screencast with cursor overlay.
-- **More vision providers** — native `google-genai` backend for Gemini features the OpenAI-compat endpoint doesn't expose (multi-image batching, structured output schemas).
-
-Contributions welcome on any of these — open an issue first if it's a large change.
+- **Self-hosted** — `npm start` on any machine with Chromium, plus `python -m nanobot` for the Python tier.
+- **Docker** — `docker compose up -d`. Mount `~/.superbrowser/cookie-jar/` as a volume if you want the jar to survive restarts.
+- **Kubernetes** — one pod per instance; mount a PVC for the cookie jar and handoff ledger.
+- **[RunAgent Cloud](https://runagent.cloud)** — the target home. Stateful-serverless with managed proxy pool, chat-app bridges, shared jar storage. Part of the RunAgent super-agent family (OpenClaw, PicoClaw, ZeroClaw).
 
 ---
 
-## Deployment
+## The short list of things nobody else does
 
-SuperBrowser is a stateful HTTP server. Deploy it however fits your stack:
-
-- **Self-hosted** — `npm start` on any machine with Chromium
-- **Docker** — `docker compose up -d`
-- **Kubernetes** — one pod per instance, horizontal scaling; per-task cookie jar + handoff ledger are on disk (mount a PVC if you want them to survive pod restarts)
-- **[RunAgent Cloud](https://runagent.cloud)** — the target home: stateful-serverless deployment with managed proxy pool, chat-app bridges, and shared jar storage. Part of the RunAgent super-agent ecosystem (OpenClaw, PicoClaw, ZeroClaw).
+- **One tool surface, two backends.** `browser_click_at(vision_index="V3")` works on Puppeteer and on undetected Chromium, transparently. Mid-task escalation between tiers preserves cookies + URL + localStorage.
+- **Vision prefetched after every mutating action.** Screenshots return instantly with bboxes already labeled — no 8-second Gemini wait in the tool's critical path.
+- **Hallucination guards at the tool layer.** The agent can't fabricate a 403, can't retype into a field with an open dropdown, can't pivot to Google Search mid-task.
+- **Typed block classification + tier-aware learnings.** The system remembers that gozayaan.com needs Tier 3, louisvuitton.com needs residential proxies, browser-use.github.io needs canvas CAPTCHA OCR — per-domain, per-tier, per-outcome.
+- **Human handoff that survives cold starts.** Cookies persist, ledger prevents double-prompting, webhook lets any messenger bot receive the "tap to solve" link.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. For larger changes (new captcha strategy, new vision provider, new messaging bridge), open an issue first so we can agree on the shape.
-
-Running the test suite:
+Issues and PRs welcome. For substantial changes (new tier, new block classifier pattern, new messaging bridge, new captcha strategy), open an issue first so we can agree on the shape.
 
 ```bash
-npm test                  # vitest — agent executor, DOM, actions
+npm test                  # TS side — agent executor, DOM, actions
 npx tsc --noEmit          # type check
+
+cd nanobot && source venv/bin/activate
+python -m pytest tests/ -q
 ```
 
-Python side:
+Technical documentation (full endpoint reference, every env var, every tool schema, architectural deep-dives) will live at a separate docs site once the surface stabilizes.
 
-```bash
-source venv/bin/activate
-cd nanobot
-python -m pytest tests/ -q   # if tests present
-```
+---
 
 ## License
 
-MIT
+MIT.
