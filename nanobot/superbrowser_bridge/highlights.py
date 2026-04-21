@@ -111,6 +111,7 @@ def build_som_screenshot(
     image_h: int,
     *,
     max_boxes: int = 20,
+    cursor_trail: Optional[Sequence[tuple[int, int]]] = None,
 ) -> str:
     """Set-of-Marks overlay: paint previous-pass VisionResponse.bboxes on
     the image so the vision model can re-anchor on its own labels.
@@ -121,10 +122,17 @@ def build_som_screenshot(
     `max_boxes` to keep the image readable (20 matches `highlights.py`'s
     aesthetic cap and keeps overlay cost low).
 
-    Returns the input b64 unchanged on any failure (empty bboxes, zero
-    dims, PIL missing) — overlay must never block a vision call.
+    Optional `cursor_trail` is a list of (x, y) pixel points (oldest to
+    newest) drawn as numbered dots with fading alpha — used by the
+    captcha step-mode loop to show the model where it has already
+    clicked on previous steps, so stale tile re-clicks are visible in
+    the image itself (complementing the structured `Previous click` hint
+    in the user prompt).
+
+    Returns the input b64 unchanged on any failure (empty bboxes/trail,
+    zero dims, PIL missing) — overlay must never block a vision call.
     """
-    if not bboxes or image_w <= 0 or image_h <= 0:
+    if (not bboxes and not cursor_trail) or image_w <= 0 or image_h <= 0:
         return screenshot_b64
     # Rank identically to VisionResponse.as_brain_text: intent_relevant
     # first, then clickable, then by confidence desc. Keep original
@@ -151,16 +159,21 @@ def build_som_screenshot(
             "role": role,
             "bounds": {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0},
         })
-    if not elements:
+    if not elements and not cursor_trail:
         return screenshot_b64
     # bounds are already in image-pixel space; no DPR scaling needed.
-    return build_highlighted_screenshot(screenshot_b64, elements, device_pixel_ratio=1.0)
+    return build_highlighted_screenshot(
+        screenshot_b64, elements, device_pixel_ratio=1.0,
+        cursor_trail=cursor_trail,
+    )
 
 
 def build_highlighted_screenshot(
     screenshot_b64: str,
     elements: Sequence[Mapping[str, object]],
     device_pixel_ratio: float = 1.0,
+    *,
+    cursor_trail: Optional[Sequence[tuple[int, int]]] = None,
 ) -> str:
     """Return a new base64 JPEG with bbox overlay drawn on top of the input.
 
@@ -170,6 +183,9 @@ def build_highlighted_screenshot(
           `bounds` MUST be in CSS pixels; device_pixel_ratio scales them up to
           device pixels for drawing on the actual screenshot bitmap.
         device_pixel_ratio: from CDP Page.getLayoutMetrics; default 1.
+        cursor_trail: optional list of (x, y) image-pixel points, drawn as
+          numbered dots with fading alpha (oldest → faintest). Used by the
+          captcha step-mode loop to surface where earlier clicks landed.
 
     Returns:
         Base64 JPEG of the annotated screenshot. On any failure (e.g., PIL
@@ -231,6 +247,45 @@ def build_highlighted_screenshot(
         # Filled background rect behind the label for contrast
         draw.rectangle([lx, ly, lx + tw + 6, ly + th + 4], fill=color)
         draw.text((lx + 3, ly + 2), label, fill=(0, 0, 0), font=font)
+
+    # Cursor trail — numbered dots with older points rendered fainter.
+    # The list is oldest → newest; we draw newest brightest so it stays
+    # visually distinct from the bbox overlays above.
+    if cursor_trail:
+        trail = list(cursor_trail)[-6:]  # cap at 6 to keep the image readable
+        n = len(trail)
+        for i, pt in enumerate(trail):
+            try:
+                px = int(pt[0] * dpr)
+                py = int(pt[1] * dpr)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if px < 0 or py < 0 or px >= vw or py >= vh:
+                continue
+            # Fade from 90→255 alpha in the outline; fill stays bright for
+            # the most recent click only.
+            freshness = (i + 1) / n
+            r = int(8 + (2 * dpr))  # dot radius
+            # Ring color: bright magenta, faded for older points via a
+            # brightness reduction instead of true alpha (JPEG has no alpha).
+            ring_b = int(80 + 175 * freshness)
+            ring = (255, 0, ring_b)
+            draw.ellipse([px - r, py - r, px + r, py + r],
+                         outline=ring, width=max(1, int(2 * dpr)))
+            # Only the most recent gets a filled center + label.
+            if i == n - 1:
+                draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=ring)
+                tag = f"#{i + 1}"
+                try:
+                    bb = draw.textbbox((0, 0), tag, font=font)
+                    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+                except Exception:
+                    tw, th = len(tag) * 7, 12
+                tx = min(vw - tw - 2, px + r + 2)
+                ty = max(0, py - th - 2)
+                draw.rectangle([tx, ty, tx + tw + 4, ty + th + 2],
+                               fill=ring)
+                draw.text((tx + 2, ty), tag, fill=(255, 255, 255), font=font)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=82)

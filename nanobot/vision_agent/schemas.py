@@ -259,6 +259,101 @@ class SuggestedAction(BaseModel):
         return max(1, min(3, p))
 
 
+class NextAction(BaseModel):
+    """The single next action the vision agent commits to, during captcha
+    step-mode.
+
+    Populated only when the caller asks for `solve_captcha_step` intent.
+    The captcha loop consumes exactly one of these per iteration —
+    click_tile drives a center-click at `target_bbox`, drag_slider starts
+    a drag from `target_bbox` center toward the widget's right edge,
+    submit clicks the verify button, done exits the loop, stuck
+    escalates to human handoff.
+
+    The model reasons about "what changed since my last click" via the
+    `last_action` hint in the user prompt; `expect_change` describes what
+    the model thinks should happen after this step so the loop can pick
+    an appropriate wait strategy.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_type: Literal[
+        "click_tile", "drag_slider", "type_text", "submit", "done", "stuck",
+    ] = Field(default="stuck")
+    target_bbox: Optional[BBox] = Field(default=None)
+    # For type_text only: the input field to type into. Vision reads the
+    # distorted-word image, transcribes it into `type_value`, and gives
+    # us the input bbox here so the loop can POST /type-at directly.
+    target_input_bbox: Optional[BBox] = Field(default=None)
+    type_value: str = Field(
+        default="",
+        description=(
+            "For action_type=type_text: the exact string to type into "
+            "target_input_bbox — usually vision's best-effort transcription "
+            "of a distorted-word captcha image."
+        ),
+    )
+    label: str = Field(default="", description="Human-readable target label.")
+    reasoning: str = Field(default="", description="Short why-this-action text.")
+    expect_change: Literal[
+        "static", "new_tile", "widget_replace", "page_nav",
+    ] = Field(default="static")
+
+    @field_validator("action_type", mode="before")
+    @classmethod
+    def _coerce_action_type(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "stuck"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        valid = {"click_tile", "drag_slider", "type_text", "submit", "done", "stuck"}
+        if s in valid:
+            return s
+        aliases = {
+            "click": "click_tile",
+            "tile_click": "click_tile",
+            "tap": "click_tile",
+            "drag": "drag_slider",
+            "slide": "drag_slider",
+            "slider": "drag_slider",
+            "type": "type_text",
+            "fill": "type_text",
+            "enter": "type_text",
+            "verify": "submit",
+            "finish": "done",
+            "complete": "done",
+            "give_up": "stuck",
+            "bail": "stuck",
+        }
+        return aliases.get(s, "stuck")
+
+    @field_validator("expect_change", mode="before")
+    @classmethod
+    def _coerce_expect_change(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "static"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        valid = {"static", "new_tile", "widget_replace", "page_nav"}
+        return s if s in valid else "static"
+
+    @field_validator("label", "reasoning", mode="before")
+    @classmethod
+    def _coerce_short_str(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:400]
+
+    @field_validator("type_value", mode="before")
+    @classmethod
+    def _coerce_type_value(cls, v: object) -> str:
+        if v is None:
+            return ""
+        # Captcha answers are short — cap at 40 chars so a hallucinated
+        # paragraph can't become a typed value.
+        s = str(v).strip()
+        return s[:40]
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -278,6 +373,14 @@ class VisionResponse(BaseModel):
     bboxes: list[BBox] = Field(default_factory=list)
     flags: PageFlags = Field(default_factory=PageFlags)
     suggested_actions: list[SuggestedAction] = Field(default_factory=list)
+    next_action: Optional[NextAction] = Field(
+        default=None,
+        description=(
+            "Single-step action commitment for captcha step-mode. Populated "
+            "only when intent is solve_captcha_step; null for every other "
+            "intent so non-captcha flows stay unchanged."
+        ),
+    )
     changes_from_previous: str = Field(
         default="",
         description="What changed since the previous screenshot.",

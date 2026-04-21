@@ -564,11 +564,107 @@ def _record_routing_outcome(
         pass
 
 
+def record_cf_failure(domain: str) -> int:
+    """Increment `cf_failure_streak` on the per-domain routing ledger.
+
+    When the streak reaches 2, set `needs_headful=true` as a sticky
+    per-domain flag. Callers (captcha solver, interactive session) read
+    this to decide whether xvfb + headful Chromium is likely the only
+    way forward. Returns the new streak value.
+
+    No-op when domain is empty or the ledger file is unwritable.
+    """
+    if not domain or domain == "unknown":
+        return 0
+    from datetime import datetime, timezone
+    path = _routing_path(domain)
+    data: dict = {"domain": domain}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                loaded = _json.load(f)
+            if isinstance(loaded, dict):
+                data.update(loaded)
+        except (ValueError, OSError):
+            pass
+    streak = int(data.get("cf_failure_streak", 0)) + 1
+    data["cf_failure_streak"] = streak
+    if streak >= 2:
+        # Sticky once true — a human has to clear it by deleting the flag.
+        data["needs_headful"] = True
+    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            _json.dump(data, f, indent=2)
+    except OSError:
+        pass
+    return streak
+
+
+def record_cf_success(domain: str) -> None:
+    """Reset the CF failure streak after a successful solve.
+
+    `needs_headful` stays sticky — once a domain has required headful
+    twice, future sessions should keep that profile even after the
+    occasional auto-pass, because the underlying fingerprint issue
+    hasn't changed.
+    """
+    if not domain or domain == "unknown":
+        return
+    from datetime import datetime, timezone
+    path = _routing_path(domain)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except (ValueError, OSError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("cf_failure_streak", 0) == 0:
+        return
+    data["cf_failure_streak"] = 0
+    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(path, "w") as f:
+            _json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def needs_headful(domain: str) -> bool:
+    """Return True if a prior CF failure has marked this domain as
+    needing headful Chromium. Sticky — set by `record_cf_failure` after
+    two consecutive CF timeouts. Used by the interactive session manager
+    and the CF solver to shape escalation messages.
+    """
+    if not domain or domain == "unknown":
+        return False
+    path = _routing_path(domain)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except (ValueError, OSError):
+        return False
+    return bool(isinstance(data, dict) and data.get("needs_headful"))
+
+
 def choose_starting_tier(domain: str) -> int:
     """Return the lowest tier known to succeed on this domain, else 0.
 
-    Used by the orchestrator to skip tiers that have reliably failed in
-    the past and jump straight to the cheapest working one.
+    Primary signal is `lowest_successful_tier` — the cheapest tier that
+    actually delivered content. Secondary: when no tier has succeeded
+    yet but T1 is known to fail (e.g. Imperva-gated domain), return 3
+    so the caller opens a T3 patchright session directly instead of
+    burning another T1 attempt that will just re-hit the same 403.
+
+    Used by the orchestrator and BrowserOpenTool to skip tiers that
+    have reliably failed in the past and jump straight to the cheapest
+    working one.
     """
     if not domain or domain == "unknown":
         return 0
@@ -585,6 +681,12 @@ def choose_starting_tier(domain: str) -> int:
     lst = data.get("lowest_successful_tier")
     if isinstance(lst, int) and 0 <= lst <= 5:
         return lst
+    outcomes = data.get("tier_outcomes") or {}
+    if isinstance(outcomes, dict):
+        # BrowserOpenTool is binary (t1 vs t3 — T2 is read-only curl).
+        # If T1 is on record as failing, go straight to T3.
+        if str(outcomes.get("1", "")).startswith("fail"):
+            return 3
     return 0
 
 

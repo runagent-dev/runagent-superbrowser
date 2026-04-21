@@ -53,6 +53,26 @@ BROWSER_WORKSPACE = str(_BASE / "workspace_browser")
 
 
 
+def _task_fingerprint(instructions: str) -> str:
+    """SHA1 fingerprint of a normalized task-instruction string.
+
+    Used to gate the "Resume From Checkpoint" injection so checkpoints
+    from a completed task can't leak into the prompt of a SUBSEQUENT,
+    different task on the same domain. Normalization is aggressive on
+    purpose — whitespace collapsed, lowercased, punctuation stripped —
+    so that tiny prompt tweaks (extra space, casing) still match.
+    """
+    import hashlib as _hashlib
+    import re as _re
+    if not instructions:
+        return ""
+    s = (instructions or "").lower()
+    # Strip punctuation beyond alnum/space; collapse whitespace.
+    s = _re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    return _hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
 def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
     """Parse captcha solve results from step_history and update per-domain JSON.
 
@@ -126,12 +146,21 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
     per_method: dict[str, dict] = {}
     for a in kept:
         method = a.get("method") or "unknown"
-        bucket = per_method.setdefault(method, {"attempts": 0, "solved": 0, "durations": []})
+        bucket = per_method.setdefault(
+            method,
+            {"attempts": 0, "solved": 0, "durations": [], "steps": []},
+        )
         bucket["attempts"] += 1
         if a.get("solved"):
             bucket["solved"] += 1
             if a.get("durationMs"):
                 bucket["durations"].append(int(a["durationMs"]))
+            # Iterative loop emits a "steps" field. Track for budget
+            # tuning: if p95 steps creeps up on a domain, the site has
+            # likely hardened its challenge cadence and we should widen
+            # the screenshot budget or shortcut to human handoff earlier.
+            if isinstance(a.get("steps"), int) and a["steps"] > 0:
+                bucket["steps"].append(int(a["steps"]))
 
     # Pick the winning method = highest success rate, tiebreak by speed.
     best_method = None
@@ -172,6 +201,13 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
                 "solved": b["solved"],
                 "success_rate": round(b["solved"] / b["attempts"], 3) if b["attempts"] else 0.0,
                 "median_ms": int(statistics.median(b["durations"])) if b["durations"] else None,
+                "steps_p50": int(statistics.median(b["steps"])) if b["steps"] else None,
+                "steps_p95": (
+                    int(statistics.quantiles(b["steps"], n=20)[18])
+                    if len(b["steps"]) >= 2 else (
+                        b["steps"][0] if b["steps"] else None
+                    )
+                ),
             }
             for m, b in per_method.items()
         },
@@ -602,8 +638,11 @@ class DelegateBrowserTaskTool(Tool):
                     pass
 
         # Check for checkpoint from a previous failed worker attempt.
-        # Only resume if the checkpoint domain matches the current task domain
-        # to prevent stale checkpoints from unrelated tasks.
+        # Guard with BOTH domain match AND task-fingerprint match — a
+        # domain-only check lets a BMW-search checkpoint leak into a
+        # Mercedes-search task on the same site. The fingerprint is a
+        # SHA1 of the normalized task text; we only inject a "Resume
+        # From Checkpoint" hint when the SAME task re-runs.
         last_checkpoint_path = "/tmp/superbrowser/last_checkpoint.json"
         if os.path.exists(last_checkpoint_path):
             try:
@@ -611,18 +650,25 @@ class DelegateBrowserTaskTool(Tool):
                     checkpoint = _json.load(f)
                 cp_url = checkpoint.get("url", "")
                 cp_domain = _domain_from_url(cp_url) if cp_url else ""
-                # Only inject checkpoint if it's for the same domain as the current task
-                if cp_url and domain and cp_domain == domain:
+                cp_fp = str(checkpoint.get("task_fingerprint") or "")
+                current_fp = _task_fingerprint(instructions)
+                same_domain = bool(cp_url and domain and cp_domain == domain)
+                same_task = bool(cp_fp and current_fp and cp_fp == current_fp)
+                if same_domain and same_task:
                     parts.append(
                         f"\n## Resume From Checkpoint\n"
-                        f"A previous worker made progress to: {cp_url}\n"
+                        f"A previous attempt at THIS SAME TASK reached: {cp_url}\n"
                         f"Start from this URL instead of the beginning. "
                         f"Call browser_open with this URL directly.\n"
                         f"Do NOT repeat the steps that led to this point."
                     )
                 else:
-                    # Stale checkpoint from a different domain — remove it
-                    os.remove(last_checkpoint_path)
+                    # Different task (or different domain) → remove so
+                    # it can't leak into the current worker's prompt.
+                    try:
+                        os.remove(last_checkpoint_path)
+                    except OSError:
+                        pass
             except (ValueError, KeyError):
                 pass
 
@@ -838,11 +884,24 @@ CRITICAL RULES:
                 except Exception as exc:
                     print(f"  [captcha learnings update failed: {exc}]")
 
-            # Copy checkpoint for potential re-delegation
+            # Copy checkpoint for potential re-delegation, stamping the
+            # task fingerprint on the global copy so the next worker's
+            # "Resume From Checkpoint" injection only fires for the SAME
+            # task — not just any task on the same domain.
             cp_path = os.path.join(task_dir, "checkpoint.json")
             if os.path.exists(cp_path):
-                import shutil
-                shutil.copy2(cp_path, "/tmp/superbrowser/last_checkpoint.json")
+                try:
+                    with open(cp_path) as _cpf:
+                        cp_data = _json.load(_cpf)
+                    if isinstance(cp_data, dict):
+                        cp_data["task_fingerprint"] = _task_fingerprint(instructions)
+                        with open("/tmp/superbrowser/last_checkpoint.json", "w") as _out:
+                            _json.dump(cp_data, _out)
+                except (ValueError, OSError, KeyError):
+                    # Fall back to a raw copy if stamping fails — worst
+                    # case the read-side guard just rejects it next time.
+                    import shutil
+                    shutil.copy2(cp_path, "/tmp/superbrowser/last_checkpoint.json")
 
             # --- Determine if the run was captcha-blocked (Layer 3) --------
             # Inspect the step_history.json for explicit captcha-fail signals.
@@ -1221,7 +1280,24 @@ class CheckLearningsTool(Tool):
         if not sections:
             return f"No learnings or routing history found for {domain}. This is the first task on this site."
 
-        return "\n\n".join(sections)
+        # Preface: past learnings are PATTERNS, not verbatim answers.
+        # Without this guidance, the LLM copies concrete values (e.g.
+        # `makes[]=bmw` from a BMW task) into an unrelated follow-up
+        # query (e.g. a Mercedes task on the same site).
+        preamble = (
+            "## How to use these learnings\n"
+            "These are PATTERNS learned from PAST tasks on this site. "
+            "They are NOT the answer to the current task. When you see "
+            "concrete values in a URL / selector / script (e.g. a "
+            "specific brand, year range, price, ID), treat them as "
+            "placeholders you MUST replace with values from the CURRENT "
+            "user task. If the current task is about a DIFFERENT entity "
+            "than a past learning mentions, the URL pattern still "
+            "applies — just swap the query params. Do NOT echo concrete "
+            "values from these learnings back to the user as if they "
+            "were the current task's answer."
+        )
+        return "\n\n".join([preamble, *sections])
 
 
 @tool_parameters(
@@ -1239,11 +1315,23 @@ class SaveLearningTool(Tool):
 
     name = "save_learning"
     description = (
-        "Save ACTIONABLE learnings for a site. Future workers will follow these directly. Include:\n"
-        "- WORKING: exact script patterns (browser_run_script code), URL patterns, selectors, wait strategies\n"
+        "Save ACTIONABLE, GENERALIZABLE learnings for a site. Future "
+        "workers and future tasks (possibly about different "
+        "entities/queries on the same site) will read these. Include:\n"
+        "- WORKING: URL patterns, selectors, script patterns, wait strategies\n"
         "- FAILED: what was tried and WHY it failed, with 'DO NOT:' instructions\n"
-        "Read the [Worker Activity Log] to extract successful patterns. "
-        "Write learnings as step-by-step instructions a worker can directly execute."
+        "CRITICAL — abstract task-specific values into placeholders.\n"
+        "  BAD:  URL: /shopping/results/?makes[]=bmw&year_min=2010&list_price_min=25000\n"
+        "  GOOD: URL: /shopping/results/?makes[]=<brand>&year_min=<year_min>&list_price_min=<min_price>\n"
+        "Brands, model names, dates, prices, zip codes, user-entered "
+        "queries are ALL task-specific — use placeholders. Structural "
+        "bits (param names, selector paths, wait durations, DOM "
+        "patterns) stay concrete. If a value is specific to the "
+        "CURRENT task, do not encode it into a learning that the NEXT "
+        "task on the same site will read.\n"
+        "Read the [Worker Activity Log] to extract generalizable "
+        "patterns. Write learnings as step-by-step instructions a "
+        "worker can directly execute after substituting placeholders."
     )
 
     async def execute(self, site: str, learning: str, **kw: Any) -> str:

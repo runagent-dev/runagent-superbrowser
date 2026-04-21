@@ -9,6 +9,7 @@ from .detect import CaptchaInfo, detect
 from .solve_token import solve_token
 from .solve_vision import solve_vision
 from .solve_slider import solve_slider
+from .solve_cf import solve_cf_interstitial
 from .widget_screenshot import widget_screenshot
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "solve_token",
     "solve_vision",
     "solve_slider",
+    "solve_cf_interstitial",
     "widget_screenshot",
 ]

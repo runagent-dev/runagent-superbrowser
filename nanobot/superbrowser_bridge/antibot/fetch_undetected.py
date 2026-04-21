@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Any, Optional
@@ -166,11 +167,31 @@ async def fetch_undetected(
 
     stealth = Stealth()
 
+    # Match interactive_session.py: force HTTP/1.1 by default so hosts
+    # like cars.com (Imperva) that reject non-allowlisted HTTP/2 frames
+    # don't surface as ERR_HTTP2_PROTOCOL_ERROR before any content loads.
+    # Opt back into HTTP/2 via T3_DISABLE_HTTP2=0.
+    launch_args: list[str] = []
+    if os.environ.get("T3_DISABLE_HTTP2", "1") != "0":
+        launch_args.append("--disable-http2")
+
+    # Match interactive_session.py: allow CHROME_PATH / CHROME_CHANNEL to
+    # point at a real Google Chrome binary instead of bundled Chromium.
+    # Keeps both T3 paths fingerprint-consistent.
+    chrome_path = os.environ.get("CHROME_PATH") or None
+    chrome_channel = os.environ.get("CHROME_CHANNEL") or None
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=headless,
-            proxy=launch_proxy,
-        )
+        launch_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "proxy": launch_proxy,
+            "args": launch_args or None,
+        }
+        if chrome_path:
+            launch_kwargs["executable_path"] = chrome_path
+        if chrome_channel:
+            launch_kwargs["channel"] = chrome_channel
+        browser = await pw.chromium.launch(**launch_kwargs)
         try:
             context = await browser.new_context(
                 viewport={"width": viewport[0], "height": viewport[1]},

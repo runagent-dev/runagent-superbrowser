@@ -69,6 +69,7 @@ class VisionAgent:
         image_width: int | None = None,
         image_height: int | None = None,
         task_instruction: str | None = None,
+        cursor_trail: list[tuple[int, int]] | None = None,
     ) -> VisionResponse:
         start = time.monotonic()
         key: CacheKey = (
@@ -110,7 +111,15 @@ class VisionAgent:
         # VISION_SOM_OVERLAY=0 for A/B testing. Any failure here falls
         # through to the raw screenshot — overlay must never block a
         # vision call.
-        if os.environ.get("VISION_SOM_OVERLAY", "1") != "0":
+        #
+        # Suppressed during solve_captcha_step: between steps the captcha
+        # grid re-renders, so previous-pass bboxes point at dead tiles.
+        # Overlaying them would anchor the model on stale targets.
+        _bucket = intent_bucket(intent)
+        if (
+            os.environ.get("VISION_SOM_OVERLAY", "1") != "0"
+            and _bucket != "solve_captcha_step"
+        ):
             prev = self._last_response_bboxes.get(session_id or "_") or []
             if prev and image_width > 0 and image_height > 0:
                 try:
@@ -120,6 +129,25 @@ class VisionAgent:
                     )
                 except Exception as exc:
                     _log(f"SoM overlay failed (non-fatal): {exc!r}")
+
+        # Cursor trail overlay — only for captcha step-mode. Draws numbered
+        # dots where earlier step-mode clicks landed so Gemini can reason
+        # about "I already clicked that tile" from the image itself in
+        # addition to the structured `Previous click` hint in the prompt.
+        if (
+            _bucket == "solve_captcha_step"
+            and cursor_trail
+            and image_width > 0
+            and image_height > 0
+        ):
+            try:
+                from superbrowser_bridge.highlights import build_som_screenshot
+                screenshot_b64 = build_som_screenshot(
+                    screenshot_b64, [], image_width, image_height,
+                    cursor_trail=list(cursor_trail),
+                )
+            except Exception as exc:
+                _log(f"cursor trail overlay failed (non-fatal): {exc!r}")
 
         user_prompt = build_user_prompt(
             intent=intent,
@@ -169,10 +197,18 @@ class VisionAgent:
         # Remember this pass's bboxes so the next screenshot from the
         # same session gets a SoM overlay. An empty list is stored
         # deliberately — prevents a stale overlay from lingering after
-        # a pass that saw no interactive elements.
-        self._last_response_bboxes[session_id or "_"] = list(parsed.bboxes)
+        # a pass that saw no interactive elements. For step-mode captcha
+        # solving we do NOT remember, since the next step will re-render
+        # and stale bboxes would mislead the overlay.
+        if _bucket != "solve_captcha_step":
+            self._last_response_bboxes[session_id or "_"] = list(parsed.bboxes)
 
-        await self._cache.put(key, parsed)
+            # Skip the cache for step-mode: each step needs a fresh pass,
+            # and a coincidental key collision (same session, same url,
+            # same dom_hash, same intent bucket) could return the prior
+            # step's response to the current one. Non-step intents cache
+            # as before so hot pages stay fast.
+            await self._cache.put(key, parsed)
         return parsed
 
 

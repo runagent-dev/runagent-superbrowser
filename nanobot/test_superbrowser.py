@@ -25,8 +25,64 @@ import asyncio
 import sys
 import uuid
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+async def _run_and_capture(orchestrator, task: str, session_key: str) -> str:
+    """Run the orchestrator and return the user-visible content.
+
+    `Nanobot.run()` returns `result.content`, which is the LLM's direct
+    text output. When the orchestrator (or any nested agent) delivers
+    its answer via the `message()` tool instead of direct text, the
+    content goes out through the bus and `result.content` is an empty
+    string — so this test harness would print a blank "Agent:" line.
+
+    Fix: subscribe to the orchestrator's outbound bus during the turn,
+    collect any non-progress / non-streaming messages, and fall back to
+    the bus-captured content when `result.content` is empty. First
+    non-empty content wins; matches what the CLI channel renders.
+    """
+    bus = orchestrator._loop.bus
+    captured: list[str] = []
+    stop = asyncio.Event()
+
+    async def _pump() -> None:
+        while not stop.is_set():
+            try:
+                msg = await asyncio.wait_for(bus.consume_outbound(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            md = msg.metadata or {}
+            # Skip progress pings, streaming deltas/ends, and the empty
+            # "turn complete" marker — those aren't the final answer.
+            if md.get("_progress") or md.get("_stream_delta") or md.get("_stream_end"):
+                continue
+            if msg.content:
+                captured.append(msg.content)
+
+    pump = asyncio.create_task(_pump())
+    try:
+        result = await orchestrator.run(task, session_key=session_key)
+    finally:
+        # Give the pump a beat to drain any still-in-flight message.
+        await asyncio.sleep(0.05)
+        stop.set()
+        pump.cancel()
+        try:
+            await pump
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    direct = (result.content or "").strip() if result else ""
+    if direct:
+        return direct
+    if captured:
+        # Last capture wins — the final message tool call is usually the
+        # definitive answer (earlier ones may be progress breadcrumbs).
+        return captured[-1]
+    return ""
 
 
 async def main():
@@ -45,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """go to amazon uk and search philips trimmers and give me price. Use browser tools"""
+        """go to https://weather.com/ Find out the cold and flu forecast and today's air quality in Champaign, IL.. must from https://weather.com/. use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
@@ -57,8 +113,8 @@ async def main():
     session_key = f"orchestrator:{task_id}"
 
     # First turn — send the task
-    result = await orchestrator.run(task, session_key=session_key)
-    print(f"\nAgent: {result.content}")
+    content = await _run_and_capture(orchestrator, task, session_key)
+    print(f"\nAgent: {content}")
 
     # Multi-turn loop
     while True:
@@ -68,8 +124,8 @@ async def main():
         if user_input.lower() in ("quit", "exit", "q"):
             break
 
-        result = await orchestrator.run(user_input, session_key=session_key)
-        print(f"\nAgent: {result.content}")
+        content = await _run_and_capture(orchestrator, user_input, session_key)
+        print(f"\nAgent: {content}")
 
 
 if __name__ == "__main__":

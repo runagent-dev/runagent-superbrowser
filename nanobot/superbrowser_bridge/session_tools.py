@@ -241,6 +241,14 @@ async def _t3_dispatch_from_http(
                     res = await _cap.solve_slider(mgr, sid, info)
                     if res.get("solved") or method == "slider":
                         return _T3Response(res)
+                if (
+                    method in ("auto", "cf_wait")
+                    and info.type == "cf_interstitial"
+                ):
+                    # Whole-page CF interstitial — wait for auto-pass.
+                    res = await _cap.solve_cf_interstitial(mgr, sid, info)
+                    if res.get("solved") or method == "cf_wait":
+                        return _T3Response(res)
                 if method in ("auto", "vision"):
                     res = await _cap.solve_vision(mgr, sid, info)
                     return _T3Response(res)
@@ -257,8 +265,37 @@ async def _t3_dispatch_from_http(
     except KeyError as exc:
         return _T3Response({"error": f"session {exc} not found"}, status_code=404)
     except Exception as exc:
+        # Log the full traceback to both stdout and a dedicated log file
+        # so operators can diagnose T3 crashes without having to grep
+        # through asyncio noise. The file path is intentionally stable
+        # so repeated failures accumulate for post-mortem inspection.
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        _err_msg = (
+            f"[t3 dispatch] verb={verb!r} sid={sid!r} "
+            f"{type(exc).__name__}: {exc}"
+        )
+        print(_err_msg)
+        print(tb_str)
+        try:
+            log_path = os.environ.get("T3_ERROR_LOG") or "/tmp/superbrowser/t3_errors.log"
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a") as _lf:
+                from datetime import datetime as _dt
+                _lf.write(
+                    f"\n--- {_dt.utcnow().isoformat()} ---\n"
+                    f"{_err_msg}\n"
+                    f"body: {json.dumps(body, default=str)[:500]}\n"
+                    f"{tb_str}\n"
+                )
+        except Exception:
+            pass
         return _T3Response(
-            {"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            {
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "verb": verb,
+                "traceback_head": tb_str.splitlines()[-3:] if tb_str else [],
+            },
             status_code=500,
         )
 
@@ -301,6 +338,18 @@ async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
             "index": i,
         })
     payload = {"bboxes": payload_bboxes, "imageWidth": iw, "imageHeight": ih}
+    # For T3 sessions, fan out to the local Python event bus so the T3
+    # viewer at :3101 can paint the same overlays T1 shows. The TS
+    # server POST still runs (404s cleanly for t3-* session IDs) so
+    # the non-T3 path stays byte-identical.
+    if session_id.startswith("t3-"):
+        try:
+            from superbrowser_bridge.antibot import t3_event_bus as _bus
+            _bus.default().emit_vision_bboxes(
+                session_id, payload_bboxes, iw, ih,
+            )
+        except Exception:
+            pass
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             await client.post(
@@ -433,16 +482,21 @@ _ATOMIC_FIX_TEXT_JS = """
   if (!isInput && !isEditable) {
     return {ok: false, reason: 'not_input', tag};
   }
+  const attrLabel = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.name || '';
+  const attrName = el.name || '';
+  const attrAutocomplete = el.getAttribute('autocomplete') || '';
+  const attrInputType = isInput ? (el.getAttribute('type') || 'text').toLowerCase() : '';
   if (isInput) {
-    const t = (el.getAttribute('type') || 'text').toLowerCase();
     if (['file','checkbox','radio','hidden','submit','button',
-         'image','reset','range','color'].includes(t)) {
-      return {ok: false, reason: 'non_text_input', tag, input_type: t};
+         'image','reset','range','color'].includes(attrInputType)) {
+      return {ok: false, reason: 'non_text_input', tag, input_type: attrInputType};
     }
   }
   const before = isInput ? (el.value || '') : (el.innerText || '');
   if (before === target) {
-    return {ok: true, before, after: target, changed: false, tag};
+    return {ok: true, before, after: target, changed: false, tag,
+            label: attrLabel, name: attrName, autocomplete: attrAutocomplete,
+            input_type: attrInputType};
   }
   try { el.focus(); } catch (_) {}
   try {
@@ -465,7 +519,9 @@ _ATOMIC_FIX_TEXT_JS = """
     return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag};
   }
   const after = isInput ? (el.value || '') : (el.innerText || '');
-  return {ok: after === target, before, after, changed: before !== after, tag};
+  return {ok: after === target, before, after, changed: before !== after, tag,
+          label: attrLabel, name: attrName, autocomplete: attrAutocomplete,
+          input_type: attrInputType};
 })()
 """
 
@@ -547,6 +603,14 @@ def _schedule_vision_prefetch(
             state._last_vision_summary = resp.summary
             state._last_dom_hash = dh or state._last_dom_hash
             state.vision_calls += 1
+            # Push the fresh bboxes to live viewers immediately —
+            # without this, overlay only updates on the next
+            # screenshot tool call, so the user sees bboxes lag by
+            # one full action cycle. Fire-and-forget, non-fatal.
+            try:
+                await _push_vision_bboxes(session_id, resp)
+            except Exception:
+                pass
         except Exception as exc:
             print(f"  [vision prefetch failed: {exc}]")
 
@@ -701,6 +765,14 @@ class BrowserSessionState:
         self.captcha_mode: bool = False
         self.captcha_mode_remaining: int = 0
         self.captcha_solve_round: int = 0
+
+        # Cloudflare-interstitial navigation guard: set by BrowserNavigateTool
+        # when the server reports block_class=cloudflare, cleared by a
+        # successful browser_solve_captcha or navigation to a different URL.
+        # While set, a repeat navigate to the same URL is refused with a
+        # structured error telling the agent to solve first.
+        self.last_nav_cf_blocked_url: str = ""
+        self.nav_solve_called_since_block: bool = False
 
         # Per-index fingerprint cache. Populated on each /state fetch; read
         # by click/type tools to send `expected_fingerprint` along with the
@@ -1380,7 +1452,9 @@ async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" =
         return ""
 
 
-def _build_network_block_message(status_code: int, url: str) -> str:
+def _build_network_block_message(
+    status_code: int, url: str, block_class: str = "",
+) -> str:
     """Structured message when a page returns 4xx/5xx — tells the worker to
     stop immediately rather than trying interactions on a blocked shell.
 
@@ -1389,7 +1463,28 @@ def _build_network_block_message(status_code: int, url: str) -> str:
     all, so no amount of clicking will help. The right move is to exit the
     worker via done(success=False) so the orchestrator can route to the
     search worker or escalate (proxy, TLS fingerprinting, etc.).
+
+    EXCEPTION: Cloudflare Managed Challenge masquerades as a 403 "Just a
+    moment" page — the challenge can often auto-pass given enough time +
+    humanized interaction. When `block_class='cloudflare'`, route the
+    agent to `browser_solve_captcha(method='auto')` first; only fall
+    back to `done(success=False)` if the solver can't clear it.
     """
+    if (block_class or "").lower() == "cloudflare":
+        return (
+            f"\n\n[CF_INTERSTITIAL status={status_code} url={url} "
+            f"block_class=cloudflare]\n"
+            f"Cloudflare Managed Challenge ('Just a moment...') detected. "
+            f"This is NOT a permanent block — CF is scoring the session "
+            f"and may auto-clear given more time + humanization.\n"
+            f"ACTION: call browser_solve_captcha(method='auto') — the "
+            f"dedicated CF waiter (up to 60s of humanized polling) is "
+            f"wired to handle this. If the solver returns solved=false "
+            f"with block_class=cloudflare, THEN call "
+            f"done(success=False, final_answer='CF_INTERSTITIAL_STUCK: {url}') "
+            f"so the orchestrator can escalate to residential proxy / "
+            f"headful mode / search."
+        )
     reason_hint = {
         401: "Authentication required — this page needs a logged-in session.",
         403: "Forbidden — site's bot detection refused at the network layer. No page interaction will help.",
@@ -1480,6 +1575,60 @@ class BrowserOpenTool(Tool):
     def exclusive(self) -> bool:
         return True
 
+    async def _open_session_on_tier(
+        self,
+        tier_name: str,
+        *,
+        url: str | None,
+        region: str | None,
+        proxy: str | None,
+    ) -> Any:
+        """Open a session on the given tier. Returns the raw data dict on
+        success, or a plain string when the tier-open itself fails (rate
+        limit, T3 launch exception). String returns bubble up unchanged
+        so the caller can surface them to the agent.
+        """
+        if tier_name == "t3":
+            from superbrowser_bridge.antibot import interactive_session as _t3mgr
+            try:
+                return await _t3mgr.default().open(
+                    url,
+                    task_id=self.s.task_id,
+                    timeout_s=45.0,
+                )
+            except Exception as exc:
+                return (
+                    f"[t3_open_failed] Could not open Tier-3 undetected "
+                    f"Chromium session: {type(exc).__name__}: {str(exc)[:200]}"
+                )
+        # Default: T1 via the TS server.
+        payload: dict[str, Any] = {}
+        if url:
+            payload["url"] = url
+        if region:
+            payload["region"] = region
+        if proxy:
+            payload["proxy"] = proxy
+        if self.s.human_handoff_enabled:
+            payload["enableHumanHandoff"] = True
+            payload["humanHandoffBudget"] = self.s.human_handoff_budget
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/create",
+            json=payload,
+            timeout=45.0,
+        )
+        if r.status_code == 429:
+            return (
+                "[transient_rate_limit] Browser session service is busy "
+                "(HTTP 429 after retries). This is a temporary rate limit, "
+                "NOT a permanent outage. Wait ~30 seconds and call "
+                "browser_open again. Do not switch to a different strategy."
+            )
+        r.raise_for_status()
+        return r.json()
+
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, tier: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
 
@@ -1559,57 +1708,71 @@ class BrowserOpenTool(Tool):
 
         print(f"\n>> browser_open(url={url}, region={region}, tier={chosen_tier}) [session #{self.s.sessions_opened}, screenshots left: {self.s.screenshot_budget}]")
 
-        if chosen_tier == "t3":
-            # Route directly to the in-process patchright manager. Bypasses the
-            # TS server entirely — the resulting t3-session-<uuid> session_id
-            # is detected by the _request_with_backoff interceptor for all
-            # subsequent tool calls on this session.
-            from superbrowser_bridge.antibot import interactive_session as _t3mgr
-            try:
-                data = await _t3mgr.default().open(
-                    url,
-                    task_id=self.s.task_id,
-                    timeout_s=45.0,
-                )
-            except Exception as exc:
-                return (
-                    f"[t3_open_failed] Could not open Tier-3 undetected "
-                    f"Chromium session: {type(exc).__name__}: {str(exc)[:200]}"
-                )
-        else:
-            payload: dict[str, Any] = {}
-            if url:
-                payload["url"] = url
-            if region:
-                payload["region"] = region
-            if proxy:
-                payload["proxy"] = proxy
-            # Opt in to human handoff on the TS side. The server instantiates a
-            # HumanInputManager for this session and the captcha orchestrator
-            # can fall back to a human handoff after auto-solve exhausts.
-            if self.s.human_handoff_enabled:
-                payload["enableHumanHandoff"] = True
-                payload["humanHandoffBudget"] = self.s.human_handoff_budget
+        # Escalate=True when the caller wants T1→T3 auto-recovery. Kept
+        # behind a flag so an explicit `tier='t1'` request from the agent
+        # is honored without surprise upgrades.
+        allow_escalation = (tier or "auto").lower() == "auto"
+        data = await self._open_session_on_tier(
+            chosen_tier, url=url, region=region, proxy=proxy,
+        )
+        if isinstance(data, str):
+            # `_open_session_on_tier` returns a string on hard failure
+            # (transient rate limit, t3 launch failure). Surface it.
+            return data
 
-            r = await _request_with_backoff(
-                "POST",
-                f"{SUPERBROWSER_URL}/session/create",
-                json=payload,
-                timeout=45.0,
+        # --- T1 → T3 auto-escalation -------------------------------------
+        # When the Tier-1 Puppeteer path hits a hard anti-bot block
+        # (401/403/429/502/503) before any content loads, the Tier-3
+        # patchright + stealth stack is the right next hop. Close the
+        # doomed T1 session, record the block so choose_starting_tier
+        # prefers T3 next time, and re-open on T3 within this tool call
+        # — the caller sees one consistent result regardless of which
+        # tier actually served it.
+        status_code = data.get("statusCode") if isinstance(data, dict) else None
+        if (
+            allow_escalation
+            and chosen_tier == "t1"
+            and isinstance(status_code, int)
+            and status_code in (401, 403, 429, 502, 503)
+        ):
+            print(
+                f"  [T1→T3 auto-escalation] HTTP {status_code} on T1; "
+                f"retrying with patchright (T3)..."
             )
-            if r.status_code == 429:
-                # Retries exhausted. Give the LLM a CLEAR hint that this is
-                # transient — otherwise it hallucinates a permanent outage
-                # (observed 2026-04-14 log: "the service is completely
-                # blocking session creation") and gives up entirely.
-                return (
-                    "[transient_rate_limit] Browser session service is busy "
-                    "(HTTP 429 after retries). This is a temporary rate limit, "
-                    "NOT a permanent outage. Wait ~30 seconds and call "
-                    "browser_open again. Do not switch to a different strategy."
-                )
-            r.raise_for_status()
-            data = r.json()
+            # Clean up the blocked T1 session.
+            t1_sid = (data or {}).get("sessionId", "")
+            if t1_sid:
+                try:
+                    await _request_with_backoff(
+                        "DELETE",
+                        f"{SUPERBROWSER_URL}/session/{t1_sid}",
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            # Record the T1 block so next task on this domain starts on T3.
+            try:
+                from urllib.parse import urlparse as _up
+                from superbrowser_bridge.routing import _record_routing_outcome
+                host = (_up(url or "").hostname or "").lower()
+                if host:
+                    block_class = (
+                        "rate_limit" if status_code in (429, 503)
+                        else "antibot_403"
+                    )
+                    _record_routing_outcome(
+                        host, approach="browser", success=False,
+                        tier=1, block_class=block_class,
+                    )
+            except Exception:
+                pass
+            # Re-open on T3.
+            chosen_tier = "t3"
+            data = await self._open_session_on_tier(
+                "t3", url=url, region=region, proxy=proxy,
+            )
+            if isinstance(data, str):
+                return data
 
         actual_url = data.get("url", url or "")
         self.s.session_id = data.get("sessionId", "")
@@ -1656,13 +1819,32 @@ class BrowserOpenTool(Tool):
         # Network-layer block detection (4xx/5xx). Fast-fails before the worker
         # wastes iterations on an unresponsive page. 404 is treated as fatal
         # here (wrong URL) but not a network block per se.
+        #
+        # Special-case Cloudflare: a 403 with `block_class=cloudflare` is
+        # usually the Managed Challenge interstitial, not a permanent
+        # refusal. Arm the nav-guard (so duplicate navigate without solve
+        # is refused) and emit a caption that routes to browser_solve_captcha.
         status_code = data.get("statusCode")
+        _block_class = (
+            str(data.get("block_class") or data.get("blockClass") or "")
+            .lower()
+        )
         if isinstance(status_code, int):
             self.s.last_network_status = status_code
             if status_code >= 400 and status_code != 404:
                 self.s.network_blocked = True
-                caption += _build_network_block_message(status_code, actual_url)
-                self.s.record_step("browser_open", url or "blank", f"NETWORK_BLOCKED status={status_code}")
+                caption += _build_network_block_message(
+                    status_code, actual_url, block_class=_block_class,
+                )
+                if _block_class == "cloudflare":
+                    self.s.last_nav_cf_blocked_url = self.s._normalize_url(actual_url)
+                    self.s.nav_solve_called_since_block = False
+                    self.s.record_step(
+                        "browser_open", url or "blank",
+                        f"CF_INTERSTITIAL status={status_code}",
+                    )
+                else:
+                    self.s.record_step("browser_open", url or "blank", f"NETWORK_BLOCKED status={status_code}")
                 return caption
             elif status_code == 404:
                 caption += _build_network_block_message(404, actual_url)
@@ -1785,6 +1967,32 @@ class BrowserNavigateTool(Tool):
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
 
+        # CF-interstitial nav guard: if the last navigate to THIS URL was
+        # Cloudflare-blocked and nothing has been done to resolve it, a
+        # fresh page.goto will just re-trigger the same interstitial and
+        # burn budget. Tell the agent to call browser_solve_captcha first.
+        _norm_target = self.s._normalize_url(url)
+        if (
+            self.s.last_nav_cf_blocked_url
+            and _norm_target == self.s.last_nav_cf_blocked_url
+            and not self.s.nav_solve_called_since_block
+        ):
+            self.s.record_step(
+                "browser_navigate", url,
+                "BLOCKED: last navigate to this URL hit CF interstitial; "
+                "call browser_solve_captcha first",
+            )
+            return (
+                f"[CF_INTERSTITIAL_PENDING] The last navigate to {url} "
+                f"landed on a Cloudflare Managed Challenge "
+                f"('Performing security verification'). Re-navigating "
+                f"before solving will just re-trigger the same challenge. "
+                f"Call browser_solve_captcha(session_id='{session_id}', "
+                f"method='auto') to wait for the interstitial to auto-"
+                f"clear, THEN retry this navigate. If the solver also "
+                f"fails, call browser_ask_user to hand off to a human."
+            )
+
         # Detect regression before navigating
         regression = self.s.is_regression(url)
         if regression:
@@ -1803,17 +2011,47 @@ class BrowserNavigateTool(Tool):
         self.s.log_activity(f"navigate({url})", f"title={data.get('title', '?')}")
         self.s.record_url(actual_url)
 
+        # Set/clear the CF nav-guard based on what came back. `block_class`
+        # is populated by interactive_session.py after the challenge wait
+        # loop fails to clear. A navigate to any OTHER URL clears the
+        # guard regardless — progress elsewhere means the stuck state is
+        # gone.
+        _block_class = (
+            str(data.get("block_class") or data.get("blockClass") or "")
+            .lower()
+        )
+        if _block_class == "cloudflare":
+            self.s.last_nav_cf_blocked_url = self.s._normalize_url(actual_url)
+            self.s.nav_solve_called_since_block = False
+        elif _norm_target != self.s.last_nav_cf_blocked_url:
+            # Navigated to a different URL that isn't CF-blocked — guard off.
+            self.s.last_nav_cf_blocked_url = ""
+            self.s.nav_solve_called_since_block = False
+
         caption = _format_state(data, self.s)
 
         # Network-layer block detection — same logic as browser_open. Exit
         # early so the worker doesn't try to interact with a 403/429 shell.
+        # CF interstitial gets the solve-captcha routing caption and the
+        # nav-guard block set above.
         status_code = data.get("statusCode")
         if isinstance(status_code, int):
             self.s.last_network_status = status_code
             if status_code >= 400 and status_code != 404:
                 self.s.network_blocked = True
-                caption += _build_network_block_message(status_code, actual_url)
-                self.s.record_step("browser_navigate", url, f"NETWORK_BLOCKED status={status_code}")
+                caption += _build_network_block_message(
+                    status_code, actual_url, block_class=_block_class,
+                )
+                if _block_class == "cloudflare":
+                    self.s.record_step(
+                        "browser_navigate", url,
+                        f"CF_INTERSTITIAL status={status_code}",
+                    )
+                else:
+                    self.s.record_step(
+                        "browser_navigate", url,
+                        f"NETWORK_BLOCKED status={status_code}",
+                    )
                 return caption
             elif status_code == 404:
                 caption += _build_network_block_message(404, actual_url)
@@ -2333,13 +2571,35 @@ class BrowserTypeAtTool(Tool):
             f"{label}, text={text[:30]!r}",
             "skip_match" if not changed else ("cleared_and_typed" if before else "typed_into_empty"),
         )
-        _schedule_vision_prefetch(self.s, session_id)
         synthetic_data = {
             "success": True,
             "before": before,
             "after": after,
             "changed": changed,
         }
+        # Post-type semantic verification. Returns a caption suffix and
+        # may have already corrected the field in place.
+        if changed:
+            from .type_verify import verify_and_correct
+            field_meta = {
+                "label": str(result.get("label", "") or ""),
+                "name": str(result.get("name", "") or ""),
+                "autocomplete": str(result.get("autocomplete", "") or ""),
+                "input_type": str(result.get("input_type", "") or ""),
+            }
+            outcome = await verify_and_correct(
+                self.s, session_id,
+                target_x=target_x, target_y=target_y,
+                typed_text=text, label=label,
+                page_url=self.s.current_url,
+                field_meta=field_meta,
+            )
+            if outcome.kind == "corrected" and outcome.corrected_to:
+                synthetic_data["after"] = outcome.after or outcome.corrected_to
+                synthetic_data["auto_corrected"] = True
+                synthetic_data["corrected_to"] = outcome.corrected_to
+            caption += outcome.caption_suffix
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(synthetic_data, caption)
 
 
@@ -2490,7 +2750,6 @@ class BrowserFixTextAtTool(Tool):
             f"{label}, target={text[:30]!r}",
             diff,
         )
-        _schedule_vision_prefetch(self.s, session_id)
         # Wrap result in the same shape build_text_only expects.
         synthetic_data = {
             "success": True,
@@ -2499,6 +2758,27 @@ class BrowserFixTextAtTool(Tool):
             "changed": changed,
             "diff": diff,
         }
+        if changed:
+            from .type_verify import verify_and_correct
+            field_meta = {
+                "label": str(result.get("label", "") or ""),
+                "name": str(result.get("name", "") or ""),
+                "autocomplete": str(result.get("autocomplete", "") or ""),
+                "input_type": str(result.get("input_type", "") or ""),
+            }
+            outcome = await verify_and_correct(
+                self.s, session_id,
+                target_x=target_x, target_y=target_y,
+                typed_text=text, label=label,
+                page_url=self.s.current_url,
+                field_meta=field_meta,
+            )
+            if outcome.kind == "corrected" and outcome.corrected_to:
+                synthetic_data["after"] = outcome.after or outcome.corrected_to
+                synthetic_data["auto_corrected"] = True
+                synthetic_data["corrected_to"] = outcome.corrected_to
+            caption += outcome.caption_suffix
+        _schedule_vision_prefetch(self.s, session_id)
         return self.s.build_text_only(synthetic_data, caption)
 
 
@@ -2699,6 +2979,22 @@ class BrowserTypeTool(Tool):
                 "suggestion above via browser_click_at or use browser_keys "
                 "(ArrowDown + Enter) to select the first one."
             )
+
+        # Post-type semantic verification (index-addressed variant).
+        # Skip when the tool no-op'd (field already matched).
+        if pre_action != "skip_match":
+            from .type_verify import verify_and_correct_by_index
+            outcome = await verify_and_correct_by_index(
+                self.s, session_id,
+                dom_index=index, typed_text=text,
+                page_url=self.s.current_url,
+                field_meta={},
+            )
+            if outcome.kind == "corrected" and outcome.corrected_to:
+                if isinstance(data, dict):
+                    data["auto_corrected"] = True
+                    data["corrected_to"] = outcome.corrected_to
+            caption += outcome.caption_suffix
 
         # Prefetch vision so next screenshot call finds bboxes cached.
         _schedule_vision_prefetch(self.s, session_id)
@@ -3271,6 +3567,443 @@ class BrowserCaptchaScreenshotTool(Tool):
         )
 
 
+# --- Iterative captcha loop -------------------------------------------------
+# Shared between BrowserSolveCaptchaTool (Python path, method='vision') and
+# antibot/captcha/solve_vision.py (T3 HTTP path, POST /captcha/solve). Both
+# entry points end up here so a fix to the "click every tile blindly" bug
+# cannot regress in one path while the other is left behind.
+
+_SUBMIT_KEYWORDS = ("verify", "submit", "next", "continue", "check", "done", "i'm done")
+
+
+def _first_actionable(resp: Any) -> Any:
+    """Pick the next bbox worth acting on from a VisionResponse.
+
+    Preference: unselected captcha_tile → slider_handle → verify/submit
+    button → captcha_widget fallback. Returns None if the response has
+    nothing usable. Purely local — no side effects.
+    """
+    bboxes = getattr(resp, "bboxes", None) or []
+    tiles, handles, submits, widgets = [], [], [], []
+    for b in bboxes:
+        role = (getattr(b, "role", "") or "").lower()
+        label = (getattr(b, "label", "") or "").lower()
+        if role == "captcha_tile":
+            tiles.append(b)
+        elif role == "slider_handle":
+            handles.append(b)
+        elif role == "captcha_widget":
+            widgets.append(b)
+        elif role == "button" and any(kw in label for kw in _SUBMIT_KEYWORDS):
+            submits.append(b)
+    # Tiles first if any remain; submit only takes priority when tiles are
+    # gone (i.e. grid challenge completed).
+    if tiles:
+        return tiles[0]
+    if handles:
+        return handles[0]
+    if submits:
+        return submits[0]
+    if widgets:
+        return widgets[0]
+    return None
+
+
+async def _solve_captcha_iterative(
+    session_id: str,
+    captcha_info: Any,
+    vision_agent: Any,
+    *,
+    task_instruction: str = "",
+    solve_round: int = 0,
+    max_steps: int = 12,
+) -> dict[str, Any]:
+    """Per-step vision-driven captcha solver.
+
+    Each iteration: screenshot → vision (returns one next action) → click
+    or drag → poll structural hash until page changes (cap 600ms). Exits
+    when vision reports captcha_present=false or when a safety guard
+    (dead-action streak, max_steps, HTTP failure) fires.
+
+    Returns a structured dict the orchestrator's captcha-learnings
+    consumer understands — see orchestrator_tools._update_captcha_learnings.
+    Never raises into the caller; failures collapse into solved=False +
+    an `error` field.
+    """
+    actions: list[str] = []
+    last_click_xy: tuple[int, int] | None = None
+    # Trail of up to 6 recent click points, overlaid on the next
+    # screenshot so the model can see where we've already interacted.
+    cursor_trail: list[tuple[int, int]] = []
+    same_action_streak = 0
+    steps_taken = 0
+    model_name: str | None = None
+    provider_name: str | None = None
+
+    # Surface any text prompt the native detector already captured.
+    prompt_hint = ""
+    if captcha_info is not None:
+        for n in list(getattr(captcha_info, "notes", None) or []):
+            if isinstance(n, str) and n.startswith("text_signal:"):
+                prompt_hint = n.split(":", 1)[1]
+                break
+
+    for step in range(max_steps):
+        steps_taken = step + 1
+        # 1. Screenshot + page state.
+        try:
+            sr = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true"},
+                timeout=15.0,
+            )
+            sr.raise_for_status()
+            state = sr.json()
+        except Exception as exc:
+            actions.append(f"step {step}: state fetch failed: {exc}")
+            return {
+                "solved": False, "method": "vision_iterative",
+                "subMethod": "python_vision_agent",
+                "steps": steps_taken, "actions": actions,
+                "provider": provider_name, "model": model_name,
+                "error": f"state_fetch:{exc}",
+            }
+
+        b64 = state.get("screenshot")
+        if not b64:
+            actions.append(f"step {step}: no screenshot in state payload")
+            return {
+                "solved": False, "method": "vision_iterative",
+                "subMethod": "python_vision_agent",
+                "steps": steps_taken, "actions": actions,
+                "provider": provider_name, "model": model_name,
+                "error": "no_screenshot",
+            }
+        current_url = state.get("url", "")
+        elements_str = (
+            state.get("clickableElementsToString") or state.get("elements") or ""
+        )
+        try:
+            page_hash = BrowserSessionState.hash_page_content(elements_str)
+        except Exception:
+            page_hash = ""
+        img_w, img_h = _read_image_dims(b64)
+
+        # 2. Ask vision for the single next action.
+        last_action_hint = (
+            f"Previous click: ({last_click_xy[0]},{last_click_xy[1]})"
+            if last_click_xy else "Previous click: none"
+        )
+        try:
+            resp = await vision_agent.analyze(
+                screenshot_b64=b64,
+                # "captcha step" routes to the solve_captcha_step intent
+                # bucket in prompts.intent_bucket — step-mode suppresses
+                # SoM overlay and skips result caching.
+                intent="solve captcha step — pick the single next action",
+                session_id=session_id,
+                url=current_url,
+                dom_hash=f"cap-r{solve_round}-s{step}-{page_hash}",
+                image_width=img_w,
+                image_height=img_h,
+                task_instruction=(
+                    (task_instruction or "")
+                    + ("\nCaptcha prompt: " + prompt_hint if prompt_hint else "")
+                    + f"\n{last_action_hint}"
+                    + "\nReturn next_action committing to ONE step. If every "
+                    "matching tile appears selected/dismissed, pick "
+                    "action_type=submit targeting the verify button. If the "
+                    "captcha appears gone, pick action_type=done. Do NOT "
+                    "target within 40 pixels of the previous click unless a "
+                    "visibly new tile has rendered there."
+                ),
+                cursor_trail=cursor_trail if cursor_trail else None,
+            )
+        except Exception as exc:
+            actions.append(f"step {step}: vision call failed: {exc}")
+            return {
+                "solved": False, "method": "vision_iterative",
+                "subMethod": "python_vision_agent",
+                "steps": steps_taken, "actions": actions,
+                "provider": provider_name, "model": model_name,
+                "error": f"vision_call:{exc}",
+            }
+
+        model_name = model_name or resp.model
+        provider_name = provider_name or resp.provider
+
+        # 3. Done if the captcha is gone (only trust this after step 0 —
+        # the very first screenshot should see the captcha).
+        if step > 0 and not resp.flags.captcha_present:
+            actions.append(f"step {step}: captcha_present=false, exiting loop")
+            break
+
+        # 4. Prefer the structured next_action from step-mode. Fall back
+        # to the bbox-preference picker for older vision responses that
+        # don't fill next_action (e.g. providers that ignore the field,
+        # or non-step intents calling the shim).
+        na = getattr(resp, "next_action", None)
+        forced_drag = False  # na says drag_slider — override role dispatch
+        forced_type = False  # na says type_text — use target_input_bbox
+        type_value = ""
+        last_expect_change = "static"
+        if na is not None:
+            at = (getattr(na, "action_type", "") or "").lower()
+            if at == "done":
+                actions.append(f"step {step}: next_action=done, exiting loop")
+                break
+            if at == "stuck":
+                actions.append(
+                    f"step {step}: next_action=stuck "
+                    f"(reason: {getattr(na, 'reasoning', '')[:120]})"
+                )
+                return {
+                    "solved": False, "method": "vision_iterative",
+                    "subMethod": "python_vision_agent",
+                    "steps": steps_taken, "actions": actions,
+                    "provider": provider_name, "model": model_name,
+                    "error": "vision_stuck",
+                }
+            forced_drag = at == "drag_slider"
+            forced_type = at == "type_text"
+            last_expect_change = getattr(na, "expect_change", "static") or "static"
+            if forced_type:
+                # type_text targets the input field, not the image.
+                target = (
+                    getattr(na, "target_input_bbox", None)
+                    or getattr(na, "target_bbox", None)
+                )
+                type_value = (getattr(na, "type_value", "") or "").strip()
+                if not type_value:
+                    actions.append(
+                        f"step {step}: type_text without type_value — treating as stuck"
+                    )
+                    return {
+                        "solved": False, "method": "vision_iterative",
+                        "subMethod": "python_vision_agent",
+                        "steps": steps_taken, "actions": actions,
+                        "provider": provider_name, "model": model_name,
+                        "error": "type_text_missing_value",
+                    }
+            else:
+                target = getattr(na, "target_bbox", None)
+        else:
+            target = None
+
+        if target is None:
+            target = _first_actionable(resp)
+        if target is None:
+            if step == 0 and resp.flags.captcha_widget_bbox is not None:
+                target = resp.flags.captcha_widget_bbox
+            else:
+                actions.append(f"step {step}: no actionable bbox returned")
+                return {
+                    "solved": False, "method": "vision_iterative",
+                    "subMethod": "python_vision_agent",
+                    "steps": steps_taken, "actions": actions,
+                    "provider": provider_name, "model": model_name,
+                    "error": "no_actionable_bbox",
+                }
+
+        try:
+            cx, cy = target.center_pixels(img_w, img_h)
+            x0, y0, x1, y1 = target.to_pixels(img_w, img_h)
+        except Exception as exc:
+            actions.append(f"step {step}: malformed bbox: {exc}")
+            return {
+                "solved": False, "method": "vision_iterative",
+                "subMethod": "python_vision_agent",
+                "steps": steps_taken, "actions": actions,
+                "provider": provider_name, "model": model_name,
+                "error": "malformed_bbox",
+            }
+
+        # 5. Dead-action guard. Two successive near-duplicates within 40px
+        # and no site change → bail to the caller (who decides handoff).
+        if last_click_xy and abs(cx - last_click_xy[0]) < 40 and abs(cy - last_click_xy[1]) < 40:
+            same_action_streak += 1
+            if same_action_streak >= 2:
+                actions.append(
+                    f"step {step}: third same-target attempt within 40px — bailing"
+                )
+                return {
+                    "solved": False, "method": "vision_iterative",
+                    "subMethod": "python_vision_agent",
+                    "steps": steps_taken, "actions": actions,
+                    "provider": provider_name, "model": model_name,
+                    "error": "dead_action_streak",
+                }
+        else:
+            same_action_streak = 0
+
+        # 6. Dispatch. Explicit `drag_slider` / `type_text` from next_action
+        # win; otherwise fall back to bbox role.
+        role = (getattr(target, "role", "") or "").lower()
+        if forced_type:
+            try:
+                tr = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/type-at",
+                    json={
+                        "x": cx, "y": cy,
+                        "text": type_value,
+                        "clear": True,
+                    },
+                    timeout=30.0,
+                )
+                if tr.status_code >= 400:
+                    actions.append(
+                        f"step {step}: type-at HTTP {tr.status_code}, ending loop"
+                    )
+                    break
+                actions.append(
+                    f"step {step}: type_text {type_value!r} @({cx},{cy})"
+                )
+            except Exception as exc:
+                actions.append(f"step {step}: type-at dispatch exception: {exc}")
+                break
+        elif forced_drag or role == "slider_handle":
+            if captcha_info is not None and getattr(captcha_info, "widget_bbox", None):
+                wbb = captcha_info.widget_bbox
+                ex = max(float(wbb[2]) - 12, cx + 50)
+            elif resp.flags.captcha_widget_bbox is not None:
+                _x0, _y0, _x1, _y1 = resp.flags.captcha_widget_bbox.to_pixels(
+                    img_w, img_h,
+                )
+                ex = max(_x1 - 12, cx + 50)
+            else:
+                ex = cx + 250
+            try:
+                dr = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/drag",
+                    json={
+                        "startX": cx, "startY": cy,
+                        "endX": ex, "endY": cy,
+                        "steps": 30,
+                    },
+                    timeout=30.0,
+                )
+                if dr.status_code >= 400:
+                    actions.append(
+                        f"step {step}: drag HTTP {dr.status_code}, ending loop"
+                    )
+                    break
+                actions.append(
+                    f"step {step}: drag handle {getattr(target, 'label', '')!r} "
+                    f"({cx},{cy})→({int(ex)},{cy})"
+                )
+            except Exception as exc:
+                actions.append(f"step {step}: drag dispatch exception: {exc}")
+                break
+        else:
+            try:
+                cr = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/click",
+                    json={
+                        "x": cx, "y": cy,
+                        "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                    },
+                    timeout=30.0,
+                )
+                if cr.status_code == 409:
+                    actions.append(
+                        f"step {step}: click@({cx},{cy}) refused "
+                        "(low-reward band) — re-analyzing"
+                    )
+                    # Do NOT advance last_click_xy/streak; re-ask vision.
+                    continue
+                if cr.status_code >= 400:
+                    actions.append(
+                        f"step {step}: click HTTP {cr.status_code}, ending loop"
+                    )
+                    break
+                actions.append(
+                    f"step {step}: click {role or 'bbox'} "
+                    f"{getattr(target, 'label', '')!r} @({cx},{cy})"
+                )
+            except Exception as exc:
+                actions.append(f"step {step}: click dispatch exception: {exc}")
+                break
+
+        last_click_xy = (cx, cy)
+        cursor_trail.append((cx, cy))
+        if len(cursor_trail) > 6:
+            cursor_trail.pop(0)
+
+        # 7. Poll the structural hash until it changes, capped adaptively
+        # based on vision's expect_change hint. Hash-poll is faster than
+        # a blind sleep on static grids and safer on slow re-rendering
+        # ones. page_nav gets a much longer ceiling because whole-page
+        # transitions take ~1.5s.
+        poll_cap = {
+            "page_nav": 2.5,
+            "widget_replace": 1.0,
+            "new_tile": 0.6,
+            "static": 0.3,
+        }.get(last_expect_change, 0.6)
+        change_deadline = time.monotonic() + poll_cap
+        while time.monotonic() < change_deadline:
+            await asyncio.sleep(0.08)
+            try:
+                pr = await _request_with_backoff(
+                    "GET",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "false"},
+                    timeout=5.0,
+                )
+                if pr.status_code != 200:
+                    continue
+                ps = pr.json()
+                _elems = (
+                    ps.get("clickableElementsToString")
+                    or ps.get("elements") or ""
+                )
+                if not _elems:
+                    continue
+                new_hash = BrowserSessionState.hash_page_content(_elems)
+                if new_hash and new_hash != page_hash:
+                    break
+            except Exception:
+                pass
+
+    # 8. Verify once.
+    solved = False
+    try:
+        vr = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            params={"vision": "true"},
+            timeout=15.0,
+        )
+        if vr.status_code == 200:
+            verify_state = vr.json()
+            verify_b64 = verify_state.get("screenshot")
+            if verify_b64:
+                vresp = await vision_agent.analyze(
+                    screenshot_b64=verify_b64,
+                    intent="verify captcha cleared",
+                    session_id=session_id,
+                    url=verify_state.get("url", ""),
+                    dom_hash=f"cap-verify-r{solve_round}",
+                )
+                solved = not vresp.flags.captcha_present
+    except Exception:
+        solved = False
+
+    return {
+        "solved": solved,
+        "method": "vision_iterative",
+        "subMethod": "python_vision_agent",
+        "steps": steps_taken,
+        "actions": actions,
+        "provider": provider_name,
+        "model": model_name,
+    }
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -3286,8 +4019,18 @@ class BrowserSolveCaptchaTool(Tool):
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
+        # Per-session lock so concurrent solve calls on the same session
+        # serialize around captcha_solve_round / captcha_screenshots_used.
+        # The agent fires single-threaded, but retry loops or stray parallel
+        # tool calls can race otherwise.
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def execute(self, session_id: str, method: str | None = None, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
+        # Any solve attempt unblocks the CF nav-guard — whether or not
+        # the solve succeeds, the agent has acknowledged the interstitial,
+        # and re-navigating is no longer a blind loop.
+        self.s.nav_solve_called_since_block = True
+
         # Vision-based solve path. Replaces the three deleted TS vision
         # strategies (recaptcha-ai-grid, slider-drag, generic-vision) with
         # a single call to our dedicated Python vision agent. When the
@@ -3296,6 +4039,48 @@ class BrowserSolveCaptchaTool(Tool):
         # hitting the server's captcha/solve endpoint.
         if method == "vision":
             return await self._solve_via_vision(session_id)
+
+        # Auto-route captcha types that the TS server registry has no
+        # strategy for (text_captcha, generic) straight to the Python
+        # vision loop. Without this, method='auto' on T1 would fall all
+        # the way through to human_handoff for a classic distorted-word
+        # captcha that vision can solve directly.
+        #
+        # cf_interstitial gets its own solver (wait-based, not vision):
+        # the whole page IS the challenge, no clicking needed — CF's JS
+        # just needs time + humanization to auto-pass.
+        if method in (None, "auto"):
+            try:
+                dr = await _request_with_backoff(
+                    "GET",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/captcha/detect",
+                    timeout=10.0,
+                )
+                if dr.status_code == 200:
+                    det_cap = (dr.json() or {}).get("captcha") or {}
+                    det_type = (det_cap.get("type") or "").lower()
+                    det_present = bool(det_cap.get("present"))
+                    det_notes = det_cap.get("notes") or []
+                    print(
+                        f"  [auto-route] detect -> type={det_type!r} "
+                        f"present={det_present} notes={det_notes}"
+                    )
+                    if det_type == "cf_interstitial":
+                        return await self._solve_via_cf_wait(session_id)
+                    if det_type in ("text_captcha", "text", "generic", "image"):
+                        return await self._solve_via_vision(session_id)
+                else:
+                    print(
+                        f"  [auto-route] detect HTTP {dr.status_code} — "
+                        f"falling through to TS solver"
+                    )
+            except Exception as exc:
+                # Detection failure is non-fatal — fall through to the
+                # standard TS solver path which runs its own detection.
+                print(
+                    f"  [auto-route] detect raised "
+                    f"{type(exc).__name__}: {exc} — falling through"
+                )
 
         payload: dict[str, Any] = {}
         if method:
@@ -3409,17 +4194,121 @@ class BrowserSolveCaptchaTool(Tool):
 
         return f"{summary}\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
 
-    async def _solve_via_vision(self, session_id: str) -> str:
-        """Python-side captcha solver driven entirely by the vision agent.
+    async def _solve_via_cf_wait(self, session_id: str) -> str:
+        """Solve a Cloudflare Managed Challenge by waiting for auto-pass.
 
-        Flow:
-            1. Grab a screenshot + DOM state.
-            2. Ask the vision agent for captcha widget / tiles / handles.
-            3. Click each captcha_tile. For slider_handle, drag to the
-               right edge of the widget.
-            4. Re-screenshot and re-check flags.captcha_present. If still
-               present after one pass, report NOT solved (fast-to-human
-               policy will hand off).
+        Routes to `/captcha/solve` with method='cf_wait' — the T3 HTTP
+        dispatcher picks up `cf_interstitial` detect type and calls the
+        dedicated humanized wait loop (`antibot.captcha.solve_cf`). On
+        T1 the TS server's own CF handling runs.
+        """
+        print(f"  [cf_wait] entering solver for session={session_id}")
+        self.s.captcha_solve_round += 1
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            try:
+                r = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve",
+                    json={"method": "cf_wait"},
+                    timeout=120.0,
+                )
+                if r.status_code >= 400:
+                    body_snippet = ""
+                    try:
+                        body_snippet = json.dumps(r.json(), default=str)[:400]
+                    except Exception:
+                        body_snippet = (getattr(r, "text", "") or "")[:400]
+                    print(
+                        f"  [cf_wait] dispatcher returned HTTP {r.status_code}: "
+                        f"{body_snippet}"
+                    )
+                    data: dict[str, Any] = {
+                        "solved": False, "method": "cf_wait",
+                        "error": f"HTTP {r.status_code}",
+                        "dispatcher_body": body_snippet,
+                    }
+                else:
+                    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    if not isinstance(data, dict):
+                        data = {"solved": False, "method": "cf_wait",
+                                "error": "non-dict response"}
+                    print(
+                        f"  [cf_wait] result: solved={data.get('solved')} "
+                        f"durationMs={data.get('durationMs')} "
+                        f"iterations={data.get('iterations')} "
+                        f"cookies={data.get('cookies_landed')}"
+                    )
+            except Exception as exc:
+                import traceback as _tb
+                print(
+                    f"  [cf_wait] dispatch raised {type(exc).__name__}: {exc}"
+                )
+                print(_tb.format_exc())
+                data = {
+                    "solved": False, "method": "cf_wait",
+                    "error": f"dispatch failed: {exc}",
+                }
+
+        self.s.record_step(
+            "browser_solve_captcha",
+            "cf_wait",
+            f"solved={data.get('solved')} | "
+            f"{json.dumps(data, default=str)[:300]}",
+        )
+
+        if data.get("solved"):
+            self.s.captcha_mode = False
+            self.s.captcha_mode_remaining = 0
+            # Clear any nav-guard set by a prior failed navigate.
+            self.s.last_nav_cf_blocked_url = ""
+            return (
+                f"Captcha SOLVED via cf_wait (CF interstitial auto-passed "
+                f"in {data.get('durationMs', 0)}ms)"
+                f"\n\nResult JSON:\n{json.dumps(data, indent=2, default=str)}"
+            )
+        return (
+            f"Captcha NOT solved: CF interstitial did not auto-clear. "
+            f"Consider residential proxy (PROXY_POOL_RESIDENTIAL) or "
+            f"headful mode (SUPERBROWSER_ALLOW_HEADFUL=1 + xvfb), or "
+            f"call browser_ask_user for human handoff."
+            f"\n\nResult JSON:\n{json.dumps(data, indent=2, default=str)}"
+        )
+
+    async def _try_slider_dispatch(self, session_id: str) -> dict | None:
+        """POST to /captcha/solve with method='slider' and return the parsed
+        result, or None if the call itself errored.
+
+        Used by `_solve_via_vision` to give sliders first chance at the
+        dedicated bezier-drag solver before falling back to vision-driven
+        drag. Keeps the solver boundary clean — we just forward and let
+        the tier's native slider code (antibot.captcha.solve_slider on
+        T3, src/browser/captcha equivalent on T1) do its thing.
+        """
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/captcha/solve",
+                json={"method": "slider"},
+                timeout=60.0,
+            )
+            if r.status_code >= 400:
+                return None
+            data = r.json()
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return None
+
+    async def _solve_via_vision(self, session_id: str) -> str:
+        """Python-side captcha solver — delegates to the iterative loop.
+
+        Per-step flow lives in `_solve_captcha_iterative` so the T3 HTTP
+        dispatch path (antibot/captcha/solve_vision.py shim) and this
+        Python-tool path share one implementation. This method owns the
+        session-state plumbing around the loop: enable check, per-session
+        serialization, captcha_mode reset, and structured-result logging.
         """
         try:
             from vision_agent import get_vision_agent, vision_agent_enabled
@@ -3435,151 +4324,90 @@ class BrowserSolveCaptchaTool(Tool):
             )
 
         self.s.captcha_solve_round += 1
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
 
-        # Fetch screenshot + elements.
-        r = await _request_with_backoff(
-            "GET",
-            f"{SUPERBROWSER_URL}/session/{session_id}/state",
-            params={"vision": "true"},
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        state = r.json()
-
-        b64 = state.get("screenshot")
-        if not b64:
-            return "Captcha NOT solved: could not fetch screenshot from server."
-
-        agent = get_vision_agent()
-        try:
-            resp = await agent.analyze(
-                screenshot_b64=b64,
-                intent="solve captcha — identify widget, tiles, and handles",
-                session_id=session_id,
-                url=state.get("url", self.s.current_url),
-                dom_hash="",  # force cache miss for this solve attempt
-            )
-        except Exception as exc:
-            return f"Captcha NOT solved: vision call failed ({exc})."
-
-        if not resp.flags.captcha_present and not resp.flags.captcha_widget_bbox:
-            # Vision didn't see a captcha — maybe already cleared.
-            self.s.captcha_mode = False
-            self.s.captcha_mode_remaining = 0
-            return (
-                "Captcha SOLVED via vision/no_widget_visible — the vision "
-                "agent reports no captcha present on the page. If you "
-                "disagree, take a fresh screenshot and retry."
-            )
-
-        tiles = [b for b in resp.bboxes if b.role == "captcha_tile"]
-        handles = [b for b in resp.bboxes if b.role == "slider_handle"]
-        widget = resp.flags.captcha_widget_bbox
-
-        actions: list[str] = []
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Click each tile the vision agent flagged.
-            for tile in tiles:
-                cx, cy = tile.center()
-                try:
-                    await client.post(
-                        f"{SUPERBROWSER_URL}/session/{session_id}/click",
-                        json={"x": cx, "y": cy},
-                    )
-                    actions.append(f"click tile {tile.label!r} @({cx},{cy})")
-                    await asyncio.sleep(0.25)
-                except Exception as exc:
-                    actions.append(f"click tile failed: {exc}")
-
-            # Drag any slider handles to the right edge of their widget
-            # (or the handle bbox + 250px as a fallback).
-            for handle in handles:
-                sx, sy = handle.center()
-                if widget is not None:
-                    ex = widget.x + max(widget.w - 12, 1)
-                    ey = sy
-                else:
-                    ex, ey = sx + 250, sy
-                try:
-                    await client.post(
-                        f"{SUPERBROWSER_URL}/session/{session_id}/drag",
-                        json={"startX": sx, "startY": sy, "endX": ex, "endY": ey, "steps": 30},
-                    )
-                    actions.append(f"drag slider {handle.label!r} {sx},{sy} → {ex},{ey}")
-                    await asyncio.sleep(0.5)
-                except Exception as exc:
-                    actions.append(f"drag slider failed: {exc}")
-
-            # If we didn't find either, try clicking the widget center —
-            # reCAPTCHA "I'm not a robot" checkbox falls through here.
-            if not tiles and not handles and widget is not None:
-                cx, cy = widget.center()
-                try:
-                    await client.post(
-                        f"{SUPERBROWSER_URL}/session/{session_id}/click",
-                        json={"x": cx, "y": cy},
-                    )
-                    actions.append(f"click widget center @({cx},{cy})")
-                    await asyncio.sleep(1.0)
-                except Exception as exc:
-                    actions.append(f"click widget failed: {exc}")
-
-            # Verify.
+        async with lock:
+            # Best-effort detect for dispatcher context (slider widgets need
+            # the server-side pixel bbox to clamp drag endpoints). Failure
+            # is non-fatal — the loop proceeds with what vision sees.
+            captcha_info: Any = None
             try:
-                vr = await client.get(
-                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                    params={"vision": "true"},
+                dr = await _request_with_backoff(
+                    "GET",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/captcha/detect",
+                    timeout=10.0,
                 )
-                vr.raise_for_status()
-                verify_state = vr.json()
-            except Exception as exc:
-                verify_state = {"screenshot": None, "error": str(exc)}
-
-        verify_b64 = verify_state.get("screenshot")
-        solved = False
-        if verify_b64:
-            try:
-                vresp = await agent.analyze(
-                    screenshot_b64=verify_b64,
-                    intent="verify captcha cleared",
-                    session_id=session_id,
-                    url=verify_state.get("url", self.s.current_url),
-                    dom_hash="",
-                )
-                solved = not vresp.flags.captcha_present
+                if dr.status_code == 200:
+                    cap = (dr.json() or {}).get("captcha") or {}
+                    from superbrowser_bridge.antibot.captcha.detect import CaptchaInfo
+                    captcha_info = CaptchaInfo(
+                        type=cap.get("type", "none"),
+                        present=bool(cap.get("present", True)),
+                        site_key=cap.get("site_key", "") or "",
+                        widget_selector=cap.get("widget_selector", "") or "",
+                        widget_bbox=cap.get("widget_bbox"),
+                        input_bbox=cap.get("input_bbox"),
+                        frame_url=cap.get("frame_url", "") or "",
+                        notes=list(cap.get("notes") or []),
+                    )
             except Exception:
-                solved = False
+                captcha_info = None
 
-        structured = {
-            "solved": solved,
-            "method": "vision",
-            "subMethod": "python_vision_agent",
-            "attempts": 1,
-            "tiles_clicked": len(tiles),
-            "handles_dragged": len(handles),
-            "actions": actions,
-            "provider": resp.provider,
-            "model": resp.model,
-        }
+            # Slider pre-dispatch: the dedicated bezier-drag solver
+            # (antibot.captcha.solve_slider on T3 / TS equivalent on T1)
+            # has a motion profile tuned to defeat Geetest/Tencent/DataDome
+            # fingerprinting. Vision-driven drag via our /drag endpoint
+            # works, but the bezier solver is materially better at this
+            # specific class. Route sliders to it first; fall through to
+            # the iterative loop only if the dedicated solver returns
+            # unsolved.
+            if captcha_info is not None and captcha_info.type == "slider":
+                slider_result = await self._try_slider_dispatch(session_id)
+                if slider_result is not None and slider_result.get("solved"):
+                    self.s.record_step(
+                        "browser_solve_captcha",
+                        "vision->slider",
+                        f"solved=True via dedicated slider solver | "
+                        f"{json.dumps(slider_result, default=str)[:280]}",
+                    )
+                    self.s.captcha_mode = False
+                    self.s.captcha_mode_remaining = 0
+                    return (
+                        f"Captcha SOLVED via dedicated slider bezier-drag"
+                        f"\n\nResult JSON:\n{json.dumps(slider_result, indent=2, default=str)}"
+                    )
+                # Dedicated solver failed — fall through to the iterative
+                # loop so vision can try. Error paths end up reported by
+                # the loop result.
+
+            agent = get_vision_agent()
+            result = await _solve_captcha_iterative(
+                session_id,
+                captcha_info,
+                agent,
+                task_instruction=self.s.task_instruction,
+                solve_round=self.s.captcha_solve_round,
+            )
+
         self.s.record_step(
             "browser_solve_captcha",
             "vision",
-            f"solved={solved} | {json.dumps(structured, default=str)[:300]}",
+            f"solved={result.get('solved')} | "
+            f"{json.dumps(result, default=str)[:300]}",
         )
 
-        if solved:
+        if result.get("solved"):
             self.s.captcha_mode = False
             self.s.captcha_mode_remaining = 0
             return (
-                f"Captcha SOLVED via vision/python_vision_agent "
-                f"({len(tiles)} tile(s), {len(handles)} handle(s))"
-                f"\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+                f"Captcha SOLVED via vision_iterative "
+                f"({result.get('steps', 0)} step(s))"
+                f"\n\nResult JSON:\n{json.dumps(result, indent=2, default=str)}"
             )
         return (
-            f"Captcha NOT solved after one vision-driven attempt. "
+            f"Captcha NOT solved after {result.get('steps', 0)} step(s). "
             f"Per fast-to-human policy, call browser_ask_user next."
-            f"\n\nResult JSON:\n{json.dumps(structured, indent=2, default=str)}"
+            f"\n\nResult JSON:\n{json.dumps(result, indent=2, default=str)}"
         )
 
 

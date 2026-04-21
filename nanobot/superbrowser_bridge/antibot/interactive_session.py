@@ -65,6 +65,125 @@ SESSION_MAX_LIFETIME_S = 2 * 60 * 60
 _DOM_INDEXER_PATH = Path(__file__).parent / "dom_indexer.js"
 
 
+_XVFB_STARTED: bool = False
+
+
+def _maybe_start_xvfb(headless: bool) -> None:
+    """If we're launching headful on a host with no DISPLAY, try to spawn
+    Xvfb and point the browser at it. No-op otherwise.
+
+    Opt-out via T3_AUTO_XVFB=0 for deployments that manage their own
+    display. Silent fallback when Xvfb isn't installed — caller stays
+    headful-intent, but with no DISPLAY the browser will fail naturally
+    and the operator sees a clear "xvfb not found" log line.
+    """
+    global _XVFB_STARTED
+    if _XVFB_STARTED:
+        return
+    if headless:
+        return
+    if os.environ.get("T3_AUTO_XVFB", "1") == "0":
+        return
+    if os.environ.get("DISPLAY"):
+        return  # Caller already has a display — don't stomp on it.
+    import shutil as _shutil
+    import subprocess as _subprocess
+    xvfb_bin = _shutil.which("Xvfb")
+    if not xvfb_bin:
+        logger.warning(
+            "T3_HEADLESS=0 but Xvfb is not installed and DISPLAY is "
+            "unset — browser launch will likely fail. "
+            "apt install xvfb, or set T3_HEADLESS=1."
+        )
+        return
+    display = os.environ.get("T3_XVFB_DISPLAY") or ":99"
+    try:
+        _subprocess.Popen(
+            [xvfb_bin, display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            # Detach so our asyncio loop exiting doesn't kill Xvfb.
+            preexec_fn=os.setpgrp,
+        )
+        os.environ["DISPLAY"] = display
+        _XVFB_STARTED = True
+        logger.info("started Xvfb on %s (display=%s)", xvfb_bin, display)
+        # Give Xvfb a moment to bind the socket before Chrome tries to
+        # connect. Avoids flaky "cannot open display" on fast boxes.
+        import time as _time
+        _time.sleep(0.3)
+    except Exception as exc:
+        logger.warning("failed to start Xvfb: %s — falling back to headless", exc)
+
+
+def _profile_root() -> Path:
+    """Resolve the parent directory for per-domain browser profiles.
+
+    Overridable via T3_PROFILE_ROOT; defaults to ~/.superbrowser/profiles/.
+    Creation is lazy — the caller materializes the per-domain subdir
+    on first use.
+    """
+    override = os.environ.get("T3_PROFILE_ROOT")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".superbrowser" / "profiles"
+
+
+def _domain_safe(domain: str) -> str:
+    """Sanitize a domain string into a filesystem-safe directory name."""
+    if not domain:
+        return "_blank"
+    # Lowercase, strip www., replace anything non-alphanum with underscore.
+    s = domain.lower()
+    if s.startswith("www."):
+        s = s[4:]
+    import re as _re
+    s = _re.sub(r"[^a-z0-9._-]", "_", s)
+    return s or "_blank"
+
+
+def _resolve_profile_dir(domain: str) -> Path:
+    """Return the per-domain profile directory, evicting it first when
+    size exceeds T3_PROFILE_MAX_MB (default 200) to keep disk bounded.
+
+    This resolver is the single seam that a future object-storage adapter
+    can replace: swap this function to download-then-return a local path,
+    and a close hook that uploads on shutdown, and the rest of the stack
+    is unaffected.
+    """
+    base = _profile_root() / _domain_safe(domain)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.debug("profile dir mkdir %s failed: %s", base, exc)
+        return base
+
+    try:
+        cap_mb = float(os.environ.get("T3_PROFILE_MAX_MB") or 200.0)
+    except ValueError:
+        cap_mb = 200.0
+    try:
+        # Cheap size check — recursive du without tools.
+        total = 0
+        for root, _dirs, files in os.walk(base):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    continue
+        if total > cap_mb * 1024 * 1024:
+            logger.warning(
+                "profile %s exceeded %.0f MB (%d bytes) — evicting",
+                base, cap_mb, total,
+            )
+            import shutil as _shutil
+            _shutil.rmtree(base, ignore_errors=True)
+            base.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("profile size check %s: %s", base, exc)
+    return base
+
+
 @dataclass
 class _ManagedSession:
     id: str
@@ -76,6 +195,22 @@ class _ManagedSession:
     proxy: Optional[str]
     ua: str = ""
     task_id: str = ""
+    # Set when this session owns a per-session Browser (i.e. was opened
+    # via `launch_persistent_context` with its own user_data_dir). The
+    # close path must close this in addition to the context so we don't
+    # leak Chromium processes. `None` means the session shares the
+    # singleton browser and close only tears down the context.
+    persistent_browser: Optional[Any] = None
+    # CDP session used for Page.startScreencast. Populated in `open()`
+    # when the live viewer is running; close path stops the screencast
+    # before tearing down the context. `None` means no screencast (CDP
+    # attach failed, or viewer infra not available).
+    cdp: Optional[Any] = None
+    # Virtual cursor position tracked across tool calls so we can do
+    # smooth bezier approaches to each target (instead of teleporting)
+    # and feed those intermediate points into the viewer overlay.
+    cursor_x: float = 640.0
+    cursor_y: float = 384.0
 
 
 class T3SessionManager:
@@ -99,22 +234,46 @@ class T3SessionManager:
                 return
             self._pw = await async_playwright().start()
             headless = os.environ.get("T3_HEADLESS", "1") != "0"
-            self._browser = await self._pw.chromium.launch(
-                headless=headless,
-                args=[
-                    # Existing canonical stealth flag.
-                    "--disable-blink-features=AutomationControlled",
-                    # Reduce site-isolation signals that Cloudflare's JS reads
-                    # to tell headless Chromium apart from a real Chrome build.
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--disable-site-isolation-trials",
-                    # Suppress first-run / default-browser prompts that delay
-                    # page navigation and leave telltale console output.
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    # Keep GPU ON — disabling it is itself a headless tell.
-                ],
-            )
+            _maybe_start_xvfb(headless)
+            args = [
+                # Existing canonical stealth flag.
+                "--disable-blink-features=AutomationControlled",
+                # Reduce site-isolation signals that Cloudflare's JS reads
+                # to tell headless Chromium apart from a real Chrome build.
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                # Suppress first-run / default-browser prompts that delay
+                # page navigation and leave telltale console output.
+                "--no-first-run",
+                "--no-default-browser-check",
+                # Keep GPU ON — disabling it is itself a headless tell.
+            ]
+            # HTTP/2 off by default. Some anti-bot stacks (Imperva on
+            # cars.com, a couple of Akamai deployments) reject HTTP/2
+            # frames from Chromium when the TLS/JA3 fingerprint doesn't
+            # match their allowlist, surfacing as ERR_HTTP2_PROTOCOL_ERROR
+            # before a page even renders. Forcing HTTP/1.1 makes those
+            # hosts reachable at a small latency cost. Opt back into
+            # HTTP/2 per-process via T3_DISABLE_HTTP2=0.
+            if os.environ.get("T3_DISABLE_HTTP2", "1") != "0":
+                args.append("--disable-http2")
+            # Real-Chrome override: CHROME_PATH points at a real Google
+            # Chrome binary (e.g. /usr/bin/google-chrome), CHROME_CHANNEL
+            # uses Playwright's channel selector ("chrome", "chrome-beta",
+            # "msedge"). Real Chrome carries codec/UA/JIT signals that
+            # bundled Chromium lacks and Imperva/CF score for. `None` for
+            # either preserves today's behaviour (bundled Chromium).
+            chrome_path = os.environ.get("CHROME_PATH") or None
+            chrome_channel = os.environ.get("CHROME_CHANNEL") or None
+            launch_kwargs: dict[str, Any] = {
+                "headless": headless,
+                "args": args,
+            }
+            if chrome_path:
+                launch_kwargs["executable_path"] = chrome_path
+            if chrome_channel:
+                launch_kwargs["channel"] = chrome_channel
+            self._browser = await self._pw.chromium.launch(**launch_kwargs)
             # Start a janitor that closes idle/aged sessions. Survives the
             # lifetime of the worker process.
             if self._cleanup_task is None or self._cleanup_task.done():
@@ -172,8 +331,19 @@ class T3SessionManager:
         """Create a new session. Returns the same dict shape the TS server
         returns from POST /session/create.
         """
-        await self._ensure_browser()
-        assert self._browser is not None
+        persist = os.environ.get("T3_PERSIST_PROFILE", "0") != "0"
+        if not persist:
+            await self._ensure_browser()
+            assert self._browser is not None
+        else:
+            # Persistent mode needs Playwright running even if we won't
+            # touch `self._browser`. Kick the shared janitor up the same
+            # way as the ephemeral path does.
+            async with self._lock:
+                if self._pw is None:
+                    self._pw = await async_playwright().start()
+                if self._cleanup_task is None or self._cleanup_task.done():
+                    self._cleanup_task = asyncio.create_task(self._janitor())
         domain = urlparse(url or "about:blank").hostname or ""
 
         if proxy is None:
@@ -195,13 +365,54 @@ class T3SessionManager:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             )
-        context = await self._browser.new_context(
-            viewport={"width": viewport[0], "height": viewport[1]},
-            locale="en-US",
-            timezone_id="America/New_York",
-            proxy=launch_proxy,
-            user_agent=ua,
-        )
+        persistent_browser: Optional[Any] = None
+        if persist:
+            # Per-session persistent context: each domain gets its own
+            # user-data-dir so localStorage/IndexedDB/service-workers/
+            # cf_clearance survive across sessions within this VM
+            # lifetime. Different launch semantics from ephemeral mode:
+            # `launch_persistent_context` takes launch + context kwargs
+            # in a single call and returns a BrowserContext whose
+            # owning Browser must be closed with it.
+            profile_dir = _resolve_profile_dir(domain)
+            persist_args: list[str] = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            if os.environ.get("T3_DISABLE_HTTP2", "1") != "0":
+                persist_args.append("--disable-http2")
+            persist_headless = os.environ.get("T3_HEADLESS", "1") != "0"
+            _maybe_start_xvfb(persist_headless)
+            persist_kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "headless": persist_headless,
+                "args": persist_args,
+                "viewport": {"width": viewport[0], "height": viewport[1]},
+                "locale": "en-US",
+                "timezone_id": "America/New_York",
+                "proxy": launch_proxy,
+                "user_agent": ua,
+            }
+            chrome_path = os.environ.get("CHROME_PATH") or None
+            chrome_channel = os.environ.get("CHROME_CHANNEL") or None
+            if chrome_path:
+                persist_kwargs["executable_path"] = chrome_path
+            if chrome_channel:
+                persist_kwargs["channel"] = chrome_channel
+            context = await self._pw.chromium.launch_persistent_context(**persist_kwargs)
+            # Remember the browser handle so close() can tear it down.
+            persistent_browser = getattr(context, "browser", None)
+        else:
+            context = await self._browser.new_context(
+                viewport={"width": viewport[0], "height": viewport[1]},
+                locale="en-US",
+                timezone_id="America/New_York",
+                proxy=launch_proxy,
+                user_agent=ua,
+            )
         # Conservative playwright-stealth surface. Keep UA, webdriver,
         # languages, permissions, plugins, WebGL, sec-ch-ua patches on —
         # these are read by Cloudflare IUAM and benefit from spoofing.
@@ -267,6 +478,10 @@ class T3SessionManager:
 
         sid = f"t3-session-{uuid.uuid4().hex}"
         now = time.time()
+        # Seed the virtual cursor at a realistic-ish starting point
+        # (upper-left quadrant, small random offset) so smooth-move to
+        # the first click doesn't start from dead center.
+        import random as _init_rng
         self._sessions[sid] = _ManagedSession(
             id=sid,
             context=context,
@@ -277,7 +492,83 @@ class T3SessionManager:
             proxy=proxy,
             ua=ua,
             task_id=task_id,
+            persistent_browser=persistent_browser,
+            cursor_x=float(_init_rng.randint(280, 620)),
+            cursor_y=float(_init_rng.randint(220, 420)),
         )
+
+        # CDP screencast → T3 viewer. Starts streaming JPEG frames as
+        # fast as CfT encodes them (every other frame at quality 60 ≈
+        # 12-15 FPS in practice). The emit is per-frame into the bus;
+        # the viewer's WS handler fans out to subscribers. Failures
+        # here are non-fatal — polling-fallback still works.
+        # Opt-out via T3_DISABLE_SCREENCAST=1 (saves bandwidth when
+        # the viewer isn't in use, e.g. non-interactive runs).
+        if os.environ.get("T3_DISABLE_SCREENCAST") != "1":
+            frame_counter = {"n": 0}
+            try:
+                cdp = await context.new_cdp_session(page)
+                self._sessions[sid].cdp = cdp
+
+                def _on_frame(params: dict) -> None:
+                    # Runs inside patchright's event loop. Emit into
+                    # the bus + schedule the CDP ack as a task (ack
+                    # is async so we can't await from a sync handler).
+                    try:
+                        data = params.get("data") or ""
+                        md = params.get("metadata") or {}
+                        from . import t3_event_bus as _bus
+                        _bus.default().emit_screencast_frame(
+                            sid, data,
+                            width=int(md.get("deviceWidth") or 0),
+                            height=int(md.get("deviceHeight") or 0),
+                            timestamp=float(md.get("timestamp") or 0.0),
+                        )
+                        frame_counter["n"] += 1
+                        # One-shot log on the first frame so the
+                        # operator can verify screencast actually
+                        # started (not just CDP attach).
+                        if frame_counter["n"] == 1:
+                            print(
+                                f"  [cdp screencast] first frame received "
+                                f"for {sid} ({len(data)} bytes)"
+                            )
+                        ack_sid = params.get("sessionId")
+                        if ack_sid is not None:
+                            asyncio.create_task(
+                                cdp.send(
+                                    "Page.screencastFrameAck",
+                                    {"sessionId": int(ack_sid)},
+                                ),
+                            )
+                    except Exception as exc:
+                        logger.debug("screencast frame handler: %s", exc)
+
+                cdp.on("Page.screencastFrame", _on_frame)
+                # Tight parameters for smoother viewer — quality 55
+                # (small JPEGs) at everyNthFrame=1 gives ~20-24 FPS
+                # on a well-provisioned VM. Bump T3_SCREENCAST_QUALITY
+                # down if bandwidth is a concern.
+                quality = int(os.environ.get("T3_SCREENCAST_QUALITY") or 55)
+                every_nth = int(os.environ.get("T3_SCREENCAST_EVERY_N") or 1)
+                await cdp.send("Page.startScreencast", {
+                    "format": "jpeg",
+                    "quality": quality,
+                    "everyNthFrame": every_nth,
+                })
+                print(
+                    f"  [cdp screencast] started for {sid} "
+                    f"(quality={quality}, everyNthFrame={every_nth})"
+                )
+            except Exception as exc:
+                print(
+                    f"  [cdp screencast] setup FAILED for {sid}: "
+                    f"{type(exc).__name__}: {exc} — viewer will use "
+                    f"250ms polling fallback"
+                )
+                logger.debug(
+                    "CDP screencast setup failed (non-fatal): %s", exc,
+                )
 
         if url:
             nav = await self._goto_with_warmup(sid, url, timeout_s)
@@ -294,7 +585,11 @@ class T3SessionManager:
                     nav = await self._goto_with_warmup(sid, url, timeout_s)
                     nav["retry_used"] = True
                 except Exception as exc:
-                    logger.debug("retry with fresh context failed: %s", exc)
+                    import traceback as _tb
+                    logger.warning(
+                        "retry with fresh context failed (sid=%s): %s\n%s",
+                        sid, exc, _tb.format_exc(),
+                    )
                     nav.setdefault("block_class", "cloudflare")
         else:
             nav = {"url": "about:blank", "status": 0, "title": ""}
@@ -339,6 +634,26 @@ class T3SessionManager:
         s = self._sessions.get(sid)
         if s is None:
             raise KeyError(f"session not found: {sid}")
+        # Persistent-profile sessions do not participate in the fresh-UA
+        # retry dance: the whole point of a persistent profile is that
+        # continuity (same UA, same localStorage, same cf_clearance) is
+        # what passes the challenge. Rebuilding would wipe it. Skip —
+        # the CF solver will still humanize-wait on the current context.
+        if s.persistent_browser is not None:
+            logger.info(
+                "retry skipped for persistent-profile session %s "
+                "(rebuild would discard the profile)", sid,
+            )
+            return
+        # Also defensive: if the shared browser is somehow None (shouldn't
+        # happen in ephemeral mode but surfaced a NoneType crash before
+        # this guard landed), bail cleanly instead of attacking None.
+        if self._browser is None:
+            logger.warning(
+                "retry aborted for %s: shared browser is None "
+                "(persistent mode without persistent_browser set?)", sid,
+            )
+            return
         # Demote the proxy tier for this domain so the next attempt may
         # pick a stricter pool (residential if configured).
         try:
@@ -398,6 +713,239 @@ class T3SessionManager:
         s.page = new_page
         s.ua = new_ua
         s.proxy = new_proxy
+
+    async def _move_cursor_smooth(
+        self,
+        sid: str,
+        target_x: float,
+        target_y: float,
+        *,
+        steps: Optional[int] = None,
+    ) -> None:
+        """Move the browser cursor along a bezier arc to (target_x,
+        target_y), emitting each intermediate point to the T3 event bus.
+
+        Two wins: (1) the live viewer's SVG cursor glides instead of
+        teleporting, so the UX feels continuous; (2) Cloudflare /
+        Imperva sensor code sees smooth mousemove entropy instead of
+        a bot-like jump to the click coordinate. Real humans take
+        ~80-250 ms to move their cursor to a visible target; we
+        replicate that with variable per-step delay.
+
+        Safe on failure — any exception inside the loop just advances
+        the cursor state and returns. Never raises into the caller.
+        """
+        import math as _math
+        import random as _rng
+        try:
+            s = self._get(sid)
+        except KeyError:
+            return
+        sx, sy = float(s.cursor_x), float(s.cursor_y)
+        tx, ty = float(target_x), float(target_y)
+        dx, dy = tx - sx, ty - sy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < 2.0:
+            # Already on target — just update state, no motion needed.
+            s.cursor_x, s.cursor_y = tx, ty
+            return
+        # Step count scales with distance so short hops aren't
+        # needlessly chunky and long travels still look smooth.
+        n = steps if steps is not None else max(6, min(24, int(dist / 45)))
+        # Control-point offset perpendicular to the line gives an arc,
+        # not a straight line. Real mouse paths curve slightly.
+        perp_mag = _rng.uniform(-0.22, 0.22) * dist
+        mx = (sx + tx) / 2.0
+        my = (sy + ty) / 2.0
+        if dist > 0.0:
+            nx = -dy / dist
+            ny = dx / dist
+            mx += perp_mag * nx
+            my += perp_mag * ny
+        # Resolve the event bus once — re-importing on every step is
+        # the kind of micro-overhead that adds up at 15-24 steps.
+        try:
+            from . import t3_event_bus as _bus_mod
+            bus = _bus_mod.default()
+        except Exception:
+            bus = None
+        page = s.page
+        try:
+            for i in range(1, n + 1):
+                t = i / n
+                # Ease-in-out: velocity higher mid-arc than at endpoints.
+                t2 = t * t * (3 - 2 * t)
+                x = (1 - t2) ** 2 * sx + 2 * (1 - t2) * t2 * mx + t2 ** 2 * tx
+                y = (1 - t2) ** 2 * sy + 2 * (1 - t2) * t2 * my + t2 ** 2 * ty
+                # Micro-jitter mimics hand tremor; too small to matter
+                # for click accuracy at the final step since we snap to
+                # tx,ty after the loop.
+                x += _rng.uniform(-0.8, 0.8)
+                y += _rng.uniform(-0.8, 0.8)
+                try:
+                    await page.mouse.move(x, y)
+                except Exception:
+                    break
+                if bus is not None:
+                    try:
+                        bus.emit_cursor_move(sid, x, y)
+                    except Exception:
+                        pass
+                await asyncio.sleep(_rng.uniform(0.008, 0.022))
+            # Snap to the exact target so downstream `mouse.click()` lands
+            # where it was asked. Don't skip — the jitter above would
+            # otherwise leave us ±1 px off.
+            try:
+                await page.mouse.move(tx, ty)
+            except Exception:
+                pass
+            if bus is not None:
+                try:
+                    bus.emit_cursor_move(sid, tx, ty)
+                except Exception:
+                    pass
+        finally:
+            s.cursor_x, s.cursor_y = tx, ty
+
+    async def _wait_for_cf_clear(
+        self,
+        sid: str,
+        *,
+        timeout_s: float = 30.0,
+        origin_url: str = "",
+    ) -> dict[str, Any]:
+        """Poll an active session until a Cloudflare-style challenge clears.
+
+        Watches for three exit conditions (any one trips):
+          - title no longer matches known challenge strings
+          - URL changed away from `origin_url`
+          - at least one challenge-clearance cookie (cf_clearance, __cf_bm,
+            datadome, _abck, ak_bmsc, incap_ses_, reese84) present
+
+        Humanizes during the wait (mouse moves + occasional wheel) so
+        Cloudflare's sensor sees interaction signals. Used by both
+        `_goto_with_warmup` (post-nav auto-wait) and the `solve_cf`
+        captcha solver (explicit retry after a tool-surface detect).
+
+        Returns a structured dict — callers decide whether `cleared=false`
+        warrants escalation.
+        """
+        s = self._get(sid)
+        import math as _math
+        import random as _rng
+        # ONLY cookies that specifically indicate a challenge has been
+        # PASSED — not bot-management cookies (__cf_bm, _abck, ak_bmsc,
+        # incap_ses_) which CF/Akamai set on every request regardless
+        # of challenge outcome. Treating those as success signals causes
+        # false positives where the page is still on the interstitial
+        # but we declare solved=true and move on (observed 2026-04-21
+        # on cars.com: solver returned solved=True in 1.2s while the
+        # title was still 'Just a moment...').
+        clearance_cookie_names = {
+            "cf_clearance",   # Cloudflare challenge passed
+            "datadome",       # DataDome challenge passed
+            "reese84",        # Incapsula / Imperva challenge passed
+        }
+        origin = origin_url or s.page.url
+        deadline = time.time() + float(timeout_s)
+        iteration = 0
+        cleared = False
+        cookies_landed: list[str] = []
+        final_title = ""
+        final_url = origin
+        # Nothing session-local needed here — `_move_cursor_smooth`
+        # reads/writes the cursor position on `s` directly. Left a
+        # stub name for the inner waypoint emitter so the loop body
+        # below reads naturally.
+        async def _humanize_move_to(tx: float, ty: float) -> None:
+            await self._move_cursor_smooth(sid, tx, ty)
+        try:
+            while time.time() < deadline:
+                iteration += 1
+                title_now = (await s.page.title() or "").lower()
+                body_snippet = (await s.page.evaluate(
+                    "() => (document.body ? document.body.innerText.slice(0, 400) : '').toLowerCase()"
+                )) or ""
+                looks_challenge = (
+                    "just a moment" in title_now
+                    or "verifying" in body_snippet
+                    or "security check" in body_snippet
+                    or "performing" in body_snippet
+                    or "checking your browser" in body_snippet
+                    or "one moment" in body_snippet
+                    or "verify you are human" in body_snippet
+                )
+                current_url = s.page.url
+                url_changed = current_url and current_url != origin
+                final_url = current_url or origin
+                final_title = title_now
+                # Exit fast: page no longer looks like a challenge AND either
+                # URL redirected away OR we've seen at least two iterations
+                # (the first iteration fires before the challenge JS runs).
+                if not looks_challenge and (url_changed or iteration > 1):
+                    cleared = True
+                    break
+                cookies_now = await s.context.cookies()
+                names = {c.get("name", "") for c in cookies_now}
+                matched = names & clearance_cookie_names
+                # Only exit on cookie match when the page ALSO no longer
+                # looks like a challenge — protects against the case
+                # where cf_clearance is present (e.g. stale from the
+                # cookie jar) but CF is still serving the interstitial
+                # because it rejected the replayed value.
+                if matched and not looks_challenge:
+                    cookies_landed = sorted(matched)
+                    # Clearance landed — give the redirect a beat to finish.
+                    await asyncio.sleep(1.2)
+                    cleared = True
+                    break
+                # Humanize during the wait: smooth bezier mouse arcs +
+                # occasional wheel. CF's sensor counts mousemove events
+                # and scores entropy/smoothness — teleports score as
+                # bot-like, curves score as human. Each waypoint sits
+                # inside the visible viewport with a short dwell before
+                # the next arc starts.
+                try:
+                    # Bias waypoints away from the current cursor so
+                    # we generate actual motion (picking near-same
+                    # coords gives tiny jitters that CF ignores).
+                    while True:
+                        tx = _rng.randint(180, 1180)
+                        ty = _rng.randint(140, 640)
+                        if abs(tx - s.cursor_x) + abs(ty - s.cursor_y) > 120:
+                            break
+                    await _humanize_move_to(float(tx), float(ty))
+                    # Brief dwell — humans pause between movements.
+                    await asyncio.sleep(_rng.uniform(0.15, 0.5))
+                    if iteration % 3 == 0:
+                        try:
+                            await s.page.mouse.wheel(0, _rng.randint(80, 220))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # Loop pacing — shorter than the old 1s because the
+                # smooth-move itself now takes 150-500ms, so the wake
+                # cadence naturally lands in the "real user" band.
+                await asyncio.sleep(_rng.uniform(0.35, 0.75))
+        except Exception as exc:
+            import traceback as _tb
+            logger.warning(
+                "challenge-wait loop raised (sid=%s iter=%d): %s\n%s",
+                sid, iteration, exc, _tb.format_exc(),
+            )
+            return {
+                "cleared": False, "iterations": iteration,
+                "cookies_landed": cookies_landed,
+                "final_url": final_url, "final_title": final_title,
+                "error": f"{type(exc).__name__}: {exc}"[:200],
+            }
+        return {
+            "cleared": cleared, "iterations": iteration,
+            "cookies_landed": cookies_landed,
+            "final_url": final_url, "final_title": final_title,
+            "error": "",
+        }
 
     async def _goto_with_warmup(
         self, sid: str, url: str, timeout_s: float
@@ -475,65 +1023,14 @@ class T3SessionManager:
         except Exception:
             pass
 
-        # If we landed on a self-clearing challenge (Cloudflare "Just a
-        # moment", DataDome auto-verify, basic Akamai IUAM) give the JS
-        # time to run and stamp clearance cookies before we hand control
-        # back. Detected by title + presence of challenge cookie names.
-        # Defaults to 30s (configurable via T3_CF_WAIT_S). Mouse motion +
-        # occasional wheel scroll fires during the poll loop to look
-        # human while the challenge JS is scoring us.
-        import random as _rng
-        origin_challenge_url = s.page.url
-        try:
-            challenge_cookie_names = {
-                "cf_clearance", "__cf_bm", "datadome", "_abck",
-                "ak_bmsc", "incap_ses_", "reese84",
-            }
-            wait_s = float(os.environ.get("T3_CF_WAIT_S") or 30.0)
-            deadline = time.time() + wait_s
-            iteration = 0
-            while time.time() < deadline:
-                iteration += 1
-                title_now = (await s.page.title() or "").lower()
-                body_snippet = (await s.page.evaluate(
-                    "() => (document.body ? document.body.innerText.slice(0, 400) : '').toLowerCase()"
-                )) or ""
-                looks_challenge = (
-                    "just a moment" in title_now
-                    or "verifying" in body_snippet
-                    or "security check" in body_snippet
-                    or "performing" in body_snippet
-                    or "checking your browser" in body_snippet
-                    or "one moment" in body_snippet
-                    or "verify you are human" in body_snippet
-                )
-                current_url = s.page.url
-                url_changed = current_url and current_url != origin_challenge_url
-                # Exit fast: page no longer looks like a challenge AND either
-                # URL redirected away OR the title changed meaningfully.
-                if not looks_challenge and (url_changed or iteration > 1):
-                    break
-                cookies_now = await s.context.cookies()
-                names = {c.get("name", "") for c in cookies_now}
-                if names & challenge_cookie_names:
-                    # Clearance landed — give the redirect a beat to finish.
-                    await asyncio.sleep(1.2)
-                    break
-                # Humanize during the wait: small mouse moves + occasional
-                # wheel. Cloudflare's sensor counts mousemove + wheel events
-                # when deciding whether to clear automatically.
-                try:
-                    await s.page.mouse.move(
-                        _rng.randint(150, 900),
-                        _rng.randint(120, 600),
-                    )
-                    if iteration % 3 == 0:
-                        await s.page.mouse.wheel(0, _rng.randint(120, 320))
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
-        except Exception as exc:
-            logger.debug("challenge-wait loop: %s", exc)
+        # Self-clearing challenge wait (CF "Just a moment", DataDome auto-
+        # verify, basic Akamai IUAM). Humanized polling lives in
+        # `_wait_for_cf_clear` so the dedicated CF captcha solver can
+        # reuse it. Defaults 30s, configurable via T3_CF_WAIT_S.
+        wait_s = float(os.environ.get("T3_CF_WAIT_S") or 30.0)
+        await self._wait_for_cf_clear(
+            sid, timeout_s=wait_s, origin_url=s.page.url,
+        )
 
         # If the page still shows a challenge after the wait, see whether
         # a Cloudflare Turnstile iframe is present and try to auto-solve
@@ -636,16 +1133,40 @@ class T3SessionManager:
     async def navigate(self, sid: str, url: str, *, timeout_s: float = 45.0) -> dict[str, Any]:
         nav = await self._goto_with_warmup(sid, url, timeout_s)
         state = await self.state(sid)
+        # Live viewer telemetry — banner shows the current URL + title
+        # so the operator always knows where the worker landed.
+        try:
+            from . import t3_event_bus as _bus
+            _bus.default().emit_navigation(
+                sid, state.get("url", ""), state.get("title", ""),
+            )
+        except Exception:
+            pass
         return {**nav, **{k: v for k, v in state.items() if k not in nav}}
 
     async def close(self, sid: str) -> dict[str, Any]:
         s = self._sessions.pop(sid, None)
         if s is None:
             return {"success": False}
+        # Stop screencast before tearing down the context; otherwise
+        # CDP warns about dangling listeners during context shutdown.
+        if s.cdp is not None:
+            try:
+                await s.cdp.send("Page.stopScreencast")
+            except Exception as exc:
+                logger.debug("stop screencast %s: %s", sid, exc)
         try:
             await s.context.close()
         except Exception as exc:
             logger.debug("context close %s: %s", sid, exc)
+        # Per-session persistent browser — close only applies when the
+        # session was opened with launch_persistent_context. Shared
+        # browser (ephemeral mode) stays alive for other sessions.
+        if s.persistent_browser is not None:
+            try:
+                await s.persistent_browser.close()
+            except Exception as exc:
+                logger.debug("persistent browser close %s: %s", sid, exc)
         return {"success": True}
 
     # --- observation ---------------------------------------------------------
@@ -746,7 +1267,38 @@ class T3SessionManager:
         return _content.to_markdown(html or "")
 
     async def evaluate(self, sid: str, script: str) -> Any:
+        """Run a JS snippet in the page and return its result.
+
+        Playwright's `page.evaluate(str)` only accepts a bare expression
+        or a function literal — a statement body like
+        `const x = foo(); return x.bar;` raises `SyntaxError: Illegal
+        return statement` because `return` at the top level is invalid
+        JS. Nanobot's LLM and the TS server's `/evaluate` route both
+        emit statement-body scripts routinely, so we auto-wrap anything
+        that looks like one into an IIFE `(() => { <body> })()`. Bare
+        expressions pass through untouched.
+        """
         s = self._get(sid)
+        body = script.strip()
+        # Wrap only when it's a statement body, never a function literal —
+        # arrow fns / `async () => {}` / bare `function` / IIFE `(() => ...)()`
+        # / block `{ ... }` all stay as-is so their semantics are preserved.
+        starts_function = body.startswith(
+            ("(", "async ", "async(", "function", "=>", "{")
+        )
+        needs_wrap = False
+        if body and not starts_function:
+            import re as _re
+            has_top_return = _re.search(
+                r"(?:^|[\s;{])return(?:$|[\s(;])", body,
+            ) is not None
+            # Multi-statement: any ; that isn't just a trailing terminator.
+            has_multi_stmt = ";" in body.rstrip(" \t\n;")
+            needs_wrap = has_top_return or has_multi_stmt
+        if needs_wrap:
+            # `async () => {}` lets callers use `await` at the top of
+            # the body the same way run_script does.
+            script = f"(async () => {{ {body} }})()"
         return await s.page.evaluate(script)
 
     async def run_script(self, sid: str, code: str) -> dict[str, Any]:
@@ -933,11 +1485,28 @@ class T3SessionManager:
                 logger.debug("snap eval failed: %s", exc)
 
         try:
-            await s.page.mouse.move(target_x, target_y)
+            # Smooth bezier approach to the target — intermediate cursor
+            # positions stream to the viewer so the SVG arrow glides
+            # instead of teleporting, and CF sensor code sees realistic
+            # mousemove entropy.
+            await self._move_cursor_smooth(sid, target_x, target_y)
             await asyncio.sleep(0.05)
             await s.page.mouse.click(target_x, target_y)
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
+
+        # Live viewer telemetry — pulse the clicked location with the
+        # snap state + bbox (if any) so the operator sees exactly where
+        # the cursor landed.
+        try:
+            from . import t3_event_bus as _bus
+            _bus.default().emit_click_target(
+                sid,
+                x=target_x, y=target_y,
+                snapped=snapped, bbox=bbox, target=snap_target or None,
+            )
+        except Exception:
+            pass
 
         try:
             await s.page.wait_for_load_state(
@@ -1139,6 +1708,13 @@ class T3SessionManager:
         label: str = "",
     ) -> dict[str, Any]:
         s = self._get(sid)
+        # Smooth cursor approach to the field before we touch it —
+        # otherwise the SVG arrow in the viewer teleports to the
+        # input, which looks robotic.
+        try:
+            await self._move_cursor_smooth(sid, cx, cy)
+        except Exception:
+            pass
         # Pre-type probe: read the field's CURRENT value before deciding
         # what to do. Three cases:
         #   1. field already contains `text` → skip the type entirely
@@ -1236,6 +1812,16 @@ class T3SessionManager:
             await s.page.keyboard.type(text, delay=30)
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
+        # Live viewer telemetry — show keystrokes as they land. One
+        # emit per char so the indicator's buffer fills character-by-
+        # character rather than appearing in a single 40-char blob.
+        try:
+            from . import t3_event_bus as _bus
+            bus = _bus.default()
+            for ch in text:
+                bus.emit_keystroke(sid, ch)
+        except Exception:
+            pass
         st = await self.state(sid)
         action = "cleared_and_typed" if current_value else "typed_into_empty"
         return {
@@ -1248,8 +1834,22 @@ class T3SessionManager:
     async def keys(self, sid: str, keys: list[str]) -> dict[str, Any]:
         s = self._get(sid)
         try:
+            from . import t3_event_bus as _bus
+            bus = _bus.default()
+        except Exception:
+            bus = None
+        try:
             for k in keys:
                 await s.page.keyboard.press(k)
+                # Live viewer: surface each key press in the typing
+                # indicator so keyboard-only interactions (Tab, Enter,
+                # arrows) are visible without waiting for the next
+                # screencast frame.
+                if bus is not None:
+                    try:
+                        bus.emit_keystroke(sid, k)
+                    except Exception:
+                        pass
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
         st = await self.state(sid)
@@ -1263,6 +1863,23 @@ class T3SessionManager:
         percent: Optional[float] = None,
     ) -> dict[str, Any]:
         s = self._get(sid)
+        # Live viewer: surface a cursor move + "scrolling" click-pulse
+        # at the viewport center so the operator sees activity even
+        # before the next screencast frame lands.
+        try:
+            from . import t3_event_bus as _bus
+            vp = await s.page.evaluate(
+                "() => ({w: window.innerWidth || 1366, h: window.innerHeight || 768})",
+            )
+            cx = float(vp.get("w", 1366)) / 2
+            cy = float(vp.get("h", 768)) / 2
+            _bus.default().emit_cursor_move(sid, cx, cy)
+            _bus.default().emit_click_target(
+                sid, x=cx, y=cy, snapped=False,
+                target=f"scroll:{direction or f'{percent}%'}",
+            )
+        except Exception:
+            pass
         try:
             if percent is not None:
                 await s.page.evaluate(
@@ -1291,6 +1908,16 @@ class T3SessionManager:
     ) -> dict[str, Any]:
         s = self._get(sid)
         try:
+            from . import t3_event_bus as _bus
+            bus = _bus.default()
+        except Exception:
+            bus = None
+        if bus is not None:
+            try:
+                bus.emit_drag(sid, start_x, start_y, end_x, end_y)
+            except Exception:
+                pass
+        try:
             await s.page.mouse.move(start_x, start_y)
             await s.page.mouse.down()
             for i in range(1, steps + 1):
@@ -1300,6 +1927,13 @@ class T3SessionManager:
                 x = start_x + (end_x - start_x) * t2
                 y = start_y + (end_y - start_y) * t2
                 await s.page.mouse.move(x, y)
+                # Cursor telemetry — throttled inside the bus, safe to
+                # fire on every step.
+                if bus is not None:
+                    try:
+                        bus.emit_cursor_move(sid, x, y)
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.01)
             await s.page.mouse.up()
         except Exception as exc:

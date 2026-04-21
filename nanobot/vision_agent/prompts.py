@@ -49,8 +49,24 @@ JSON object with this exact shape:
       "priority": <int 1-3>
     }
   ],
-  "changes_from_previous": "What changed since the previous screenshot (empty if first screenshot)"
+  "changes_from_previous": "What changed since the previous screenshot (empty if first screenshot)",
+  "next_action": null
 }
+
+When the caller asks for intent "solve captcha step" (and ONLY then),
+you MUST also populate `next_action` with exactly one planned action:
+
+  "next_action": {
+    "action_type": "click_tile" | "drag_slider" | "type_text" | "submit" | "done" | "stuck",
+    "target_bbox": { "box_2d": [ymin,xmin,ymax,xmax], "label": "...", ... } | null,
+    "target_input_bbox": { "box_2d": [...], ... } | null,
+    "type_value": "<string to type — only for action_type=type_text>",
+    "label": "<short target label, e.g. 'tile with traffic light 2,1'>",
+    "reasoning": "<one sentence on why this action, not another>",
+    "expect_change": "static" | "new_tile" | "widget_replace" | "page_nav"
+  }
+
+For every other intent, leave `next_action` null (or omit the key).
 
 Hard rules for box_2d (THIS IS CRITICAL FOR CLICK ACCURACY):
 - Format is [ymin, xmin, ymax, xmax] in that exact order.
@@ -97,12 +113,20 @@ General rules:
 
 
 def intent_bucket(intent: str) -> str:
-    """Collapse free-form intent into one of 5 coarse buckets for caching.
+    """Collapse free-form intent into one of 6 coarse buckets for caching.
 
     Slight phrasing variation ("check login state" vs "verify login succeeded")
     should share a cache entry, but "observe" and "solve captcha" must not.
+
+    `solve_captcha_step` is its own bucket because the step-mode contract
+    (single next_action, no SoM overlay, no result caching) is materially
+    different from the original one-shot `solve_captcha` pass.
     """
     s = (intent or "").lower()
+    # Check step-mode BEFORE the broader captcha match so it doesn't get
+    # swallowed into the generic "solve_captcha" bucket.
+    if "captcha step" in s or "captcha_step" in s:
+        return "solve_captcha_step"
     if any(k in s for k in ("captcha", "challenge", "prove you")):
         return "solve_captcha"
     if any(k in s for k in ("click", "fill", "type", "select", "choose", "interact", "dismiss", "submit")):
@@ -181,7 +205,48 @@ def build_user_prompt(
     )
     context += "\n" + page_type_detection
 
-    if bucket == "solve_captcha":
+    if bucket == "solve_captcha_step":
+        specific = (
+            "CAPTCHA STEP MODE — you are solving ONE step of a live "
+            "captcha. The page state is live; between calls the site may "
+            "re-render tiles, swap the entire grid, or change the prompt.\n\n"
+            "Return `next_action` committing to EXACTLY ONE of:\n"
+            "  - click_tile: target a single matching tile. target_bbox = "
+            "that tile's tight box_2d. expect_change='new_tile' if clicking "
+            "this tile will likely cause the site to swap it for a new one; "
+            "'static' if the grid will stay as-is.\n"
+            "  - drag_slider: target the draggable handle. expect_change "
+            "is usually 'widget_replace' or 'page_nav'.\n"
+            "  - type_text: for classic distorted-word captchas (an image "
+            "shows warped characters with a text input nearby). Read the "
+            "characters in the image as carefully as you can and put "
+            "them in `type_value` (case-sensitive if the image is mixed-"
+            "case; digits are digits, letters are letters). target_bbox "
+            "= the captcha image. target_input_bbox = the input field to "
+            "type into (tight box around the visible input). If any "
+            "character is ambiguous, emit your best guess and note the "
+            "uncertainty in `reasoning` — the loop will verify post-"
+            "submit. expect_change is usually 'widget_replace' or "
+            "'page_nav'.\n"
+            "  - submit: target the verify / continue / I-am-human button. "
+            "Only choose this when you see NO remaining matching tiles. "
+            "expect_change is usually 'page_nav' or 'widget_replace'.\n"
+            "  - done: captcha appears CLEARED (no widget, no tiles, no "
+            "challenge text). target_bbox=null. Pick this only when you "
+            "are confident the captcha is gone — the loop will verify.\n"
+            "  - stuck: you cannot identify a matching tile AND no verify "
+            "button is visible. target_bbox=null. Reasoning MUST name what "
+            "is ambiguous. This triggers human handoff — use sparingly.\n\n"
+            "Cursor rule: the user prompt lists the `Previous click` "
+            "coordinate. Do NOT target a bbox whose center is within 40px "
+            "of that coordinate unless a VISIBLY new tile has rendered "
+            "there since the last click (reasoning must say so).\n\n"
+            "Also populate the normal `bboxes` array with only the tiles "
+            "and widget chrome you can see — keep it to ≤12 entries, no "
+            "navigation/footer noise. Set captcha_present to the truth: "
+            "false only if you're sure the challenge is gone."
+        )
+    elif bucket == "solve_captcha":
         specific = (
             "Focus on the captcha challenge. List the outer widget as "
             "captcha_widget, each selectable tile as captcha_tile (left-to-"
