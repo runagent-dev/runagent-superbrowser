@@ -125,7 +125,16 @@ async def _t3_dispatch_from_http(
                 x = float(body.get("x", body.get("bbox", {}).get("x0", 0)))
                 y = float(body.get("y", body.get("bbox", {}).get("y0", 0)))
                 bbox = body.get("bbox")
-                data = await mgr.click_at(sid, x, y, bbox=bbox)
+                expected_label = body.get("expected_label") or body.get("label")
+                strategy = body.get("strategy") or "primary"
+                data = await mgr.click_at(
+                    sid, x, y, bbox=bbox,
+                    strategy=str(strategy).lower(),
+                    expected_label=(
+                        str(expected_label).strip()
+                        if expected_label else None
+                    ),
+                )
             else:
                 data = await mgr.click(sid, int(body["index"]))
             return _T3Response(data)
@@ -161,7 +170,20 @@ async def _t3_dispatch_from_http(
             return _T3Response(data)
 
         if verb == "keys":
-            data = await mgr.keys(sid, list(body.get("keys", [])))
+            # BrowserKeysTool sends `keys` as either a string ("Enter",
+            # "ArrowDown", or a chord like "Control+A") OR as a list of
+            # such strings. NEVER pass a bare string through `list()` —
+            # that splits it into individual characters and presses each
+            # one, turning `browser_keys("Enter")` into typing the
+            # letters E-n-t-e-r into the focused input.
+            raw_keys = body.get("keys", [])
+            if isinstance(raw_keys, str):
+                keys_list = [raw_keys]
+            elif isinstance(raw_keys, (list, tuple)):
+                keys_list = [str(k) for k in raw_keys]
+            else:
+                keys_list = []
+            data = await mgr.keys(sid, keys_list)
             return _T3Response(data)
 
         if verb == "scroll":
@@ -300,13 +322,73 @@ async def _t3_dispatch_from_http(
         )
 
 
-async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
+def _vision_alternatives_hint(
+    state: "BrowserSessionState",
+    *,
+    exclude_index: int | None = None,
+    limit: int = 3,
+) -> str:
+    """Build a short "try these instead" line from the last vision pass.
+
+    Used on click refusals (low confidence, timeout, blocker, stale
+    index) so the brain has concrete alternative targets instead of
+    reflexively retrying a neighbour [index]. Returns the empty string
+    when there's no usable vision data.
+    """
+    resp = getattr(state, "_last_vision_response", None)
+    if resp is None:
+        return ""
+    freshness = getattr(resp, "screenshot_freshness", "fresh") or "fresh"
+    if freshness == "stale":
+        return ""
+    bboxes = list(getattr(resp, "bboxes", []) or [])
+    if not bboxes:
+        return ""
+    ranked = sorted(
+        enumerate(bboxes, start=1),
+        key=lambda pair: (
+            0 if getattr(pair[1], "intent_relevant", False) else 1,
+            0 if getattr(pair[1], "clickable", False) else 1,
+            -float(getattr(pair[1], "confidence", 0.0) or 0.0),
+        ),
+    )
+    picks: list[str] = []
+    for i, b in ranked:
+        if exclude_index is not None and i == exclude_index:
+            continue
+        label = (getattr(b, "label", "") or getattr(b, "role", "") or "").strip()
+        conf = float(getattr(b, "confidence", 0.0) or 0.0)
+        picks.append(f"V{i} (conf {conf:.2f} '{label[:30]}')")
+        if len(picks) >= limit:
+            break
+    if not picks:
+        return ""
+    tag = "" if freshness == "fresh" else f" [vision {freshness}]"
+    return "Higher-value targets from recent vision" + tag + ": " + ", ".join(picks) + "."
+
+
+async def _push_vision_bboxes(
+    session_id: str,
+    resp: Any,
+    *,
+    url: str | None = None,
+    latency_ms: int | None = None,
+) -> None:
     """POST denormalized bboxes to the SuperBrowser server so live
     viewers can flash them on the screencast overlay.
 
     Fire-and-forget; never raises into the caller. Brain-text indices
     (`V_n`) come from the same ranking `as_brain_text()` uses so the
     overlay's labels match what the brain sees.
+
+    Extra payload fields (all optional):
+      - `url`          — the URL the screenshot was captured on. The UI
+                          uses this to drop bboxes whose URL no longer
+                          matches the current screencast frame.
+      - `freshness`    — `fresh|uncertain|stale` from the vision model.
+                          The UI dims the overlay when != "fresh".
+      - `latencyMs`    — vision-agent round-trip. Surfaces in the UI as
+                          debug info.
     """
     if not session_id:
         return
@@ -337,7 +419,16 @@ async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
             "intent_relevant": bool(getattr(b, "intent_relevant", False)),
             "index": i,
         })
-    payload = {"bboxes": payload_bboxes, "imageWidth": iw, "imageHeight": ih}
+    freshness = getattr(resp, "screenshot_freshness", "fresh") or "fresh"
+    payload: dict[str, Any] = {
+        "bboxes": payload_bboxes,
+        "imageWidth": iw,
+        "imageHeight": ih,
+        "url": url or "",
+        "freshness": freshness,
+    }
+    if latency_ms is not None:
+        payload["latencyMs"] = int(latency_ms)
     # For T3 sessions, fan out to the local Python event bus so the T3
     # viewer at :3101 can paint the same overlays T1 shows. The TS
     # server POST still runs (404s cleanly for t3-* session IDs) so
@@ -347,6 +438,9 @@ async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
             from superbrowser_bridge.antibot import t3_event_bus as _bus
             _bus.default().emit_vision_bboxes(
                 session_id, payload_bboxes, iw, ih,
+                url=url or "",
+                freshness=freshness,
+                latency_ms=latency_ms,
             )
         except Exception:
             pass
@@ -358,6 +452,32 @@ async def _push_vision_bboxes(session_id: str, resp: Any) -> None:
             )
     except Exception:
         # Best-effort — overlay is debug visualization, not load-bearing.
+        pass
+
+
+async def _push_vision_pending(session_id: str) -> None:
+    """Tell live viewers a vision pass is in flight. The UI renders a
+    transient "vision updating…" indicator; without it the overlay
+    silently lags the action by one Gemini round-trip.
+
+    Fire-and-forget. Never raises into the caller.
+    """
+    if not session_id:
+        return
+    payload = {"dispatchedAt": int(time.time() * 1000)}
+    if session_id.startswith("t3-"):
+        try:
+            from superbrowser_bridge.antibot import t3_event_bus as _bus
+            _bus.default().emit_vision_pending(session_id)
+        except Exception:
+            pass
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            await client.post(
+                f"{SUPERBROWSER_URL}/session/{session_id}/vision-pending",
+                json=payload,
+            )
+    except Exception:
         pass
 
 
@@ -548,10 +668,15 @@ def _diff_text(a: str, b: str) -> str:
 
 def _schedule_vision_prefetch(
     state: "BrowserSessionState", session_id: str,
-) -> None:
+) -> "asyncio.Task[Any] | None":
     """Fire a background vision_agent.analyze() so the next
     `browser_screenshot` call finds cached bboxes instead of waiting 3-8s
-    for Gemini. Fire-and-forget: errors are swallowed.
+    for Gemini.
+
+    Returns the spawned task so callers can optionally wait for it with
+    a budget via `_await_vision_prefetch`. Errors are swallowed inside
+    `_run()`; the caller receives `None` when vision is disabled, the
+    session is missing, or task creation failed.
 
     Called from the success path of mutating tools (click, type, scroll,
     navigate). Uses the same cache key as the sync path so the real
@@ -564,13 +689,20 @@ def _schedule_vision_prefetch(
             vision_agent_enabled,
         )
     except ImportError:
-        return
+        return None
     if not vision_agent_enabled() or get_vision_agent is None:
-        return
+        return None
     if not session_id:
-        return
+        return None
 
-    async def _run() -> None:
+    # Announce pending vision so the UI can show a "vision updating…"
+    # indicator. Fire-and-forget; failure must not block the prefetch.
+    try:
+        asyncio.create_task(_push_vision_pending(session_id))
+    except Exception:
+        pass
+
+    async def _run() -> "Any":
         try:
             r = await _request_with_backoff(
                 "GET",
@@ -579,15 +711,23 @@ def _schedule_vision_prefetch(
                 timeout=15.0,
             )
             if r.status_code != 200:
-                return
+                return None
             data = r.json()
             b64 = data.get("screenshot")
             if not b64:
-                return
+                return None
             agent = get_vision_agent()
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")
             dh = dom_hash_of(elements) if dom_hash_of else ""
+            dispatched = time.monotonic()
+            # DPR: when the viewport runs at deviceScaleFactor > 1 the
+            # screenshot is physical-pixel sized. Pass it through so
+            # click dispatch can divide to land in CSS pixel space.
+            try:
+                dpr_val = float(data.get("devicePixelRatio") or 1.0)
+            except (TypeError, ValueError):
+                dpr_val = 1.0
             resp = await agent.analyze(
                 screenshot_b64=b64,
                 intent=state._last_intent or "observe page",
@@ -599,8 +739,11 @@ def _schedule_vision_prefetch(
                 image_height=img_h,
                 task_instruction=state.task_instruction or None,
             )
+            resp.with_image_dims(img_w, img_h, dpr=dpr_val)
             state._last_vision_response = resp
             state._last_vision_summary = resp.summary
+            state._last_vision_ts = time.time()
+            state._last_vision_url = (data.get("url", "") or state.current_url or "")
             state._last_dom_hash = dh or state._last_dom_hash
             state.vision_calls += 1
             # Push the fresh bboxes to live viewers immediately —
@@ -608,16 +751,85 @@ def _schedule_vision_prefetch(
             # screenshot tool call, so the user sees bboxes lag by
             # one full action cycle. Fire-and-forget, non-fatal.
             try:
-                await _push_vision_bboxes(session_id, resp)
+                latency_ms = int((time.monotonic() - dispatched) * 1000)
+                await _push_vision_bboxes(
+                    session_id, resp,
+                    url=state._last_vision_url,
+                    latency_ms=latency_ms,
+                )
             except Exception:
                 pass
+            return resp
         except Exception as exc:
             print(f"  [vision prefetch failed: {exc}]")
+            return None
 
     try:
-        asyncio.create_task(_run())
+        return asyncio.create_task(_run())
     except Exception:
-        pass
+        return None
+
+
+async def _append_fresh_vision(
+    task: "asyncio.Task[Any] | None",
+    result: str,
+    *,
+    budget_ms: int | None = None,
+) -> str:
+    """Wait for the prefetched vision pass (up to the budget) and
+    append a one-line brain-facing hint to `result` when it arrives.
+
+    The hint lets the planner reason on the post-action screen state
+    in the SAME tool response rather than waiting for the next
+    screenshot call. If the vision pass didn't finish in time, the
+    task keeps running in the background (shielded) and the overlay
+    will update on the next push.
+    """
+    resp = await _await_vision_prefetch(task, budget_ms=budget_ms)
+    if resp is None:
+        return result
+    summary = (getattr(resp, "summary", "") or "").strip()
+    if not summary:
+        return result
+    note = summary[:240]
+    freshness = getattr(resp, "screenshot_freshness", "fresh") or "fresh"
+    if freshness != "fresh":
+        note = f"{note} [freshness={freshness}]"
+    sep = "" if result.endswith("\n") else "\n"
+    return f"{result}{sep}[vision] {note}"
+
+
+async def _await_vision_prefetch(
+    task: "asyncio.Task[Any] | None",
+    budget_ms: int | None = None,
+) -> "Any":
+    """Wait up to `budget_ms` for a prefetch task to complete.
+
+    Returns the VisionResponse when the task finishes in time, otherwise
+    None. On timeout the task is left running (shielded) so the
+    background cache write + UI push still happen. Budget defaults to
+    VISION_AWAIT_BUDGET_MS env var (fallback 2000 ms); 0 disables the
+    wait and returns immediately.
+    """
+    if task is None:
+        return None
+    if budget_ms is None:
+        try:
+            budget_ms = int(
+                os.environ.get("VISION_AWAIT_BUDGET_MS") or "2000"
+            )
+        except ValueError:
+            budget_ms = 2000
+    if budget_ms <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=budget_ms / 1000.0,
+        )
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
 
 
 async def _feedback_gate(tool_name: str) -> str | None:
@@ -748,6 +960,19 @@ class BrowserSessionState:
         self.last_click_dom_hash: str = ""
         self.consecutive_dead_clicks: int = 0
         self.MAX_CONSECUTIVE_SAME_TARGET = 3
+        # Cross-index flail guard. consecutive_dead_clicks only catches
+        # REPEATS of the same target. When the brain walks
+        # [21]→[22]→[20] with every dispatch timing out, each looks like
+        # a fresh target so that guard resets. Track HTTP timeouts
+        # independently so two-in-a-row forces a re-screenshot.
+        self.consecutive_click_timeouts: int = 0
+        self.MAX_CONSECUTIVE_CLICK_TIMEOUTS = 2
+        # Telemetry: how many times the TS-side snap-to-interactive
+        # failed to find a clickable descendant inside the bbox we sent.
+        # Incremented whenever a click response has snap.snapped=false.
+        # Reset on every screenshot. Used to surface "vision bboxes are
+        # habitually wrapping non-clickable containers" hints.
+        self.snap_miss_count: int = 0
         # Active session ID (set by browser_open)
         self.session_id: str = ""
         # How many times has BrowserOpenTool had to refuse a redundant call?
@@ -833,6 +1058,13 @@ class BrowserSessionState:
             self._last_vision_response: Optional["_VR"] = None  # type: ignore[assignment]
         except Exception:
             self._last_vision_response: Any = None  # type: ignore[assignment]
+        # Freshness bookkeeping for the cached vision response. Mutating
+        # tools read these to decide whether to piggyback
+        # `_last_vision_response.as_brain_text()` onto their text reply —
+        # that's the fast path that keeps bboxes in front of the brain
+        # without a browser_screenshot round trip.
+        self._last_vision_ts: float = 0.0
+        self._last_vision_url: str = ""
 
         # Dead-type guard state. Tracks the last browser_type call so we can
         # reject a second identical type to the same index — the pattern
@@ -841,6 +1073,18 @@ class BrowserSessionState:
         self.last_type_index: int = -1
         self.last_type_text: str = ""
         self.last_type_at: float = 0.0
+
+        # Hierarchical perceive-plan-act state. Populated by the
+        # screenshot tool after a vision pass; consumed by the click
+        # ladder and the browser_plan_next_steps tool.
+        #   _last_blockers       — DOM-derived blockers from ui_blockers.detect
+        #   _last_action_queue   — ActionQueue from action_planner.plan
+        #   _pending_postcondition — Postcondition dict the next click is
+        #                            supposed to satisfy; verify_action
+        #                            checks it after click_at returns.
+        self._last_blockers: list = []  # list[BlockerInfo]
+        self._last_action_queue: Any = None  # Optional[ActionQueue]
+        self._pending_postcondition: Optional[dict] = None
 
     @property
     def backend(self) -> str:
@@ -1328,6 +1572,8 @@ class BrowserSessionState:
                 )
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
+                self._last_vision_ts = time.time()
+                self._last_vision_url = effective_url or self.current_url or ""
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
                 label = (caption or "").split("\n")[0][:30].replace(" ", "-")
@@ -1339,10 +1585,44 @@ class BrowserSessionState:
                 # coded by role) for ~1.5s before the next click. Failure
                 # is non-fatal — vision still works, just no overlay.
                 try:
-                    asyncio.create_task(_push_vision_bboxes(self.session_id, resp))
+                    asyncio.create_task(_push_vision_bboxes(
+                        self.session_id, resp,
+                        url=self._last_vision_url,
+                    ))
                 except Exception as exc:
                     print(f"  [vision-overlay push failed: {exc}]")
-                text = f"{caption}\n\n{resp.as_brain_text()}" if caption else resp.as_brain_text()
+
+                # Hierarchical planner pass — DOM-side blocker scan +
+                # action sequencing. Only runs for t3 sessions (t1
+                # Puppeteer sessions would need a TS-side blocker
+                # endpoint; deferred). Soft-fails: any exception here
+                # falls back to the vision-only caption.
+                plan_text = ""
+                if self.session_id.startswith("t3-") and \
+                        os.environ.get("ACTION_PLANNER_AUTO", "1") != "0":
+                    try:
+                        from superbrowser_bridge.antibot import interactive_session as _t3mgr
+                        from superbrowser_bridge.antibot.ui_blockers import detect as _detect_blockers
+                        from superbrowser_bridge.action_planner import plan as _plan_actions
+                        mgr = _t3mgr.default()
+                        blockers = await _detect_blockers(mgr, self.session_id)
+                        self._last_blockers = blockers
+                        queue = _plan_actions(
+                            vresp=resp,
+                            blockers=blockers,
+                            task_instruction=self.task_instruction or "",
+                            url=effective_url or "",
+                            recent_steps=self.step_history[-8:] if self.step_history else [],
+                        )
+                        self._last_action_queue = queue
+                        plan_text = queue.to_brain_text()
+                    except Exception as exc:
+                        print(f"  [action-planner: skipped — {exc}]")
+
+                brain_text = resp.as_brain_text()
+                if plan_text:
+                    brain_text = f"{brain_text}\n\n{plan_text}"
+                text = f"{caption}\n\n{brain_text}" if caption else brain_text
                 return [{"type": "text", "text": text}]
             except Exception as exc:
                 # Never let a vision-layer failure break a tool result —
@@ -1417,9 +1697,53 @@ class BrowserSessionState:
             result += f"\nConsole errors: {data['consoleErrors']}"
         if data.get("pendingDialogs"):
             result += f"\nPending dialogs: {data['pendingDialogs']}"
+        # Piggyback cached vision if it's still fresh — gives the brain
+        # up-to-date bboxes after a mutating tool WITHOUT a screenshot
+        # round trip + Gemini call. "Fresh" = same URL as the action's
+        # response AND less than FRESH_VISION_SECONDS old. The brain can
+        # then call browser_click_at(vision_index=V_n) immediately on the
+        # next turn, skipping a 2-5s vision pass.
+        cached = self._fresh_vision_text(data.get("url", ""))
+        if cached:
+            result += f"\n\n{cached}"
         if self.action_count >= 5:
             result += "\n\n[HINT: Use browser_run_script to batch remaining steps into ONE script.]"
         return result
+
+    # How old a cached vision response can be before we stop piggybacking
+    # it onto mutating-tool replies. Short enough that the brain doesn't
+    # click stale bboxes; long enough to cover a rapid click-scroll-click
+    # sequence where no fresh vision has landed yet.
+    FRESH_VISION_SECONDS = 10.0
+
+    def _fresh_vision_text(self, tool_url: str) -> str:
+        """Return cached vision's brain_text when safe to attach, else "".
+
+        Safe means: we have a cached VisionResponse, its URL matches the
+        URL this tool response is reporting (so the brain doesn't mistake
+        pre-navigation bboxes for post-navigation state), and it's young
+        enough (FRESH_VISION_SECONDS) to still reflect the page.
+
+        Rendering is deliberately cheap — `as_brain_text()` is pure
+        Python string formatting, no I/O.
+        """
+        resp = self._last_vision_response
+        if resp is None:
+            return ""
+        if (time.time() - self._last_vision_ts) > self.FRESH_VISION_SECONDS:
+            return ""
+        # URL match — normalize to just scheme+host+path (ignore query
+        # churn that doesn't meaningfully change the page).
+        def _strip_query(u: str) -> str:
+            if not u:
+                return ""
+            return u.split("?", 1)[0].split("#", 1)[0]
+        if tool_url and _strip_query(tool_url) != _strip_query(self._last_vision_url):
+            return ""
+        try:
+            return "[CACHED VISION — bboxes still valid; use vision_index=V_n to click]\n" + resp.as_brain_text()
+        except Exception:
+            return ""
 
 
 async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" = None) -> str:
@@ -2202,6 +2526,24 @@ class BrowserClickTool(Tool):
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
+        # Cross-index flail guard. If the last two clicks timed out,
+        # force a re-screenshot before dispatching another HTTP click —
+        # the backend is hung (blocker, loader, nav in flight) and
+        # walking [N±1] just wastes the iteration budget.
+        if self.s.consecutive_click_timeouts >= self.s.MAX_CONSECUTIVE_CLICK_TIMEOUTS:
+            alts = _vision_alternatives_hint(self.s, limit=3)
+            self.s.log_activity(
+                f"click([{index}])(LOOP_BLOCKED)",
+                f"timeouts={self.s.consecutive_click_timeouts}",
+            )
+            return (
+                f"[click_loop_detected] {self.s.consecutive_click_timeouts} "
+                f"consecutive click timeouts. The page is likely blocked "
+                f"(loader, modal, or a pending navigation). Call "
+                f"browser_screenshot to refresh vision before any further "
+                f"click."
+                + (f"\n{alts}" if alts else "")
+            )
         target_key = f"click[{index}]"
         dead = self.s.check_dead_click(target_key)
         if dead:
@@ -2217,6 +2559,23 @@ class BrowserClickTool(Tool):
         cached_fp = self.s.element_fingerprints.get(index)
         if cached_fp:
             payload["expected_fingerprint"] = cached_fp
+        elif self.s.element_fingerprints:
+            # The cache has entries, just not for this index — the brain
+            # is addressing an index that wasn't in the last state
+            # response. Almost always means stale. Surface fast instead
+            # of letting the TS click fail obscurely.
+            await _fetch_elements(session_id, self.s)
+            if index not in self.s.element_fingerprints:
+                return (
+                    f"[click_failed:unknown_index] [{index}] is not in "
+                    f"the current selectorMap (fingerprints={len(self.s.element_fingerprints)} "
+                    f"indices). Re-read the elements list and pick a "
+                    f"valid index, or use browser_click_at(V_n) with a "
+                    f"vision bbox."
+                )
+            cached_fp = self.s.element_fingerprints.get(index)
+            if cached_fp:
+                payload["expected_fingerprint"] = cached_fp
 
         try:
             r = await _request_with_backoff(
@@ -2263,19 +2622,48 @@ class BrowserClickTool(Tool):
             return (
                 f"[click_failed:http_{e.response.status_code}] {e.response.text[:200] if e.response.text else str(e)[:200]}"
             )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            # Click dispatched but the backend never responded — almost
+            # always means the page is blocked (a pending navigation, a
+            # loader still running, or an overlay intercepting events).
+            # Count it so the flail guard above trips on the next call.
+            self.s.consecutive_click_timeouts += 1
+            self.s.log_activity(
+                f"click([{index}])(TIMEOUT)",
+                f"count={self.s.consecutive_click_timeouts}",
+            )
+            alts = _vision_alternatives_hint(
+                self.s, exclude_index=None, limit=3,
+            )
+            return (
+                f"[click_failed:timeout] The backend didn't respond to "
+                f"click([{index}]) within the HTTP timeout. The page is "
+                f"likely waiting on navigation or blocked by a loader. "
+                f"Call browser_screenshot to re-vision before retrying."
+                + (f"\n{alts}" if alts else "")
+            )
         except Exception as e:
-            # True transport error (connection refused, timeout). JS
-            # fallback doesn't help here either — the server is down.
+            # True transport error (connection refused, etc.). Server down.
             self.s.log_activity(f"click([{index}])(TRANSPORT)", str(e)[:60])
             return f"[click_failed:transport] {str(e)[:200]} — browser service unreachable. Retry in a few seconds."
 
+        # Successful HTTP response — clear the timeout counter so the
+        # flail guard doesn't trip on a future unrelated hiccup.
+        self.s.consecutive_click_timeouts = 0
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
+        # Snap telemetry (P3.12).
+        snap = data.get("snap") if isinstance(data, dict) else None
+        if isinstance(snap, dict) and snap.get("snapped") is False:
+            self.s.snap_miss_count += 1
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
         self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(data, f"Clicked [{index}]")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(data, f"Clicked [{index}]"),
+        )
 
 
 @tool_parameters(
@@ -2353,6 +2741,74 @@ class BrowserClickAtTool(Tool):
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
+            # Freshness gate — refuse to click when the last vision pass
+            # flagged the screenshot as stale or uncertain. The planner
+            # should re-screenshot before committing a click on a frame
+            # the model itself said it couldn't trust.
+            freshness = getattr(resp, "screenshot_freshness", "fresh")
+            if freshness != "fresh":
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
+                )
+                return (
+                    f"[click_at_failed:stale_vision freshness={freshness}] "
+                    "Vision flagged the last screenshot as not fresh "
+                    "(URL/page mismatch or loading overlay). Call "
+                    "browser_screenshot to refresh vision before clicking."
+                    + (f"\n{alts}" if alts else "")
+                )
+            # Blocker gate — if the scene has an active blocker layer
+            # (cookie banner, modal, consent dialog) and this bbox lives
+            # in a different layer, refuse. The planner must dismiss
+            # the blocker before acting on content beneath it.
+            scene = getattr(resp, "scene", None)
+            active_blocker = (
+                getattr(scene, "active_blocker_layer_id", None)
+                if scene is not None else None
+            )
+            if active_blocker:
+                bbox_layer = getattr(bbox, "layer_id", None)
+                if bbox_layer and bbox_layer != active_blocker:
+                    # Find the dismiss hint from the blocker layer so
+                    # the brain has a concrete target to click first.
+                    dismiss_hint = ""
+                    try:
+                        for layer in (getattr(scene, "layers", []) or []):
+                            if getattr(layer, "id", None) == active_blocker:
+                                dismiss_hint = (
+                                    getattr(layer, "dismiss_hint", "") or ""
+                                )
+                                break
+                    except Exception:
+                        dismiss_hint = ""
+                    hint = f" Dismiss '{dismiss_hint}' first." if dismiss_hint else ""
+                    return (
+                        f"[click_at_failed:blocker_active layer={active_blocker}] "
+                        f"A blocker layer ({active_blocker}) is on top of "
+                        f"content, and V{vision_index} sits in a different "
+                        f"layer ({bbox_layer}).{hint} Then re-screenshot."
+                    )
+            # Confidence gate — a low-confidence bbox is Gemini's way of
+            # saying "I'm not sure this is really here". Clicking it
+            # lands on the wrong target more often than not. Threshold
+            # is tuned via VISION_MIN_CLICK_CONFIDENCE (default 0.45).
+            try:
+                min_conf = float(
+                    os.environ.get("VISION_MIN_CLICK_CONFIDENCE") or "0.45"
+                )
+            except ValueError:
+                min_conf = 0.45
+            if getattr(bbox, "confidence", 0.5) < min_conf:
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
+                )
+                return (
+                    f"[click_at_failed:low_confidence V{vision_index}] "
+                    f"bbox confidence={bbox.confidence:.2f} < "
+                    f"{min_conf:.2f}. Call browser_screenshot to re-run "
+                    "vision, then retry with a higher-confidence target."
+                    + (f"\n{alts}" if alts else "")
+                )
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return (
@@ -2360,8 +2816,19 @@ class BrowserClickAtTool(Tool):
                     "has no source image dimensions; cannot denormalize "
                     "box_2d. Re-fetch state."
                 )
-            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            # CDP/JS expects CSS pixels; on retina/HiDPI viewports the
+            # screenshot is physical-pixel-sized so we divide by DPR.
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
             payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+            # Carry the vision label into the click payload so the T3
+            # backend can run a post-snap semantic match check. Empty
+            # label → the check is skipped on the backend, which is
+            # fine for raw-coord clicks further below.
+            bbox_label = (getattr(bbox, "label", "") or "").strip()
+            if bbox_label:
+                payload["expected_label"] = bbox_label[:120]
+                payload["label"] = bbox_label[:120]
             log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
             print(f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1})")
         else:
@@ -2388,6 +2855,30 @@ class BrowserClickAtTool(Tool):
             return f"[low_reward_band] {err}"
         r.raise_for_status()
         data = r.json()
+        # Element-mismatch guard (P1.4). The T3 backend compared the
+        # element at the click target to the vision label we sent and
+        # decided they don't match. Don't dispatch — return an
+        # observation so the brain can re-screenshot and pick again.
+        if isinstance(data, dict) and data.get("error") == "element_mismatch":
+            found = data.get("found", {}) or {}
+            alts = _vision_alternatives_hint(
+                self.s, exclude_index=vision_index, limit=3,
+            )
+            self.s.log_activity(
+                f"click_at{log_target}(ELEM_MISMATCH)",
+                f"found={found.get('tag','?')}",
+            )
+            return (
+                f"[click_at_failed:element_mismatch] Vision said this "
+                f"target was '{data.get('expected_label','')}' but the "
+                f"element at ({data.get('coords', {}).get('x','?')},"
+                f"{data.get('coords', {}).get('y','?')}) is "
+                f"<{(found.get('tag') or '?').lower()} "
+                f"role='{found.get('role','')}'> text='"
+                f"{(found.get('text') or '')[:80]}'. Call "
+                f"browser_screenshot to refresh vision."
+                + (f"\n{alts}" if alts else "")
+            )
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
@@ -2400,13 +2891,162 @@ class BrowserClickAtTool(Tool):
         else:
             snap_note = ""
 
+        # Post-click verification — look up the postcondition the planner
+        # attached to this target (by vision_index or by coord match)
+        # and run it via verify_action. Runs only for t3 sessions and
+        # when VERIFY_AFTER_CLICK is enabled (default on). A miss is
+        # reported in the caption so the brain can decide to retry with
+        # a different strategy or call browser_plan_next_steps.
+        verify_note = ""
+        if session_id.startswith("t3-") and \
+                os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
+            postcond = self._lookup_postcondition(vision_index, x, y)
+            if postcond is not None:
+                try:
+                    from superbrowser_bridge.antibot import interactive_session as _t3mgr
+                    from superbrowser_bridge.verify_action import verify_after, PreState
+                    mgr = _t3mgr.default()
+                    vr = await verify_after(
+                        mgr, session_id, postcond,
+                        pre_state=PreState(url=self.s.current_url or ""),
+                        state=self.s,
+                    )
+                    if not vr.verified:
+                        # Default postcondition (dom_mutated) failing means
+                        # the click went out but NOTHING changed — page,
+                        # DOM, URL all identical. Before bothering the
+                        # brain, ESCALATE through the click ladder —
+                        # many pages reject "primary" bezier clicks but
+                        # respond to a direct `el.click()` (JS) dispatch
+                        # or to keyboard Enter. Silent failure most
+                        # often means the site's click handler has a
+                        # guard our primary click tripped (0-dwell, CSS
+                        # pointer-events masking, framework re-render).
+                        is_silent_default = (
+                            postcond.get("kind") == "dom_mutated"
+                            and not getattr(
+                                self.s._last_action_queue, "actions", None,
+                            )
+                        )
+                        escalated = False
+                        if is_silent_default and \
+                                os.environ.get("CLICK_LADDER_AUTO", "1") != "0" and \
+                                payload.get("bbox"):
+                            for alt_strategy in ("js", "keyboard"):
+                                try:
+                                    from superbrowser_bridge.antibot import (
+                                        interactive_session as _t3mgr2,
+                                    )
+                                    mgr2 = _t3mgr2.default()
+                                    alt_bbox = payload.get("bbox")
+                                    alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
+                                    alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
+                                    alt_resp = await mgr2.click_at(
+                                        session_id, alt_x, alt_y,
+                                        bbox=alt_bbox,
+                                        strategy=alt_strategy,
+                                    )
+                                    if not isinstance(alt_resp, dict) or \
+                                            not alt_resp.get("success"):
+                                        continue
+                                    # Re-verify after the escalated strategy.
+                                    vr2 = await verify_after(
+                                        mgr, session_id, postcond,
+                                        pre_state=PreState(
+                                            url=self.s.current_url or "",
+                                        ),
+                                        state=self.s,
+                                    )
+                                    if vr2.verified:
+                                        escalated = True
+                                        verify_note = (
+                                            f"\n[click_escalated strategy={alt_strategy}] "
+                                            f"Primary click was silent; "
+                                            f"{alt_strategy} strategy landed the "
+                                            f"action."
+                                        )
+                                        break
+                                except Exception as exc:
+                                    print(
+                                        f"  [click ladder ({alt_strategy}) "
+                                        f"failed: {exc}]"
+                                    )
+                                    continue
+                        if not escalated:
+                            if is_silent_default:
+                                verify_note = (
+                                    f"\n[click_silent reason={vr.reason}] "
+                                    f"Primary + escalated (js/keyboard) "
+                                    f"clicks all landed no DOM change. "
+                                    f"Target likely non-interactive, "
+                                    f"covered by an overlay, or waiting "
+                                    f"on an async load. Call "
+                                    f"browser_screenshot to re-vision, "
+                                    f"dismiss any active blocker, or try "
+                                    f"a different target."
+                                )
+                            else:
+                                verify_note = (
+                                    f"\n[VERIFY_MISS kind={vr.kind} reason={vr.reason}] "
+                                    f"The click dispatched but the expected effect "
+                                    f"({postcond.get('kind')}) didn't land. Consider "
+                                    f"browser_plan_next_steps to re-sequence, or try "
+                                    f"a different target."
+                                )
+                    elif os.environ.get("VERIFY_DEBUG") == "1":
+                        verify_note = f"\n[verify_ok kind={vr.kind}]"
+                except Exception as exc:
+                    print(f"  [verify_action: skipped — {exc}]")
+
         self.s.record_step(
             "browser_click_at",
             log_target,
             f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
         )
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
+        )
+
+    def _lookup_postcondition(
+        self,
+        vision_index: int | None,
+        x: float | None,
+        y: float | None,
+    ) -> dict | None:
+        """Match the current click against the top planned action and return
+        its postcondition, or fall through to a weakest-possible
+        default that only catches "click dispatched but page didn't
+        change at all" (the canonical silent-miss signal).
+
+        A planner match is: the click's vision_index equals the top
+        action's target_vision_index, OR the click's (x, y) falls
+        inside the top action's target bbox (± 10 px slack).
+
+        The default (dom_mutated) runs when no planner postcondition
+        applies. Set VERIFY_DEFAULT=0 to disable and preserve the old
+        "no postcondition, no verification" behaviour.
+        """
+        queue = self.s._last_action_queue
+        if queue is not None and getattr(queue, "actions", None):
+            top = queue.actions[0]
+            # vision_index match (preferred)
+            if vision_index is not None and top.target_vision_index is not None:
+                if int(vision_index) == int(top.target_vision_index):
+                    return top.postcondition.to_dict()
+            # coord match (fallback)
+            if x is not None and y is not None and top.target_bbox_pixels:
+                x0, y0, x1, y1 = top.target_bbox_pixels
+                if (x0 - 10) <= float(x) <= (x1 + 10) and \
+                        (y0 - 10) <= float(y) <= (y1 + 10):
+                    return top.postcondition.to_dict()
+        # Default: "did anything change?" — dom_mutated catches the
+        # "click silently missed" case even when the planner didn't
+        # attach an explicit postcondition.
+        if os.environ.get("VERIFY_DEFAULT", "1") != "0":
+            return {"kind": "dom_mutated"}
+        return None
 
 
 @tool_parameters(
@@ -2509,7 +3149,8 @@ class BrowserTypeAtTool(Tool):
                     "has no source image dimensions; cannot denormalize "
                     "box_2d. Take a fresh screenshot."
                 )
-            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
             target_x = (x0 + x1) / 2
             target_y = (y0 + y1) / 2
             label = f"V{vision_index}"
@@ -2599,8 +3240,11 @@ class BrowserTypeAtTool(Tool):
                 synthetic_data["auto_corrected"] = True
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(synthetic_data, caption)
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(synthetic_data, caption),
+        )
 
 
 @tool_parameters(
@@ -2682,7 +3326,8 @@ class BrowserFixTextAtTool(Tool):
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return "[fix_text_at_failed:no_image_dims] take a fresh screenshot."
-            x0, y0, x1, y1 = bbox.to_pixels(iw, ih)
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
             target_x = (x0 + x1) / 2
             target_y = (y0 + y1) / 2
             label = f"V{vision_index}"
@@ -2778,8 +3423,11 @@ class BrowserFixTextAtTool(Tool):
                 synthetic_data["auto_corrected"] = True
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(synthetic_data, caption)
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(synthetic_data, caption),
+        )
 
 
 @tool_parameters(
@@ -2997,9 +3645,11 @@ class BrowserTypeTool(Tool):
             caption += outcome.caption_suffix
 
         # Prefetch vision so next screenshot call finds bboxes cached.
-        _schedule_vision_prefetch(self.s, session_id)
-
-        return self.s.build_text_only(data, caption)
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(data, caption),
+        )
 
 
 @tool_parameters(
@@ -3035,8 +3685,11 @@ class BrowserKeysTool(Tool):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(data, f"Sent keys: {keys}")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(data, f"Sent keys: {keys}"),
+        )
 
 
 @tool_parameters(
@@ -3082,8 +3735,11 @@ class BrowserScrollTool(Tool):
             if elements:
                 data["elements"] = elements
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
-        _schedule_vision_prefetch(self.s, session_id)
-        return self.s.build_text_only(data, action)
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(data, action),
+        )
 
 
 @tool_parameters(
@@ -3383,6 +4039,71 @@ class BrowserDialogTool(Tool):
         )
         r.raise_for_status()
         return f"Dialog {'accepted' if accept else 'dismissed'}"
+
+
+@tool_parameters(
+    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+)
+class BrowserPlanNextStepsTool(Tool):
+    """Re-run the hierarchical action planner against the cached vision
+    + blocker state without taking a fresh screenshot.
+
+    Useful after a click that missed its postcondition — the brain wants
+    an updated plan without burning screenshot budget. The planner itself
+    is cached by scene fingerprint, so rapid re-plans on an unchanged
+    scene return the same queue in near-zero time.
+
+    Returns the ordered [PLAN] block as plain text. The worker LLM can
+    read it and pick the top action to execute, or override.
+    """
+
+    name = "browser_plan_next_steps"
+    description = (
+        "Re-compute the planned action queue (dismiss blockers → main goal) "
+        "from the most recent vision + DOM-blocker snapshot. No screenshot, "
+        "no vision call — cheap. Call after a failed dismiss or when the "
+        "scene may have changed and you want the planner's latest ranking "
+        "before deciding the next tool."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, **kw: Any) -> str:
+        if not session_id.startswith("t3-"):
+            return (
+                "[plan_unavailable] Planner currently runs only for t3 "
+                "(undetected Chromium) sessions. Call browser_screenshot "
+                "to get a fresh vision + suggested_actions instead."
+            )
+        resp = self.s._last_vision_response
+        if resp is None:
+            return (
+                "[plan_unavailable] No cached vision response. Run "
+                "browser_screenshot first."
+            )
+        try:
+            from superbrowser_bridge.antibot import interactive_session as _t3mgr
+            from superbrowser_bridge.antibot.ui_blockers import detect as _detect_blockers
+            from superbrowser_bridge.action_planner import plan as _plan_actions
+            mgr = _t3mgr.default()
+            blockers = await _detect_blockers(mgr, session_id)
+            self.s._last_blockers = blockers
+            queue = _plan_actions(
+                vresp=resp,
+                blockers=blockers,
+                task_instruction=self.s.task_instruction or "",
+                url=self.s.current_url or "",
+                recent_steps=self.s.step_history[-8:] if self.s.step_history else [],
+            )
+            self.s._last_action_queue = queue
+            return queue.to_brain_text()
+        except Exception as exc:
+            return f"[plan_failed] {str(exc)[:200]}"
 
 
 @tool_parameters(
@@ -4069,6 +4790,43 @@ class BrowserSolveCaptchaTool(Tool):
                         return await self._solve_via_cf_wait(session_id)
                     if det_type in ("text_captcha", "text", "generic", "image"):
                         return await self._solve_via_vision(session_id)
+                    if det_type in ("recaptcha-v2", "hcaptcha"):
+                        # Cheap first attempt: let the vision loop click the
+                        # widget checkbox. On a trusted-fingerprint session
+                        # (patchright + good proxy) this alone often passes.
+                        # Small step budget so we bail fast if the image-tile
+                        # challenge appears — the token vendor / human handoff
+                        # below handle that class better.
+                        print(
+                            f"  [vision checkbox] trying widget click "
+                            f"(max_steps=3) for {det_type!r} before token vendor"
+                        )
+                        vr = await self._try_vision_solve_for_widget(
+                            session_id, det_cap, max_steps=3,
+                        )
+                        if vr and vr.get("solved"):
+                            self.s.captcha_mode = False
+                            self.s.captcha_mode_remaining = 0
+                            self.s.record_step(
+                                "browser_solve_captcha",
+                                "vision_checkbox",
+                                f"solved=True via vision checkbox-click | "
+                                f"{json.dumps(vr, default=str)[:300]}",
+                            )
+                            return (
+                                f"Captcha SOLVED via vision checkbox-click "
+                                f"({vr.get('steps', 0)} step(s))"
+                                f"\n\nResult JSON:\n"
+                                f"{json.dumps(vr, indent=2, default=str)}"
+                            )
+                        if vr is not None:
+                            self.s.record_step(
+                                "browser_solve_captcha",
+                                "vision_checkbox",
+                                f"solved=False via vision checkbox-click, "
+                                f"falling through | "
+                                f"{json.dumps(vr, default=str)[:300]}",
+                            )
                 else:
                     print(
                         f"  [auto-route] detect HTTP {dr.status_code} — "
@@ -4300,6 +5058,51 @@ class BrowserSolveCaptchaTool(Tool):
         except Exception:
             pass
         return None
+
+    async def _try_vision_solve_for_widget(
+        self,
+        session_id: str,
+        det_cap: dict,
+        *,
+        max_steps: int,
+    ) -> dict[str, Any] | None:
+        """Attempt a vision+cursor solve for widget captchas (recaptcha-v2,
+        hcaptcha) using the already-detected widget bbox. Returns the
+        structured result dict from `_solve_captcha_iterative`, or None
+        when vision is unavailable — the caller reads None as "skip vision,
+        go straight to token vendor." Never raises.
+        """
+        try:
+            from vision_agent import get_vision_agent, vision_agent_enabled
+        except ImportError:
+            return None
+        if not vision_agent_enabled():
+            return None
+
+        from superbrowser_bridge.antibot.captcha.detect import CaptchaInfo
+        captcha_info = CaptchaInfo(
+            type=det_cap.get("type", "none"),
+            present=bool(det_cap.get("present", True)),
+            site_key=det_cap.get("site_key", "") or "",
+            widget_selector=det_cap.get("widget_selector", "") or "",
+            widget_bbox=det_cap.get("widget_bbox"),
+            input_bbox=det_cap.get("input_bbox"),
+            frame_url=det_cap.get("frame_url", "") or "",
+            notes=list(det_cap.get("notes") or []),
+        )
+
+        self.s.captcha_solve_round += 1
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            agent = get_vision_agent()
+            return await _solve_captcha_iterative(
+                session_id,
+                captcha_info,
+                agent,
+                task_instruction=self.s.task_instruction,
+                solve_round=self.s.captcha_solve_round,
+                max_steps=max_steps,
+            )
 
     async def _solve_via_vision(self, session_id: str) -> str:
         """Python-side captcha solver — delegates to the iterative loop.
@@ -5088,6 +5891,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserVerifyFactTool(state),
         BrowserRequestHelpTool(state),
         BrowserEscalateTool(state),       # NEW — t1 → t3 migration
+        BrowserPlanNextStepsTool(state),  # NEW — hierarchical planner
         BrowserCloseTool(state),
     ]
     for tool in tools:

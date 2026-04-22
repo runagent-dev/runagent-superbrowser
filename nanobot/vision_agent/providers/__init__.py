@@ -52,7 +52,14 @@ def select_provider() -> VisionProvider:
         )
 
     base_url_env = os.environ.get("VISION_BASE_URL") or None
-    max_tokens = int(os.environ.get("VISION_MAX_TOKENS") or "1500")
+    # Default bumped from 1500 → 4096: complex pages (seat maps,
+    # product listings, checkout grids) routinely serialize to ~3K+
+    # chars of JSON. At ~4 chars/token that's ~800 tokens just for
+    # payload; headers + `scene.layers` push past the old cap and
+    # truncate the response mid-bbox, which then fails JSON parsing.
+    # 4096 gives enough headroom while staying below the usual
+    # per-model output cap.
+    max_tokens = int(os.environ.get("VISION_MAX_TOKENS") or "4096")
     timeout_ms = int(os.environ.get("VISION_TIMEOUT_MS") or "8000")
 
     return GeminiVisionProvider(
@@ -64,8 +71,46 @@ def select_provider() -> VisionProvider:
     )
 
 
+def select_fallback_provider() -> VisionProvider | None:
+    """Optional secondary provider used when the primary fails twice.
+
+    Gated on VISION_FALLBACK_MODEL being set. Defaults to reusing the
+    primary API key and base URL — so the typical config just points
+    at a bigger Gemini model (e.g. Pro) as a retry backstop. Returns
+    None when no fallback is configured.
+    """
+    fb_model = (os.environ.get("VISION_FALLBACK_MODEL") or "").strip()
+    if not fb_model:
+        return None
+    fb_key = (
+        os.environ.get("VISION_FALLBACK_API_KEY")
+        or os.environ.get("VISION_API_KEY")
+        or ""
+    ).strip()
+    if not fb_key:
+        return None
+    base_url_env = (
+        os.environ.get("VISION_FALLBACK_BASE_URL")
+        or os.environ.get("VISION_BASE_URL")
+        or None
+    )
+    # Fallback gets more headroom than primary — it only runs when
+    # the primary was too truncated or errored, so we pay for
+    # completeness.
+    fb_max_tokens = int(os.environ.get("VISION_FALLBACK_MAX_TOKENS") or "6144")
+    fb_timeout_ms = int(os.environ.get("VISION_FALLBACK_TIMEOUT_MS") or "15000")
+    return GeminiVisionProvider(
+        model=fb_model,
+        api_key=fb_key,
+        base_url=base_url_env,
+        max_tokens=fb_max_tokens,
+        timeout_s=fb_timeout_ms / 1000.0,
+    )
+
+
 __all__ = [
     "GeminiVisionProvider",
     "VisionProvider",
     "select_provider",
+    "select_fallback_provider",
 ]

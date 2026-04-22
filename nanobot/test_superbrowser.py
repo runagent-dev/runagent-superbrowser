@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """go to https://weather.com/ Find out the cold and flu forecast and today's air quality in Champaign, IL.. must from https://weather.com/. use browser tools."""
+        """Pass the first trending chess puzzle. https://www.chess.com/"""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

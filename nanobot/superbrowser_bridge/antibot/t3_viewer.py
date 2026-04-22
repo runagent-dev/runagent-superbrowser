@@ -124,7 +124,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     from {{ opacity: 1; }}
     to   {{ opacity: 0; }}
   }}
-  /* Vision-bbox layer — persistent, dims after 5s of staleness */
+  /* Vision-bbox layer — persistent. Dimmed when the model reported
+     freshness != 'fresh'. No timer-based stale hide; bboxes only
+     clear when a new pass arrives or the URL changes. */
+  .vision-bbox-layer[data-freshness="uncertain"],
+  .vision-bbox-layer[data-freshness="stale"] {{ opacity: 0.5; }}
   .vision-bbox {{
     position: absolute; pointer-events: none;
     border: 2px dashed rgba(79,140,255,0.6);
@@ -133,7 +137,6 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .vision-bbox[data-role="captcha_tile"] {{ border-color: rgba(255,107,107,0.75); }}
   .vision-bbox[data-role="slider_handle"] {{ border-color: rgba(255,200,87,0.75); }}
   .vision-bbox[data-relevant="1"] {{ border-style: solid; border-width: 2px; }}
-  .vision-bbox.stale {{ opacity: 0.35; }}
   .vision-bbox .vlabel {{
     position: absolute; left: 0; top: -16px;
     font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -185,7 +188,6 @@ _HTML_TEMPLATE = r"""<!doctype html>
 (() => {{
   const SESSION_ID = {sid_json};
   const POLL_MS = 250;
-  const VISION_STALE_AFTER_MS = 5000;
 
   const $ = (id) => document.getElementById(id);
   const screen = $('screen');
@@ -294,13 +296,30 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }}
   }}
 
-  // --- Vision bbox layer (persistent, auto-dims) --------------------
+  // --- Vision bbox layer (persistent; URL-bound visibility) ---------
+  // Matches the T1 viewer's behaviour:
+  //   - Overlay stays until a new vision_bboxes event replaces it OR
+  //     the page URL changes (clear on navigation).
+  //   - No timer-driven fade. A stale / uncertain freshness flag from
+  //     the vision model just dims the layer to 50% opacity.
+  //   - vision_pending shows a transient "vision updating…" status
+  //     so the user knows a refresh is in flight.
   let visionLayer = null;
-  let visionLayerAt = 0;
+  let visionLayerUrl = '';
+  let visionPendingTimer = null;
+  function clearVisionBboxes() {{
+    if (visionLayer) {{ try {{ visionLayer.remove(); }} catch (e) {{}} visionLayer = null; }}
+    visionLayerUrl = '';
+  }}
   function showVisionBboxes(d) {{
     if (!d || !Array.isArray(d.bboxes)) return;
+    // Cancel pending indicator — the pass landed.
+    if (visionPendingTimer) {{ clearTimeout(visionPendingTimer); visionPendingTimer = null; }}
     if (visionLayer) {{ try {{ visionLayer.remove(); }} catch (e) {{}} visionLayer = null; }}
     const layer = document.createElement('div');
+    layer.className = 'vision-bbox-layer';
+    const freshness = d.freshness || 'fresh';
+    layer.dataset.freshness = freshness;
     layer.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;z-index:4;';
     for (const b of d.bboxes) {{
       if (typeof b.x0 !== 'number') continue;
@@ -328,14 +347,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }}
     screenWrap.appendChild(layer);
     visionLayer = layer;
-    visionLayerAt = Date.now();
+    visionLayerUrl = d.url || '';
+    // Status strip: show freshness + round-trip so the viewer doesn't
+    // need devtools to see vision state.
+    const bits = ['vision: ' + freshness];
+    if (typeof d.latencyMs === 'number') bits.push(d.latencyMs + 'ms');
+    if (wsConnected) statusEl.textContent = 'streaming — ' + bits.join(' · ');
   }}
-  setInterval(() => {{
-    if (!visionLayer) return;
-    const stale = (Date.now() - visionLayerAt) > VISION_STALE_AFTER_MS;
-    const kids = visionLayer.children || [];
-    for (let i = 0; i < kids.length; i++) kids[i].classList.toggle('stale', stale);
-  }}, 1000);
+  function showVisionPending() {{
+    if (wsConnected) statusEl.textContent = 'streaming — vision updating…';
+    if (visionPendingTimer) clearTimeout(visionPendingTimer);
+    visionPendingTimer = setTimeout(() => {{
+      visionPendingTimer = null;
+      if (wsConnected) statusEl.textContent = 'streaming';
+    }}, 10000);
+  }}
 
   // --- Keystroke indicator ------------------------------------------
   let typingBuffer = '';
@@ -396,10 +422,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
           case 'vision_bboxes':
             showVisionBboxes(msg.payload);
             break;
+          case 'vision_pending':
+            showVisionPending();
+            break;
           case 'keystroke':
             showKeystroke(msg.payload.key);
             break;
           case 'navigation':
+            // URL changed → the previous pass's bboxes are anchored to
+            // a page that no longer exists. Clear them immediately;
+            // the next vision pass will replace.
+            if (msg.payload && msg.payload.url && msg.payload.url !== visionLayerUrl) {{
+              clearVisionBboxes();
+            }}
             showNavigation(msg.payload);
             break;
           case 'drag':

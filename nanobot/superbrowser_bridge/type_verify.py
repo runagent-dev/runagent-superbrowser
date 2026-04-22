@@ -469,6 +469,54 @@ def _format_ops(ops: list[tuple[str, Any]]) -> str:
     return "; ".join(chunks) if chunks else "no change"
 
 
+_READ_FIELD_VALUE_JS = r"""
+(() => {
+  const X = __X__, Y = __Y__;
+  const el = document.elementFromPoint(X, Y);
+  if (!el) return {ok: false, reason: 'no element at coords'};
+  // Walk to an input/textarea/contenteditable ancestor — the actual
+  // field might be wrapped by a click-swallowing label/span.
+  let cur = el;
+  let hops = 0;
+  while (cur && hops < 6) {
+    const tag = (cur.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') {
+      return {ok: true, value: String(cur.value || ''), tag: tag};
+    }
+    if (cur.isContentEditable) {
+      return {ok: true, value: String(cur.innerText || cur.textContent || ''), tag: 'contenteditable'};
+    }
+    cur = cur.parentElement;
+    hops++;
+  }
+  return {ok: false, reason: 'no input ancestor'};
+})()
+"""
+
+
+async def _read_field_value(
+    session_id: str, target_x: float, target_y: float,
+) -> tuple[bool, str]:
+    """Read the current value of the input at (x, y).
+
+    Returns (ok, value). `ok=False` on evaluate failure or when there's
+    no input-like element under the coords — treat as "unknown, don't
+    assert anything". Never raises.
+    """
+    js = (
+        _READ_FIELD_VALUE_JS
+        .replace("__X__", str(float(target_x)))
+        .replace("__Y__", str(float(target_y)))
+    )
+    try:
+        result = await _run_evaluate(session_id, js, timeout=5.0)
+    except Exception:
+        return False, ""
+    if not result.get("ok"):
+        return False, ""
+    return True, str(result.get("value", "") or "")
+
+
 async def _apply_surgical(
     session_id: str, *, target_x: float, target_y: float,
     before: str, target: str,
@@ -548,13 +596,84 @@ async def verify_and_correct(
         suffix = f"\n[verify: skipped ({reason})]" if debug else ""
         return VerifyOutcome(kind="skipped", caption_suffix=suffix)
 
+    # DOM-readback self-heal: before we trust the task-substring shortcut
+    # (which otherwise short-circuits to "ok" without reading the DOM),
+    # read what's ACTUALLY in the field. If the field value doesn't
+    # match `typed_text` within a small edit distance, the caller's
+    # intent wasn't fully delivered — autocomplete dropdowns, IME
+    # composition glitches, and pre-existing field content can all
+    # mangle the result. Surgical-fix to make DOM == typed_text, no
+    # Gemini call needed (we already know the intent).
+    read_ok, dom_value = await _read_field_value(
+        session_id, target_x, target_y,
+    )
+    if read_ok and dom_value != typed_text:
+        # Plan a surgical edit from the DOM value toward the intent.
+        plan = plan_surgical_edit(dom_value, typed_text)
+        if plan is not None:
+            state._verify_in_progress = True  # type: ignore[attr-defined]
+            try:
+                applied, new_after, ops = await _apply_surgical(
+                    session_id,
+                    target_x=target_x, target_y=target_y,
+                    before=dom_value, target=typed_text,
+                )
+            finally:
+                state._verify_in_progress = False  # type: ignore[attr-defined]
+            if applied and new_after == typed_text:
+                ops_str = _format_ops(ops or [])
+                state.record_step(
+                    "verify",
+                    f"{label} self_heal={typed_text!r} was={dom_value!r}",
+                    f"corrected ({ops_str})",
+                )
+                return VerifyOutcome(
+                    kind="corrected",
+                    caption_suffix=(
+                        f"\n[verify: self-heal corrected field — "
+                        f"was {dom_value!r}, now {typed_text!r}; {ops_str}]"
+                    ),
+                    corrected_to=typed_text,
+                    before=dom_value,
+                    after=typed_text,
+                    confidence=1.0,
+                    extra={"self_heal": True, "ops": [list(op) for op in (ops or [])]},
+                )
+            # Surgical apply failed — fall through so Gemini reflection
+            # still has a chance to catch / correct, but DON'T trip the
+            # task-substring shortcut below because that would lie about
+            # the field value.
+        else:
+            # Diff too large (>3 chars) — likely legitimate autocomplete
+            # expansion ("Kevin Hart" → "Kevin Hart Live 2026"). Leave
+            # alone and note it in debug output. Falls through to normal
+            # verify path.
+            if debug:
+                print(
+                    f"  [verify] DOM-readback: dom_value={dom_value!r} "
+                    f"differs from typed={typed_text!r} by >3 chars, "
+                    f"assuming autocomplete — skipping self-heal"
+                )
+
     task_instr = (getattr(state, "task_instruction", "") or "")
     if task_instr and _task_has_token(task_instr, typed_text):
-        # LLM typed something already in the task — it's fine.
-        return VerifyOutcome(
-            kind="ok",
-            caption_suffix="\n[verify: ok]",
-        )
+        # Only take the fast-path "ok" when DOM agrees with intent.
+        # If the readback above found a mismatch we couldn't fix, we
+        # fall through to the Gemini reflector instead of silently
+        # declaring victory.
+        if read_ok and dom_value == typed_text:
+            return VerifyOutcome(
+                kind="ok",
+                caption_suffix="\n[verify: ok (dom matches intent)]",
+            )
+        if not read_ok:
+            # DOM probe failed — keep original behavior for safety so
+            # we don't regress sites where the readback injection can't
+            # find the field.
+            return VerifyOutcome(
+                kind="ok",
+                caption_suffix="\n[verify: ok]",
+            )
 
     if _cache_hit(session_id, label, typed_text):
         return VerifyOutcome(kind="skipped", caption_suffix="")

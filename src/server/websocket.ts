@@ -41,7 +41,7 @@ import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
 import { feedbackBus, type FeedbackEvent } from '../agent/feedback-bus.js';
 import { ScreencastManager } from '../browser/screencast.js';
-import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent, type ClickTargetEvent, type VisionBboxesEvent } from '../browser/input-events.js';
+import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent, type ClickTargetEvent, type VisionBboxesEvent, type VisionPendingEvent } from '../browser/input-events.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -222,13 +222,27 @@ export function attachWebSocketServer(
   });
 
   // Fires after each vision pass — the viewer flashes the full set of
-  // detected bboxes on the live frame for ~1.5s. Lets the user see what
-  // Gemini "saw" so misses can be attributed to vision vs snap.
+  // detected bboxes on the live frame. Lets the user see what Gemini
+  // "saw" so misses can be attributed to vision vs snap. Now carries
+  // url/freshness/latencyMs so the UI can gate display by URL match
+  // and dim stale/uncertain frames instead of hiding bboxes on a timer.
   inputEventBus.on('vision_bboxes', (evt: VisionBboxesEvent) => {
     broadcastToSession(wss, evt.sessionId, 'vision_bboxes', {
       bboxes: evt.bboxes,
       imageWidth: evt.imageWidth,
       imageHeight: evt.imageHeight,
+      url: evt.url,
+      freshness: evt.freshness,
+      latencyMs: evt.latencyMs,
+    });
+  });
+
+  // Fires when a vision call is dispatched, BEFORE the model returns.
+  // Lets the UI show a transient "vision updating…" indicator so the
+  // user knows an overlay refresh is in flight.
+  inputEventBus.on('vision_pending', (evt: VisionPendingEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'vision_pending', {
+      dispatchedAt: evt.dispatchedAt,
     });
   });
 

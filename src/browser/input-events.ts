@@ -66,6 +66,26 @@ export interface VisionBboxesEvent {
   }>;
   imageWidth?: number;
   imageHeight?: number;
+  /** URL the screenshot was captured on. UI drops bboxes whose URL
+   *  no longer matches the current screencast frame. */
+  url?: string;
+  /** Model's self-report of screenshot freshness. UI dims the overlay
+   *  when this is not "fresh". */
+  freshness?: 'fresh' | 'uncertain' | 'stale';
+  /** Vision-agent round-trip in milliseconds (debug). */
+  latencyMs?: number;
+  ts: number;
+}
+
+/**
+ * Vision-pass dispatched — emitted when the Python bridge kicks off a
+ * vision call. Live viewers render a transient "vision updating…"
+ * indicator so the user can see the overlay is about to refresh rather
+ * than assume it's stuck.
+ */
+export interface VisionPendingEvent {
+  sessionId: string;
+  dispatchedAt: number;
   ts: number;
 }
 
@@ -112,14 +132,30 @@ class InputEventBus extends EventEmitter {
     bboxes: VisionBboxesEvent['bboxes'],
     imageWidth?: number,
     imageHeight?: number,
+    extras?: {
+      url?: string;
+      freshness?: VisionBboxesEvent['freshness'];
+      latencyMs?: number;
+    },
   ): void {
     this.emit('vision_bboxes', {
       sessionId,
       bboxes,
       imageWidth,
       imageHeight,
+      url: extras?.url,
+      freshness: extras?.freshness,
+      latencyMs: extras?.latencyMs,
       ts: Date.now(),
     } satisfies VisionBboxesEvent);
+  }
+
+  emitVisionPending(sessionId: string, dispatchedAt?: number): void {
+    this.emit('vision_pending', {
+      sessionId,
+      dispatchedAt: dispatchedAt ?? Date.now(),
+      ts: Date.now(),
+    } satisfies VisionPendingEvent);
   }
 }
 

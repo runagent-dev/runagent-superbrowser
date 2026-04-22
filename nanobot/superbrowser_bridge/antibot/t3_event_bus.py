@@ -149,9 +149,15 @@ class T3EventBus:
         snapped: bool = False,
         bbox: Optional[dict] = None,
         target: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         """A click has been dispatched. Viewer pulses at (x, y) and
         briefly draws the bbox if provided.
+
+        `strategy` records which dispatch mechanism landed the click —
+        primary / keyboard / js / parent. Useful for the viewer to show
+        ladder attempts distinctly (and for A/B analysis of which tiers
+        actually move the needle on real-world sites).
         """
         payload: dict[str, Any] = {
             "x": float(x), "y": float(y), "snapped": bool(snapped),
@@ -160,6 +166,8 @@ class T3EventBus:
             payload["bbox"] = bbox
         if target is not None:
             payload["target"] = target
+        if strategy is not None:
+            payload["strategy"] = str(strategy)
         self._push(session_id, "click_target", payload)
 
     def emit_drag(
@@ -188,15 +196,34 @@ class T3EventBus:
         bboxes: list[dict],
         image_w: int,
         image_h: int,
+        *,
+        url: str = "",
+        freshness: str = "fresh",
+        latency_ms: int | None = None,
     ) -> None:
         """Full vision-agent bbox set for the current page. Viewer
-        replaces any prior overlay and auto-dims old boxes after a
-        few seconds.
+        replaces any prior overlay when the payload URL matches the
+        current screencast frame's URL. `freshness` dims the overlay
+        when the model wasn't confident the screenshot was current.
         """
-        self._push(session_id, "vision_bboxes", {
+        payload: dict = {
             "bboxes": bboxes,
             "imageWidth": int(image_w),
             "imageHeight": int(image_h),
+            "url": str(url or ""),
+            "freshness": str(freshness or "fresh"),
+        }
+        if latency_ms is not None:
+            payload["latencyMs"] = int(latency_ms)
+        self._push(session_id, "vision_bboxes", payload)
+
+    def emit_vision_pending(self, session_id: str) -> None:
+        """A vision pass is in flight. The viewer shows a transient
+        "vision updating…" indicator so the user can see that the
+        overlay is about to refresh, instead of assuming it's stuck.
+        """
+        self._push(session_id, "vision_pending", {
+            "dispatchedAt": int(time.time() * 1000),
         })
 
     def emit_navigation(

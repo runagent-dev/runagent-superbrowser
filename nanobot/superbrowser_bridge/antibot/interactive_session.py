@@ -58,6 +58,107 @@ from . import content as _content
 
 logger = logging.getLogger(__name__)
 
+
+def _env_light_mode() -> bool:
+    """Global kill-switch for T3 antibot overhead.
+
+    When set, disables bezier cursor humanization, shortens settle
+    windows, uses faster load-state for navigation, and skips the
+    30s CF warm-up wait. Useful when T3 is only being used because
+    a session was already on T3 (e.g. auth flow continuation) but
+    the target site itself has no bot protection.
+    """
+    return os.environ.get("T3_LIGHT_MODE", "0") == "1"
+
+
+def _labels_match(expected: str, el_info: dict) -> bool:
+    """Return True when the element at the click target plausibly
+    matches the vision agent's label for this bbox.
+
+    The matcher is intentionally lax — different sources of text
+    (aria-label vs inner text vs placeholder) legitimately differ
+    from the vision label by a few words — and it exists purely to
+    catch the gross misfire where vision said "Buy Now" but we're
+    about to click a wrapper <div> or a completely different element.
+
+    Accepts a match when:
+      - any word in `expected` (>= 3 chars) appears in any of the
+        element's readable fields, case-insensitive, OR
+      - the element is an input/textarea/select whose role/type
+        matches the vision label semantics (input-like labels from
+        vision can legitimately have no visible text).
+    """
+    if not expected:
+        return True
+    exp = expected.strip().lower()
+    if not exp:
+        return True
+    fields = [
+        (el_info.get("text") or "").lower(),
+        (el_info.get("aria") or "").lower(),
+        (el_info.get("title") or "").lower(),
+        (el_info.get("placeholder") or "").lower(),
+        (el_info.get("value") or "").lower(),
+        (el_info.get("role") or "").lower(),
+    ]
+    haystack = " ".join(fields)
+    if not haystack.strip():
+        # Inputs/selects may legitimately have no visible text. Don't
+        # reject them just for being empty — the snap already verified
+        # the element sits within the bbox, which is strong enough.
+        tag = (el_info.get("tag") or "").upper()
+        if tag in {"INPUT", "TEXTAREA", "SELECT", "BUTTON"}:
+            return True
+        return False
+    # Any non-trivial word from the expected label found in the
+    # haystack is a pass. Split on whitespace and common JSON-ish
+    # separators so phrases like "sign-in" still match.
+    import re
+    words = [
+        w for w in re.split(r"[\s\-_/,.:;()\"']+", exp)
+        if len(w) >= 3
+    ]
+    if not words:
+        # Expected label was all punctuation / short tokens — fall back
+        # to substring match.
+        return exp in haystack
+    return any(w in haystack for w in words)
+
+
+# Chromium error substrings that mean "the proxy itself is broken, not
+# the target site." On these, retrying the same URL against the same
+# proxy will hit the exact same wall — the only useful recovery is to
+# bypass the proxy entirely for this session.
+#
+# Excludes ERR_NAME_NOT_RESOLVED / ERR_CONNECTION_REFUSED / ERR_TIMED_OUT:
+# those can be site-down or network-flaky and shouldn't silently demote
+# the proxy config.
+_PROXY_ERROR_SUBSTRINGS = (
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_PROXY_AUTH_UNSUPPORTED",
+    "ERR_PROXY_AUTH_REQUESTED",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+    "ERR_HTTPS_PROXY_TUNNEL_RESPONSE",
+    "ERR_MANDATORY_PROXY_CONFIGURATION_FAILED",
+    "ERR_UNEXPECTED_PROXY_AUTH",
+)
+
+
+def _is_proxy_error(nav_error: str) -> bool:
+    """True when a navigation failure came from the proxy layer.
+
+    Covers CONNECT refused (dead proxy), auth rejected (bad creds /
+    expired subscription), and cert-chain mismatches on HTTPS proxies.
+    Everything else — DNS, timeouts, site 5xx, CF challenges — routes
+    through different recovery paths and MUST NOT bypass the proxy
+    (doing so would leak the real IP to sites that block scraping).
+    """
+    if not nav_error:
+        return False
+    msg = nav_error.upper()
+    return any(sig in msg for sig in _PROXY_ERROR_SUBSTRINGS)
+
 # Match the TS server's session lifetime (src/server/http.ts:40-41).
 SESSION_IDLE_TIMEOUT_S = 30 * 60
 SESSION_MAX_LIFETIME_S = 2 * 60 * 60
@@ -184,6 +285,100 @@ def _resolve_profile_dir(domain: str) -> Path:
     return base
 
 
+# Injected via `context.add_init_script` at session open AND via
+# on-demand `ensure_scene_observer()` (patchright's init_script goes
+# through an HTTP inject route that doesn't fire on data: URLs or
+# set_content, so synthetic test harnesses need the on-demand path).
+# Every page gets a long-lived MutationObserver that watches for
+# overlay churn: when a `position:fixed|absolute` element with
+# z-index > 1000 is ADDED — the strong signal for "a modal just
+# appeared" — the observer stamps `window.__superbrowser_scene_dirty_ts__`
+# with `Date.now()`. Python-side code reads this in the screenshot
+# path to bust the vision cache key.
+#
+# Removal-detection is intentionally weaker: `getComputedStyle` on a
+# removed node returns empty, so our `significantNode` check won't
+# fire for removedNodes. That's fine — removal is either driven by
+# the brain's own dismiss click (handled by `verify_action.bbox_disappeared`)
+# or by site JS auto-closing, which results in a new element appearing
+# below (still triggers the add path). The observer's job is to catch
+# SURPRISE modals that appear without a concurrent user action.
+#
+# The observer is attached to `document.documentElement` rather than
+# `document.body` so it survives full page replacements (SPAs that
+# replace body via route changes still keep the observer). It uses a
+# small debounce (150ms) to coalesce bursts of mutations that often
+# accompany overlay animations (the banner animates into view, then
+# its children mutate several more times in the same frame).
+#
+# Safety: wrapped in a try/catch + idempotency guard so double-injection
+# (iframe navigate, same-document nav) doesn't crash the page.
+_SCENE_DIRTY_OBSERVER_JS = r"""
+(() => {
+  try {
+    if (window.__superbrowser_scene_obs_installed__) return;
+    window.__superbrowser_scene_obs_installed__ = true;
+    window.__superbrowser_scene_dirty_ts__ = 0;
+
+    const THRESHOLD_Z = 1000;
+    const significantNode = (node) => {
+      if (!(node instanceof Element)) return false;
+      let cs;
+      try { cs = getComputedStyle(node); } catch { return false; }
+      if (!cs) return false;
+      if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+      const z = parseInt(cs.zIndex, 10) || 0;
+      return z > THRESHOLD_Z;
+    };
+
+    let debounceTimer = null;
+    const markDirty = () => {
+      if (debounceTimer !== null) return;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        window.__superbrowser_scene_dirty_ts__ = Date.now();
+      }, 150);
+    };
+
+    const install = () => {
+      if (!document.documentElement) return false;
+      const obs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          for (const n of m.addedNodes) {
+            if (significantNode(n)) { markDirty(); return; }
+          }
+          for (const n of m.removedNodes) {
+            if (significantNode(n)) { markDirty(); return; }
+          }
+          // Style/class mutations on an element that might be fixed
+          // — cheap check: its current computed style qualifies.
+          if (m.type === 'attributes' && significantNode(m.target)) {
+            markDirty();
+            return;
+          }
+        }
+      });
+      obs.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'class', 'hidden'],
+      });
+      window.__superbrowser_scene_obs__ = obs;
+      return true;
+    };
+
+    if (install()) return;
+    // documentElement not ready — hook once it is.
+    const poll = setInterval(() => {
+      if (install()) clearInterval(poll);
+    }, 50);
+    setTimeout(() => clearInterval(poll), 5000);
+  } catch (_e) { /* never break the page */ }
+})();
+"""
+
+
 @dataclass
 class _ManagedSession:
     id: str
@@ -211,6 +406,28 @@ class _ManagedSession:
     # and feed those intermediate points into the viewer overlay.
     cursor_x: float = 640.0
     cursor_y: float = 384.0
+    # Last time the in-page MutationObserver reported a significant
+    # scene change (new position:fixed z>1000 element added or
+    # removed). Python-side timestamp; refreshed from
+    # `window.__superbrowser_scene_dirty_ts__` during screenshot cache
+    # key computation. Drives cache-bust for event-driven re-vision.
+    scene_dirty_ts: float = 0.0
+    # Timestamp of the last vision pass that CONSUMED scene_dirty_ts.
+    # A scene_dirty event is considered "fresh" when scene_dirty_ts >
+    # last_vision_ts; consumed otherwise.
+    last_vision_ts: float = 0.0
+    # Proxy was disabled for this session after a proxy-class nav error
+    # (ERR_TUNNEL_CONNECTION_FAILED / ERR_PROXY_CONNECTION_FAILED).
+    # Prevents the retry path from re-picking the same broken proxy on
+    # every subsequent navigate. A broken proxy won't heal in 100ms;
+    # the user re-enables it by closing the session (+ fixing .env).
+    proxy_disabled: bool = False
+    # Auto-downshift: when True, skip the antibot overhead (bezier
+    # humanization, long CF waits, networkidle settle) for this
+    # session. Set after a successful nav with NO CF/PX signals, so
+    # easy sites match T1 performance while hard sites keep the full
+    # armor. Forced on by T3_LIGHT_MODE=1.
+    light_mode: bool = False
 
 
 class T3SessionManager:
@@ -467,6 +684,20 @@ class T3SessionManager:
                 except Exception:
                     pass
 
+        # Event-driven re-vision hook: inject a MutationObserver that
+        # flips a timestamp whenever a significant overlay appears or
+        # disappears (position:fixed|absolute with z-index > 1000). The
+        # screenshot code reads this timestamp before deciding whether
+        # the vision cache key is still valid. If a modal appeared since
+        # the last vision pass, cache is busted even though the URL +
+        # DOM hash match. Falls back to passive (planner-driven) revision
+        # on pages where the observer can't attach for any reason.
+        if os.environ.get("SCENE_DIRTY_OBSERVER", "1") != "0":
+            try:
+                await context.add_init_script(_SCENE_DIRTY_OBSERVER_JS)
+            except Exception as exc:
+                logger.debug("scene-dirty observer inject failed: %s", exc)
+
         page = await context.new_page()
 
         # Capture the real UA post-stealth so UA-pinned cookies are saved
@@ -497,81 +728,36 @@ class T3SessionManager:
             cursor_y=float(_init_rng.randint(220, 420)),
         )
 
-        # CDP screencast → T3 viewer. Starts streaming JPEG frames as
-        # fast as CfT encodes them (every other frame at quality 60 ≈
-        # 12-15 FPS in practice). The emit is per-frame into the bus;
-        # the viewer's WS handler fans out to subscribers. Failures
-        # here are non-fatal — polling-fallback still works.
-        # Opt-out via T3_DISABLE_SCREENCAST=1 (saves bandwidth when
-        # the viewer isn't in use, e.g. non-interactive runs).
-        if os.environ.get("T3_DISABLE_SCREENCAST") != "1":
-            frame_counter = {"n": 0}
-            try:
-                cdp = await context.new_cdp_session(page)
-                self._sessions[sid].cdp = cdp
-
-                def _on_frame(params: dict) -> None:
-                    # Runs inside patchright's event loop. Emit into
-                    # the bus + schedule the CDP ack as a task (ack
-                    # is async so we can't await from a sync handler).
-                    try:
-                        data = params.get("data") or ""
-                        md = params.get("metadata") or {}
-                        from . import t3_event_bus as _bus
-                        _bus.default().emit_screencast_frame(
-                            sid, data,
-                            width=int(md.get("deviceWidth") or 0),
-                            height=int(md.get("deviceHeight") or 0),
-                            timestamp=float(md.get("timestamp") or 0.0),
-                        )
-                        frame_counter["n"] += 1
-                        # One-shot log on the first frame so the
-                        # operator can verify screencast actually
-                        # started (not just CDP attach).
-                        if frame_counter["n"] == 1:
-                            print(
-                                f"  [cdp screencast] first frame received "
-                                f"for {sid} ({len(data)} bytes)"
-                            )
-                        ack_sid = params.get("sessionId")
-                        if ack_sid is not None:
-                            asyncio.create_task(
-                                cdp.send(
-                                    "Page.screencastFrameAck",
-                                    {"sessionId": int(ack_sid)},
-                                ),
-                            )
-                    except Exception as exc:
-                        logger.debug("screencast frame handler: %s", exc)
-
-                cdp.on("Page.screencastFrame", _on_frame)
-                # Tight parameters for smoother viewer — quality 55
-                # (small JPEGs) at everyNthFrame=1 gives ~20-24 FPS
-                # on a well-provisioned VM. Bump T3_SCREENCAST_QUALITY
-                # down if bandwidth is a concern.
-                quality = int(os.environ.get("T3_SCREENCAST_QUALITY") or 55)
-                every_nth = int(os.environ.get("T3_SCREENCAST_EVERY_N") or 1)
-                await cdp.send("Page.startScreencast", {
-                    "format": "jpeg",
-                    "quality": quality,
-                    "everyNthFrame": every_nth,
-                })
-                print(
-                    f"  [cdp screencast] started for {sid} "
-                    f"(quality={quality}, everyNthFrame={every_nth})"
-                )
-            except Exception as exc:
-                print(
-                    f"  [cdp screencast] setup FAILED for {sid}: "
-                    f"{type(exc).__name__}: {exc} — viewer will use "
-                    f"250ms polling fallback"
-                )
-                logger.debug(
-                    "CDP screencast setup failed (non-fatal): %s", exc,
-                )
+        await self._attach_screencast(sid, context, page)
 
         if url:
             nav = await self._goto_with_warmup(sid, url, timeout_s)
+            # Proxy-failure auto-recovery (checked FIRST — no point
+            # checking CF block state if the proxy refused the tunnel,
+            # the page is a chrome-error:// shell). Opt-out via
+            # T3_PROXY_FALLBACK=0.
+            if (
+                os.environ.get("T3_PROXY_FALLBACK", "1") != "0"
+                and _is_proxy_error(nav.get("nav_error", ""))
+            ):
+                logger.warning(
+                    "open %s hit proxy error (%s) — falling back to "
+                    "DIRECT connection and retrying once",
+                    url, nav.get("nav_error", "")[:120],
+                )
+                try:
+                    await self._rebuild_context_for_retry(
+                        sid, domain, viewport, import_state,
+                        force_direct=True,
+                    )
+                    nav = await self._goto_with_warmup(sid, url, timeout_s)
+                    nav["proxy_fallback"] = True
+                except Exception as exc:
+                    logger.warning(
+                        "proxy-fallback retry failed on open (sid=%s): %s",
+                        sid, exc,
+                    )
+                    nav.setdefault("proxy_fallback_error", str(exc)[:200])
             # One retry on hard Cloudflare block: if we still see a
             # challenge title and no clearance cookie landed, rebuild the
             # context with a fresh UA (+ demote proxy tier) and try once
@@ -619,31 +805,243 @@ class T3SessionManager:
             return True
         return False
 
+    async def _attach_screencast(
+        self,
+        sid: str,
+        context: Any,
+        page: Any,
+    ) -> None:
+        """Attach a CDP screencast for the live viewer. Idempotent-safe:
+        call once per context (new session OR post-rebuild). Failures
+        are non-fatal — the viewer falls back to 250ms polling.
+
+        After a context rebuild (`_rebuild_context_for_retry` /
+        `_relaunch_persistent_direct`), callers MUST invoke this to
+        restart the screencast; otherwise the viewer stays frozen on
+        the last frame from the old (dead) context, which is confusing
+        because the dead frame usually shows a chrome-error page while
+        the real new context has already loaded the target site.
+        """
+        if os.environ.get("T3_DISABLE_SCREENCAST") == "1":
+            return
+        frame_counter = {"n": 0}
+        try:
+            cdp = await context.new_cdp_session(page)
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.cdp = cdp
+
+            def _on_frame(params: dict) -> None:
+                # Runs inside patchright's event loop. Emit into
+                # the bus + schedule the CDP ack as a task (ack
+                # is async so we can't await from a sync handler).
+                try:
+                    data = params.get("data") or ""
+                    md = params.get("metadata") or {}
+                    from . import t3_event_bus as _bus
+                    _bus.default().emit_screencast_frame(
+                        sid, data,
+                        width=int(md.get("deviceWidth") or 0),
+                        height=int(md.get("deviceHeight") or 0),
+                        timestamp=float(md.get("timestamp") or 0.0),
+                    )
+                    frame_counter["n"] += 1
+                    if frame_counter["n"] == 1:
+                        print(
+                            f"  [cdp screencast] first frame received "
+                            f"for {sid} ({len(data)} bytes)"
+                        )
+                    ack_sid = params.get("sessionId")
+                    if ack_sid is not None:
+                        asyncio.create_task(
+                            cdp.send(
+                                "Page.screencastFrameAck",
+                                {"sessionId": int(ack_sid)},
+                            ),
+                        )
+                except Exception as exc:
+                    logger.debug("screencast frame handler: %s", exc)
+
+            cdp.on("Page.screencastFrame", _on_frame)
+            quality = int(os.environ.get("T3_SCREENCAST_QUALITY") or 55)
+            every_nth = int(os.environ.get("T3_SCREENCAST_EVERY_N") or 1)
+            await cdp.send("Page.startScreencast", {
+                "format": "jpeg",
+                "quality": quality,
+                "everyNthFrame": every_nth,
+            })
+            print(
+                f"  [cdp screencast] started for {sid} "
+                f"(quality={quality}, everyNthFrame={every_nth})"
+            )
+        except Exception as exc:
+            print(
+                f"  [cdp screencast] setup FAILED for {sid}: "
+                f"{type(exc).__name__}: {exc} — viewer will use "
+                f"250ms polling fallback"
+            )
+            logger.debug(
+                "CDP screencast setup failed (non-fatal): %s", exc,
+            )
+
+    async def _relaunch_persistent_direct(
+        self,
+        sid: str,
+        viewport: tuple[int, int],
+    ) -> None:
+        """Tear down a persistent-profile session and relaunch it DIRECT.
+
+        Used when the current proxy is refusing connections — a case
+        where profile continuity is worth less than basic reachability.
+        Keeps the same `user_data_dir` so any localStorage /
+        IndexedDB / service-worker state the previous session managed
+        to land stays intact.
+        """
+        s = self._sessions.get(sid)
+        if s is None:
+            raise KeyError(f"session not found: {sid}")
+        domain = s.domain or ""
+        profile_dir = _resolve_profile_dir(domain)
+        # Stop the CDP screencast FIRST — closing the context while the
+        # screencast task is mid-flight produces a "TargetClosedError:
+        # CDPSession.send" that asyncio logs as "Task exception was
+        # never retrieved". Cosmetic but noisy. Mirror the teardown
+        # order in `close()`.
+        if s.cdp is not None:
+            try:
+                await s.cdp.send("Page.stopScreencast")
+            except Exception as exc:
+                logger.debug("stop screencast before relaunch %s: %s", sid, exc)
+            s.cdp = None
+        try:
+            await s.context.close()
+        except Exception:
+            pass
+        try:
+            if s.persistent_browser is not None:
+                await s.persistent_browser.close()
+        except Exception:
+            pass
+        persist_headless = os.environ.get("T3_HEADLESS", "1") != "0"
+        _maybe_start_xvfb(persist_headless)
+        persist_args: list[str] = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if os.environ.get("T3_DISABLE_HTTP2", "1") != "0":
+            persist_args.append("--disable-http2")
+        persist_kwargs: dict[str, Any] = {
+            "user_data_dir": str(profile_dir),
+            "headless": persist_headless,
+            "args": persist_args,
+            "viewport": {"width": viewport[0], "height": viewport[1]},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            # No proxy key at all — direct connection.
+            "user_agent": s.ua,
+        }
+        chrome_path = os.environ.get("CHROME_PATH") or None
+        chrome_channel = os.environ.get("CHROME_CHANNEL") or None
+        if chrome_path:
+            persist_kwargs["executable_path"] = chrome_path
+        if chrome_channel:
+            persist_kwargs["channel"] = chrome_channel
+        if self._pw is None:
+            # Shouldn't happen — _ensure_browser ran during open() — but
+            # fail cleanly rather than crash if someone calls this mid-
+            # teardown.
+            raise RuntimeError("playwright not initialized; cannot relaunch")
+        new_context = await self._pw.chromium.launch_persistent_context(
+            **persist_kwargs,
+        )
+        # Apply the same stealth surface as the original launch.
+        stealth = Stealth(
+            navigator_user_agent_override=s.ua,
+            navigator_webdriver=True,
+            navigator_languages=True,
+            navigator_permissions=True,
+            navigator_plugins=True,
+            navigator_vendor=True,
+            navigator_platform=True,
+            navigator_hardware_concurrency=True,
+            navigator_user_agent_data=True,
+            webgl_vendor=True,
+            hairline=True,
+            iframe_content_window=True,
+            media_codecs=True,
+            sec_ch_ua=True,
+        )
+        try:
+            await stealth.apply_stealth_async(new_context)
+        except Exception as exc:
+            logger.debug("stealth reapply failed (non-fatal): %s", exc)
+        # launch_persistent_context gives back a context with at least
+        # one page already. Reuse it instead of creating another.
+        pages = new_context.pages
+        new_page = pages[0] if pages else await new_context.new_page()
+        s.context = new_context
+        s.page = new_page
+        s.persistent_browser = getattr(new_context, "browser", None)
+        s.proxy = None
+        s.proxy_disabled = True
+        # Re-attach CDP screencast so the live viewer doesn't stay
+        # frozen on the old chrome-error frame. Without this the UI
+        # looks like "site is temporarily down" even after the direct
+        # retry has successfully loaded the target.
+        await self._attach_screencast(sid, new_context, new_page)
+        logger.info(
+            "persistent session %s relaunched DIRECT (profile=%s)",
+            sid, profile_dir,
+        )
+
     async def _rebuild_context_for_retry(
         self,
         sid: str,
         domain: str,
         viewport: tuple[int, int],
         import_state: Optional[dict],
+        *,
+        force_direct: bool = False,
     ) -> None:
         """Close and recreate the session's context with a different UA
         and a demoted proxy tier. Used as a one-shot retry on hard CF
         blocks. Preserves the session_id so the LLM's subsequent calls
-        keep routing to the same slot."""
+        keep routing to the same slot.
+
+        When `force_direct=True`, we skip `proxy_tiers.pick()` entirely
+        and launch the new context with NO proxy. Used to recover from
+        `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_PROXY_CONNECTION_FAILED`
+        — conditions where the proxy itself is the blocker, not the
+        site. The session is flagged so subsequent navigations also
+        stay direct (a broken proxy will still be broken in 100ms).
+        """
         from .headers import for_profile, random_profile
         s = self._sessions.get(sid)
         if s is None:
             raise KeyError(f"session not found: {sid}")
-        # Persistent-profile sessions do not participate in the fresh-UA
-        # retry dance: the whole point of a persistent profile is that
+        # Persistent-profile sessions normally skip the fresh-UA retry
+        # dance — the whole point of a persistent profile is that
         # continuity (same UA, same localStorage, same cf_clearance) is
-        # what passes the challenge. Rebuilding would wipe it. Skip —
-        # the CF solver will still humanize-wait on the current context.
-        if s.persistent_browser is not None:
+        # what passes the CF challenge. Rebuilding for CF blocks would
+        # discard that and defeat the purpose.
+        #
+        # BUT: for force_direct (proxy dead), we MUST rebuild even on
+        # persistent profiles. A broken proxy means every request is
+        # failing upstream of the site, so profile continuity is moot
+        # — nothing reached the site to populate the profile anyway.
+        # Relaunch the persistent context with proxy=None, keeping the
+        # same user_data_dir so any prior accumulated state is intact.
+        if s.persistent_browser is not None and not force_direct:
             logger.info(
                 "retry skipped for persistent-profile session %s "
                 "(rebuild would discard the profile)", sid,
             )
+            return
+        if s.persistent_browser is not None and force_direct:
+            await self._relaunch_persistent_direct(sid, viewport)
             return
         # Also defensive: if the shared browser is somehow None (shouldn't
         # happen in ephemeral mode but surfaced a NoneType crash before
@@ -654,14 +1052,27 @@ class T3SessionManager:
                 "(persistent mode without persistent_browser set?)", sid,
             )
             return
-        # Demote the proxy tier for this domain so the next attempt may
-        # pick a stricter pool (residential if configured).
-        try:
-            proxy_tiers.default().demote(domain)
-        except Exception:
-            pass
-        new_proxy = proxy_tiers.default().pick(domain)
-        launch_proxy = _proxy_to_playwright(new_proxy)
+        if force_direct:
+            # Proxy recovery path: don't demote (which would pick a
+            # different proxy that's probably just as broken), just skip
+            # the proxy layer entirely for this session. Remember it on
+            # the session so future navigations stay direct.
+            new_proxy = None
+            launch_proxy = None
+            s.proxy_disabled = True
+            logger.info(
+                "session %s switched to DIRECT (bypassing proxy) after "
+                "proxy-class navigation error", sid,
+            )
+        else:
+            # Demote the proxy tier for this domain so the next attempt may
+            # pick a stricter pool (residential if configured).
+            try:
+                proxy_tiers.default().demote(domain)
+            except Exception:
+                pass
+            new_proxy = proxy_tiers.default().pick(domain)
+            launch_proxy = _proxy_to_playwright(new_proxy)
         # Pick a fresh UA profile distinct from the previous one.
         old_profile = os.environ.get("T3_UA_PROFILE")
         try:
@@ -671,6 +1082,14 @@ class T3SessionManager:
             new_ua = for_profile(profile)["User-Agent"]
         except Exception:
             new_ua = s.ua
+        # Stop CDP screencast before context close to avoid a stray
+        # "TargetClosedError: CDPSession.send" on the background task.
+        if s.cdp is not None:
+            try:
+                await s.cdp.send("Page.stopScreencast")
+            except Exception:
+                pass
+            s.cdp = None
         # Close the old context + page.
         try:
             await s.context.close()
@@ -713,6 +1132,8 @@ class T3SessionManager:
         s.page = new_page
         s.ua = new_ua
         s.proxy = new_proxy
+        # Re-attach CDP screencast — see note in _relaunch_persistent_direct.
+        await self._attach_screencast(sid, new_context, new_page)
 
     async def _move_cursor_smooth(
         self,
@@ -747,6 +1168,17 @@ class T3SessionManager:
         dist = (dx * dx + dy * dy) ** 0.5
         if dist < 2.0:
             # Already on target — just update state, no motion needed.
+            s.cursor_x, s.cursor_y = tx, ty
+            return
+        # Light mode: teleport the cursor in a single move. Skips the
+        # 50-500ms bezier humanization that real anti-bot sites need
+        # but easy sites don't. Matches T1's "no cursor simulation"
+        # behaviour so perceived click latency drops to T1 levels.
+        if s.light_mode or _env_light_mode():
+            try:
+                await s.page.mouse.move(tx, ty)
+            except Exception:
+                pass
             s.cursor_x, s.cursor_y = tx, ty
             return
         # Step count scales with distance so short hops aren't
@@ -951,6 +1383,7 @@ class T3SessionManager:
         self, sid: str, url: str, timeout_s: float
     ) -> dict[str, Any]:
         s = self._get(sid)
+        _light = bool(s.light_mode or _env_light_mode())
         prev_url = s.page.url or ""
         target_host = urlparse(url).hostname or ""
         prev_host = urlparse(prev_url).hostname or ""
@@ -965,7 +1398,8 @@ class T3SessionManager:
         # signature that DataDome/Akamai flag instantly.
         target_is_root = url.rstrip("/") == root.rstrip("/")
         needs_warmup = (
-            warmup.should_warmup(url)
+            not _light
+            and warmup.should_warmup(url)
             and (cross_origin or prev_host == "")
             and not target_is_root
         )
@@ -985,9 +1419,10 @@ class T3SessionManager:
         # Pre-navigation humanization — brief mouse motion + timing jitter.
         # Breaks the "two page.goto calls fired 50ms apart" signature that
         # Akamai/DataDome use to flag scripted nav. Costs ~0.4-1.2s per
-        # navigate. Tune via T3_NAV_JITTER=0 to disable.
+        # navigate. Tune via T3_NAV_JITTER=0 to disable. Auto-skipped in
+        # light mode.
         import random as _random
-        if os.environ.get("T3_NAV_JITTER") != "0":
+        if not _light and os.environ.get("T3_NAV_JITTER") != "0":
             try:
                 await s.page.mouse.move(
                     _random.randint(200, 800),
@@ -1002,9 +1437,16 @@ class T3SessionManager:
         # Only set when prev_url is an http(s) URL to avoid leaking about:blank.
         referer = prev_url if prev_url.startswith(("http://", "https://")) else None
 
+        nav_error: str = ""
         try:
             goto_kwargs: dict[str, Any] = {
-                "wait_until": "domcontentloaded",
+                # Light mode uses 'commit' — the fastest safe signal
+                # (response headers received). T1's default is also
+                # 'commit'-equivalent (no full-load wait), so this
+                # matches T1's perceived snap. Full mode keeps
+                # 'domcontentloaded' so the warmup + CF probe still
+                # have a parsed page to inspect.
+                "wait_until": "commit" if _light else "domcontentloaded",
                 "timeout": int(timeout_s * 1000),
             }
             if referer:
@@ -1014,23 +1456,36 @@ class T3SessionManager:
         except Exception as exc:
             logger.warning("navigate %s failed: %s", url, exc)
             status = 0
+            # Preserve the raw error string so the caller can classify it
+            # (proxy failure vs DNS vs site-down vs CF block). Chromium
+            # errors show up as "net::ERR_*" in the exception message;
+            # without capturing we can only see status=0.
+            nav_error = str(exc)[:500]
 
-        try:
-            await s.page.wait_for_load_state(
-                "networkidle",
-                timeout=min(int(timeout_s * 1000), 15_000),
-            )
-        except Exception:
-            pass
+        # Skip the networkidle wait in light mode — T1 doesn't do
+        # this either; it just fires the tool observation after commit
+        # and lets the next screenshot pick up any post-nav changes.
+        if not _light:
+            try:
+                await s.page.wait_for_load_state(
+                    "networkidle",
+                    timeout=min(int(timeout_s * 1000), 15_000),
+                )
+            except Exception:
+                pass
 
         # Self-clearing challenge wait (CF "Just a moment", DataDome auto-
         # verify, basic Akamai IUAM). Humanized polling lives in
         # `_wait_for_cf_clear` so the dedicated CF captcha solver can
-        # reuse it. Defaults 30s, configurable via T3_CF_WAIT_S.
-        wait_s = float(os.environ.get("T3_CF_WAIT_S") or 30.0)
-        await self._wait_for_cf_clear(
-            sid, timeout_s=wait_s, origin_url=s.page.url,
-        )
+        # reuse it. Defaults 30s, configurable via T3_CF_WAIT_S. Light
+        # mode skips the wait entirely — the whole point of light mode
+        # is "this site has no CF"; the auto-downshift logic below will
+        # refuse to flip on sessions that hit a CF challenge.
+        if not _light:
+            wait_s = float(os.environ.get("T3_CF_WAIT_S") or 30.0)
+            await self._wait_for_cf_clear(
+                sid, timeout_s=wait_s, origin_url=s.page.url,
+            )
 
         # If the page still shows a challenge after the wait, see whether
         # a Cloudflare Turnstile iframe is present and try to auto-solve
@@ -1081,6 +1536,8 @@ class T3SessionManager:
         result: dict[str, Any] = {
             "url": s.page.url, "status": status, "title": title, "statusCode": status,
         }
+        if nav_error:
+            result["nav_error"] = nav_error
         # If the page STILL looks like a Cloudflare interstitial after the
         # wait + optional autosolve, mark the result so the caller can
         # choose to escalate (residential proxy, human handoff) instead of
@@ -1104,6 +1561,29 @@ class T3SessionManager:
             # decide to call browser_solve_captcha when no API key is set
             # or auto-solve didn't clear.
             result["turnstile"] = turnstile_info
+        # Auto-downshift: if this nav succeeded cleanly (200-ish status,
+        # no CF / Turnstile / block_class signals) and the session
+        # isn't already in light mode, flip it on. Subsequent clicks &
+        # nav use the T1-parity fast path. Hard sites never trip this
+        # branch because the CF probe above tags `block_class` or
+        # `turnstile` before we reach here.
+        #
+        # Disable the downshift with T3_AUTO_DOWNSHIFT=0 to preserve
+        # full-armor behaviour (e.g., on sessions that start easy but
+        # become hostile on sub-pages).
+        if (
+            not _light
+            and os.environ.get("T3_AUTO_DOWNSHIFT", "1") != "0"
+            and not s.light_mode
+            and not result.get("block_class")
+            and not result.get("turnstile")
+            and 200 <= int(result.get("status") or 0) < 400
+        ):
+            s.light_mode = True
+            logger.info(
+                "t3 auto-downshift: session=%s host=%s (no CF signals)",
+                sid, urlparse(url).hostname or "",
+            )
         return result
 
     async def _save_domain_cookies(self, sid: str, url: str) -> None:
@@ -1132,6 +1612,45 @@ class T3SessionManager:
 
     async def navigate(self, sid: str, url: str, *, timeout_s: float = 45.0) -> dict[str, Any]:
         nav = await self._goto_with_warmup(sid, url, timeout_s)
+        # Proxy-failure auto-recovery: if Chromium reported a proxy-layer
+        # error (tunnel refused, auth rejected, etc.) AND we're not
+        # already running direct, rebuild the context without a proxy
+        # and retry once. Opt-out via T3_PROXY_FALLBACK=0 for deployments
+        # that MUST keep the proxy (real IP leak is worse than failure).
+        s = self._sessions.get(sid)
+        if (
+            s is not None
+            and not s.proxy_disabled
+            and os.environ.get("T3_PROXY_FALLBACK", "1") != "0"
+            and _is_proxy_error(nav.get("nav_error", ""))
+        ):
+            logger.warning(
+                "navigate %s hit proxy error (%s) — falling back to "
+                "DIRECT connection and retrying once",
+                url, nav.get("nav_error", "")[:120],
+            )
+            try:
+                # Reuse the existing viewport/import_state knobs by
+                # reading them off the current session.
+                viewport = (1280, 720)
+                try:
+                    vs = await s.page.evaluate(
+                        "() => [window.innerWidth || 1280, window.innerHeight || 720]"
+                    )
+                    if isinstance(vs, list) and len(vs) == 2:
+                        viewport = (int(vs[0]), int(vs[1]))
+                except Exception:
+                    pass
+                await self._rebuild_context_for_retry(
+                    sid, s.domain, viewport, None, force_direct=True,
+                )
+                nav = await self._goto_with_warmup(sid, url, timeout_s)
+                nav["proxy_fallback"] = True
+            except Exception as exc:
+                logger.warning(
+                    "proxy-fallback retry failed for %s: %s", url, exc,
+                )
+                nav.setdefault("proxy_fallback_error", str(exc)[:200])
         state = await self.state(sid)
         # Live viewer telemetry — banner shows the current URL + title
         # so the operator always knows where the worker landed.
@@ -1266,7 +1785,72 @@ class T3SessionManager:
         html = await s.page.content()
         return _content.to_markdown(html or "")
 
-    async def evaluate(self, sid: str, script: str) -> Any:
+    async def ensure_scene_observer(self, sid: str) -> None:
+        """Idempotently install the MutationObserver on the current page.
+
+        Patchright's `context.add_init_script` goes through an
+        inject_route that only fires on HTTP(S) navigations; in local
+        test harnesses (data: URLs, set_content) the script never lands.
+        To stay robust across both real and synthetic environments, we
+        also install the observer on-demand here. The JS is guarded by
+        `window.__superbrowser_scene_obs_installed__` so re-injection
+        on a live page is a no-op.
+        """
+        if os.environ.get("SCENE_DIRTY_OBSERVER", "1") == "0":
+            return
+        s = self._sessions.get(sid)
+        if not s:
+            return
+        try:
+            await s.page.evaluate(_SCENE_DIRTY_OBSERVER_JS)
+        except Exception as exc:
+            logger.debug("ensure_scene_observer inject failed: %s", exc)
+
+    async def consume_scene_dirty(self, sid: str) -> bool:
+        """Was the scene changed by a DOM mutation since the last vision pass?
+
+        Reads `window.__superbrowser_scene_dirty_ts__` (set by the
+        injected MutationObserver) and compares it to the session's
+        `last_vision_ts`. Returns True if a mutation was recorded since
+        the last consume + updates `last_vision_ts` so the next call
+        only reports NEW mutations.
+
+        On probe failure (page closed, binding unavailable), fail safe:
+        return False so we don't thrash the vision cache. The planner-
+        driven revision path still kicks in for explicit URL/flag changes.
+        """
+        s = self._sessions.get(sid)
+        if not s:
+            return False
+        # Ensure the observer exists on this page (handles navigation to
+        # a fresh document that wiped the prior instance).
+        await self.ensure_scene_observer(sid)
+        try:
+            raw = await s.page.evaluate(
+                "() => (window.__superbrowser_scene_dirty_ts__ || 0)"
+            )
+        except Exception as exc:
+            logger.debug("consume_scene_dirty eval failed: %s", exc)
+            return False
+        try:
+            ts_ms = float(raw or 0) / 1000.0
+        except (TypeError, ValueError):
+            return False
+        if ts_ms <= 0:
+            return False
+        # Convert to a comparable "since session start" monotonic; here
+        # we just compare the JS Date.now() epoch seconds against the
+        # last consume stamp. Python's time.time() is also epoch seconds
+        # so the comparison is valid, subject to minor clock skew —
+        # acceptable because we only care about "has anything happened
+        # since the last pass, within this process".
+        changed = ts_ms > s.last_vision_ts
+        if changed:
+            s.last_vision_ts = max(ts_ms, s.last_vision_ts)
+            s.scene_dirty_ts = ts_ms
+        return changed
+
+    async def evaluate(self, sid: str, script: str, arg: Any = None) -> Any:
         """Run a JS snippet in the page and return its result.
 
         Playwright's `page.evaluate(str)` only accepts a bare expression
@@ -1277,6 +1861,11 @@ class T3SessionManager:
         emit statement-body scripts routinely, so we auto-wrap anything
         that looks like one into an IIFE `(() => { <body> })()`. Bare
         expressions pass through untouched.
+
+        `arg` — when the script is a function literal (`(x) => ...`,
+        `async (x) => ...`), Playwright passes `arg` as that function's
+        single parameter. For statement-body scripts auto-wrapped into
+        an IIFE, arg is ignored (no way to thread it through).
         """
         s = self._get(sid)
         body = script.strip()
@@ -1299,6 +1888,9 @@ class T3SessionManager:
             # `async () => {}` lets callers use `await` at the top of
             # the body the same way run_script does.
             script = f"(async () => {{ {body} }})()"
+            return await s.page.evaluate(script)
+        if arg is not None:
+            return await s.page.evaluate(script, arg)
         return await s.page.evaluate(script)
 
     async def run_script(self, sid: str, code: str) -> dict[str, Any]:
@@ -1448,22 +2040,49 @@ class T3SessionManager:
     # --- interaction ---------------------------------------------------------
 
     async def click_at(
-        self, sid: str, x: float, y: float, *, bbox: Optional[dict] = None,
+        self,
+        sid: str,
+        x: float,
+        y: float,
+        *,
+        bbox: Optional[dict] = None,
+        strategy: str = "primary",
+        expected_label: Optional[str] = None,
     ) -> dict[str, Any]:
+        """Execute a click. `strategy` selects the dispatch mechanism.
+
+        Strategies, in escalating order of desperation:
+          - "primary"  — smooth-cursor bezier approach + mouse.click (default).
+                          What real users look like. Tier-1 CF sensors
+                          see realistic mousemove entropy here.
+          - "keyboard" — focus the element via JS, then keyboard.press('Enter').
+                          Works when the element has `pointer-events: none`
+                          on the visual and the real hit target is an
+                          invisible overlay a few pixels off.
+          - "js"       — `el.click()` directly on the snapped element.
+                          Bypasses any CSS-level pointer masking.
+          - "parent"   — walk up to nearest button/a/[role=button] and click
+                          *its* center. Cookie banners often have a padded
+                          wrapper eating pointer events.
+
+        Wrapper code (session_tools.BrowserClickAtTool) runs the ladder:
+        call primary, verify postcondition, if it missed → call keyboard,
+        verify again, and so on. `click_at` itself is stateless — one
+        call = one strategy = one attempt.
+        """
         s = self._get(sid)
-        # If bbox is given, attempt element-snapping inside it.
         target_x, target_y = x, y
         snapped = False
         snap_target = ""
+        snap_info: Optional[dict] = None
         if bbox is not None:
             try:
-                snap = await s.page.evaluate(
+                snap_info = await s.page.evaluate(
                     """({x0, y0, x1, y1}) => {
                       const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
                       const el = document.elementFromPoint(cx, cy);
                       if (!el) return null;
                       const r = el.getBoundingClientRect();
-                      // Only snap if the element's center is within the bbox.
                       const ex = r.left + r.width / 2, ey = r.top + r.height / 2;
                       if (ex < x0 || ex > x1 || ey < y0 || ey > y1) return null;
                       return {x: ex, y: ey, tag: el.tagName.toLowerCase(),
@@ -1476,47 +2095,196 @@ class T3SessionManager:
                         "y1": float(bbox.get("y1", y)),
                     },
                 )
-                if isinstance(snap, dict):
-                    target_x = float(snap.get("x", x))
-                    target_y = float(snap.get("y", y))
+                if isinstance(snap_info, dict):
+                    target_x = float(snap_info.get("x", x))
+                    target_y = float(snap_info.get("y", y))
                     snapped = True
-                    snap_target = f"{snap.get('tag','')}:{snap.get('text','')}"
+                    snap_target = f"{snap_info.get('tag','')}:{snap_info.get('text','')}"
             except Exception as exc:
                 logger.debug("snap eval failed: %s", exc)
 
-        try:
-            # Smooth bezier approach to the target — intermediate cursor
-            # positions stream to the viewer so the SVG arrow glides
-            # instead of teleporting, and CF sensor code sees realistic
-            # mousemove entropy.
-            await self._move_cursor_smooth(sid, target_x, target_y)
-            await asyncio.sleep(0.05)
-            await s.page.mouse.click(target_x, target_y)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)[:200]}
+        # Semantic-match guard (P1.4). If the caller gave us the label
+        # the vision agent used for this bbox, fetch the element at the
+        # snapped target and confirm it looks like the right thing.
+        # Catches the "vision said 'Buy Now' but the element at (x,y)
+        # is actually a parent <section>" class of misfires that would
+        # otherwise land a click on the wrong target.
+        if expected_label and expected_label.strip():
+            try:
+                elem_info = await s.page.evaluate(
+                    """([x, y]) => {
+                        const el = document.elementFromPoint(x, y);
+                        if (!el) return null;
+                        const attr = (k) => (el.getAttribute(k) || '').trim();
+                        return {
+                            tag: el.tagName,
+                            role: attr('role'),
+                            aria: attr('aria-label'),
+                            title: attr('title'),
+                            placeholder: attr('placeholder'),
+                            value: (el.value || '').toString().trim(),
+                            text: (el.innerText || '').trim().slice(0, 160),
+                        };
+                    }""",
+                    [target_x, target_y],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("elementFromPoint for semantic match failed: %s", exc)
+                elem_info = None
+            if isinstance(elem_info, dict):
+                if not _labels_match(expected_label, elem_info):
+                    return {
+                        "success": False,
+                        "error": "element_mismatch",
+                        "expected_label": expected_label[:120],
+                        "found": {
+                            "tag": elem_info.get("tag"),
+                            "role": elem_info.get("role"),
+                            "text": (
+                                elem_info.get("text")
+                                or elem_info.get("aria")
+                                or elem_info.get("title")
+                                or ""
+                            )[:120],
+                        },
+                        "coords": {"x": int(target_x), "y": int(target_y)},
+                        "strategy": strat if False else (strategy or "primary"),
+                    }
 
-        # Live viewer telemetry — pulse the clicked location with the
-        # snap state + bbox (if any) so the operator sees exactly where
-        # the cursor landed.
+        strat = (strategy or "primary").lower()
+        # Human-like dwell between mousedown and mouseup. A same-tick
+        # click (playwright's default delay=0) fires mousedown +
+        # mouseup with no gap, which breaks:
+        #   - React / Vue click handlers that read intermediate state
+        #   - drag recognizers (treat 0ms dwell as null-drag → no click)
+        #   - analytics / bot scoring (0ms dwell flagged, handler
+        #     silently dropped)
+        # Tune via T3_CLICK_DELAY_MS_MIN / MAX. Defaults match the
+        # 40-120ms range observed on real human mousedown traces.
+        try:
+            dwell_min = int(os.environ.get("T3_CLICK_DELAY_MS_MIN") or "40")
+            dwell_max = int(os.environ.get("T3_CLICK_DELAY_MS_MAX") or "120")
+        except ValueError:
+            dwell_min, dwell_max = 40, 120
+        import random as _rng
+        click_dwell_ms = _rng.uniform(dwell_min, max(dwell_min, dwell_max))
+        _light_click = bool(s.light_mode or _env_light_mode())
+        try:
+            if strat == "primary":
+                await self._move_cursor_smooth(sid, target_x, target_y)
+                # Skip the 50ms settle in light mode — matches T1 which
+                # has no such pause. The move + click can fire in the
+                # same tick.
+                if not _light_click:
+                    await asyncio.sleep(0.05)
+                await s.page.mouse.click(
+                    target_x, target_y, delay=click_dwell_ms,
+                )
+            elif strat == "keyboard":
+                await self._move_cursor_smooth(sid, target_x, target_y)
+                await asyncio.sleep(0.05)
+                focus_js = """([x, y]) => {
+                  const el = document.elementFromPoint(x, y);
+                  if (!el) return {ok: false, reason: 'no element'};
+                  try {
+                    if (typeof el.focus === 'function') el.focus();
+                  } catch {}
+                  return {ok: true, tag: el.tagName,
+                          role: el.getAttribute('role') || ''};
+                }"""
+                info = await s.page.evaluate(focus_js, [target_x, target_y])
+                # Default to Enter; Space for checkbox/radio roles.
+                key = "Enter"
+                if isinstance(info, dict):
+                    r = (info.get("role") or "").lower()
+                    if r in ("checkbox", "radio"):
+                        key = "Space"
+                await s.page.keyboard.press(key)
+            elif strat == "js":
+                js_click = """([x, y]) => {
+                  const el = document.elementFromPoint(x, y);
+                  if (!el) return {ok: false, reason: 'no element'};
+                  try {
+                    if (typeof el.click === 'function') el.click();
+                    else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                  } catch (e) { return {ok: false, reason: String(e).slice(0, 80)}; }
+                  return {ok: true, tag: el.tagName};
+                }"""
+                await s.page.evaluate(js_click, [target_x, target_y])
+            elif strat == "parent":
+                parent_js = """([x, y]) => {
+                  let el = document.elementFromPoint(x, y);
+                  if (!el) return {ok: false, reason: 'no element'};
+                  let n = el;
+                  let hops = 0;
+                  while (n && n !== document.body && hops < 8) {
+                    const tag = n.tagName;
+                    const role = n.getAttribute && n.getAttribute('role');
+                    if (tag === 'BUTTON' || tag === 'A' || role === 'button') {
+                      try { n.click(); return {ok: true, tag, hops}; }
+                      catch (e) {}
+                    }
+                    n = n.parentElement;
+                    hops++;
+                  }
+                  return {ok: false, reason: 'no button ancestor'};
+                }"""
+                await s.page.evaluate(parent_js, [target_x, target_y])
+            else:
+                return {"success": False, "error": f"unknown strategy: {strat}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)[:200], "strategy": strat}
+
         try:
             from . import t3_event_bus as _bus
             _bus.default().emit_click_target(
                 sid,
                 x=target_x, y=target_y,
                 snapped=snapped, bbox=bbox, target=snap_target or None,
+                strategy=strat,
             )
         except Exception:
             pass
 
+        _light = bool(s.light_mode or _env_light_mode())
         try:
             await s.page.wait_for_load_state(
-                "domcontentloaded", timeout=5000,
+                "domcontentloaded",
+                # Light mode uses a shorter wait — on easy sites the
+                # DCL event lands almost immediately, and a 5s ceiling
+                # just delays the state() fetch on SPAs that don't
+                # fire DCL twice.
+                timeout=1500 if _light else 5000,
             )
         except Exception:
             pass
+        # Brief JS-render settle so React/Vue effects commit before we
+        # snapshot the DOM and screenshot. Without this the screenshot
+        # can catch a mid-transition frame and vision anchors on
+        # placeholders rather than the settled elements. 250ms is enough
+        # for most SPAs; configurable via T3_POST_CLICK_SETTLE_MS. Light
+        # mode defaults to 0 (T1 parity).
+        try:
+            default_settle = "0" if _light else "250"
+            settle_ms = int(
+                os.environ.get("T3_POST_CLICK_SETTLE_MS") or default_settle
+            )
+        except ValueError:
+            settle_ms = 0 if _light else 250
+        if settle_ms > 0:
+            await asyncio.sleep(settle_ms / 1000.0)
+        # Skip networkidle in light mode — matches T1's simpler
+        # waitForIdle(1.5s) semantics (T1 doesn't wait for networkidle
+        # either; it waits for a short idle window).
+        if not _light:
+            try:
+                await s.page.wait_for_load_state("networkidle", timeout=1500)
+            except Exception:
+                pass
         st = await self.state(sid)
         return {
             "success": True,
+            "strategy": strat,
             "url": st["url"],
             "title": st["title"],
             "elements": st["elements"],
@@ -1752,7 +2520,15 @@ class T3SessionManager:
             }
 
         try:
-            await s.page.mouse.click(cx, cy)
+            try:
+                type_min = int(os.environ.get("T3_CLICK_DELAY_MS_MIN") or "40")
+                type_max = int(os.environ.get("T3_CLICK_DELAY_MS_MAX") or "120")
+            except ValueError:
+                type_min, type_max = 40, 120
+            import random as _rng
+            await s.page.mouse.click(
+                cx, cy, delay=_rng.uniform(type_min, max(type_min, type_max)),
+            )
             # Tiny settle pause — some components rely on focus-change to
             # open their dropdown / clear placeholder state.
             await asyncio.sleep(0.08)
@@ -1812,6 +2588,112 @@ class T3SessionManager:
             await s.page.keyboard.type(text, delay=30)
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
+        # Post-type DOM readback + self-heal. Autocomplete dropdowns,
+        # IME composition glitches, and input-event handlers can swallow
+        # or substitute characters silently — you intended "Kevin Hart"
+        # and the field ends up with "Kevin Hert". If the readback shows
+        # a tiny mismatch (≤3 chars), we fix it in place using the same
+        # native-setter approach the clear path uses. Larger diffs are
+        # left alone (legit autocomplete expansion, e.g. "Kevin Hart" ->
+        # "Kevin Hart Live 2026").
+        settle = float(os.environ.get("T3_POSTTYPE_SETTLE_MS") or 120) / 1000.0
+        if settle > 0:
+            await asyncio.sleep(settle)
+        posttype_note = ""
+        if os.environ.get("T3_POSTTYPE_HEAL", "1") != "0":
+            try:
+                probe2 = await s.page.evaluate(
+                    """({x, y}) => {
+                      const el = document.elementFromPoint(x, y);
+                      if (!el) return null;
+                      if ('value' in el && el.value !== undefined)
+                        return {v: el.value};
+                      if (el.isContentEditable)
+                        return {v: el.innerText || ''};
+                      return {v: (el.textContent || '').trim()};
+                    }""",
+                    {"x": cx, "y": cy},
+                )
+                post_value = str((probe2 or {}).get("v", "") or "")
+                if post_value != text:
+                    def _levenshtein(a: str, b: str, cap: int = 4) -> int:
+                        # Bounded Wagner-Fischer — returns cap+1 once the
+                        # distance is known to exceed cap. O(n*m) time
+                        # but n,m are tiny strings so it's ~µs.
+                        if abs(len(a) - len(b)) > cap:
+                            return cap + 1
+                        if not a:
+                            return len(b) if len(b) <= cap else cap + 1
+                        if not b:
+                            return len(a) if len(a) <= cap else cap + 1
+                        prev = list(range(len(b) + 1))
+                        for i in range(1, len(a) + 1):
+                            cur = [i] + [0] * len(b)
+                            best = cur[0]
+                            for j in range(1, len(b) + 1):
+                                ins = cur[j - 1] + 1
+                                dele = prev[j] + 1
+                                sub = prev[j - 1] + (0 if a[i-1] == b[j-1] else 1)
+                                cur[j] = min(ins, dele, sub)
+                                if cur[j] < best:
+                                    best = cur[j]
+                            if best > cap:
+                                return cap + 1
+                            prev = cur
+                        return prev[-1]
+                    dist = _levenshtein(post_value, text, cap=3)
+                    if dist <= 3 and dist > 0:
+                        # Small drift — reset the field to the intended
+                        # value via native setter (React/Vue-safe).
+                        try:
+                            await s.page.evaluate(
+                                """({x, y, target}) => {
+                                  const el = document.elementFromPoint(x, y);
+                                  if (!el) return false;
+                                  try {
+                                    let proto = null;
+                                    if (el.tagName === 'TEXTAREA') proto = HTMLTextAreaElement.prototype;
+                                    else if (el.tagName === 'INPUT') proto = HTMLInputElement.prototype;
+                                    if (proto) {
+                                      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                                      if (desc && desc.set) {
+                                        desc.set.call(el, target);
+                                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                                        return true;
+                                      }
+                                      el.value = target;
+                                      return true;
+                                    }
+                                    if (el.isContentEditable) {
+                                      el.textContent = target;
+                                      el.dispatchEvent(new Event('input', {bubbles: true}));
+                                      return true;
+                                    }
+                                  } catch (_) {}
+                                  return false;
+                                }""",
+                                {"x": cx, "y": cy, "target": text},
+                            )
+                            posttype_note = (
+                                f"self_heal: was {post_value!r}, "
+                                f"reset to {text!r} (dist={dist})"
+                            )
+                            logger.info(
+                                "type self-heal at (%s,%s): %r -> %r (dist=%d)",
+                                cx, cy, post_value, text, dist,
+                            )
+                        except Exception as exc:
+                            logger.debug("self-heal apply failed: %s", exc)
+                    elif dist > 3:
+                        # Large drift — probably autocomplete expansion.
+                        # Log but don't touch.
+                        posttype_note = (
+                            f"skipped_self_heal: dom={post_value!r} "
+                            f"diff>3 chars (assuming autocomplete)"
+                        )
+            except Exception as exc:
+                logger.debug("post-type probe failed: %s", exc)
         # Live viewer telemetry — show keystrokes as they land. One
         # emit per char so the indicator's buffer fills character-by-
         # character rather than appearing in a single 40-char blob.
@@ -1823,6 +2705,9 @@ class T3SessionManager:
         except Exception:
             pass
         st = await self.state(sid)
+        if posttype_note:
+            st = dict(st)
+            st["posttype_note"] = posttype_note
         action = "cleared_and_typed" if current_value else "typed_into_empty"
         return {
             "success": True,

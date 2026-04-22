@@ -25,3 +25,5 @@ nanobot/workspace*/SOUL.md
 nanobot/workspace*/learnings/
 nanobot/workspace*/**/.nanobot/
 *.jsonl
+
+todo/

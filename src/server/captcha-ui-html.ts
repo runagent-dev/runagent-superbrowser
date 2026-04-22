@@ -441,16 +441,29 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
 
       // --- Vision-pass overlay (persistent) --------------------------
       // Draws the entire bbox set returned by the vision agent and
-      // KEEPS it on screen. Only replaced when the next vision_bboxes
-      // event arrives. After ~5s of no new event, the .stale class is
-      // added so the layer dims — a visual signal that what you're
-      // looking at is the last pass, not the current one.
+      // KEEPS it on screen. Replaced when the next vision_bboxes event
+      // arrives OR when the URL the bboxes were captured on no longer
+      // matches the current page URL. The layer is dimmed when the
+      // model self-reported the screenshot as non-fresh.
       let visionBboxLayer = null;
-      let visionBboxLayerAt = 0;
-      const VISION_STALE_AFTER_MS = 5000;
+      let visionBboxLayerUrl = '';
+      let visionPendingTimer = null;
+
+      function clearVisionBboxes() {
+        if (visionBboxLayer) {
+          try { visionBboxLayer.remove(); } catch (e) {}
+          visionBboxLayer = null;
+        }
+        visionBboxLayerUrl = '';
+      }
 
       function showVisionBboxes(data) {
         if (!data || !Array.isArray(data.bboxes)) return;
+        // Cancel the "vision updating…" indicator — the pass landed.
+        if (visionPendingTimer) {
+          clearTimeout(visionPendingTimer);
+          visionPendingTimer = null;
+        }
         // Replace any prior layer so two overlays don't stack.
         if (visionBboxLayer) {
           try { visionBboxLayer.remove(); } catch (e) {}
@@ -464,6 +477,11 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
         layer.style.bottom = '0';
         layer.style.pointerEvents = 'none';
         layer.style.zIndex = '4';
+        const freshness = data.freshness || 'fresh';
+        if (freshness !== 'fresh') {
+          layer.style.opacity = '0.5';
+          layer.dataset.freshness = freshness;
+        }
         for (const b of data.bboxes) {
           if (typeof b.x0 !== 'number') continue;
           const tl = projectPoint(b.x0, b.y0);
@@ -490,20 +508,34 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
         }
         screenWrap.appendChild(layer);
         visionBboxLayer = layer;
-        visionBboxLayerAt = Date.now();
+        visionBboxLayerUrl = data.url || '';
+        // Update the status strip with freshness / latency so the
+        // viewer can see vision state without opening devtools.
+        const bits = ['vision: ' + freshness];
+        if (typeof data.latencyMs === 'number') {
+          bits.push(data.latencyMs + 'ms');
+        }
+        if (wsConnected) {
+          statusEl.textContent = 'streaming live — ' + bits.join(' · ');
+        }
       }
 
-      // Cheap 1 Hz staleness watcher — toggles the .stale class on
-      // every bbox in the current layer so CSS fades them together.
-      // No-op when no layer is mounted.
-      setInterval(function() {
-        if (!visionBboxLayer) return;
-        const stale = (Date.now() - visionBboxLayerAt) > VISION_STALE_AFTER_MS;
-        const children = visionBboxLayer.children || [];
-        for (let i = 0; i < children.length; i++) {
-          children[i].classList.toggle('stale', stale);
+      function showVisionPending() {
+        // Fires when the Python bridge dispatches a vision call. Show
+        // a transient "vision updating…" hint so the user knows the
+        // overlay is about to refresh. Clears on vision_bboxes or
+        // after 10s if no reply arrives.
+        if (wsConnected) {
+          statusEl.textContent = 'streaming live — vision updating…';
         }
-      }, 1000);
+        if (visionPendingTimer) clearTimeout(visionPendingTimer);
+        visionPendingTimer = setTimeout(() => {
+          visionPendingTimer = null;
+          if (wsConnected) {
+            statusEl.textContent = 'streaming live';
+          }
+        }, 10000);
+      }
 
       // --- Typing indicator ------------------------------------------
       let typingBuffer = '';
@@ -559,6 +591,9 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
                   break;
                 case 'vision_bboxes':
                   showVisionBboxes(msg.data);
+                  break;
+                case 'vision_pending':
+                  showVisionPending();
                   break;
                 case 'keystroke':
                   showKeystroke(msg.data.key);

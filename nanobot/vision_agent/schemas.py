@@ -91,6 +91,21 @@ class BBox(BaseModel):
     )
     confidence: float = Field(default=0.5)
     intent_relevant: bool = Field(default=False)
+    role_in_scene: Literal[
+        "blocker", "target", "chrome", "content", "unknown",
+    ] = Field(
+        default="unknown",
+        description=(
+            "What this bbox IS relative to the current task — `blocker` for "
+            "cookie/consent buttons, `target` for the actual goal element, "
+            "`chrome` for navigation/footer, `content` for article body, "
+            "`unknown` when uncertain. Drives the action planner."
+        ),
+    )
+    layer_id: Optional[str] = Field(
+        default=None,
+        description="ID of the SceneLayer this bbox belongs to. None when scene is absent.",
+    )
 
     @field_validator("box_2d", mode="before")
     @classmethod
@@ -157,13 +172,66 @@ class BBox(BaseModel):
             return bool(v)
         return False
 
-    def to_pixels(self, image_w: int, image_h: int) -> tuple[int, int, int, int]:
-        """Denormalize box_2d to CSS pixel rect (x0, y0, x1, y1)."""
+    @field_validator("role_in_scene", mode="before")
+    @classmethod
+    def _coerce_role_in_scene(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "unknown"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        valid = {"blocker", "target", "chrome", "content", "unknown"}
+        if s in valid:
+            return s
+        aliases = {
+            "overlay": "blocker",
+            "modal": "blocker",
+            "popup": "blocker",
+            "dismiss": "blocker",
+            "goal": "target",
+            "main": "target",
+            "nav": "chrome",
+            "navigation": "chrome",
+            "header": "chrome",
+            "footer": "chrome",
+            "body": "content",
+            "article": "content",
+        }
+        return aliases.get(s, "unknown")
+
+    @field_validator("layer_id", mode="before")
+    @classmethod
+    def _coerce_layer_id(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s[:40] if s else None
+
+    def to_pixels(
+        self,
+        image_w: int,
+        image_h: int,
+        *,
+        dpr: float = 1.0,
+    ) -> tuple[int, int, int, int]:
+        """Denormalize box_2d to CSS pixel rect (x0, y0, x1, y1).
+
+        `image_w` / `image_h` are the SCREENSHOT pixel dimensions (the
+        physical PNG/JPEG resolution). `dpr` is the device pixel ratio
+        of the viewport the screenshot was taken against.
+
+        When the screenshot is captured at DPR > 1 (retina/HiDPI) the
+        PNG dims are DPR × the CSS viewport. CDP `Input.dispatchMouseEvent`
+        and JS `elementFromPoint` both expect CSS pixels, so we divide
+        by DPR when denormalizing for click dispatch. Leave `dpr=1.0`
+        for uses that genuinely want image-pixel coords (e.g. drawing
+        overlays on the raw screenshot).
+        """
         ymin, xmin, ymax, xmax = self.box_2d
-        x0 = int(round(xmin / 1000.0 * image_w))
-        y0 = int(round(ymin / 1000.0 * image_h))
-        x1 = int(round(xmax / 1000.0 * image_w))
-        y1 = int(round(ymax / 1000.0 * image_h))
+        scale_w = image_w / max(dpr, 1e-6)
+        scale_h = image_h / max(dpr, 1e-6)
+        x0 = int(round(xmin / 1000.0 * scale_w))
+        y0 = int(round(ymin / 1000.0 * scale_h))
+        x1 = int(round(xmax / 1000.0 * scale_w))
+        y1 = int(round(ymax / 1000.0 * scale_h))
         # Guarantee non-empty box even if model emitted ymin==ymax.
         if x1 <= x0:
             x1 = x0 + 1
@@ -171,9 +239,142 @@ class BBox(BaseModel):
             y1 = y0 + 1
         return x0, y0, x1, y1
 
-    def center_pixels(self, image_w: int, image_h: int) -> tuple[int, int]:
-        x0, y0, x1, y1 = self.to_pixels(image_w, image_h)
+    def center_pixels(
+        self,
+        image_w: int,
+        image_h: int,
+        *,
+        dpr: float = 1.0,
+    ) -> tuple[int, int]:
+        x0, y0, x1, y1 = self.to_pixels(image_w, image_h, dpr=dpr)
         return ((x0 + x1) // 2, (y0 + y1) // 2)
+
+
+class SceneLayer(BaseModel):
+    """A single visual layer in the page's current stack.
+
+    Layers are ordered top-most first (painter order: layers[0] sits above
+    layers[1]). A `blocks_interaction_below=true` layer is one the user
+    must dismiss before elements in layers below can be reached — cookie
+    consent walls, login modals, newsletter popups, captcha challenges.
+
+    Emitted by the vision agent when it can distinguish a stacked scene;
+    absent on flat content pages, which the client treats as a single
+    implicit content layer.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default="L0_content")
+    kind: Literal[
+        "modal", "drawer", "toast", "banner", "sticky_header", "content",
+    ] = Field(default="content")
+    bbox: Optional[BBox] = Field(default=None)
+    blocks_interaction_below: bool = Field(default=False)
+    dismiss_hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Label of the best-guess dismiss button inside this layer "
+            "(e.g. 'Accept all', 'Close', 'Not now')."
+        ),
+    )
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v: object) -> str:
+        if v is None:
+            return "L0_content"
+        s = str(v).strip()
+        return s[:40] if s else "L0_content"
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _coerce_kind(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "content"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        valid = {"modal", "drawer", "toast", "banner", "sticky_header", "content"}
+        if s in valid:
+            return s
+        aliases = {
+            "popup": "modal",
+            "dialog": "modal",
+            "overlay": "modal",
+            "sidebar": "drawer",
+            "notification": "toast",
+            "cookie_banner": "banner",
+            "consent": "banner",
+            "header": "sticky_header",
+        }
+        return aliases.get(s, "content")
+
+    @field_validator("blocks_interaction_below", mode="before")
+    @classmethod
+    def _coerce_blocks(cls, v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "yes", "1", "t", "y")
+        if isinstance(v, (int, float)):
+            return bool(v)
+        return False
+
+    @field_validator("dismiss_hint", mode="before")
+    @classmethod
+    def _coerce_dismiss_hint(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("none", "null"):
+            return None
+        return s[:120]
+
+
+class SceneGraph(BaseModel):
+    """The layered structure of the current page as the eyes see it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    layers: list[SceneLayer] = Field(
+        default_factory=list,
+        description="Painter order, top-most first.",
+    )
+    active_blocker_layer_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The layer the user MUST interact with before the page below "
+            "is reachable. Usually layers[0].id when layers[0].blocks_"
+            "interaction_below. None if the scene is unblocked."
+        ),
+    )
+
+    @field_validator("layers", mode="before")
+    @classmethod
+    def _coerce_layers(cls, v: object) -> list:
+        if v is None:
+            return []
+        if isinstance(v, (dict, BaseModel)):
+            return [v]
+        if isinstance(v, list):
+            return [item for item in v if isinstance(item, (dict, BaseModel))]
+        return []
+
+    @field_validator("active_blocker_layer_id", mode="before")
+    @classmethod
+    def _coerce_blocker_id(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("none", "null"):
+            return None
+        return s[:40]
+
+    def top_blocker(self) -> Optional[SceneLayer]:
+        """Return the top-most layer that blocks interaction, or None."""
+        for layer in self.layers:
+            if layer.blocks_interaction_below:
+                return layer
+        return None
 
 
 class PageFlags(BaseModel):
@@ -354,6 +555,35 @@ class NextAction(BaseModel):
         return s[:40]
 
 
+class DiffInfo(BaseModel):
+    """Structured snapshot of what changed between two vision passes.
+
+    Computed deterministically by the vision client after parsing —
+    NOT emitted by the model. Lets the planner decide "did my last
+    action actually do something?" without parsing prose.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    bboxes_added: list[str] = Field(
+        default_factory=list,
+        description="Labels that appeared this pass that weren't present last pass.",
+    )
+    bboxes_removed: list[str] = Field(
+        default_factory=list,
+        description="Labels present last pass that are gone this pass.",
+    )
+    url_changed: bool = Field(default=False)
+    modal_state: Literal["same", "opened", "closed"] = Field(
+        default="same",
+        description=(
+            "Relative change to the top-most blocking layer: "
+            "`opened` when a blocker appeared this pass, `closed` when "
+            "one went away, `same` otherwise."
+        ),
+    )
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -385,6 +615,36 @@ class VisionResponse(BaseModel):
         default="",
         description="What changed since the previous screenshot.",
     )
+    diff_from_previous: Optional[DiffInfo] = Field(
+        default=None,
+        description=(
+            "Structured diff computed client-side (not emitted by the "
+            "model) comparing this pass's bboxes against the previous "
+            "pass for the same session. None on the first pass. Gives "
+            "the planner a boolean-friendly 'did my action work?' "
+            "signal that doesn't require parsing prose."
+        ),
+    )
+    screenshot_freshness: Literal["fresh", "uncertain", "stale"] = Field(
+        default="fresh",
+        description=(
+            "Self-reported freshness of the screenshot. `fresh` = the image "
+            "matches the Page URL and is fully rendered; `uncertain` = "
+            "loading spinners or placeholders cover the content; `stale` = "
+            "page chrome contradicts the URL. The bridge gates actions on "
+            "this field — stale/uncertain frames trigger a re-capture "
+            "rather than a click."
+        ),
+    )
+    scene: Optional[SceneGraph] = Field(
+        default=None,
+        description=(
+            "Layered structure of the page — modal/toast/banner/sticky_header/"
+            "content layers, painter order top-most first. Absent when Gemini "
+            "didn't emit one; the client derives a degenerate single-layer "
+            "scene in that case so downstream planners never see a None."
+        ),
+    )
     intent: str = Field(default="observe")
     cached: bool = False
     duration_ms: int = 0
@@ -397,10 +657,27 @@ class VisionResponse(BaseModel):
     # out of the validation/serialization surface.
     _image_width: int = PrivateAttr(default=0)
     _image_height: int = PrivateAttr(default=0)
+    # Device-pixel-ratio of the viewport the screenshot was taken
+    # against. 1.0 on standard viewports; >1 on retina/HiDPI. When set,
+    # `BBox.to_pixels(..., dpr=dpr)` divides the denormalized coords so
+    # CDP click dispatch lands in CSS pixel space. Default 1.0 keeps
+    # existing call sites correct for the common DPR=1 config.
+    _dpr: float = PrivateAttr(default=1.0)
 
-    def with_image_dims(self, width: int, height: int) -> "VisionResponse":
+    def with_image_dims(
+        self,
+        width: int,
+        height: int,
+        *,
+        dpr: float | None = None,
+    ) -> "VisionResponse":
         self._image_width = int(width)
         self._image_height = int(height)
+        if dpr is not None:
+            try:
+                self._dpr = float(dpr) if float(dpr) > 0 else 1.0
+            except (TypeError, ValueError):
+                self._dpr = 1.0
         return self
 
     @property
@@ -410,6 +687,10 @@ class VisionResponse(BaseModel):
     @property
     def image_height(self) -> int:
         return self._image_height
+
+    @property
+    def dpr(self) -> float:
+        return self._dpr
 
     @field_validator("summary", "relevant_text", "intent", mode="before")
     @classmethod
@@ -463,6 +744,22 @@ class VisionResponse(BaseModel):
             return ""
         return str(v)[:1000]
 
+    @field_validator("screenshot_freshness", mode="before")
+    @classmethod
+    def _coerce_freshness(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "fresh"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        if s in {"fresh", "uncertain", "stale"}:
+            return s
+        aliases = {
+            "ok": "fresh", "ready": "fresh", "current": "fresh",
+            "loading": "uncertain", "pending": "uncertain",
+            "partial": "uncertain", "unknown": "uncertain",
+            "old": "stale", "mismatch": "stale", "wrong": "stale",
+        }
+        return aliases.get(s, "uncertain")
+
     def as_brain_text(self, max_bboxes: int = 30) -> str:
         """Render into a compact text block the nanobot brain consumes.
 
@@ -488,8 +785,14 @@ class VisionResponse(BaseModel):
         ]
         flags_line = "Flags: " + "  ".join(flag_bits)
 
-        def _rank(b: BBox) -> tuple[int, int, float]:
+        def _rank(b: BBox) -> tuple[int, int, int, float]:
+            # Blocker bboxes rank first so "dismiss cookie banner" never
+            # gets buried behind 20 content elements.
+            role_rank = 0 if b.role_in_scene == "blocker" else (
+                1 if b.role_in_scene == "target" else 2
+            )
             return (
+                role_rank,
                 0 if b.intent_relevant else 1,
                 0 if b.clickable else 1,
                 -b.confidence,
@@ -499,7 +802,14 @@ class VisionResponse(BaseModel):
         elements_lines: list[str] = []
         iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
-            marker = "  ← matches intent" if b.intent_relevant else ""
+            if b.role_in_scene == "blocker":
+                role_tag = " [BLOCKER]"
+            elif b.role_in_scene == "target":
+                role_tag = " [TARGET]"
+            elif b.intent_relevant:
+                role_tag = "  ← matches intent"
+            else:
+                role_tag = ""
             if iw > 0 and ih > 0:
                 x0, y0, x1, y1 = b.to_pixels(iw, ih)
                 coord_text = f"({x0},{y0} → {x1},{y1})"
@@ -510,7 +820,7 @@ class VisionResponse(BaseModel):
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "
                 f"{coord_text}"
-                f"{marker}"
+                f"{role_tag}"
             )
         truncated = (
             f"  … {len(self.bboxes) - max_bboxes} more bboxes truncated"
@@ -523,6 +833,31 @@ class VisionResponse(BaseModel):
             f"Summary: {self.summary}",
             flags_line,
         ]
+        if self.scene and self.scene.layers:
+            # Walk layers top-most first so the brain sees what's on top
+            # before what's underneath. Index each layer to [V...] labels
+            # the brain can reference — matches the ordered bbox list below.
+            ordered_ids = [b.layer_id for b in ordered]
+            scene_lines = ["Scene:"]
+            for layer in self.scene.layers:
+                blocks = "blocks=true" if layer.blocks_interaction_below else "blocks=false"
+                label_q = f'"{layer.dismiss_hint}"' if layer.dismiss_hint else "-"
+                # Find bboxes in this layer among the rendered ones.
+                vrefs = [
+                    f"V{j+1}" for j, lid in enumerate(ordered_ids)
+                    if lid and lid == layer.id
+                ]
+                vref_str = ("  bboxes=" + ",".join(vrefs)) if vrefs else ""
+                scene_lines.append(
+                    f"  {layer.id} [{layer.kind}, {blocks}]  dismiss_hint={label_q}"
+                    f"{vref_str}"
+                )
+            if self.scene.active_blocker_layer_id:
+                scene_lines.append(
+                    f"  active_blocker={self.scene.active_blocker_layer_id} "
+                    f"(must dismiss before pursuing main goal)"
+                )
+            parts.extend(scene_lines)
         if self.changes_from_previous:
             parts.append(f"Changes: {self.changes_from_previous}")
         if self.relevant_text:
@@ -559,11 +894,17 @@ class VisionResponse(BaseModel):
         """
         if vision_index_1based < 1:
             return None
-        ordered = sorted(self.bboxes, key=lambda b: (
-            0 if b.intent_relevant else 1,
-            0 if b.clickable else 1,
-            -b.confidence,
-        ))
+        def _rank(b: BBox) -> tuple[int, int, int, float]:
+            role_rank = 0 if b.role_in_scene == "blocker" else (
+                1 if b.role_in_scene == "target" else 2
+            )
+            return (
+                role_rank,
+                0 if b.intent_relevant else 1,
+                0 if b.clickable else 1,
+                -b.confidence,
+            )
+        ordered = sorted(self.bboxes, key=_rank)
         idx = vision_index_1based - 1
         if idx >= len(ordered):
             return None

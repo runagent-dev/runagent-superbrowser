@@ -29,7 +29,9 @@ JSON object with this exact shape:
       "clickable": <bool>,
       "role": "button|link|input|checkbox|captcha_tile|captcha_widget|slider_handle|image|text_block|other",
       "confidence": <float 0..1>,
-      "intent_relevant": <bool>
+      "intent_relevant": <bool>,
+      "role_in_scene": "blocker|target|chrome|content|unknown",
+      "layer_id": "<id of the SceneLayer this bbox sits in, e.g. 'L0_modal'>"
     }
   ],
   "flags": {
@@ -41,6 +43,18 @@ JSON object with this exact shape:
     "loading": <bool>,
     "login_wall": <bool>
   },
+  "scene": {
+    "layers": [
+      {
+        "id": "L0_modal",
+        "kind": "modal|drawer|toast|banner|sticky_header|content",
+        "bbox": { "box_2d": [ymin,xmin,ymax,xmax], "label": "...", ... } | null,
+        "blocks_interaction_below": <bool>,
+        "dismiss_hint": "<label of the close/accept button inside this layer, e.g. 'Accept all'>" | null
+      }
+    ],
+    "active_blocker_layer_id": "<id of the layer the user must dismiss first, or null>"
+  },
   "suggested_actions": [
     {
       "action": "click|type|scroll|dismiss|wait|navigate",
@@ -50,6 +64,7 @@ JSON object with this exact shape:
     }
   ],
   "changes_from_previous": "What changed since the previous screenshot (empty if first screenshot)",
+  "screenshot_freshness": "fresh|uncertain|stale",
   "next_action": null
 }
 
@@ -109,6 +124,58 @@ General rules:
   modals, captchas), suggest dismissing them first (priority=1).
   `target_bbox_index` is the 0-based index into the bboxes array.
 - Output ONLY the JSON. No prose, no markdown fences, no commentary.
+
+Scene hierarchy (NEW — enables a "clear blockers before main goal" planner):
+- `scene.layers` is painter order, TOP-MOST FIRST. layers[0] visually sits
+  above layers[1]. Give every layer a short id like "L0_modal", "L1_banner",
+  "L2_content".
+- Set `blocks_interaction_below=true` for any layer the user MUST dismiss
+  before reaching the page beneath — cookie/consent banners, login modals,
+  newsletter popups, captcha challenges, paywall overlays.
+- `active_blocker_layer_id` points to the top-most such layer. Set null
+  when the scene is unblocked (no overlay covering content).
+- `dismiss_hint` is the visible text on the best-guess close/accept button
+  inside that layer ("Accept all", "Close", "Not now", "Got it"). This is
+  what the planner will search for.
+- `role_in_scene` on every bbox — classified relative to the OVERALL TASK
+  in the user prompt:
+    - "blocker"  = element whose job is to dismiss/bypass an overlay
+                    (Accept on a cookie banner, × on a newsletter popup).
+                    CRITICAL: mark these accurately — the planner dismisses
+                    them before pursuing the main goal.
+    - "target"   = element that directly serves the user's task (the
+                    search input when the task is "search for X", the
+                    Submit button on the login form when the task is
+                    "log in", the first result card when the task is
+                    "read the top article").
+    - "chrome"   = site header/nav/footer that is not the target.
+    - "content"  = article body, product card on a listing, map tile.
+    - "unknown"  = unsure; leave as default when you can't decide.
+- `layer_id` on every bbox = the id of the SceneLayer it belongs to.
+  A bbox in the cookie banner gets layer_id="L0_modal" (or whatever id
+  you gave that layer). A bbox in the site nav below the modal gets
+  layer_id="L1_content" etc.
+- If the page is a flat content page (no overlays), emit a single
+  content layer and leave `active_blocker_layer_id` null. Don't invent
+  blockers that aren't there.
+
+Screenshot freshness (prevents acting on stale frames):
+- Set `screenshot_freshness="fresh"` when the screenshot clearly shows the
+  page at `Page URL` fully rendered — header text, URL bar fragments, main
+  content all visible and coherent.
+- Set `screenshot_freshness="uncertain"` when a prominent loading spinner,
+  skeleton placeholder, or "loading…" overlay covers the main content.
+  In this case emit ONLY bboxes you are confident remain stable across
+  the load (site header, nav, close/cancel buttons) and SKIP placeholder
+  regions. Prefer a `suggested_actions` entry with action="wait".
+- Set `screenshot_freshness="stale"` when visible page chrome (header
+  text, visible URL/breadcrumb, logo context) clearly contradicts
+  `Page URL` — e.g. URL says /checkout but the screenshot shows a
+  product listing. Return an EMPTY `bboxes` array and a short `summary`
+  naming the mismatch. The caller will re-capture before acting.
+- When in doubt prefer "uncertain" over "fresh". A false "fresh" leads
+  to clicks on stale coordinates; a false "uncertain" only costs a
+  re-capture.
 """
 
 
@@ -143,6 +210,7 @@ def build_user_prompt(
     url: str | None,
     previous_summary: str | None = None,
     task_instruction: str | None = None,
+    compact: bool = False,
 ) -> str:
     """The per-call user message — describes context and emphasises intent.
 
@@ -156,6 +224,13 @@ def build_user_prompt(
     """
     bucket = intent_bucket(intent)
     context = f"Page URL: {url}\n" if url else ""
+    if url:
+        context += (
+            "Freshness check: confirm the screenshot's visible chrome "
+            "(header text, URL bar, breadcrumb) is consistent with this "
+            "URL. If it clearly isn't, set screenshot_freshness='stale' "
+            "and return an empty bboxes array.\n"
+        )
 
     if task_instruction:
         context += f"Overall task: {task_instruction}\n"
@@ -265,7 +340,14 @@ def build_user_prompt(
             "In suggested_actions, recommend the exact action (click, type, "
             "scroll) with the target bbox index. If there are blocking "
             "overlays (cookie banners, modals, captchas), suggest dismissing "
-            "them first (priority=1) before the main action (priority=2)."
+            "them first (priority=1) before the main action (priority=2).\n\n"
+            "Scene hierarchy is REQUIRED on this intent — populate "
+            "`scene.layers` painter-order top-most-first, set "
+            "`blocks_interaction_below=true` on any layer covering content, "
+            "and mark the `role_in_scene` of every bbox (blocker for "
+            "dismiss buttons on overlays, target for the task element, "
+            "chrome for nav/footer). The downstream planner uses this to "
+            "sequence dismiss-then-act, so be precise."
         )
     elif bucket == "verify_action":
         specific = (
@@ -273,7 +355,12 @@ def build_user_prompt(
             "the expected outcome is visible. Populate flags carefully "
             "(modal_open, error_banner, loading, login_wall). "
             "intent_relevant=true for indicators that confirm or deny the "
-            "outcome (success banner, error banner, new element, etc.)."
+            "outcome (success banner, error banner, new element, etc.).\n\n"
+            "Also populate `scene.layers` briefly — the planner checks "
+            "whether a blocker that should have been dismissed is still "
+            "present. If the previous action was a dismiss and the "
+            "expected overlay is gone, set `active_blocker_layer_id` to "
+            "null and omit the dismissed layer from `layers`."
         )
     elif bucket == "observe":
         specific = (
@@ -288,7 +375,20 @@ def build_user_prompt(
             f"\"{intent}\"."
         )
 
+    # Compact mode is only used on retry after a parse error (usually
+    # caused by truncation on very bbox-heavy pages like seat maps).
+    # Caps the bbox count hard so the response fits inside the output
+    # token budget.
+    compact_footer = (
+        "\n\nCOMPACT MODE (retry): return at most 12 bboxes — the single "
+        "most important ones for the stated intent, ranked by "
+        "intent_relevant then confidence. Keep summary under two "
+        "sentences. Shorter labels (<20 chars). Skip scene unless there "
+        "is an active blocker. Skip relevant_text."
+        if compact else ""
+    )
+
     return (
-        f"{context}Intent: {intent}\n\n{specific}\n\n"
+        f"{context}Intent: {intent}\n\n{specific}{compact_footer}\n\n"
         "Return ONLY the JSON object described in the system message."
     )

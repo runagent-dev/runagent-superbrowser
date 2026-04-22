@@ -809,6 +809,9 @@ export function createHttpServer(
         }>;
         imageWidth?: number;
         imageHeight?: number;
+        url?: string;
+        freshness?: 'fresh' | 'uncertain' | 'stale';
+        latencyMs?: number;
       };
       const bboxes = Array.isArray(body.bboxes) ? body.bboxes : [];
       // Lazy import to avoid a circular dep at module load.
@@ -818,8 +821,33 @@ export function createHttpServer(
         bboxes,
         body.imageWidth,
         body.imageHeight,
+        {
+          url: body.url,
+          freshness: body.freshness,
+          latencyMs: body.latencyMs,
+        },
       );
       res.json({ ok: true, count: bboxes.length });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Announce that a vision pass is in flight. The UI shows a
+   * transient "vision updating…" indicator until the next
+   * vision-bboxes event lands.
+   */
+  app.post('/session/:id/vision-pending', async (req, res) => {
+    if (!getSession(req.params.id)) {
+      res.status(404).json({ error: 'Session not found or expired' });
+      return;
+    }
+    try {
+      const body = (req.body ?? {}) as { dispatchedAt?: number };
+      const { inputEventBus } = await import('../browser/input-events.js');
+      inputEventBus.emitVisionPending(req.params.id, body.dispatchedAt);
+      res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
