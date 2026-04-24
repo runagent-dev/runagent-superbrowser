@@ -60,7 +60,13 @@ def select_provider() -> VisionProvider:
     # 4096 gives enough headroom while staying below the usual
     # per-model output cap.
     max_tokens = int(os.environ.get("VISION_MAX_TOKENS") or "4096")
-    timeout_ms = int(os.environ.get("VISION_TIMEOUT_MS") or "8000")
+    # Bumped default 8000 → 20000: gemini-3-flash-preview frequently
+    # exceeds 8s on image-heavy pages (observed 3+ timeouts in a row on
+    # Chase's calculator with 100KB screenshots). 20s is well under the
+    # agent's iteration budget but gives headroom for tail latency. The
+    # compact retry in client.py uses retry_timeout_s (~45s) for extra
+    # slack on the second chance.
+    timeout_ms = int(os.environ.get("VISION_TIMEOUT_MS") or "20000")
 
     return GeminiVisionProvider(
         model=model,

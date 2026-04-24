@@ -110,7 +110,30 @@ class BBox(BaseModel):
     @field_validator("box_2d", mode="before")
     @classmethod
     def _coerce_box(cls, v: object) -> list[int]:
-        # Accept tuple/list of 4 numbers; clamp each to [0, 1000].
+        # Accept tuple/list of 4 numbers OR dict shapes the model actually
+        # emits in the wild:
+        #   {"ymin": .., "xmin": .., "ymax": .., "xmax": ..}
+        #   {"y0": .., "x0": .., "y1": .., "x1": ..}
+        #   {"x0", "y0", "x1", "y1"}                (rendered-space form)
+        #   {"box_2d": [...]}                       (nested)
+        # Fall back to [0,0,0,0] silently rather than raising — a malformed
+        # bbox should zero-out that entry, not sink the whole response.
+        if isinstance(v, dict):
+            for keys in (
+                ("ymin", "xmin", "ymax", "xmax"),
+                ("y0", "x0", "y1", "x1"),
+            ):
+                if all(k in v for k in keys):
+                    v = [v[k] for k in keys]
+                    break
+            else:
+                if "box_2d" in v and isinstance(v["box_2d"], (list, tuple)):
+                    v = v["box_2d"]
+                elif all(k in v for k in ("x0", "y0", "x1", "y1")):
+                    # Rendered-space order: convert to the ymin/xmin/ymax/xmax form
+                    v = [v["y0"], v["x0"], v["y1"], v["x1"]]
+                else:
+                    return [0, 0, 0, 0]
         if not isinstance(v, (list, tuple)) or len(v) != 4:
             return [0, 0, 0, 0]
         out: list[int] = []
@@ -584,6 +607,27 @@ class DiffInfo(BaseModel):
     )
 
 
+class DomAnchor(BaseModel):
+    """Compact DOM-side hint forwarded to the vision prompt.
+
+    Seeds vision with "here are the clickable elements the DOM script
+    found, bucketed by region" so the model is less likely to cull
+    sidebar/toolbar items when it caps the bbox list. Built by the
+    Python bridge from `SelectorEntry` — vision consumes it as prompt
+    context only, never as output.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    label: str = Field(default="", description="Visible text or ARIA name.")
+    region_tag: Literal[
+        "toolbar", "sidebar", "header", "footer", "main",
+    ] = Field(default="main")
+    # Normalized rect [ymin, xmin, ymax, xmax] in 0-1000 space so it
+    # shares coordinate semantics with BBox.box_2d.
+    box_2d: list[int] = Field(default_factory=lambda: [0, 0, 0, 0])
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -651,6 +695,15 @@ class VisionResponse(BaseModel):
     tokens_used: Optional[int] = None
     model: Optional[str] = None
     provider: Optional[str] = None
+    coverage_mode: bool = Field(
+        default=False,
+        description=(
+            "True when this response came from a `coverage_request` pass — "
+            "bbox cap was lifted and page-type culling rules were disabled. "
+            "Consumers should not cache these responses and should trust "
+            "their completeness more than a standard pass."
+        ),
+    )
 
     # Source image dimensions used to denormalize box_2d to CSS pixels.
     # Set via `with_image_dims()` after parsing. PrivateAttr keeps these

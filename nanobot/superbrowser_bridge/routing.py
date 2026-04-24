@@ -278,6 +278,22 @@ def _extract_browser_target(text: str) -> str | None:
     return None
 
 
+def learning_reads_enabled() -> bool:
+    """Gate for all learning/routing-history reads. Writes are unaffected.
+
+    Default OFF: stale per-domain failure history was forcing T1-friendly
+    sites onto T3 (e.g. petfinder.com → 403 at the IP layer). Flip env to
+    "1" to restore prior learning-aware routing. Writes keep flowing into
+    the store either way, so re-enabling immediately resumes informed
+    decisions with the accumulated data intact.
+
+    Carve-out: record_cf_failure / record_cf_success / _record_routing_outcome
+    are read-modify-write through routing_store.upsert and are NOT gated —
+    their internal read is required to compute the new value correctly.
+    """
+    return os.environ.get("LEARNING_READS_ENABLED", "0") != "0"
+
+
 def _classify_task(instructions: str, url: str | None = None) -> dict:
     """Deterministic routing classifier.
 
@@ -515,53 +531,138 @@ def _record_routing_outcome(
     if not domain or domain == "unknown":
         return
     from datetime import datetime, timezone
-    path = _routing_path(domain)
-    data: dict = {
-        "domain": domain,
-        "browser_success": 0, "browser_fail": 0,
-        "search_success": 0, "search_fail": 0,
-        "search_needed_render": 0,
-        "tier_outcomes": {},
-        "lowest_successful_tier": None,
-        "block_class": "",
-        "last_updated": None,
-    }
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                loaded = _json.load(f)
-            if isinstance(loaded, dict):
-                data.update(loaded)
-        except (ValueError, OSError):
-            pass
-    # Legacy counters (kept so _preferred_approach continues to work).
-    key = f"{approach}_{'success' if success else 'fail'}"
-    if key in data:
-        data[key] = int(data.get(key, 0)) + 1
-    if used_rendered:
-        data["search_needed_render"] = int(data.get("search_needed_render", 0)) + 1
-    # Tier-aware ledger.
-    if tier is not None:
-        outcomes = data.get("tier_outcomes") or {}
-        if not isinstance(outcomes, dict):
-            outcomes = {}
-        outcomes[str(tier)] = (
-            "success" if success
-            else (f"fail:{block_class}" if block_class else "fail")
-        )
-        data["tier_outcomes"] = outcomes
-        if success:
-            cur = data.get("lowest_successful_tier")
-            if cur is None or int(tier) < int(cur):
-                data["lowest_successful_tier"] = int(tier)
-        if block_class:
-            data["block_class"] = block_class
-    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    # Lazy import to avoid circular dependency: routing_store imports
+    # LEARNINGS_DIR / _routing_path from this module at top-level.
+    from superbrowser_bridge import routing_store
+
+    def _mutate(data: dict) -> dict:
+        # Seed defaults for first-time domains so subsequent reads
+        # encounter a stable shape.
+        for k, v in (
+            ("domain", domain),
+            ("browser_success", 0), ("browser_fail", 0),
+            ("search_success", 0), ("search_fail", 0),
+            ("search_needed_render", 0),
+            ("tier_outcomes", {}),
+            ("lowest_successful_tier", None),
+            ("block_class", ""),
+            ("last_updated", None),
+        ):
+            data.setdefault(k, v)
+        # Legacy counters (kept so _preferred_approach continues to work).
+        key = f"{approach}_{'success' if success else 'fail'}"
+        if key in data:
+            data[key] = int(data.get(key, 0)) + 1
+        if used_rendered:
+            data["search_needed_render"] = int(data.get("search_needed_render", 0)) + 1
+        # Tier-aware ledger. Transient block classes (timeout, network
+        # errors, short rate-limits) go into a separate side-channel
+        # so they don't poison `lowest_successful_tier` — see
+        # is_transient() below.
+        if tier is not None:
+            outcomes = data.get("tier_outcomes") or {}
+            if not isinstance(outcomes, dict):
+                outcomes = {}
+            if (not success) and is_transient(block_class):
+                # Record but don't write to the load-bearing tier_outcomes
+                # field. Capped at last 5 entries with timestamps so the
+                # ledger doesn't grow unbounded on a flaky network.
+                transient = data.get("tier_transient_failures") or []
+                if not isinstance(transient, list):
+                    transient = []
+                transient.append({
+                    "tier": int(tier),
+                    "block_class": block_class,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                })
+                data["tier_transient_failures"] = transient[-5:]
+            else:
+                outcomes[str(tier)] = (
+                    "success" if success
+                    else (f"fail:{block_class}" if block_class else "fail")
+                )
+                data["tier_outcomes"] = outcomes
+            if success:
+                cur = data.get("lowest_successful_tier")
+                if cur is None or int(tier) < int(cur):
+                    data["lowest_successful_tier"] = int(tier)
+                # Track when the cheapest-known tier last succeeded so
+                # choose_starting_tier can decay graduations after the
+                # configured TTL.
+                data["lowest_successful_tier_last_seen"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                # Successful tier means "TTL retry" worked — clear the
+                # pending re-promotion flag.
+                if data.get("tier_retry_pending"):
+                    data["tier_retry_pending"] = False
+            if block_class and not is_transient(block_class):
+                data["block_class"] = block_class
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return data
+
     try:
-        with open(path, "w") as f:
-            _json.dump(data, f, indent=2)
-    except OSError:
-        pass
+        routing_store.upsert(domain, _mutate)
+    except Exception:
+        # Last-ditch fallback: write directly to the JSON file so we
+        # don't lose the outcome if SQLite is unavailable.
+        path = _routing_path(domain)
+        data: dict = {"domain": domain}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    loaded = _json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except (ValueError, OSError):
+                pass
+        try:
+            data = _mutate(data)
+            with open(path, "w") as f:
+                _json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+
+# --- Block-class taxonomy -------------------------------------------------
+
+# Transient failures shouldn't poison the per-domain tier ledger — a
+# random network blip or a brief rate limit doesn't mean the tier is
+# unsuitable for this domain. Permanent failures (HTTP 401/403 from
+# antibot, captcha persistently failing) DO reflect a real fingerprint
+# mismatch and should escalate.
+TRANSIENT_BLOCK_CLASSES = frozenset({
+    "timeout",
+    "network_error",
+    "rate_limit_short",
+    "service_unavailable_short",
+})
+
+# Used as documentation; not strictly required by is_transient.
+PERMANENT_BLOCK_CLASSES = frozenset({
+    "antibot_403",
+    "antibot_403_persistent",
+    "captcha_failed",
+    "akamai",
+    "cloudflare_persistent",
+    "datadome",
+    "perimeterx",
+    "kasada",
+    "rate_limit",          # legacy class name — treat as persistent
+    "network_blocked",     # legacy
+})
+
+
+def is_transient(block_class: str) -> bool:
+    """True when this failure class is likely to clear on retry.
+
+    Transient failures (timeout, brief 429/503) get logged into a
+    separate tier_transient_failures list so the next call still
+    considers the cheaper tier. Permanent failures (antibot 401/403,
+    captcha-failed) flip tier_outcomes[tier] to fail:* which steers
+    choose_starting_tier toward the next higher tier.
+    """
+    return bool(block_class) and block_class in TRANSIENT_BLOCK_CLASSES
 
 
 def record_cf_failure(domain: str) -> int:
@@ -577,28 +678,25 @@ def record_cf_failure(domain: str) -> int:
     if not domain or domain == "unknown":
         return 0
     from datetime import datetime, timezone
-    path = _routing_path(domain)
-    data: dict = {"domain": domain}
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                loaded = _json.load(f)
-            if isinstance(loaded, dict):
-                data.update(loaded)
-        except (ValueError, OSError):
-            pass
-    streak = int(data.get("cf_failure_streak", 0)) + 1
-    data["cf_failure_streak"] = streak
-    if streak >= 2:
-        # Sticky once true — a human has to clear it by deleting the flag.
-        data["needs_headful"] = True
-    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    from superbrowser_bridge import routing_store
+
+    streak = 0
+
+    def _mutate(data: dict) -> dict:
+        nonlocal streak
+        data.setdefault("domain", domain)
+        streak = int(data.get("cf_failure_streak", 0)) + 1
+        data["cf_failure_streak"] = streak
+        if streak >= 2:
+            # Sticky once true — a human has to clear it by deleting the flag.
+            data["needs_headful"] = True
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return data
+
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            _json.dump(data, f, indent=2)
-    except OSError:
-        pass
+        routing_store.upsert(domain, _mutate)
+    except Exception:
+        return streak
     return streak
 
 
@@ -613,25 +711,167 @@ def record_cf_success(domain: str) -> None:
     if not domain or domain == "unknown":
         return
     from datetime import datetime, timezone
-    path = _routing_path(domain)
-    if not os.path.exists(path):
+    from superbrowser_bridge import routing_store
+
+    cur = routing_store.load(domain)
+    if cur is None:
+        # Fall back to legacy JSON for the read; allows callers that
+        # were operating on a domain pre-migration to still flip the
+        # streak to 0.
+        path = _routing_path(domain)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                cur = _json.load(f)
+        except (ValueError, OSError):
+            return
+        if not isinstance(cur, dict):
+            return
+    if int(cur.get("cf_failure_streak", 0)) == 0:
         return
+
+    def _mutate(data: dict) -> dict:
+        data.setdefault("domain", domain)
+        data["cf_failure_streak"] = 0
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return data
+
     try:
-        with open(path) as f:
-            data = _json.load(f)
-    except (ValueError, OSError):
-        return
-    if not isinstance(data, dict):
-        return
-    if data.get("cf_failure_streak", 0) == 0:
-        return
-    data["cf_failure_streak"] = 0
-    data["last_updated"] = datetime.now(timezone.utc).isoformat()
-    try:
-        with open(path, "w") as f:
-            _json.dump(data, f, indent=2)
-    except OSError:
+        routing_store.upsert(domain, _mutate)
+    except Exception:
         pass
+
+
+def record_tactic_failure(domain: str, tool: str) -> None:
+    """Increment the tactic-penalty counter for `tool` on `domain`.
+
+    Called from the mutation tools when `_classify_effect` reports
+    `had_effect=False` — i.e. the tool dispatched but the page didn't
+    respond. After enough failures the delegation prompt will surface
+    the penalty so the next worker picks an alternative tactic
+    upfront instead of re-discovering the same wall turn-by-turn.
+    """
+    if not domain or domain == "unknown" or not tool:
+        return
+    from datetime import datetime, timezone
+    from superbrowser_bridge import routing_store
+
+    def _mutate(data: dict) -> dict:
+        data.setdefault("domain", domain)
+        penalties = data.get("tactic_penalties")
+        if not isinstance(penalties, dict):
+            penalties = {}
+        entry = penalties.get(tool)
+        if not isinstance(entry, dict):
+            entry = {}
+        try:
+            fc = int(entry.get("failure_count") or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        entry["failure_count"] = fc + 1
+        entry["last_failure_at"] = datetime.now(timezone.utc).isoformat()
+        penalties[tool] = entry
+        data["tactic_penalties"] = penalties
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return data
+
+    try:
+        routing_store.upsert(domain, _mutate)
+    except Exception:
+        pass
+
+
+def decay_tactic_success(domain: str, tool: str) -> None:
+    """Dampen the tactic-penalty counter after a successful use of
+    `tool` on `domain`. We decrement rather than zero out so a
+    genuinely unreliable tactic still shows pressure after one lucky
+    success."""
+    if not domain or domain == "unknown" or not tool:
+        return
+    from datetime import datetime, timezone
+    from superbrowser_bridge import routing_store
+
+    cur = routing_store.load(domain)
+    if not isinstance(cur, dict):
+        return
+    penalties = cur.get("tactic_penalties")
+    if not isinstance(penalties, dict) or tool not in penalties:
+        return
+
+    def _mutate(data: dict) -> dict:
+        penalties = data.get("tactic_penalties") or {}
+        if not isinstance(penalties, dict):
+            return data
+        entry = penalties.get(tool)
+        if not isinstance(entry, dict):
+            return data
+        try:
+            fc = int(entry.get("failure_count") or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        if fc <= 1:
+            penalties.pop(tool, None)
+        else:
+            entry["failure_count"] = fc - 1
+            penalties[tool] = entry
+        data["tactic_penalties"] = penalties
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return data
+
+    try:
+        routing_store.upsert(domain, _mutate)
+    except Exception:
+        pass
+
+
+def tactic_penalty_summary(domain: str, min_count: int = 2) -> list[tuple[str, int]]:
+    """Return [(tool, failure_count), ...] sorted desc, for tools whose
+    count >= `min_count`. Used by the delegation prompt builder."""
+    if not domain or domain == "unknown":
+        return []
+    try:
+        from superbrowser_bridge import routing_store
+        data = routing_store.load(domain)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    penalties = data.get("tactic_penalties")
+    if not isinstance(penalties, dict):
+        return []
+    out: list[tuple[str, int]] = []
+    for tool, entry in penalties.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            fc = int(entry.get("failure_count") or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        if fc >= min_count:
+            out.append((str(tool), fc))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+# Mapping used by the delegation prompt to suggest an alternative when
+# a tactic has accumulated penalty failures. Hardcoded (don't over-
+# engineer): click/type tactics that React's event dispatch keeps
+# swallowing should fall back to selector-based or script-based
+# writes.
+TACTIC_ALTERNATIVES: dict[str, str] = {
+    # Semantic-target tools are listed FIRST because they're atomic
+    # (fresh vision + dispatch in one turn) and skip the V-index drift
+    # tax that's been biting click_at specifically. Selector-based
+    # tools are the second-choice fallback when semantic matching
+    # can't find the target.
+    "browser_click_at": "browser_semantic_click(target='<what to click>') — atomic fresh vision + dispatch, no V-index drift; OR browser_click_selector(<css>)",
+    "browser_click": "browser_semantic_click(target='<what to click>') or browser_click_selector(<css>)",
+    "browser_type_at": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
+    "browser_type": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
+    "browser_keys": "browser_run_script(mutates=true) calling helpers.reactSetValue then dispatching submit",
+    "browser_fix_text_at": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) using helpers.reactSetValue",
+}
 
 
 def needs_headful(domain: str) -> bool:
@@ -642,15 +882,32 @@ def needs_headful(domain: str) -> bool:
     """
     if not domain or domain == "unknown":
         return False
-    path = _routing_path(domain)
-    if not os.path.exists(path):
+    if not learning_reads_enabled():
         return False
-    try:
-        with open(path) as f:
-            data = _json.load(f)
-    except (ValueError, OSError):
-        return False
+    from superbrowser_bridge import routing_store
+    data = routing_store.load(domain)
+    if data is None:
+        # Legacy fallback for the cutover release.
+        path = _routing_path(domain)
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except (ValueError, OSError):
+            return False
     return bool(isinstance(data, dict) and data.get("needs_headful"))
+
+
+def _parse_iso(ts: str | None) -> float:
+    """Parse an ISO-8601 timestamp into a UNIX float; returns 0.0 on bad input."""
+    if not ts:
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def choose_starting_tier(domain: str) -> int:
@@ -662,25 +919,61 @@ def choose_starting_tier(domain: str) -> int:
     so the caller opens a T3 patchright session directly instead of
     burning another T1 attempt that will just re-hit the same 403.
 
-    Used by the orchestrator and BrowserOpenTool to skip tiers that
-    have reliably failed in the past and jump straight to the cheapest
-    working one.
+    TTL: when `lowest_successful_tier == 3` (the domain has graduated
+    away from cheaper tiers), only honor the graduation if the most
+    recent T3 success is within `ROUTING_TIER_GRADUATION_TTL_DAYS`
+    (default 30). Past TTL we suggest the cheaper tier so the domain
+    gets a chance to re-prove itself; if that cheaper attempt fails,
+    `tier_retry_pending` lets the next failure re-promote to T3
+    immediately without needing N consecutive failures.
     """
     if not domain or domain == "unknown":
         return 0
-    path = _routing_path(domain)
-    if not os.path.exists(path):
+    if not learning_reads_enabled():
         return 0
-    try:
-        with open(path) as f:
-            data = _json.load(f)
-    except (ValueError, OSError):
-        return 0
+    from superbrowser_bridge import routing_store
+    import time as _time
+
+    data = routing_store.load(domain)
+    if data is None:
+        # Legacy JSON fallback.
+        path = _routing_path(domain)
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except (ValueError, OSError):
+            return 0
     if not isinstance(data, dict):
         return 0
+
     lst = data.get("lowest_successful_tier")
     if isinstance(lst, int) and 0 <= lst <= 5:
+        # TTL only kicks in for graduations to T3+. Cheaper graduations
+        # don't need decay — they're already cheap.
+        if lst >= 3 and not data.get("tier_retry_pending"):
+            ttl_days = float(os.environ.get("ROUTING_TIER_GRADUATION_TTL_DAYS") or "30")
+            if ttl_days > 0:
+                last_seen = _parse_iso(data.get("lowest_successful_tier_last_seen"))
+                if last_seen > 0:
+                    age_days = (_time.time() - last_seen) / 86400.0
+                    if age_days > ttl_days:
+                        # Domain may have loosened detection since the
+                        # last T3 success — give the cheaper tier a try.
+                        # Set tier_retry_pending so the next failure
+                        # re-promotes immediately. Best-effort write —
+                        # don't block tier selection on the upsert.
+                        try:
+                            def _mark_pending(d: dict) -> dict:
+                                d["tier_retry_pending"] = True
+                                return d
+                            routing_store.upsert(domain, _mark_pending)
+                        except Exception:
+                            pass
+                        return max(0, lst - 1)
         return lst
+
     outcomes = data.get("tier_outcomes") or {}
     if isinstance(outcomes, dict):
         # BrowserOpenTool is binary (t1 vs t3 — T2 is read-only curl).
@@ -694,13 +987,20 @@ def _preferred_approach(domain: str) -> dict | None:
     """Return {approach, reason, confidence} if past outcomes show a clear
     winner on this domain. Requires ≥3 attempts per side with ≥30% delta.
     """
-    path = _routing_path(domain)
-    if not os.path.exists(path):
+    if not learning_reads_enabled():
         return None
-    try:
-        with open(path) as f:
-            data = _json.load(f)
-    except (ValueError, OSError):
+    from superbrowser_bridge import routing_store
+    data = routing_store.load(domain)
+    if data is None:
+        path = _routing_path(domain)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except (ValueError, OSError):
+            return None
+    if not isinstance(data, dict):
         return None
     bs, bf = int(data.get("browser_success", 0)), int(data.get("browser_fail", 0))
     ss, sf = int(data.get("search_success", 0)), int(data.get("search_fail", 0))

@@ -67,8 +67,41 @@ def _env_light_mode() -> bool:
     30s CF warm-up wait. Useful when T3 is only being used because
     a session was already on T3 (e.g. auth flow continuation) but
     the target site itself has no bot protection.
+
+    Also returns True when INTERACTIVE_HUMANIZE_MODE=off — the
+    tri-state env wins over the legacy binary one when both are set,
+    but here we just need to know "should the session start light?"
     """
-    return os.environ.get("T3_LIGHT_MODE", "0") == "1"
+    if os.environ.get("T3_LIGHT_MODE", "0") == "1":
+        return True
+    return _humanize_mode() == "off"
+
+
+def _humanize_mode() -> str:
+    """Tri-state humanization policy.
+
+    Values:
+      always     — bezier + micro-motions on every action (the safest
+                   default for a brand-new untrusted account on hostile
+                   sites; matches behaviour before this knob existed).
+      challenged — start cheap, only flip to full humanization after
+                   the session observes an antibot signal (CF challenge,
+                   Turnstile, captcha, 4xx from antibot). This gives
+                   T3 sessions T1-grade latency on benign sites without
+                   sacrificing protection where it matters. Recommended
+                   default for the agent-quality complaint about T3
+                   "feeling slower / behaving differently" on easy pages.
+      off        — never humanize, equivalent to T3_LIGHT_MODE=1.
+
+    `auto` is a back-compat alias for the legacy two-phase behavior:
+    full humanization on first nav, then auto-downshift after a clean
+    CF probe. This is the default if the env is unset so existing
+    deployments don't change overnight.
+    """
+    val = (os.environ.get("INTERACTIVE_HUMANIZE_MODE") or "auto").strip().lower()
+    if val in ("always", "challenged", "off", "auto"):
+        return val
+    return "auto"
 
 
 def _labels_match(expected: str, el_info: dict) -> bool:
@@ -713,6 +746,13 @@ class T3SessionManager:
         # (upper-left quadrant, small random offset) so smooth-move to
         # the first click doesn't start from dead center.
         import random as _init_rng
+        # `challenged` mode: start light. Bezier + micro-motions stay
+        # off until the session observes a real antibot signal, which
+        # the existing CF probe in _goto_with_warmup is responsible
+        # for detecting and flipping back. `always` and `auto` keep
+        # the legacy heavy-on-first-nav behaviour. `off` is global
+        # via _env_light_mode (already in use).
+        _initial_light = _humanize_mode() == "challenged"
         self._sessions[sid] = _ManagedSession(
             id=sid,
             context=context,
@@ -726,6 +766,7 @@ class T3SessionManager:
             persistent_browser=persistent_browser,
             cursor_x=float(_init_rng.randint(280, 620)),
             cursor_y=float(_init_rng.randint(220, 420)),
+            light_mode=_initial_light,
         )
 
         await self._attach_screencast(sid, context, page)
@@ -1561,6 +1602,17 @@ class T3SessionManager:
             # decide to call browser_solve_captcha when no API key is set
             # or auto-solve didn't clear.
             result["turnstile"] = turnstile_info
+        # Antibot signal observed → re-engage full humanization. Honors
+        # `challenged` mode by flipping a session that started light back
+        # to heavy stealth the moment we see a real bot-detection page.
+        if (result.get("block_class") or result.get("turnstile")) and s.light_mode:
+            s.light_mode = False
+            logger.info(
+                "t3 re-engaging full humanization: session=%s host=%s "
+                "antibot signal observed (block_class=%s turnstile=%s)",
+                sid, urlparse(url).hostname or "",
+                result.get("block_class"), bool(result.get("turnstile")),
+            )
         # Auto-downshift: if this nav succeeded cleanly (200-ish status,
         # no CF / Turnstile / block_class signals) and the session
         # isn't already in light mode, flip it on. Subsequent clicks &
@@ -1570,9 +1622,13 @@ class T3SessionManager:
         #
         # Disable the downshift with T3_AUTO_DOWNSHIFT=0 to preserve
         # full-armor behaviour (e.g., on sessions that start easy but
-        # become hostile on sub-pages).
+        # become hostile on sub-pages). Also suppressed when
+        # INTERACTIVE_HUMANIZE_MODE=always — the operator explicitly
+        # asked for max protection, don't second-guess.
+        _hmode = _humanize_mode()
         if (
             not _light
+            and _hmode != "always"
             and os.environ.get("T3_AUTO_DOWNSHIFT", "1") != "0"
             and not s.light_mode
             and not result.get("block_class")
@@ -2825,6 +2881,692 @@ class T3SessionManager:
             return {"success": False, "error": str(exc)[:200]}
         st = await self.state(sid)
         return {"success": True, "url": st["url"], "title": st["title"], "elements": st["elements"]}
+
+    async def set_slider(
+        self,
+        sid: str,
+        selector: str,
+        value: Any,
+        *,
+        value_mode: str = "absolute",
+        method: str = "auto",
+    ) -> dict[str, Any]:
+        """Set a slider's value. Mirrors src/browser/page.ts setSlider.
+
+        Tries three strategies in order: (A) native `<input type=range>`
+        value-set + input/change events, (B) ARIA slider keyboard walk,
+        (C) pixel drag. Frame-aware: probes every frame in `page.frames`.
+        """
+        s = self._get(sid)
+        page = s.page
+        import json as _json
+
+        # Find the frame that contains the selector.
+        probe_src = (
+            "(function(sel){"
+            "var el=document.querySelector(sel);"
+            "if(!el)return null;"
+            "var tag=el.tagName.toLowerCase();"
+            "var type=(el.type||'').toLowerCase();"
+            "var role=el.getAttribute('role');"
+            "var kind='other';"
+            "if(tag==='input'&&type==='range')kind='range-input';"
+            "else if(role==='slider'||el.hasAttribute('aria-valuenow'))kind='aria-slider';"
+            "function pn(s){if(s==null||s==='')return null;var n=parseFloat(s);return isFinite(n)?n:null;}"
+            "var min=kind==='range-input'?pn(el.min):pn(el.getAttribute('aria-valuemin'));"
+            "var max=kind==='range-input'?pn(el.max):pn(el.getAttribute('aria-valuemax'));"
+            "var step=kind==='range-input'?pn(el.step):null;"
+            "return {kind:kind,meta:{min:min,max:max,step:step}};"
+            f"}})({_json.dumps(selector)})"
+        )
+        resolved_frame = None
+        kind = "other"
+        meta = {"min": None, "max": None, "step": None}
+        frames_searched: list[str] = []
+        frames_list = [page.main_frame] + [f for f in page.frames if f is not page.main_frame]
+        for f in frames_list:
+            furl = f.url
+            try:
+                probe = await f.evaluate(probe_src)
+                frames_searched.append(f"{furl} (ok, found={'y' if probe else 'n'})")
+                if probe:
+                    resolved_frame = f
+                    kind = probe["kind"]
+                    meta = probe["meta"]
+                    break
+            except Exception as exc:
+                frames_searched.append(f"{furl} (err: {str(exc)[:100]})")
+        if resolved_frame is None:
+            return {
+                "strategy": "unresolved", "frameUrl": "",
+                "before": None, "after": None,
+                "min": None, "max": None, "step": None,
+                "error": f"selector not found in any frame: {selector}",
+                "framesSearched": frames_searched,
+            }
+        frame_url = resolved_frame.url
+        mn, mx = meta.get("min"), meta.get("max")
+        step_n = meta.get("step") or 1
+
+        def _to_abs(v: float) -> float:
+            if value_mode == "ratio":
+                if mn is None or mx is None:
+                    return v
+                return mn + v * (mx - mn)
+            return v
+
+        # Strategy A: native range input
+        if kind == "range-input" and method in ("auto", "range-input"):
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                target: Any = [float(_to_abs(value[0])), float(_to_abs(value[1]))]
+            else:
+                target = float(_to_abs(float(value)))
+            set_src = (
+                "(function(sel,target){"
+                "var first=document.querySelector(sel);"
+                "if(!first)return {ok:false,reason:'not-found'};"
+                "var els=[first];"
+                "if(Array.isArray(target)){"
+                "  var p=first.parentElement;"
+                "  if(p){var sibs=Array.prototype.slice.call(p.querySelectorAll('input[type=\"range\"]'));"
+                "    if(sibs.length>=2)els=sibs.slice(0,2);}"
+                "}"
+                "var before=els.map(function(e){return parseFloat(e.value);});"
+                "var targets=Array.isArray(target)?target:[target];"
+                "var setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');"
+                "setter=setter?setter.set:null;"
+                "for(var i=0;i<els.length;i++){"
+                "  var el=els[i];"
+                "  var tv=targets[Math.min(i,targets.length-1)];"
+                "  var lo=parseFloat(el.min||String(tv));"
+                "  var hi=parseFloat(el.max||String(tv));"
+                "  var st=parseFloat(el.step||'1')||1;"
+                "  var v=Math.max(lo,Math.min(hi,tv));"
+                "  v=Math.round((v-lo)/st)*st+lo;"
+                "  v=Math.round(v*1e8)/1e8;"
+                "  if(setter)setter.call(el,String(v));else el.value=String(v);"
+                "  el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "  el.dispatchEvent(new Event('change',{bubbles:true}));"
+                "}"
+                "var after=els.map(function(e){return parseFloat(e.value);});"
+                "return {ok:true,before:before,after:after};"
+                f"}})({_json.dumps(selector)},{_json.dumps(target)})"
+            )
+            result = await resolved_frame.evaluate(set_src)
+            if isinstance(result, dict) and result.get("ok"):
+                before = result["before"]
+                after = result["after"]
+                return {
+                    "strategy": "range-input", "frameUrl": frame_url,
+                    "before": before[0] if len(before) == 1 else before,
+                    "after": after[0] if len(after) == 1 else after,
+                    "min": mn, "max": mx, "step": step_n,
+                }
+
+        # Strategy B: ARIA slider → focus + arrow keys
+        if kind in ("aria-slider", "range-input") and method in ("auto", "keyboard"):
+            target_scalar = float(_to_abs(value[0] if isinstance(value, (list, tuple)) else float(value)))
+            state_src = (
+                "(function(sel){"
+                "var el=document.querySelector(sel);"
+                "if(!el)return null;"
+                "var r=el.getBoundingClientRect();"
+                "var aNow=el.getAttribute('aria-valuenow');"
+                "var aMin=el.getAttribute('aria-valuemin');"
+                "var aMax=el.getAttribute('aria-valuemax');"
+                "return {x:r.x,y:r.y,w:r.width,h:r.height,"
+                "cur:aNow!=null?parseFloat(aNow):(el.value!=null?parseFloat(el.value):NaN),"
+                "lo:aMin!=null?parseFloat(aMin):(el.min?parseFloat(el.min):NaN),"
+                "hi:aMax!=null?parseFloat(aMax):(el.max?parseFloat(el.max):NaN)};"
+                f"}})({_json.dumps(selector)})"
+            )
+            st = await resolved_frame.evaluate(state_src)
+            import math
+            if (
+                st is not None
+                and all(math.isfinite(st[k]) for k in ("cur", "lo", "hi"))
+            ):
+                # Frame offset: cross-origin iframes start at their iframe element's box.
+                off_x, off_y = 0.0, 0.0
+                if resolved_frame is not page.main_frame:
+                    try:
+                        fe = await resolved_frame.frame_element()
+                        if fe is not None:
+                            box = await fe.bounding_box()
+                            if box:
+                                off_x, off_y = box["x"], box["y"]
+                    except Exception:
+                        pass
+                cx = round(st["x"] + st["w"] / 2 + off_x)
+                cy = round(st["y"] + st["h"] / 2 + off_y)
+                try:
+                    await page.mouse.click(cx, cy)
+                except Exception:
+                    pass
+                clamped = max(st["lo"], min(st["hi"], target_scalar))
+                delta = clamped - st["cur"]
+                stn = step_n if step_n and step_n > 0 else 1
+                n = min(500, abs(round(delta / stn)))
+                if clamped == st["lo"]:
+                    await page.keyboard.press("Home")
+                elif clamped == st["hi"]:
+                    await page.keyboard.press("End")
+                else:
+                    key_name = "ArrowRight" if delta >= 0 else "ArrowLeft"
+                    for i in range(n):
+                        await page.keyboard.press(key_name)
+                        if i % 25 == 24:
+                            await asyncio.sleep(0.008)
+                after_src = (
+                    "(function(sel){"
+                    "var el=document.querySelector(sel);"
+                    "if(!el)return null;"
+                    "var aNow=el.getAttribute('aria-valuenow');"
+                    "if(aNow!=null)return parseFloat(aNow);"
+                    "return el.value!=null?parseFloat(el.value):null;"
+                    f"}})({_json.dumps(selector)})"
+                )
+                after = await resolved_frame.evaluate(after_src)
+                if after is not None and math.isfinite(after):
+                    return {
+                        "strategy": "keyboard", "frameUrl": frame_url,
+                        "before": st["cur"], "after": after,
+                        "min": st["lo"], "max": st["hi"], "step": stn,
+                    }
+
+        # Strategy C: pixel drag
+        if method in ("auto", "drag"):
+            if isinstance(value, (list, tuple)):
+                ratio = value[0] if value_mode == "ratio" else 0.5
+            else:
+                if value_mode == "ratio":
+                    ratio = max(0.0, min(1.0, float(value)))
+                elif mn is not None and mx is not None:
+                    ratio = (float(value) - mn) / max(1e-9, (mx - mn))
+                else:
+                    ratio = 0.5
+            rect_src = (
+                "(function(sel){"
+                "var el=document.querySelector(sel);"
+                "if(!el)return null;"
+                "var track=el.closest('[role=\"slider\"],[class*=\"slider\" i],[class*=\"track\" i]')||el;"
+                "var tr=track.getBoundingClientRect();"
+                "var hr=el.getBoundingClientRect();"
+                "return {track:{x:tr.x,y:tr.y,w:tr.width,h:tr.height},"
+                "thumb:{x:hr.x,y:hr.y,w:hr.width,h:hr.height}};"
+                f"}})({_json.dumps(selector)})"
+            )
+            rect = await resolved_frame.evaluate(rect_src)
+            if not rect:
+                return {
+                    "strategy": "unresolved", "frameUrl": frame_url,
+                    "before": None, "after": None,
+                    "min": mn, "max": mx, "step": step_n,
+                    "error": "could not read thumb/track rect",
+                    "framesSearched": frames_searched,
+                }
+            off_x, off_y = 0.0, 0.0
+            if resolved_frame is not page.main_frame:
+                try:
+                    fe = await resolved_frame.frame_element()
+                    if fe is not None:
+                        box = await fe.bounding_box()
+                        if box:
+                            off_x, off_y = box["x"], box["y"]
+                except Exception:
+                    pass
+            start_x = round(rect["thumb"]["x"] + rect["thumb"]["w"] / 2 + off_x)
+            start_y = round(rect["thumb"]["y"] + rect["thumb"]["h"] / 2 + off_y)
+            end_x = round(
+                rect["track"]["x"] + rect["track"]["w"] * max(0.0, min(1.0, ratio)) + off_x,
+            )
+            end_y = start_y
+            try:
+                await page.mouse.move(start_x, start_y)
+                await page.mouse.down()
+                steps_n = 30
+                for i in range(1, steps_n + 1):
+                    t = i / steps_n
+                    t2 = t * t * (3 - 2 * t)
+                    x = start_x + (end_x - start_x) * t2
+                    y = start_y + (end_y - start_y) * t2
+                    await page.mouse.move(x, y)
+                    await asyncio.sleep(0.01)
+                await page.mouse.up()
+            except Exception as exc:
+                return {
+                    "strategy": "unresolved", "frameUrl": frame_url,
+                    "before": None, "after": None,
+                    "min": mn, "max": mx, "step": step_n,
+                    "error": f"drag failed: {str(exc)[:120]}",
+                    "framesSearched": frames_searched,
+                }
+            after_src2 = (
+                "(function(sel){"
+                "var el=document.querySelector(sel);"
+                "if(!el)return null;"
+                "var aNow=el.getAttribute('aria-valuenow');"
+                "if(aNow!=null)return parseFloat(aNow);"
+                "return el.value!=null?parseFloat(el.value):null;"
+                f"}})({_json.dumps(selector)})"
+            )
+            after = None
+            try:
+                after = await resolved_frame.evaluate(after_src2)
+            except Exception:
+                pass
+            import math as _math
+            return {
+                "strategy": "drag", "frameUrl": frame_url,
+                "before": None,
+                "after": after if (after is not None and _math.isfinite(after)) else None,
+                "min": mn, "max": mx, "step": step_n,
+            }
+
+        return {
+            "strategy": "unresolved", "frameUrl": frame_url,
+            "before": None, "after": None,
+            "min": mn, "max": mx, "step": step_n,
+            "error": f"no strategy applied (method={method})",
+            "framesSearched": frames_searched,
+        }
+
+    async def set_slider_at(
+        self,
+        sid: str,
+        handle: dict[str, Any],
+        track: dict[str, Any],
+        ratio: float,
+    ) -> dict[str, Any]:
+        """Vision-indexed slider drag (patchright). Handle + track are
+        CSS-pixel bboxes {x, y, w, h} already denormalised by the Python
+        tool; this method just does the math and fires the drag."""
+        s = self._get(sid)
+        try:
+            hx = float(handle.get("x", 0)); hy = float(handle.get("y", 0))
+            hw = float(handle.get("w", 0)); hh = float(handle.get("h", 0))
+            tx = float(track.get("x", 0));  ty = float(track.get("y", 0))
+            tw = float(track.get("w", 0));  th = float(track.get("h", 0))
+        except Exception as exc:
+            return {
+                "strategy": "unresolved",
+                "error": f"bad bbox shape: {exc}",
+                "handle_bbox": handle, "track_bbox": track,
+            }
+        r = max(0.0, min(1.0, float(ratio)))
+        start_x = round(hx + hw / 2.0)
+        start_y = round(hy + hh / 2.0)
+        end_x = round(tx + tw * r)
+        end_y = start_y
+        try:
+            await s.page.mouse.move(start_x, start_y)
+            await s.page.mouse.down()
+            steps_n = 30
+            for i in range(1, steps_n + 1):
+                t = i / steps_n
+                t2 = t * t * (3 - 2 * t)
+                x = start_x + (end_x - start_x) * t2
+                y = start_y + (end_y - start_y) * t2
+                await s.page.mouse.move(x, y)
+                await asyncio.sleep(0.01)
+            await s.page.mouse.up()
+        except Exception as exc:
+            return {
+                "strategy": "unresolved",
+                "error": f"drag failed: {str(exc)[:120]}",
+                "handle_bbox": {"x": hx, "y": hy, "w": hw, "h": hh},
+                "track_bbox": {"x": tx, "y": ty, "w": tw, "h": th},
+            }
+        return {
+            "strategy": "vision-drag",
+            "handle_bbox": {"x": hx, "y": hy, "w": hw, "h": hh},
+            "track_bbox": {"x": tx, "y": ty, "w": tw, "h": th},
+            "target_px": {"x": end_x, "y": end_y},
+        }
+
+    async def list_slider_handles(self, sid: str) -> list[dict[str, Any]]:
+        """DOM-only slider handle enumeration (tier-3 patchright).
+
+        Mirrors page.ts listSliderHandles. Walks every frame for
+        slider-shaped elements, returns their bboxes (document CSS
+        pixels) + nearest row-level label. No vision required.
+        """
+        s = self._get(sid)
+        page = s.page
+        scan_js = (
+            "(function(){"
+            "try {"
+            "var out = [];"
+            "var sel = ['input[type=\"range\"]','[role=\"slider\"]','[aria-valuenow]',"
+            "'[class*=\"handle\" i]','[class*=\"thumb\" i]','[class*=\"slider-button\" i]',"
+            "'[class*=\"slider-handle\" i]','[data-handle]'].join(',');"
+            "var found = Array.prototype.slice.call(document.querySelectorAll(sel));"
+            "var seen = new Set();"
+            "for (var i = 0; i < found.length; i++) {"
+            "var el = found[i]; var r = el.getBoundingClientRect();"
+            "if (!r || r.width < 3 || r.height < 3) continue;"
+            "if (r.width > 200 || r.height > 200) continue;"
+            "var key = Math.round(r.left)+'_'+Math.round(r.top)+'_'+Math.round(r.width)+'_'+Math.round(r.height);"
+            "if (seen.has(key)) continue; seen.add(key);"
+            "var tag = el.tagName.toLowerCase(); var type = (el.type || '').toLowerCase();"
+            "var role = el.getAttribute('role'); var kind = 'custom';"
+            "if (tag === 'input' && type === 'range') kind = 'range-input';"
+            "else if (role === 'slider' || el.hasAttribute('aria-valuenow')) kind = 'aria-slider';"
+            "var hcy = r.top + r.height / 2;"
+            "var ytol = Math.max(r.height * 4, 80);"
+            "var label = ''; var bestDy = Infinity;"
+            "var walker = document.createTreeWalker("
+            "document.body || document.documentElement, NodeFilter.SHOW_ELEMENT, null);"
+            "var cand;"
+            "while ((cand = walker.nextNode())) {"
+            "if (cand === el || cand.contains(el)) continue;"
+            "var cr = cand.getBoundingClientRect();"
+            "if (!cr || cr.width === 0 || cr.height === 0) continue;"
+            "if (cr.height > 80) continue;"
+            "var text = (cand.textContent || '').replace(/\\s+/g, ' ').trim();"
+            "if (!text || text.length > 200 || text.length < 3) continue;"
+            "var ccy = cr.top + cr.height / 2;"
+            "var dy = Math.abs(ccy - hcy);"
+            "if (dy > ytol) continue;"
+            "if (!/[A-Za-z]/.test(text)) continue;"
+            "if (dy < bestDy) { bestDy = dy; label = text; }"
+            "}"
+            "out.push({ kind: kind, bbox: { x: r.left, y: r.top, w: r.width, h: r.height }, label: label });"
+            "}"
+            "return out;"
+            "} catch(e) { return { error: String(e && e.message || e) }; }"
+            "})()"
+        )
+
+        result: list[dict[str, Any]] = []
+        try:
+            frames = [page.main_frame] + [f for f in page.frames if f is not page.main_frame]
+        except Exception:
+            frames = []
+        for f in frames:
+            off_x, off_y = 0.0, 0.0
+            if f is not page.main_frame:
+                try:
+                    fe = await f.frame_element()
+                    if fe is not None:
+                        box = await fe.bounding_box()
+                        if box:
+                            off_x, off_y = box["x"], box["y"]
+                except Exception:
+                    pass
+            try:
+                hits = await f.evaluate(scan_js)
+            except Exception:
+                continue
+            if not isinstance(hits, list):
+                continue
+            for h in hits:
+                if not isinstance(h, dict):
+                    continue
+                bb = h.get("bbox") or {}
+                try:
+                    x = float(bb.get("x", 0)) + off_x
+                    y = float(bb.get("y", 0)) + off_y
+                    w = float(bb.get("w", 0))
+                    hh = float(bb.get("h", 0))
+                except Exception:
+                    continue
+                result.append({
+                    "index": len(result),
+                    "frame_url": f.url,
+                    "kind": h.get("kind", "custom"),
+                    "bbox": {
+                        "x": round(x), "y": round(y),
+                        "w": round(w), "h": round(hh),
+                    },
+                    "label": h.get("label", ""),
+                })
+        return result
+
+    async def drag_slider_until(
+        self,
+        sid: str,
+        handle: dict[str, Any],
+        target_value: float,
+        *,
+        label_pattern: str | None = None,
+        tolerance: float = 0.0,
+        max_iterations: int = 25,
+        step_px: int = 8,
+        direction: str = "auto",
+    ) -> dict[str, Any]:
+        """Closed-loop slider drag for tier-3 (patchright).
+
+        Same semantics as page.ts dragSliderUntil: mouse down, step +
+        read-value + adjust + release. All frames scanned per iteration.
+        """
+        s = self._get(sid)
+        page = s.page
+        import json as _json
+
+        try:
+            hx = float(handle.get("x", 0)); hy = float(handle.get("y", 0))
+            hw = float(handle.get("w", 0)); hh = float(handle.get("h", 0))
+        except Exception as exc:
+            return {
+                "strategy": "closed-loop", "completed": False,
+                "error": f"bad handle bbox: {exc}",
+                "iterations": 0,
+                "initial_value": None, "final_value": None,
+                "target_value": target_value, "tolerance": tolerance,
+                "trace": [], "label_text": None,
+            }
+        handle_cx = round(hx + hw / 2.0)
+        handle_cy = round(hy + hh / 2.0)
+        pattern_src = label_pattern or r"(-?\d+(?:\.\d+)?)"
+        y_tolerance = max(hh * 4, 80)
+
+        # Scanner walks ELEMENTS (not text nodes) and reads textContent
+        # so labels split across spans —
+        #   <label>Age Range: <span>25</span> to <span>75</span></label>
+        # — concatenate into one string the regex can match.
+        def _scan_js(local_cy: float) -> str:
+            return (
+                "(function(pat, hcy, ytol){"
+                "try{"
+                "var re = new RegExp(pat);"
+                "var best = null;"
+                "var walker = document.createTreeWalker("
+                "document.body || document.documentElement,"
+                "NodeFilter.SHOW_ELEMENT, null);"
+                "var el;"
+                "while ((el = walker.nextNode())) {"
+                "var r = el.getBoundingClientRect();"
+                "if (!r || r.width === 0 || r.height === 0) continue;"
+                "if (r.height > 80) continue;"
+                "var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();"
+                "if (!text || text.length > 300) continue;"
+                "var m = re.exec(text); if (!m) continue;"
+                "var num = parseFloat(m[1]); if (!isFinite(num)) continue;"
+                "var cy = r.top + r.height / 2;"
+                "var dy = Math.abs(cy - hcy);"
+                "if (dy > ytol) continue;"
+                "var area = r.width * r.height;"
+                "if (best === null || dy < best.dy || (dy === best.dy && area < best.area)) {"
+                "best = { dy: dy, area: area, value: num, text: text };"
+                "}"
+                "}"
+                "return best ? { value: best.value, text: best.text } : null;"
+                "} catch(e){ return null; }"
+                f"}})({_json.dumps(pattern_src)}, {local_cy}, {y_tolerance})"
+            )
+
+        async def read_value() -> tuple[float | None, str | None]:
+            try:
+                frames = [page.main_frame] + [f for f in page.frames if f is not page.main_frame]
+            except Exception:
+                frames = []
+            for f in frames:
+                off_x, off_y = 0.0, 0.0
+                if f is not page.main_frame:
+                    try:
+                        fe = await f.frame_element()
+                        if fe is not None:
+                            box = await fe.bounding_box()
+                            if box:
+                                off_x, off_y = box["x"], box["y"]
+                    except Exception:
+                        pass
+                local_cy = handle_cy - off_y
+                try:
+                    result = await f.evaluate(_scan_js(local_cy))
+                except Exception:
+                    continue
+                if result and isinstance(result, dict) and "value" in result:
+                    try:
+                        return float(result["value"]), str(result.get("text") or "")
+                    except (TypeError, ValueError):
+                        continue
+            return None, None
+
+        initial_value, initial_text = await read_value()
+        trace: list[dict[str, Any]] = [
+            {"iter": 0, "cursor_x": handle_cx, "value": initial_value},
+        ]
+        cursor_x = handle_cx
+        last_value = initial_value
+        completed = False
+
+        # Bail BEFORE pressing the mouse if we can't read the label —
+        # silent dragging without feedback is what produced the
+        # "hallucination" behaviour.
+        if initial_value is None:
+            # Same element-walk as _scan_js so diagnostic text matches
+            # what the scanner sees. Returns up to 10 row-sized labels.
+            sample_js = (
+                "(function(hcy, ytol){"
+                "try {"
+                "var out = [];"
+                "var walker = document.createTreeWalker("
+                "document.body || document.documentElement, NodeFilter.SHOW_ELEMENT, null);"
+                "var el;"
+                "while ((el = walker.nextNode())) {"
+                "var r = el.getBoundingClientRect();"
+                "if (!r || r.width === 0 || r.height === 0) continue;"
+                "if (r.height > 80) continue;"
+                "var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();"
+                "if (!text || text.length > 300) continue;"
+                "var cy = r.top + r.height / 2;"
+                "if (Math.abs(cy - hcy) > ytol) continue;"
+                "out.push(text); if (out.length >= 10) break;"
+                "}"
+                "return out;"
+                "} catch(e) { return []; }"
+                f"}})({handle_cy}, {y_tolerance})"
+            )
+            samples: list[str] = []
+            try:
+                frames = [page.main_frame] + [f for f in page.frames if f is not page.main_frame]
+            except Exception:
+                frames = []
+            for f in frames:
+                try:
+                    part = await f.evaluate(sample_js)
+                    if part and isinstance(part, list):
+                        samples.extend(str(x) for x in part)
+                        if len(samples) >= 10:
+                            break
+                except Exception:
+                    pass
+            return {
+                "strategy": "closed-loop", "completed": False,
+                "iterations": 0,
+                "initial_value": None, "final_value": None,
+                "target_value": target_value, "tolerance": tolerance,
+                "trace": trace,
+                "label_text": f"NO_MATCH — nearby text: {samples[:8]!r}",
+                "label_selector_hint": None,
+            }
+
+        # Press.
+        try:
+            await page.mouse.move(handle_cx, handle_cy)
+            await asyncio.sleep(0.05)
+            await page.mouse.down()
+        except Exception as exc:
+            return {
+                "strategy": "closed-loop", "completed": False,
+                "error": f"mouse down failed: {str(exc)[:120]}",
+                "iterations": 0,
+                "initial_value": initial_value, "final_value": last_value,
+                "target_value": target_value, "tolerance": tolerance,
+                "trace": trace, "label_text": initial_text,
+            }
+
+        step = int(step_px)
+        iters = 0
+        consecutive_misses = 0
+        try:
+            for iters in range(1, int(max_iterations) + 1):
+                if direction == "left":
+                    dir_sign = -1
+                elif direction == "right":
+                    dir_sign = 1
+                elif last_value is not None:
+                    if abs(last_value - target_value) <= tolerance:
+                        completed = True
+                        break
+                    dir_sign = 1 if target_value > last_value else -1
+                else:
+                    dir_sign = 1
+                prev_x = cursor_x
+                prev_val = last_value
+                next_x = round(cursor_x + dir_sign * step)
+                sub = 4
+                for si in range(1, sub + 1):
+                    t = si / sub
+                    ix = round(cursor_x + (next_x - cursor_x) * t)
+                    try:
+                        await page.mouse.move(ix, handle_cy)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.008)
+                cursor_x = next_x
+                await asyncio.sleep(0.03)
+                reading, _text = await read_value()
+                trace.append({"iter": iters, "cursor_x": cursor_x, "value": reading})
+                if reading is not None:
+                    consecutive_misses = 0
+                    if prev_val is not None and cursor_x != prev_x:
+                        vpp = (reading - prev_val) / (cursor_x - prev_x)
+                        import math as _math
+                        if _math.isfinite(vpp) and abs(vpp) > 1e-6:
+                            remaining = target_value - reading
+                            suggested = abs(remaining / vpp) * 0.5
+                            step = max(1, min(80, int(round(suggested))))
+                    last_value = reading
+                    if abs(last_value - target_value) <= tolerance:
+                        completed = True
+                        break
+                else:
+                    consecutive_misses += 1
+                    if consecutive_misses >= 3:
+                        # Pattern stopped matching — bail rather than drag blind.
+                        break
+                    step = max(1, step // 2)
+        finally:
+            try:
+                await page.mouse.up()
+            except Exception:
+                pass
+
+        return {
+            "strategy": "closed-loop",
+            "iterations": iters,
+            "initial_value": initial_value,
+            "final_value": last_value,
+            "target_value": target_value,
+            "tolerance": tolerance,
+            "trace": trace,
+            "label_text": initial_text,
+            "label_selector_hint": None,
+            "completed": completed,
+        }
 
     async def select(self, sid: str, index: int, value: str) -> dict[str, Any]:
         elements = await self._index_elements(sid)

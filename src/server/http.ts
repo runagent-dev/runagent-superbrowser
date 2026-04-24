@@ -27,8 +27,9 @@ import { renderCaptchaViewHtml } from './captcha-ui-html.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { fingerprintMap, invertFingerprintMap, fingerprintElement } from '../browser/fingerprint.js';
 import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
-import { loadDomainCookies } from '../browser/captcha/cookie-jar.js';
+import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
+import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot } from './effect.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -526,6 +527,23 @@ export function createHttpServer(
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
+      // Persist any cookies the site set during a successful navigation
+      // so the NEXT session on this domain (T1, T2, or T3) starts warm.
+      // Previously T1 only saved on captcha solve, leaving every fresh
+      // T1 attempt cold. Status check rejects 4xx/5xx pages where the
+      // cookies might be Cloudflare's challenge state rather than the
+      // domain's real session.
+      if (
+        req.body.url
+        && navStatusCode !== null
+        && navStatusCode >= 200
+        && navStatusCode < 400
+        && /^https?:/i.test(req.body.url)
+      ) {
+        try { await saveDomainCookies(page.getRawPage(), req.body.url); }
+        catch { /* best-effort */ }
+      }
+
       res.json({
         sessionId: id,
         url: state.url,
@@ -573,6 +591,20 @@ export function createHttpServer(
       const wantVision = req.body.vision !== false;
       const state = await page.getState({ useVision: wantVision, includeConsole: true });
 
+      // Persist post-navigation cookies on success — symmetric with the
+      // /session/create path. T1 used to skip this, so returning to the
+      // same domain in a later session always restarted from cold and
+      // re-triggered the antibot challenge.
+      if (
+        nav.statusCode !== null
+        && nav.statusCode >= 200
+        && nav.statusCode < 400
+        && /^https?:/i.test(url)
+      ) {
+        try { await saveDomainCookies(page.getRawPage(), url); }
+        catch { /* best-effort */ }
+      }
+
       res.json({
         url: state.url,
         title: state.title,
@@ -610,6 +642,18 @@ export function createHttpServer(
     try {
       const useVision = req.query.vision !== 'false';
       const includeBounds = req.query.bounds === 'true' || req.query.highlight === 'true';
+      // Optional settle gate — Python-side prefetch sends `settle=true`
+      // so the screenshot reflects a post-React-commit page instead of
+      // a mid-transition one. Bounded at 2s so a broken page doesn't
+      // hang the whole state request.
+      if (req.query.settle === 'true') {
+        try {
+          const { waitForPageReady } = await import('../browser/page-readiness.js');
+          await waitForPageReady(page.getRawPage(), 2000);
+        } catch {
+          /* best-effort — never block /state on a settle failure */
+        }
+      }
       const state = await page.getState({
         useVision,
         includeConsole: true,
@@ -656,6 +700,7 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       const { index, x, y, bbox, button, clickCount, expected_fingerprint } = req.body as {
         index?: number;
@@ -680,6 +725,8 @@ export function createHttpServer(
         // the bridge can log/trace which element actually received
         // the input.
         const snap = await page.clickInBbox(bbox, { button, clickCount });
+        await settleForEffect(page.getRawPage());
+        const effectAfter = await captureEffect(page.getRawPage());
         const newState = await page.getState({ useVision: false, includeConsole: true });
         res.json({
           success: true,
@@ -689,6 +736,7 @@ export function createHttpServer(
           consoleErrors: newState.consoleErrors,
           pendingDialogs: newState.pendingDialogs,
           snap,
+          effect: diffEffect(effectBefore, effectAfter),
         });
         return;
       }
@@ -766,6 +814,8 @@ export function createHttpServer(
       }
 
       // Return updated state — no screenshot (nanobot discards it anyway, saves processing time)
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false, includeConsole: true });
       res.json({
         success: true,
@@ -774,6 +824,7 @@ export function createHttpServer(
         elements: newState.elementTree.clickableElementsToString(),
         consoleErrors: newState.consoleErrors,
         pendingDialogs: newState.pendingDialogs,
+        effect: diffEffect(effectBefore, effectAfter),
       });
     } catch (err) {
       handleError(res, err);
@@ -858,6 +909,7 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       const { index, text, clear, expected_fingerprint } = req.body as {
         index?: number; text?: string; clear?: boolean; expected_fingerprint?: string;
@@ -898,10 +950,13 @@ export function createHttpServer(
         return;
       }
 
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false, includeConsole: true });
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
       });
     } catch (err) {
       handleError(res, err);
@@ -913,14 +968,17 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       await page.sendKeys(req.body.keys);
       await new Promise((r) => setTimeout(r, 500));
-
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false });
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
       });
     } catch (err) {
       handleError(res, err);
@@ -951,11 +1009,59 @@ export function createHttpServer(
     }
   });
 
+  /**
+   * Closed-loop scroll: walks the page in `direction` until an element
+   * matching `targetText` (substring or regex) and/or `targetRole`
+   * appears in viewport, the page can't scroll further, or
+   * `maxIterations` elapses. Returns a structured outcome with a
+   * `reason` so the caller knows whether to keep trying, retreat, or
+   * give up — closes the "blind scroll, then re-screenshot" loop the
+   * raw /scroll endpoint forces.
+   */
+  app.post('/session/:id/scroll-until', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { targetText, targetRole, direction, maxIterations, stepRatio } = req.body ?? {};
+      if (
+        (typeof targetText !== 'string' || !targetText.trim())
+        && (typeof targetRole !== 'string' || !targetRole.trim())
+      ) {
+        res.status(400).json({ error: 'targetText or targetRole required' });
+        return;
+      }
+      const outcome = await page.scrollUntil({
+        targetText: typeof targetText === 'string' ? targetText : undefined,
+        targetRole: typeof targetRole === 'string' ? targetRole : undefined,
+        direction: direction === 'up' ? 'up' : 'down',
+        maxIterations: typeof maxIterations === 'number' ? maxIterations : 10,
+        stepRatio: typeof stepRatio === 'number' ? stepRatio : 0.8,
+      });
+
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: outcome.found,
+        outcome,
+        url: newState.url,
+        elements: newState.elementTree.clickableElementsToString(),
+        scrollInfo: {
+          scrollY: newState.scrollY,
+          scrollHeight: newState.scrollHeight,
+          viewportHeight: newState.viewportHeight,
+        },
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Drag from one point to another. Useful for slider CAPTCHAs and puzzle pieces. */
   app.post('/session/:id/drag', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       const { startX, startY, endX, endY, steps } = req.body;
       if (startX === undefined || startY === undefined || endX === undefined || endY === undefined) {
@@ -965,14 +1071,297 @@ export function createHttpServer(
 
       await page.dragTo(startX, startY, endX, endY, { steps: steps || 25 });
       await new Promise((r) => setTimeout(r, 500));
-
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false });
       res.json({
         success: true,
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
       });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Return getBoundingClientRect() for one or more CSS selectors. Cheap, synchronous, no state refresh. */
+  app.post('/session/:id/rect', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { selectors, ensureVisible } = req.body ?? {};
+      if (!Array.isArray(selectors) || selectors.some((s) => typeof s !== 'string')) {
+        res.status(400).json({ error: 'selectors must be an array of CSS selector strings' });
+        return;
+      }
+      const rects = await page.getRects(selectors, { ensureVisible: !!ensureVisible });
+      res.json({ success: true, rects });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Click the center of a DOM-selected element. Zero vision cost; pixel-exact. */
+  app.post('/session/:id/click-selector', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { selector, button, clickCount, linear, ensureVisible } = req.body ?? {};
+      if (typeof selector !== 'string' || !selector) {
+        res.status(400).json({ error: 'selector is required' });
+        return;
+      }
+      const result = await page.clickSelector(selector, {
+        button, clickCount, linear, ensureVisible,
+      });
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        clicked: result,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Drag from one selector to another. Supports click_click / drag / auto methods. */
+  app.post('/session/:id/drag-selectors', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { fromSelector, toSelector, method, holdMs, linear, steps } = req.body ?? {};
+      if (typeof fromSelector !== 'string' || !fromSelector) {
+        res.status(400).json({ error: 'fromSelector is required' });
+        return;
+      }
+      if (typeof toSelector !== 'string' || !toSelector) {
+        res.status(400).json({ error: 'toSelector is required' });
+        return;
+      }
+      if (method && !['drag', 'click_click', 'auto'].includes(method)) {
+        res.status(400).json({ error: "method must be one of: drag, click_click, auto" });
+        return;
+      }
+      const outcome = await page.dragSelectors(fromSelector, toSelector, {
+        method, holdMs, linear, steps,
+      });
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        outcome,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Drag along an arbitrary polyline (jigsaw trace, connect-the-dots, signature). */
+  app.post('/session/:id/drag-path', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { points, holdMs, stepMs, button } = req.body ?? {};
+      if (!Array.isArray(points) || points.length < 2) {
+        res.status(400).json({ error: 'points must be an array of at least 2 {x,y} objects' });
+        return;
+      }
+      for (const p of points) {
+        if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') {
+          res.status(400).json({ error: 'each point must be an object with numeric x,y' });
+          return;
+        }
+      }
+      await page.dragPath(points, { holdMs, stepMs, button });
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        pointCount: points.length,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Set a slider's value (native range input, ARIA slider, or custom widget).
+   * Frame-aware: resolves selector across all frames, including same-origin
+   * iframes. Tries value-set → keyboard → drag in that order.
+   */
+  app.post('/session/:id/set-slider', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { selector, value, as, method } = req.body ?? {};
+      if (typeof selector !== 'string' || !selector) {
+        res.status(400).json({ error: 'selector (string) is required' });
+        return;
+      }
+      const valid = (v: unknown): v is number | [number, number] =>
+        typeof v === 'number'
+        || (Array.isArray(v) && v.length === 2 && v.every((n) => typeof n === 'number'));
+      if (!valid(value)) {
+        res.status(400).json({ error: 'value must be a number or [lo, hi] for dual-thumb' });
+        return;
+      }
+      if (as && !['absolute', 'ratio'].includes(as)) {
+        res.status(400).json({ error: "as must be 'absolute' or 'ratio'" });
+        return;
+      }
+      if (method && !['auto', 'range-input', 'keyboard', 'drag'].includes(method)) {
+        res.status(400).json({ error: "method must be one of: auto, range-input, keyboard, drag" });
+        return;
+      }
+      const outcome = await page.setSlider(selector, value, { as, method });
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        outcome,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Vision-indexed slider drag. Caller supplies handle + track bboxes
+   * (already resolved via cached vision response) and a 0..1 ratio.
+   * Frame-agnostic: bboxes are document-coordinate rects and CDP drag
+   * dispatches there directly.
+   */
+  app.post('/session/:id/set-slider-at', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { handle, track, ratio } = req.body ?? {};
+      const isBbox = (b: unknown): b is { x: number; y: number; w: number; h: number } =>
+        !!b && typeof b === 'object'
+        && typeof (b as any).x === 'number' && typeof (b as any).y === 'number'
+        && typeof (b as any).w === 'number' && typeof (b as any).h === 'number';
+      if (!isBbox(handle)) {
+        res.status(400).json({ error: 'handle must be {x,y,w,h}' });
+        return;
+      }
+      if (!isBbox(track)) {
+        res.status(400).json({ error: 'track must be {x,y,w,h}' });
+        return;
+      }
+      if (typeof ratio !== 'number' || !isFinite(ratio)) {
+        res.status(400).json({ error: 'ratio must be a finite number in [0, 1]' });
+        return;
+      }
+      const outcome = await page.setSliderAt(handle, track, ratio);
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        outcome,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * DOM-only slider enumeration. No vision required.
+   */
+  app.post('/session/:id/list-slider-handles', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const handles = await page.listSliderHandles();
+      res.json({ success: true, handles });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Closed-loop slider drag. Holds mouse down on the handle, steps
+   * incrementally, polls every frame's DOM for a labelled value, stops
+   * when the target is reached (within tolerance). Frame-agnostic.
+   */
+  app.post('/session/:id/drag-slider-until', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      const { handle, target_value, label_pattern, tolerance, max_iterations, step_px, direction } = req.body ?? {};
+      const isBbox = (b: unknown): b is { x: number; y: number; w: number; h: number } =>
+        !!b && typeof b === 'object'
+        && typeof (b as any).x === 'number' && typeof (b as any).y === 'number'
+        && typeof (b as any).w === 'number' && typeof (b as any).h === 'number';
+      if (!isBbox(handle)) {
+        res.status(400).json({ error: 'handle must be {x,y,w,h}' });
+        return;
+      }
+      if (typeof target_value !== 'number' || !isFinite(target_value)) {
+        res.status(400).json({ error: 'target_value must be a finite number' });
+        return;
+      }
+      if (direction && !['auto', 'left', 'right'].includes(direction)) {
+        res.status(400).json({ error: "direction must be 'auto', 'left', or 'right'" });
+        return;
+      }
+      const outcome = await page.dragSliderUntil(handle, target_value, {
+        labelPattern: typeof label_pattern === 'string' ? label_pattern : undefined,
+        tolerance: typeof tolerance === 'number' ? tolerance : undefined,
+        maxIterations: typeof max_iterations === 'number' ? max_iterations : undefined,
+        stepPx: typeof step_px === 'number' ? step_px : undefined,
+        direction,
+      });
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: outcome.completed,
+        outcome,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Screenshot a viewport region and return it as base64 JPEG. Cheaper than full-page vision. */
+  app.post('/session/:id/image-region', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { bbox, quality } = req.body ?? {};
+      if (!bbox || typeof bbox.x !== 'number' || typeof bbox.y !== 'number'
+        || typeof bbox.w !== 'number' || typeof bbox.h !== 'number') {
+        res.status(400).json({ error: 'bbox must be {x, y, w, h} with numeric values' });
+        return;
+      }
+      const base64 = await page.getImageRegion(bbox, { quality });
+      res.json({ success: true, base64, bbox });
     } catch (err) {
       handleError(res, err);
     }
@@ -1040,15 +1429,21 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       const { index, value } = req.body;
       const state = await page.getState({ useVision: false });
       const element = state.selectorMap.get(index);
       if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
       await page.selectOption(element, value);
-
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false });
-      res.json({ success: true, elements: newState.elementTree.clickableElementsToString() });
+      res.json({
+        success: true,
+        elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
+      });
     } catch (err) {
       handleError(res, err);
     }

@@ -27,6 +27,20 @@ export interface ScriptHelpers {
   sleep: (ms: number) => Promise<void>;
   log: (...args: unknown[]) => void;
   screenshot: (path?: string) => Promise<string>;
+  /**
+   * Write `value` into an `<input>`/`<textarea>` the way React
+   * expects — via the native `value` setter on the prototype, then
+   * dispatch synthetic `input`+`change` events. Plain
+   * `el.value = x` is swallowed by React's synthetic event system
+   * because the controlled-input value tracker sees "no change";
+   * this helper bypasses that and produces the same observable
+   * state as a real keystroke.
+   *
+   * Resolves `selector` in-page via `document.querySelector`.
+   * Returns the value that was written. Throws if the element
+   * isn't found or isn't an input/textarea.
+   */
+  reactSetValue: (selector: string, value: string) => Promise<string>;
 }
 
 const DEFAULT_TIMEOUT = 60_000;
@@ -112,6 +126,24 @@ export async function runPuppeteerScript(
         ...(path ? { path } : {}),
       });
       return Buffer.from(buffer).toString('base64');
+    },
+    reactSetValue: async (selector: string, value: string) => {
+      return page.evaluate((sel: string, val: string) => {
+        const el = document.querySelector(sel) as
+          | HTMLInputElement
+          | HTMLTextAreaElement
+          | null;
+        if (!el) throw new Error(`reactSetValue: selector not found: ${sel}`);
+        const proto = el.tagName === 'TEXTAREA'
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (!setter) throw new Error('reactSetValue: value setter unavailable');
+        setter.call(el, val);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return val;
+      }, selector, value);
     },
   };
 

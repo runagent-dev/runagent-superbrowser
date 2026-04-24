@@ -185,7 +185,21 @@ export interface SelectorEntry {
   tagName: string;
   attributes: Record<string, string>;
   text: string;
-  bounds?: { x: number; y: number; width: number; height: number } | null;
+  /** Viewport-pixel bounds. `vw`/`vh` are the viewport dims at capture time —
+   *  the Python perception-fusion layer needs both to normalize bounds into
+   *  vision's 0-1000 `box_2d` space. */
+  bounds?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    vw?: number;
+    vh?: number;
+  } | null;
+  /** Nearest semantic region landmark: toolbar | sidebar | header | footer | main.
+   *  Sent as an anchor hint to the vision prompt so Gemini stops culling
+   *  sidebar/toolbar elements on heavy pages. */
+  regionTag?: string | null;
   role?: string;
 }
 
@@ -285,7 +299,15 @@ interface RawDomResult {
     tagName: string;
     attributes: Record<string, string>;
     text: string;
-    bounds?: { x: number; y: number; width: number; height: number } | null;
+    bounds?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      vw?: number;
+      vh?: number;
+    } | null;
+    regionTag?: string | null;
     role?: string;
   }>;
   url: string;

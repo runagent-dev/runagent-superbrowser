@@ -52,6 +52,12 @@ class VisionProvider(abc.ABC):
         system_prompt: str,
         user_prompt: str,
         mime_type: str = "image/jpeg",
+        timeout_s: Optional[float] = None,
     ) -> ProviderResponse:
-        """Send screenshot + prompts, return raw JSON response text."""
+        """Send screenshot + prompts, return raw JSON response text.
+
+        `timeout_s` overrides the provider-default timeout for THIS
+        call only — used by the retry path to give a longer deadline
+        on the compact-mode second attempt.
+        """
         raise NotImplementedError

@@ -118,13 +118,25 @@ class VisionAgent:
         image_height: int | None = None,
         task_instruction: str | None = None,
         cursor_trail: list[tuple[int, int]] | None = None,
+        current_subgoal: Any | None = None,
     ) -> VisionResponse:
         start = time.monotonic()
+        # Subgoal id participates in the cache key — same screenshot
+        # under a different active subgoal MUST produce different bbox
+        # emphasis (that's the whole point of subgoal-aware vision), so
+        # we can't reuse a cached response across subgoal transitions.
+        subgoal_key = ""
+        if current_subgoal is not None:
+            try:
+                subgoal_key = str(getattr(current_subgoal, "id", "") or "")
+            except Exception:
+                subgoal_key = ""
         key: CacheKey = (
             session_id or "_",
             url or "_",
             dom_hash or "_",
             intent_bucket(intent),
+            subgoal_key,
         )
 
         # Resolve image dims up front — they're required to denormalize
@@ -218,20 +230,28 @@ class VisionAgent:
 
         async def _one_shot(
             provider: VisionProvider, compact: bool,
+            timeout_s: Optional[float] = None,
         ) -> tuple[Any, str, str]:
-            """Returns (parsed_or_None, raw_text, error_reason)."""
+            """Returns (parsed_or_None, raw_text, error_reason).
+
+            `timeout_s` overrides the provider-default timeout for this
+            call — we use a longer one on the compact retry after the
+            first attempt timed out.
+            """
             prompt = build_user_prompt(
                 intent=intent,
                 url=url,
                 previous_summary=previous_summary,
                 task_instruction=task_instruction,
                 compact=compact,
+                current_subgoal=current_subgoal,
             )
             try:
                 raw_ = await provider.chat_with_image(
                     screenshot_b64=screenshot_b64,
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=prompt,
+                    timeout_s=timeout_s,
                 )
             except Exception as exc:  # noqa: BLE001
                 return None, "", f"provider error: {exc}"
@@ -270,8 +290,15 @@ class VisionAgent:
                 f"{self._provider.model}); retrying in compact mode. "
                 f"first 400 chars: {first_text[:400]!r}"
             )
+            # Compact retry gets a longer timeout — the first attempt
+            # failing is usually a tail-latency issue with the primary
+            # model, not a permanent outage; giving it a generous
+            # deadline converts transient timeouts into successes.
+            retry_timeout_s = float(
+                os.environ.get("VISION_RETRY_TIMEOUT_MS") or "45000"
+            ) / 1000.0
             second, _second_text, second_err = await _one_shot(
-                self._provider, compact=True,
+                self._provider, compact=True, timeout_s=retry_timeout_s,
             )
             if second is not None:
                 parsed, raw = second
@@ -459,12 +486,62 @@ def _parse_response(text: str) -> VisionResponse | None:
     return resp
 
 
+def _strip_invalid_paths(obj: dict, errs: list[dict]) -> dict:
+    """Deep-copy `obj` with each validation-error path null-ed out.
+
+    Pydantic's `exc.errors()[*].loc` is a tuple like
+    `("scene", "layers", 0, "bbox")` — we walk into the copy and set
+    the leaf to None (or delete the dict key) so a second
+    `model_validate` has a chance to succeed on the valid portion
+    instead of returning completely empty bboxes.
+    """
+    import copy as _copy
+    out = _copy.deepcopy(obj)
+    for err in errs:
+        loc = err.get("loc") or ()
+        if not loc:
+            continue
+        parent = out
+        path = list(loc)
+        # Walk to the parent of the leaf.
+        try:
+            for step in path[:-1]:
+                if isinstance(parent, list) and isinstance(step, int):
+                    parent = parent[step]
+                elif isinstance(parent, dict):
+                    parent = parent.get(step)
+                else:
+                    parent = None
+                if parent is None:
+                    break
+            if parent is None:
+                continue
+            leaf = path[-1]
+            if isinstance(parent, dict):
+                # Removing is gentler than Nulling for Optional[...] fields:
+                # the field falls back to its default_factory / default=None.
+                parent.pop(leaf, None)
+            elif isinstance(parent, list) and isinstance(leaf, int):
+                if 0 <= leaf < len(parent):
+                    parent[leaf] = None
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out
+
+
 def _parse_response_with_error(text: str) -> tuple[VisionResponse | None, str]:
     """Best-effort JSON → VisionResponse.
 
     Returns (response, error_message). On success the error is empty. On
     failure response is None and the error carries enough context to
     debug without having to turn on DEBUG-level logging.
+
+    Soft-fail ladder on ValidationError:
+      1. Strip the failing paths and retry — widens "one bad field in
+         scene.layers" into a mostly-usable response with bboxes intact.
+      2. If that still fails, build a last-resort response carrying only
+         bboxes/summary. The brain cares about bboxes; never let a
+         malformed `scene.layers` wipe them.
     """
     if not text:
         return None, "empty response text"
@@ -495,13 +572,42 @@ def _parse_response_with_error(text: str) -> tuple[VisionResponse | None, str]:
     try:
         return VisionResponse.model_validate(obj), ""
     except ValidationError as exc:
-        # Log the first 3 validation errors — typically enough to diagnose.
-        errs = exc.errors()[:3]
+        errs = exc.errors()
         detail = "; ".join(
             f"{'.'.join(str(x) for x in e.get('loc', []))}: {e.get('msg')}"
-            for e in errs
+            for e in errs[:3]
         )
-        return None, f"pydantic validation: {detail}"
+        # Retry #1: strip the failing paths.
+        try:
+            stripped = _strip_invalid_paths(obj, errs)
+            return VisionResponse.model_validate(stripped), ""
+        except ValidationError:
+            pass
+        except Exception:
+            pass
+        # Retry #2: last-resort — bboxes-only response. We accept a
+        # partial result rather than an empty one because the brain's
+        # main use of vision is bbox emission; a malformed scene.layers
+        # should NOT wipe the bboxes the model did emit correctly.
+        try:
+            bboxes_raw = obj.get("bboxes") if isinstance(obj, dict) else None
+            summary = str(obj.get("summary") or "") if isinstance(obj, dict) else ""
+            relevant = str(obj.get("relevant_text") or "") if isinstance(obj, dict) else ""
+            fallback = VisionResponse(
+                bboxes=bboxes_raw if isinstance(bboxes_raw, list) else [],
+                summary=summary,
+                relevant_text=relevant,
+                scene=None,
+            )
+            # Annotate so downstream telemetry can distinguish a soft
+            # fallback from a real parse.
+            _log(
+                f"soft-fail: partial VisionResponse after ValidationError "
+                f"({detail[:120]}); kept {len(fallback.bboxes)} bboxes"
+            )
+            return fallback, ""
+        except Exception:
+            return None, f"pydantic validation: {detail}"
 
 
 # Label regexes used by the degenerate scene derivation below. Kept at

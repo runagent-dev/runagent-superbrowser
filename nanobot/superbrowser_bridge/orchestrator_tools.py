@@ -44,6 +44,7 @@ from superbrowser_bridge.routing import (
     _record_routing_outcome,
     _rewrite_for_search,
     _routing_path,
+    learning_reads_enabled,
 )
 
 # Where the browser worker workspace lives (relative to this file)
@@ -115,7 +116,7 @@ def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
 
     path = _captcha_learnings_path(domain)
     existing: dict = {"attempts": [], "updated_at": None}
-    if os.path.exists(path):
+    if learning_reads_enabled() and os.path.exists(path):
         try:
             with open(path) as f:
                 existing = _json.load(f)
@@ -230,6 +231,8 @@ def _domain_needs_human_handoff(domain: str) -> bool:
     first-touch domains.
     """
     if not domain:
+        return False
+    if not learning_reads_enabled():
         return False
     try:
         path = _captcha_learnings_path(domain)
@@ -555,10 +558,22 @@ class DelegateBrowserTaskTool(Tool):
         # call and cascading into the outer delegation loop. The text below
         # is deliberately hedge-free and placed early so models can't miss
         # it. Reinforced by the hard idempotency guard in BrowserOpenTool.
+        # The `Target URL:` line below (appended only when `url` was
+        # provided to delegate_browser_task) turns the rule into an
+        # absolute command. Without that line the "first call must be
+        # Target URL" text would be nonsense, so the wording below says
+        # "if a Target URL is given" and the domain-pin block further
+        # down enforces the rest.
         parts.append(
             "## HARD RULE — READ FIRST\n"
-            "You may call `browser_open` AT MOST ONCE per task. The first "
-            "call returns a session_id. Every later browser tool "
+            "You may call `browser_open` AT MOST ONCE per task. If a "
+            "`Target URL:` line appears below, the FIRST and ONLY "
+            "`browser_open` call MUST use exactly that URL — do NOT "
+            "detour to Google search, do NOT invent an article URL, do "
+            "NOT search 'site:foo.com X'. The Target URL is the "
+            "authoritative starting point; the orchestrator already "
+            "chose it.\n"
+            "The first call returns a session_id. Every later browser tool "
             "(browser_screenshot, browser_click, browser_type, "
             "browser_navigate, browser_get_markdown, browser_run_script, …) "
             "MUST take that session_id and operate on the SAME session. "
@@ -574,28 +589,143 @@ class DelegateBrowserTaskTool(Tool):
             "switch to the right tool named in the refusal message."
         )
 
+        parts.append(
+            "## PICK THE RIGHT CLICK TOOL\n"
+            "- **Puzzle / game / captcha?** Call `browser_solve_puzzle(session_id)` "
+            "first — it auto-detects chess, slider, jigsaw, rotation, and grid-drag "
+            "puzzles and runs a dedicated solver. No vision round-trip per move.\n"
+            "- **Slider / range control** (retirement calculators, filter ranges, "
+            "volume, any slider widget)? NEVER `browser_click` / "
+            "`browser_click_at` — clicks on slider thumbs do NOTHING. "
+            "NEVER `browser_drag(x1,y1,x2,y2)` with guessed coords — "
+            "it's open-loop and overshoots. Three tools, in order of "
+            "preference:\n"
+            "    • `browser_list_slider_handles(session_id)` — "
+            "FIRST step for any custom slider page. DOM-only "
+            "enumeration: returns every slider handle with its bbox + "
+            "nearest label text. No vision needed. Use this when vision "
+            "times out or returns empty bboxes.\n"
+            "    • `browser_drag_slider_until(label_hint=..., "
+            "target_value, label_pattern)` — CLOSED-LOOP drag. Holds "
+            "mouse down, steps while reading the rendered value label, "
+            "stops at target. Three ways to pick the handle, use the "
+            "first that applies:\n"
+            "        (a) `label_hint='Monthly contribution'` — "
+            "auto-resolves via browser_list_slider_handles (best choice "
+            "for custom widgets).\n"
+            "        (b) `handle_bbox_json='{\"x\":..,\"y\":..,\"w\":..,\"h\":..}'` — "
+            "pass a bbox from browser_list_slider_handles directly "
+            "(dual-thumb case where one label matches multiple "
+            "handles).\n"
+            "        (c) `vision_index=V_n` — legacy, only when vision "
+            "is healthy.\n"
+            "      *** CALL THESE ONE AT A TIME ***. Never batch parallel "
+            "`browser_drag_slider_until` calls — the CDP mouse is "
+            "session-scoped; concurrent drags fight over the cursor. "
+            "Wait for each to return (check for [drag_slider_until_failed:...]) "
+            "before firing the next. If 'initial_readback_failed', the "
+            "regex didn't match any text near the handle — the returned "
+            "`label_text` lists the real nearby labels so you can fix "
+            "the pattern.\n"
+            "    • `browser_set_slider_at(vision_index=V_n, value, "
+            "value_mode)` — open-loop variant. Faster but requires vision "
+            "to have emitted BOTH slider_handle AND slider_widget bboxes. "
+            "Fall back to drag_slider_until if it fails with no_track.\n"
+            "    • `browser_set_slider(selector, value_json)` — only if "
+            "the page has a stable CSS selector and uses "
+            "`<input type=range>` / `role=slider`. Rare on financial "
+            "sites.\n"
+            "    Do NOT navigate to the iframe URL directly "
+            "(domain-pinned). Do NOT guess selectors like "
+            "`[class*=slider i]`.\n"
+            "- **Target has a stable CSS hook** (chess squares like `.square-54`, "
+            "form fields, buttons with `data-test-id`, captcha handles)? Prefer "
+            "`browser_click_selector` / `browser_drag_selectors` / `browser_drag_path`. "
+            "Zero Gemini latency; pixel-exact centre.\n"
+            "- **No obvious selector?** Use `browser_click_at(vision_index=V_n)` — "
+            "fine for cookie banners, arbitrary buttons, and elements the vision "
+            "agent has labelled."
+        )
+
         if url:
             parts.append(f"Target URL: {url}")
 
         # Domain constraint: tell the worker not to leave the target site.
+        # When a Target URL was explicitly given, the Google search
+        # exception is REMOVED — the orchestrator has already decided
+        # where to start. Models previously hopped to Google under the
+        # "search-based research" loophole and got caught in captcha
+        # or opened the wrong site entirely.
         if domain and domain != "unknown":
             _clean_domain = domain.replace("www.", "")
-            parts.append(
-                f"\n## DOMAIN CONSTRAINT (non-negotiable)\n"
-                f"You MUST only navigate to {_clean_domain} and its subdomains. "
-                f"Google.com is allowed for search-based research tasks only. "
-                f"Do NOT visit other websites to find the answer (e.g., if asked for "
-                f"Zara dress prices, NEVER go to Amazon or other retailers). "
-                f"If {_clean_domain} blocks you with a captcha or security page, "
-                f"solve the captcha or report failure honestly — "
-                f"do NOT try alternative sites."
-            )
+            if url:
+                parts.append(
+                    f"\n## DOMAIN CONSTRAINT (non-negotiable)\n"
+                    f"You MUST only navigate to {_clean_domain} and its "
+                    f"subdomains. The Target URL above is the ONLY "
+                    f"entry point — do NOT open Google, Bing, or any "
+                    f"search engine. Do NOT visit other websites to "
+                    f"find the answer (e.g., if asked for Zara dress "
+                    f"prices, NEVER go to Amazon or other retailers). "
+                    f"If {_clean_domain} blocks you with a captcha or "
+                    f"security page, solve the captcha or report "
+                    f"failure honestly — do NOT try alternative sites."
+                )
+            else:
+                # No explicit Target URL → Google search IS useful for
+                # finding the right page on the target domain.
+                parts.append(
+                    f"\n## DOMAIN CONSTRAINT (non-negotiable)\n"
+                    f"You MUST only navigate to {_clean_domain} and its "
+                    f"subdomains. Google.com is allowed ONLY when you "
+                    f"need to find the right page on {_clean_domain} "
+                    f"(use `site:{_clean_domain}` in the query). Once "
+                    f"you find the target page, navigate directly to it. "
+                    f"Do NOT visit other websites to find the answer. "
+                    f"If {_clean_domain} blocks you with a captcha, "
+                    f"solve it or report failure honestly — do NOT try "
+                    f"alternative sites."
+                )
 
         # Inject pre-validation warning if the URL probe detected bot-block markers.
         if _probe_warning:
             parts.append(_probe_warning)
 
         parts.append(f"\n## Task\n{instructions}")
+
+        # Strategy block — bias the brain toward cursor-based actions
+        # over scripts. Empirically the LLM reaches for
+        # `browser_run_script` as a Swiss Army knife whenever a click
+        # feels complicated, but scripts get 403'd by site WAFs and
+        # produce multi-turn coordination bugs that `browser_semantic_click`
+        # handles in one atomic call. Keep this block EARLY in the
+        # prompt so it frames every tool choice that follows.
+        parts.append(
+            "\n## Strategy — Prefer cursor over scripts\n"
+            "Tool preference order for element interaction:\n"
+            "  1. **FIRST** `browser_semantic_click(target='<label>')` — "
+            "atomic fresh vision + dispatch; React-safe; no V-index "
+            "drift. Your default for any click where you can describe "
+            "the target in a phrase.\n"
+            "  2. `browser_click_at(vision_index=V_n)` — precise when "
+            "the bbox list is short and unambiguous.\n"
+            "  3. `browser_click_selector(<css>)` — when the target "
+            "has a stable CSS hook (id, data-test-id, unique class).\n"
+            "  4. **LAST RESORT** `browser_run_script(mutates=true)` — "
+            "only when no bbox/selector works or the action requires "
+            "multi-step orchestration. Sites with a WAF (SpotHero, "
+            "Akamai-class) frequently 403 this; don't reach for it "
+            "reflexively.\n\n"
+            "For text input: `browser_semantic_type(target='<field label>', "
+            "text='<text>')` is the React-safe cursor path; avoids the "
+            "\"dispatched events React ignored\" failure class.\n\n"
+            "**Popups / modals / country gates:** when vision reports a "
+            "blocker layer (cookie banner, region modal, consent), "
+            "dismiss it with `browser_semantic_click(target='<visible "
+            "label>')` — e.g. 'Accept', 'Close', 'Continue Anyway', "
+            "'Reject all'. Do NOT try to script-close them; the label "
+            "IS in the bbox list."
+        )
 
         # Auto-inject learnings so the worker follows known patterns
         # (`domain` was resolved earlier, before the handoff-budget logic).
@@ -606,6 +736,30 @@ class DelegateBrowserTaskTool(Tool):
                     learnings = f.read().strip()
                 if learnings:
                     parts.append(f"\n## Site Learnings (from past tasks — FOLLOW THESE)\n{learnings}")
+
+            # Tactic penalties — tools that have produced no_effect >=2
+            # times on this domain. Surfaces upfront so the brain picks
+            # a better-working tactic on the first attempt rather than
+            # re-discovering the same wall turn-by-turn.
+            try:
+                from superbrowser_bridge.routing import (
+                    tactic_penalty_summary, TACTIC_ALTERNATIVES,
+                )
+                penalties = tactic_penalty_summary(domain, min_count=2)
+                if penalties:
+                    lines = ["\n## Tactic Penalties (prefer alternatives)"]
+                    for tool, count in penalties[:5]:
+                        alt = TACTIC_ALTERNATIVES.get(
+                            tool,
+                            "a selector-based or scripted variant",
+                        )
+                        lines.append(
+                            f"- `{tool}`: {count} recent no_effect(s) on "
+                            f"{domain} → prefer **{alt}**"
+                        )
+                    parts.append("\n".join(lines))
+            except Exception:
+                pass
 
             # Captcha-specific learnings (Phase 5.3): tell the worker which
             # solve method has worked on this domain so it doesn't blindly
@@ -1242,8 +1396,14 @@ class CheckLearningsTool(Tool):
 
     name = "check_learnings"
     description = (
-        "Read past learnings for a website. Returns what worked and what failed. "
-        "ALWAYS call this before delegate_browser_task to avoid repeating mistakes."
+        "Learning reads are disabled in this deployment "
+        "(LEARNING_READS_ENABLED=0). Skip calling this; proceed straight "
+        "to delegate_browser_task or delegate_search_task."
+        if not learning_reads_enabled()
+        else (
+            "Read past learnings for a website. Returns what worked and what failed. "
+            "ALWAYS call this before delegate_browser_task to avoid repeating mistakes."
+        )
     )
 
     @property
@@ -1251,6 +1411,11 @@ class CheckLearningsTool(Tool):
         return True
 
     async def execute(self, site: str, **kw: Any) -> str:
+        if not learning_reads_enabled():
+            return (
+                f"Learning reads disabled (LEARNING_READS_ENABLED=0). "
+                f"No prior history consulted for {site}; proceed with the task."
+            )
         domain = _domain_from_url(site)
         path = _learnings_path(domain)
 

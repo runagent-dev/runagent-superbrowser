@@ -47,6 +47,10 @@ export function getBuildDomTreeScript(): string {
     'title', 'role', 'aria-label', 'aria-expanded', 'aria-checked',
     'aria-selected', 'aria-disabled', 'data-testid', 'for',
     'action', 'method', 'target', 'rel',
+    // Slider metadata — lets the LLM see current/min/max without a
+    // separate probe before picking a value to pass browser_set_slider.
+    'min', 'max', 'step',
+    'aria-valuenow', 'aria-valuemin', 'aria-valuemax', 'aria-orientation',
   ];
   // Heuristic: class/id substrings that strongly imply interactivity.
   // Used as a tiebreaker when other signals are absent — e.g., a <div> with
@@ -210,6 +214,33 @@ export function getBuildDomTreeScript(): string {
 
   const candidates = [];  // { el, nodeRef, bounds, tag, interactive, inViewport }
 
+  // Regions that help Python-side perception fusion seed "tools section"
+  // coverage passes. Walk up ancestors to find the nearest semantic region
+  // landmark (ARIA role or HTML5 section tag) and tag the element with it.
+  // Maps a raw role/tag to the compact token set Python expects.
+  function computeRegionTag(el) {
+    let cur = el;
+    let depth = 0;
+    while (cur && cur.nodeType === Node.ELEMENT_NODE && depth < 12) {
+      const role = (cur.getAttribute && cur.getAttribute('role') || '').toLowerCase();
+      const tag = cur.tagName && cur.tagName.toLowerCase();
+      if (role === 'toolbar') return 'toolbar';
+      if (role === 'navigation') return 'sidebar';
+      if (role === 'banner') return 'header';
+      if (role === 'contentinfo') return 'footer';
+      if (role === 'complementary') return 'sidebar';
+      if (role === 'main') return 'main';
+      if (tag === 'nav') return 'sidebar';
+      if (tag === 'aside') return 'sidebar';
+      if (tag === 'header') return 'header';
+      if (tag === 'footer') return 'footer';
+      if (tag === 'main') return 'main';
+      cur = cur.parentElement;
+      depth++;
+    }
+    return 'main';
+  }
+
   function buildNodeRef(el, interactive, visible, inViewport, isFromShadow) {
     const tag = el.tagName.toLowerCase();
     const attributes = {};
@@ -218,14 +249,21 @@ export function getBuildDomTreeScript(): string {
       if (v !== null && v !== '') attributes[attr] = v.substring(0, 100);
     }
     let bounds = null;
+    let regionTag = null;
     if (interactive) {
       const r = el.getBoundingClientRect();
+      // Viewport dims ride with every bounds payload so the Python
+      // bridge can normalize to vision's 0-1000 box_2d space without
+      // needing a separate probe.
       bounds = {
         x: Math.round(r.left),
         y: Math.round(r.top),
         width: Math.round(r.width),
         height: Math.round(r.height),
+        vw: Math.round(window.innerWidth || document.documentElement.clientWidth || 0),
+        vh: Math.round(window.innerHeight || document.documentElement.clientHeight || 0),
       };
+      regionTag = computeRegionTag(el);
     }
     return {
       type: 'ELEMENT',
@@ -240,6 +278,7 @@ export function getBuildDomTreeScript(): string {
       highlightIndex: null,
       children: [],
       bounds: bounds,
+      regionTag: regionTag,
     };
   }
 
@@ -379,6 +418,7 @@ export function getBuildDomTreeScript(): string {
       attributes: c.ref.attributes,
       text: c.ref.text,
       bounds: c.ref.bounds,
+      regionTag: c.ref.regionTag,
       role: c.ref.attributes && c.ref.attributes.role,
     });
   }

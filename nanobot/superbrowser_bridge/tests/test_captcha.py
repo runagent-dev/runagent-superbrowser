@@ -16,6 +16,7 @@ reports the captcha cleared, and (4) honors the role-preference order.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import types
 import unittest
@@ -445,10 +446,18 @@ class CFLearningsTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig_dir = routing.LEARNINGS_DIR
         routing.LEARNINGS_DIR = self._tmp.name
+        # needs_headful is gated by LEARNING_READS_ENABLED; this suite
+        # specifically tests that read-time logic, so flip it on.
+        self._orig_flag = os.environ.get("LEARNING_READS_ENABLED")
+        os.environ["LEARNING_READS_ENABLED"] = "1"
 
     def tearDown(self) -> None:
         self._routing.LEARNINGS_DIR = self._orig_dir
         self._tmp.cleanup()
+        if self._orig_flag is None:
+            os.environ.pop("LEARNING_READS_ENABLED", None)
+        else:
+            os.environ["LEARNING_READS_ENABLED"] = self._orig_flag
 
     def test_streak_increments_and_sets_needs_headful_at_two(self) -> None:
         self.assertFalse(self._routing.needs_headful("example.com"))
@@ -481,10 +490,18 @@ class TierEscalationLearningTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig_dir = routing.LEARNINGS_DIR
         routing.LEARNINGS_DIR = self._tmp.name
+        # choose_starting_tier is gated by LEARNING_READS_ENABLED; this
+        # suite specifically tests the learned-escalation logic, so on.
+        self._orig_flag = os.environ.get("LEARNING_READS_ENABLED")
+        os.environ["LEARNING_READS_ENABLED"] = "1"
 
     def tearDown(self) -> None:
         self._routing.LEARNINGS_DIR = self._orig_dir
         self._tmp.cleanup()
+        if self._orig_flag is None:
+            os.environ.pop("LEARNING_READS_ENABLED", None)
+        else:
+            os.environ["LEARNING_READS_ENABLED"] = self._orig_flag
 
     def test_fresh_domain_returns_zero(self) -> None:
         self.assertEqual(self._routing.choose_starting_tier("fresh.test"), 0)

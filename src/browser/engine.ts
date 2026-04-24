@@ -224,6 +224,41 @@ export class BrowserEngine extends EventEmitter {
       await page.evaluateOnNewDocument(getPlatformOverrideScript());
     }
 
+    // Mutation counter: installs window.__nb_mutation_counter and a
+    // MutationObserver that bumps it on any childList/attribute change.
+    // Used by post-action effect verification — the HTTP mutation
+    // handlers read this before + after an action and surface the
+    // delta so the Python side can tell "Puppeteer dispatched" apart
+    // from "the page actually changed." characterData is deliberately
+    // excluded (fires on every text tick in chat apps, would tank CPU
+    // on Slack/Notion); childList+subtree+attributes is sufficient for
+    // React re-renders and DOM-level autocomplete state changes.
+    await page.evaluateOnNewDocument(`
+      (function () {
+        try {
+          if (typeof window === 'undefined') return;
+          if (window.__nb_mutation_counter_installed) return;
+          window.__nb_mutation_counter_installed = true;
+          window.__nb_mutation_counter = 0;
+          var obs = new MutationObserver(function () {
+            window.__nb_mutation_counter = (window.__nb_mutation_counter || 0) + 1;
+          });
+          var start = function () {
+            if (document.documentElement) {
+              obs.observe(document.documentElement, {
+                childList: true, subtree: true, attributes: true,
+              });
+            }
+          };
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', start, { once: true });
+          } else {
+            start();
+          }
+        } catch (e) { /* never let instrumentation break the page */ }
+      })();
+    `);
+
     // Set viewport
     await page.setViewport(this.config.viewport);
 

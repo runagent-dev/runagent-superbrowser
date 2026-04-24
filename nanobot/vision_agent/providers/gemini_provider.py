@@ -56,6 +56,7 @@ class GeminiVisionProvider(OpenAIVisionProvider):
         system_prompt: str,
         user_prompt: str,
         mime_type: str = "image/jpeg",
+        timeout_s: Optional[float] = None,
     ) -> ProviderResponse:
         data_url = f"data:{mime_type};base64,{screenshot_b64}"
         # Gemini's OpenAI-compat endpoint forwards `extra_body` keys into
@@ -72,7 +73,11 @@ class GeminiVisionProvider(OpenAIVisionProvider):
                 }
             },
         }
-        completion = await self._client.chat.completions.create(
+        # Optional per-call timeout override for the retry path.
+        client = self._client
+        if timeout_s is not None:
+            client = client.with_options(timeout=timeout_s)
+        completion = await client.chat.completions.create(  # type: ignore[call-overload]
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -87,7 +92,7 @@ class GeminiVisionProvider(OpenAIVisionProvider):
             max_tokens=self.max_tokens,
             temperature=0.1,
             response_format={"type": "json_object"},
-            extra_body=extra_body,
+            extra_body=extra_body,  # type: ignore[arg-type]
         )
         text = completion.choices[0].message.content or ""
         tokens = None

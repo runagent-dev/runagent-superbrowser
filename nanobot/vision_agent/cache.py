@@ -1,8 +1,11 @@
 """TTL-bounded LRU cache for VisionResponses.
 
-Keyed on (session_id, url, dom_hash, intent_bucket). In-process, no disk
-persistence — vision analyses are stale after minutes anyway, so there's
-no point in paying serialization cost.
+Keyed on (session_id, url, dom_hash, intent_bucket, subgoal_id). The
+subgoal_id is included because subgoal-aware vision returns different
+bbox emphasis per subgoal even on an identical screenshot — caching
+across transitions would defeat the targeting. In-process, no disk
+persistence — vision analyses are stale after minutes anyway, so
+there's no point in paying serialization cost.
 
 Thread-safe via a single asyncio.Lock because the cache is read and
 written from async tool handlers that may interleave.
@@ -19,7 +22,7 @@ from dataclasses import dataclass
 from .schemas import VisionResponse
 
 
-CacheKey = tuple[str, str, str, str]  # (session_id, url, dom_hash, intent_bucket)
+CacheKey = tuple[str, str, str, str, str]  # (session_id, url, dom_hash, intent_bucket, subgoal_id)
 
 
 @dataclass
@@ -57,6 +60,18 @@ class VisionCache:
         reveal that the previous pass mislabelled the target."""
         async with self._lock:
             self._store.pop(key, None)
+
+    async def bust_session(self, session_id: str) -> int:
+        """Evict every entry for a session. Used by browser_rewind and
+        on URL-change boundaries where cached bboxes must not follow
+        the worker into a different page state. Returns evicted count."""
+        if not session_id:
+            return 0
+        async with self._lock:
+            keys = [k for k in self._store if k and k[0] == session_id]
+            for k in keys:
+                self._store.pop(k, None)
+            return len(keys)
 
     async def get(self, key: CacheKey) -> VisionResponse | None:
         async with self._lock:

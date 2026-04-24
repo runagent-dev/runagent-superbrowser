@@ -51,9 +51,15 @@ class OpenAIVisionProvider(VisionProvider):
         system_prompt: str,
         user_prompt: str,
         mime_type: str = "image/jpeg",
+        timeout_s: Optional[float] = None,
     ) -> ProviderResponse:
         data_url = f"data:{mime_type};base64,{screenshot_b64}"
-        completion = await self._client.chat.completions.create(
+        # Optional per-call timeout override — lets the retry path use a
+        # longer deadline than the default without rebuilding the client.
+        client = self._client
+        if timeout_s is not None:
+            client = client.with_options(timeout=timeout_s)
+        completion = await client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},

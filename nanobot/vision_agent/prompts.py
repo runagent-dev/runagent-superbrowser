@@ -117,8 +117,24 @@ General rules:
 - `intent_relevant` is true for bboxes that most directly serve the
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
 - For captcha tiles, emit one bbox per tile with role='captcha_tile' and
-  label like 'tile 1,1'. For sliders, include role='slider_handle' for
-  the draggable handle and role='captcha_widget' for the outer track.
+  label like 'tile 1,1'. For captcha sliders, include role='slider_handle'
+  for the draggable handle and role='captcha_widget' for the outer track.
+- For FORM sliders (retirement calculators, filter ranges, volume controls,
+  any <input type=range>, role=slider, or visual track+thumb pair that is
+  NOT a captcha), emit THREE bboxes per slider in this order so their V_n
+  indices sit together:
+    1. role='slider_handle' — the draggable thumb(s). For dual-thumb ranges
+       emit two handles in left-to-right order; `label` must name WHICH
+       thumb (e.g. "Age Range (low)", "Age Range (high)").
+    2. role='slider_widget' — the full track rectangle from min to max.
+       `label` = the slider's functional name (e.g. "Monthly contribution").
+    3. role='text_block' — the adjacent rendered value label if visible
+       (e.g. the "Monthly contribution ($): 300" caption). `label` = the
+       rendered text verbatim; this is the ground-truth value readback.
+  If any of the three is occluded or off-screen, skip that entry but keep
+  the others. Do NOT merge a slider_handle bbox into the slider_widget
+  rectangle — they must be separate so the tool can compute the drag
+  target along the track.
 - `suggested_actions` is REQUIRED. Always include at least one action
   based on the stated intent. If blocking overlays exist (cookie banners,
   modals, captchas), suggest dismissing them first (priority=1).
@@ -211,6 +227,7 @@ def build_user_prompt(
     previous_summary: str | None = None,
     task_instruction: str | None = None,
     compact: bool = False,
+    current_subgoal: object | None = None,
 ) -> str:
     """The per-call user message — describes context and emphasises intent.
 
@@ -219,8 +236,17 @@ def build_user_prompt(
     first 5 products in women's new arrivals"). Passing it here lets
     Gemini bias its bbox picks toward elements relevant to the task,
     rather than emitting a uniform set of bboxes for every interactive
-    region on the page. Think of it as a soft prior: same page, same
-    URL, different task = different bbox emphasis.
+    region on the page.
+
+    `current_subgoal` (when present) is the *active* sub-step from the
+    task graph — a finer-grained pointer than `task_instruction`. It
+    has `.id`, `.description`, `.look_for`, and `.expected_signals`
+    attributes (duck-typed; comes from
+    superbrowser_bridge.task_graph.Subgoal). When passed, `intent_relevant`
+    is interpreted as "serves the *current subgoal*", not the overall
+    task — so bboxes stay focused on what the user needs *right now*
+    rather than every clickable element that might serve the eventual
+    goal. This is the load-bearing change for targeted bbox emission.
     """
     bucket = intent_bucket(intent)
     context = f"Page URL: {url}\n" if url else ""
@@ -234,6 +260,38 @@ def build_user_prompt(
 
     if task_instruction:
         context += f"Overall task: {task_instruction}\n"
+
+    if current_subgoal is not None:
+        sg_id = str(getattr(current_subgoal, "id", "") or "")
+        sg_desc = str(getattr(current_subgoal, "description", "") or "").strip()
+        if sg_desc:
+            context += f"Current subgoal ({sg_id}): {sg_desc}\n"
+            look_for = list(getattr(current_subgoal, "look_for", None) or [])
+            if look_for:
+                context += "Look for: " + " | ".join(look_for[:5]) + "\n"
+            sigs = list(getattr(current_subgoal, "expected_signals", None) or [])
+            if sigs:
+                # Render signals compactly for the model. Each signal has
+                # `.kind` and `.payload` — keep the payload to a couple
+                # of useful keys so the prompt stays small.
+                lines: list[str] = []
+                for s in sigs[:4]:
+                    kind = str(getattr(s, "kind", "") or "")
+                    payload = getattr(s, "payload", None) or {}
+                    if isinstance(payload, dict):
+                        snippet = ", ".join(
+                            f"{k}={v!r}" for k, v in list(payload.items())[:2]
+                        )
+                    else:
+                        snippet = ""
+                    lines.append(f"  - {kind}: {snippet}" if snippet else f"  - {kind}")
+                context += "Subgoal complete when:\n" + "\n".join(lines) + "\n"
+            context += (
+                "Bbox priority: intent_relevant=true ONLY for elements "
+                "that serve the current subgoal above. Don't emit "
+                "intent_relevant for elements that serve the broader task "
+                "but not this immediate step.\n"
+            )
 
     if previous_summary:
         context += f"Previous page state: {previous_summary}\n"
@@ -347,7 +405,18 @@ def build_user_prompt(
             "and mark the `role_in_scene` of every bbox (blocker for "
             "dismiss buttons on overlays, target for the task element, "
             "chrome for nav/footer). The downstream planner uses this to "
-            "sequence dismiss-then-act, so be precise."
+            "sequence dismiss-then-act, so be precise.\n\n"
+            "Scroll guidance: if a [SCROLL_STATE …] line appears in the "
+            "context above, treat it as ground truth for current scroll "
+            "position. If the current subgoal target is plausibly off "
+            "the visible viewport AND no bbox on screen serves it, emit "
+            "a suggested_action with action='scroll' and a `description` "
+            "that names the target text/role (the planner will dispatch "
+            "browser_scroll_until). Use direction down by default; emit "
+            "action='scroll' with description starting 'scroll up to' "
+            "when SCROLL_STATE shows reached_bottom=true and the target "
+            "is likely above. NEVER suggest more scrolling once "
+            "reached_bottom=true unless retreating upward."
         )
     elif bucket == "verify_action":
         specific = (
@@ -392,3 +461,80 @@ def build_user_prompt(
         f"{context}Intent: {intent}\n\n{specific}{compact_footer}\n\n"
         "Return ONLY the JSON object described in the system message."
     )
+
+
+def build_coverage_prompt(
+    intent: str,
+    url: str | None,
+    expected_labels: list[str],
+    dom_anchor_hints: list[dict] | None = None,
+    task_instruction: str | None = None,
+    current_subgoal: object | None = None,
+) -> str:
+    """Second-pass prompt for "the validator told us this element should
+    be here but vision culled it" recovery.
+
+    Differences from the standard prompt:
+      - Bbox cap is LIFTED (target up to 60 bboxes). Page-type culling
+        rules are suspended for this call — toolbars, sidebars, header
+        action clusters are explicitly in-scope.
+      - `expected_labels` (e.g. the active subgoal's precondition label
+        plus any brain-declared intent target) are named in the user
+        prompt; the model is instructed to emit tight bboxes for each
+        one if visible, with a `confidence` that reflects certainty.
+      - `dom_anchor_hints` seed coordinates and regions from the DOM
+        side so the model has something to match against for small
+        icon buttons vision has historically collapsed to 4x4 px.
+
+    Callers should set `VisionResponse.coverage_mode=True` on the parsed
+    response and skip caching it — coverage passes are expensive and
+    their output is load-bearing for the next dispatch.
+    """
+    base = build_user_prompt(
+        intent=intent,
+        url=url,
+        previous_summary=None,
+        task_instruction=task_instruction,
+        compact=False,
+        current_subgoal=current_subgoal,
+    )
+    labels_fmt = (
+        ", ".join(f"'{lbl[:60]}'" for lbl in expected_labels[:12])
+        if expected_labels else "(no labels provided)"
+    )
+    anchor_lines: list[str] = []
+    for a in (dom_anchor_hints or [])[:20]:
+        lbl = str(a.get("label") or "")[:80]
+        region = str(a.get("region_tag") or "main")
+        box = a.get("box_2d") or [0, 0, 0, 0]
+        if isinstance(box, (list, tuple)) and len(box) == 4 and lbl:
+            anchor_lines.append(
+                f"  - label={lbl!r} region={region} box_2d={list(box)}"
+            )
+    anchor_block = (
+        "\nDOM anchor hints (coordinate seeds — DO re-verify tightly):\n"
+        + "\n".join(anchor_lines)
+    ) if anchor_lines else ""
+    return (
+        f"{base}\n\n"
+        "COVERAGE PASS — bbox cap is lifted for this call.\n"
+        "  * Emit up to 60 bboxes. Do NOT skip sidebars, toolbars, "
+        "header action clusters, or secondary CTAs.\n"
+        "  * Page-type culling rules (skip-sidebar, skip-nav) are "
+        "SUSPENDED — include every clickable the task might need.\n"
+        "  * Required targets — emit a tight bbox for each of these "
+        f"if visible, with a label that matches: {labels_fmt}.\n"
+        "  * If an expected label is genuinely NOT on screen, say so "
+        "in `summary` (one sentence) and emit the rest of the bboxes "
+        "normally — do not invent coordinates."
+        f"{anchor_block}\n"
+        "Return ONLY the JSON object."
+    )
+
+
+__all__ = [
+    "SYSTEM_PROMPT",
+    "intent_bucket",
+    "build_user_prompt",
+    "build_coverage_prompt",
+]
