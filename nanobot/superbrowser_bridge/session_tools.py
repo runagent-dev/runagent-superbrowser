@@ -14,7 +14,7 @@ import time
 import os
 import base64
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from nanobot.agent.tools.base import Tool, tool_parameters
@@ -202,60 +202,6 @@ async def _t3_dispatch_from_http(
                 steps=int(body.get("steps", 20)),
             )
             return _T3Response(data)
-
-        if verb == "set-slider" or verb == "set_slider":
-            outcome = await mgr.set_slider(
-                sid,
-                body.get("selector", ""),
-                body.get("value"),
-                value_mode=body.get("as", "absolute"),
-                method=body.get("method", "auto"),
-            )
-            return _T3Response({
-                "success": outcome.get("strategy") not in (None, "unresolved"),
-                "outcome": outcome,
-                "url": "",
-                "title": "",
-                "elements": "",
-            })
-
-        if verb == "set-slider-at" or verb == "set_slider_at":
-            outcome = await mgr.set_slider_at(
-                sid,
-                body.get("handle") or {},
-                body.get("track") or {},
-                float(body.get("ratio", 0.0)),
-            )
-            return _T3Response({
-                "success": outcome.get("strategy") == "vision-drag",
-                "outcome": outcome,
-                "url": "",
-                "title": "",
-                "elements": "",
-            })
-
-        if verb == "list-slider-handles" or verb == "list_slider_handles":
-            handles = await mgr.list_slider_handles(sid)
-            return _T3Response({"success": True, "handles": handles})
-
-        if verb == "drag-slider-until" or verb == "drag_slider_until":
-            outcome = await mgr.drag_slider_until(
-                sid,
-                body.get("handle") or {},
-                float(body.get("target_value", 0.0)),
-                label_pattern=body.get("label_pattern"),
-                tolerance=float(body.get("tolerance") or 0.0),
-                max_iterations=int(body.get("max_iterations") or 25),
-                step_px=int(body.get("step_px") or 8),
-                direction=body.get("direction") or "auto",
-            )
-            return _T3Response({
-                "success": bool(outcome.get("completed")),
-                "outcome": outcome,
-                "url": "",
-                "title": "",
-                "elements": "",
-            })
 
         if verb == "select":
             data = await mgr.select(sid, int(body["index"]), body.get("value", ""))
@@ -756,41 +702,12 @@ def _schedule_vision_prefetch(
     except Exception:
         pass
 
-    # Token the page is on at dispatch. If the token advances again
-    # before the analyze() call returns (a navigation or click was
-    # fired mid-flight), the incoming response reflects a prior DOM
-    # and we discard the state write — otherwise we'd stamp stale
-    # bboxes as "fresh" and the next mutation tool would unblock on
-    # the wrong screen.
-    token_at_dispatch = state.current_token
-
     async def _run() -> "Any":
         try:
-            # Settle window: give the page's JS a beat to finish its
-            # commit phase before we sample the screenshot. React in
-            # particular re-renders asynchronously after a click's
-            # onClick handler returns — without this delay the screenshot
-            # captures a pre-render state and the brain plans on bboxes
-            # that reflect nothing the user would see. Tunable via
-            # VISION_PREFETCH_SETTLE_MS (default 250, 0 disables).
-            try:
-                settle_ms = int(
-                    os.environ.get("VISION_PREFETCH_SETTLE_MS") or "250"
-                )
-            except ValueError:
-                settle_ms = 250
-            if settle_ms > 0:
-                await asyncio.sleep(settle_ms / 1000.0)
             r = await _request_with_backoff(
                 "GET",
                 f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={
-                    "vision": "true", "bounds": "true",
-                    # Tell the TS /state handler to waitForPageReady
-                    # before taking the screenshot — ensures readyState
-                    # is 'complete' and aria-busy isn't set.
-                    "settle": "true",
-                },
+                params={"vision": "true", "bounds": "true"},
                 timeout=15.0,
             )
             if r.status_code != 200:
@@ -803,21 +720,6 @@ def _schedule_vision_prefetch(
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")
             dh = dom_hash_of(elements) if dom_hash_of else ""
-            # Bust the per-session vision cache before analyze() so a
-            # dom_hash collision (React/Vue re-render that toggles a
-            # dropdown via CSS without changing DOM structure) can't
-            # serve bboxes from BEFORE this mutation's JS effects
-            # propagated. Prefetch callers are always mutation tools
-            # (click/type/keys/scroll/navigate/drag), so unconditional
-            # bust here is correct and cheap — one extra vision
-            # analyze per action, which is already the pace we pay
-            # for real user-facing work.
-            try:
-                cache = getattr(agent, "_cache", None)
-                if cache is not None and hasattr(cache, "bust_session"):
-                    await cache.bust_session(session_id)
-            except Exception:
-                pass
             dispatched = time.monotonic()
             # DPR: when the viewport runs at deviceScaleFactor > 1 the
             # screenshot is physical-pixel sized. Pass it through so
@@ -836,42 +738,14 @@ def _schedule_vision_prefetch(
                 image_width=img_w,
                 image_height=img_h,
                 task_instruction=state.task_instruction or None,
-                current_subgoal=(
-                    state.task_graph.current()
-                    if getattr(state, "task_graph", None) is not None
-                    else None
-                ),
             )
             resp.with_image_dims(img_w, img_h, dpr=dpr_val)
-            if token_at_dispatch != state.current_token:
-                # A mutation happened while we were analyzing. The
-                # response is for a prior page — dropping the state
-                # write leaves _last_vision_response pointing at the
-                # older snapshot (still belonging to prev token) so
-                # `vision_is_fresh()` stays False and the gate keeps
-                # blocking until the correct prefetch completes.
-                print(
-                    f"  [vision prefetch superseded: "
-                    f"dispatched_tok={token_at_dispatch} "
-                    f"current_tok={state.current_token}]"
-                )
-                return None
             state._last_vision_response = resp
             state._last_vision_summary = resp.summary
             state._last_vision_ts = time.time()
             state._last_vision_url = (data.get("url", "") or state.current_url or "")
             state._last_dom_hash = dh or state._last_dom_hash
-            state.last_vision_token = token_at_dispatch
             state.vision_calls += 1
-            # Cache DOM selector entries (with bounds + regionTag) so the
-            # validator's perception-fusion pass has a DOM-side stream to
-            # merge with vision bboxes. Fetched with bounds=true above.
-            try:
-                entries = data.get("selectorEntries") or []
-                if isinstance(entries, list):
-                    state.last_selector_entries = entries
-            except Exception:
-                pass
             # Push the fresh bboxes to live viewers immediately —
             # without this, overlay only updates on the next
             # screenshot tool call, so the user sees bboxes lag by
@@ -901,7 +775,6 @@ async def _append_fresh_vision(
     result: str,
     *,
     budget_ms: int | None = None,
-    state: "BrowserSessionState | None" = None,
 ) -> str:
     """Wait for the prefetched vision pass (up to the budget) and
     append a one-line brain-facing hint to `result` when it arrives.
@@ -911,21 +784,11 @@ async def _append_fresh_vision(
     screenshot call. If the vision pass didn't finish in time, the
     task keeps running in the background (shielded) and the overlay
     will update on the next push.
-
-    When `state` is passed (the norm), we also freeze the vision
-    epoch AT THE MOMENT this response lands in a brain-facing reply —
-    so V-index resolvers read from a stable snapshot even if a later
-    prefetch overwrites `_last_vision_response`.
     """
     resp = await _await_vision_prefetch(task, budget_ms=budget_ms)
     if resp is None:
         return result
     summary = (getattr(resp, "summary", "") or "").strip()
-    if state is not None:
-        try:
-            state.freeze_vision_epoch()
-        except Exception:
-            pass
     if not summary:
         return result
     note = summary[:240]
@@ -969,135 +832,6 @@ async def _await_vision_prefetch(
         return None
 
 
-async def _require_fresh_vision(
-    state: "BrowserSessionState",
-    session_id: str,
-    *,
-    max_wait_s: float | None = None,
-    reason: str = "",
-    force_refresh: bool = False,
-) -> tuple[bool, str]:
-    """Block a mutation tool until vision has just re-analyzed the page.
-
-    Returns `(True, "")` when a fresh vision pass (taken AFTER this
-    call entered) has stamped `state.last_vision_token`. Returns
-    `(False, message)` otherwise — the caller returns `message`
-    verbatim so the brain sees why its click was refused.
-
-    Behavior: by default we INVALIDATE the cached vision response
-    right at the top and wait for a brand new pass, because
-    "cached vision matches current token" is not strong enough — the
-    page can change visibly (dropdown auto-closing on blur, React
-    re-render flipping a hidden class, spinner finishing) without
-    advancing our mutation-only token. The brain's target bbox was
-    correct at analysis time but the DOM/CSS state at dispatch time
-    may be different. Forcing a fresh pass right before every
-    mutation costs one extra Gemini call per action but stops the
-    "click the element that used to be there" failure mode cold.
-
-    Opt out via VISION_GATE_ALWAYS_REFRESH=0 — then the old behavior
-    (accept any matching-token vision) returns.
-
-    Wait budget: VISION_REQUIRE_TIMEOUT_S (default 30s, hard cap 90s).
-    On timeout: `[vision_gate_timeout]`. If the token advances during
-    the wait (another mutation raced in): `[vision_gate_superseded]`.
-    """
-    # Pre-action refresh (opt-in). When ON, the gate invalidates the
-    # currently-cached vision response so a fresh Gemini analysis runs
-    # right before this mutation dispatches. This catches visible-state
-    # drift (dropdown auto-closed between analysis and dispatch) BUT
-    # also overwrites the vision snapshot the brain planned against,
-    # which destabilizes V-index resolution — V1 in the new analysis
-    # may be a different element than the V1 the brain just saw.
-    # Default OFF after R3.1: we rely on the post-action effect
-    # classifier + no-effect streak force-rewind to catch the drift
-    # case downstream, rather than paying the V-index-stability cost
-    # at dispatch time.
-    always_refresh = force_refresh or (
-        os.environ.get("VISION_GATE_ALWAYS_REFRESH", "0") == "1"
-    )
-    if always_refresh:
-        state.last_vision_token = -1
-        state._last_vision_response = None
-        try:
-            state.log_activity(
-                f"[pre_action_refresh reason={reason or 'mutation'} "
-                f"tok={state.current_token}]"
-            )
-        except Exception:
-            pass
-    if state.vision_is_fresh():
-        return True, ""
-
-    if max_wait_s is None:
-        try:
-            max_wait_s = float(os.environ.get("VISION_REQUIRE_TIMEOUT_S") or "30.0")
-        except ValueError:
-            max_wait_s = 30.0
-    # Hard cap — defense against a stuck vision service.
-    max_wait_s = min(max_wait_s, 90.0)
-
-    start_token = state.current_token
-    deadline = time.monotonic() + max_wait_s
-    poll_s = 0.1
-    fault_ms = 0
-    try:
-        # Test hook: sleep inside the prefetch so the race conditions
-        # are observable in CI. Active only when env is set.
-        fault_ms = int(os.environ.get("VISION_GATE_FAULT_INJECT_MS") or "0")
-    except ValueError:
-        fault_ms = 0
-
-    # Ensure a prefetch is in flight. If the last prefetch finished
-    # before the token advanced (stamped an older token), or none ran,
-    # kick off a fresh one tied to the current token.
-    prefetch = _schedule_vision_prefetch(state, session_id)
-    if fault_ms:
-        await asyncio.sleep(fault_ms / 1000.0)
-
-    while time.monotonic() < deadline:
-        if state.current_token != start_token:
-            return False, (
-                f"[vision_gate_superseded] {reason or 'action'} aborted: page "
-                f"mutated (token {start_token}→{state.current_token}) while "
-                f"waiting for vision. Re-plan on the new screen."
-            )
-        if state.vision_is_fresh():
-            elapsed_ms = int((max_wait_s - (deadline - time.monotonic())) * 1000)
-            try:
-                state.log_activity(
-                    f"[vision_gate_wait tok={state.current_token} ms={elapsed_ms}]"
-                )
-            except Exception:
-                pass
-            return True, ""
-        # Await the prefetch (bounded by our remaining budget) rather
-        # than busy-polling.
-        remaining = max(0.0, deadline - time.monotonic())
-        if prefetch is None or prefetch.done():
-            await asyncio.sleep(min(poll_s, remaining))
-            if prefetch is None or prefetch.done():
-                prefetch = _schedule_vision_prefetch(state, session_id)
-            continue
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(prefetch),
-                timeout=min(remaining, 2.0),
-            )
-        except asyncio.TimeoutError:
-            continue
-        except Exception:
-            # Prefetch errors are already logged in _run; try to spawn
-            # another and keep polling until the deadline.
-            prefetch = _schedule_vision_prefetch(state, session_id)
-
-    return False, (
-        f"[vision_gate_timeout] {reason or 'action'} blocked: vision did not "
-        f"confirm current page within {max_wait_s:.0f}s. Call browser_screenshot "
-        f"to force a fresh pass, or browser_rewind_to_checkpoint if the page is unresponsive."
-    )
-
-
 async def _feedback_gate(tool_name: str) -> str | None:
     """Return a deferred-result string when another subsystem owns the
     browser right now (active captcha solve). None means `proceed`.
@@ -1119,6 +853,12 @@ async def _feedback_gate(tool_name: str) -> str | None:
         print(f"  {msg}")
         return msg
     return None
+
+# After this many guard-refused browser_open calls in a single worker run, we
+# stop being polite and abort the worker. The guard's text message is clearly
+# not getting through to the LLM at this point and continuing would just
+# drain the iteration budget on a no-op loop.
+BLOCKED_BROWSER_OPEN_HARD_STOP = 3
 
 def _maybe_no_effect_prefix(
     data: Any, tool_name: str, base_caption: str,
@@ -1180,13 +920,15 @@ def _maybe_no_effect_prefix(
         f"page didn't respond — no DOM mutation, no URL change, no focus "
         f"change. Do NOT retry the same tool with the same target; try "
         f"ONE OF (in this preference order): "
-        f"(a) **browser_semantic_click(target='<label>')** — atomic "
+        f"(a) **browser_screenshot** first — the page may have changed "
+        f"under you; re-observe and click the fresh [V_n]; "
+        f"(b) **browser_semantic_click(target='<label>')** — atomic "
         f"fresh vision + dispatch, works across React apps; "
-        f"(b) browser_click_selector(<css>) — pixel-exact if the target "
+        f"(c) browser_click_selector(<css>) — pixel-exact if the target "
         f"has a stable CSS hook; "
-        f"(c) browser_run_script(mutates=true) with helpers.reactSetValue "
-        f"(LAST RESORT — many sites 403 scripts); "
-        f"(d) browser_rewind_to_checkpoint if the page appears frozen."
+        f"(d) browser_rewind_to_checkpoint if the page appears frozen. "
+        f"Do NOT synthesize clicks via browser_run_script — JS clicks are "
+        f"isTrusted=false and bot-detected; the sandbox will reject them."
     )
     return f"{hint}\n{base_caption}"
 
@@ -1324,7 +1066,7 @@ def _classify_effect(
 # stop being polite and abort the worker. The guard's text message is clearly
 # not getting through to the LLM at this point and continuing would just
 # drain the iteration budget on a no-op loop.
-BLOCKED_BROWSER_OPEN_HARD_STOP = 3
+
 
 
 class WorkerMustExitError(RuntimeError):
@@ -1414,11 +1156,6 @@ class BrowserSessionState:
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
-        # Track consecutive run_script calls so the script-usage guard
-        # can push back when the brain is reaching for scripts as a
-        # first resort instead of trying cursor tools. Resets on any
-        # successful cursor tool call (click/type/semantic_*).
-        self.consecutive_script_calls: int = 0
         # Hard guard against the brain re-clicking a target that produced
         # no DOM change. Cleared by `register_click_attempt` on a fresh
         # target; incremented when the same target re-fires AND the page
@@ -1444,18 +1181,6 @@ class BrowserSessionState:
         # Reset on every screenshot. Used to surface "vision bboxes are
         # habitually wrapping non-clickable containers" hints.
         self.snap_miss_count: int = 0
-        # DOM-side selectorEntries from the most recent /state?bounds=true
-        # fetch. Populated by browser_screenshot and the vision prefetch
-        # path. Consumed by validator.validate() → perception_fusion, so
-        # the DOM stream can recover "tools section" elements vision
-        # culled. Empty list until the first fetch.
-        self.last_selector_entries: list[dict] = []
-        # Validator counters — rejection reasons + fusion hit rates. The
-        # worker hook and /introspect endpoints surface these so the user
-        # can see at a glance that validation is (a) firing and (b) not
-        # reflexively rejecting everything. Keys kept stable across the
-        # validator module; see validator._ensure_stats for the shape.
-        self.validator_stats: dict[str, int] = {}
         # Active session ID (set by browser_open)
         self.session_id: str = ""
         # How many times has BrowserOpenTool had to refuse a redundant call?
@@ -1516,13 +1241,6 @@ class BrowserSessionState:
         # to alternative sites when the target blocks it.
         self.pinned_domain: str = ""
 
-        # Serializes slider drags when the LLM fires them in parallel.
-        # CDP/patchright mouse events are session-scoped — two concurrent
-        # drags would fight for the cursor and produce garbage readings.
-        # Created lazily in the tool so it's bound to the current event
-        # loop; see BrowserDragSliderUntilTool.execute.
-        self.slider_drag_lock: Optional[asyncio.Lock] = None
-
         # Vision preprocessor bookkeeping. Populated inside
         # build_tool_result_blocks so tools that don't pass an intent
         # explicitly inherit the last one used — useful when the brain
@@ -1555,37 +1273,27 @@ class BrowserSessionState:
         # without a browser_screenshot round trip.
         self._last_vision_ts: float = 0.0
         self._last_vision_url: str = ""
-
         # Vision epoch — a frozen snapshot of the vision response that
-        # was last embedded in a brain-facing tool reply. Tools that
-        # resolve vision_index (click_at, type_at, fix_text_at,
+        # was LAST emitted to the brain as screenshot text. Tools that
+        # resolve `vision_index` (click_at, type_at, fix_text_at,
         # drag_slider_until) read this FIRST, falling back to
-        # _last_vision_response only if epoch is None.
-        #
-        # Why the separation: background prefetches write
-        # _last_vision_response asynchronously. If the brain issued
-        # click_at(V1) planning against the vision from the last tool
-        # reply, a prefetch that landed in the mean time could have
-        # replaced _last_vision_response with a re-analysis whose
-        # bboxes are ordered differently — V1 would now resolve to a
-        # different element than the brain intended. freeze_vision_epoch
-        # snapshots the brain-facing response at the moment we emit a
-        # tool reply; V-index lookup reads from that frozen slot so the
-        # brain's target never drifts mid-dispatch.
+        # `_last_vision_response` only when the epoch is None. Needed
+        # because background vision prefetches overwrite
+        # `_last_vision_response` between screenshot-text-emit and
+        # click-dispatch — without the epoch, the brain's `V_n`
+        # picked from the screenshot resolves against a RENUMBERED
+        # prefetch response and lands on the wrong element. Advanced
+        # only when `BrowserScreenshotTool` emits fresh vision text;
+        # cleared on reset_per_session and on successful navigate.
         self._vision_epoch_id: int = 0
         self._vision_epoch_response: Any = None
+        # URL the epoch was captured on. F5 — when `current_url` no
+        # longer matches this, the epoch is stale (page implicitly
+        # navigated via Enter / form submit / button click) and
+        # `vision_for_target_resolution` falls back to the live
+        # `_last_vision_response` so the next click resolves V_n
+        # against the new page's bbox list, not the prior page's.
         self._vision_epoch_url: str = ""
-
-        # Observation token — monotonic counter advanced on every page
-        # mutation (navigate, click, type, scroll, rewind). Vision
-        # responses carry the token they observed; mutation tools refuse
-        # to fire until `last_vision_token == current_token`. This is the
-        # sequencing gate that stops clicks from landing on bboxes from
-        # a prior DOM. See `_require_fresh_vision` and
-        # `advance_observation_token` below.
-        self.current_token: int = 0
-        self.last_vision_token: int = -1
-        self.last_token_source: str = "init"
 
         # Dead-type guard state. Tracks the last browser_type call so we can
         # reject a second identical type to the same index — the pattern
@@ -1606,41 +1314,6 @@ class BrowserSessionState:
         self._last_blockers: list = []  # list[BlockerInfo]
         self._last_action_queue: Any = None  # Optional[ActionQueue]
         self._pending_postcondition: Optional[dict] = None
-
-        # Subconscious task graph — multi-step plan that survives across
-        # iterations. Built once in configure_budget() by an LLM
-        # decomposer; the active subgoal is threaded into every vision
-        # call so bbox emission stays focused on the current step
-        # rather than on every clickable element of the overall task.
-        # See nanobot/superbrowser_bridge/task_graph.py.
-        try:
-            from superbrowser_bridge.task_graph import TaskGraph as _TG  # noqa: F401
-            self.task_graph: Optional["_TG"] = None  # type: ignore[assignment]
-        except Exception:
-            self.task_graph: Any = None  # type: ignore[assignment]
-        # Per-subgoal action counter — when this exceeds the stale
-        # threshold (defined in task_graph), worker_hook injects a
-        # "this subgoal isn't progressing" hint to the brain.
-        self.actions_on_active_subgoal: int = 0
-
-        # Scroll telemetry — populated by scroll-class tools so the
-        # vision pass can render a [SCROLL_STATE …] line and decide
-        # whether more scrolling is plausible. Schema:
-        #   scrollY, scrollHeight, viewportHeight (all ints, CSS px)
-        #   direction_history: list[str], capped at last 6 actions
-        #   reached_bottom: bool — within 12px of document end
-        #   reached_top: bool    — within 4px of scrollTop=0
-        #   last_scroll_reason: str — set by browser_scroll_until
-        #     ('matched' | 'page_end' | 'page_start' | 'max_iterations')
-        self.scroll_telemetry: dict = {}
-
-        # Per-(tool, tier) action-latency histogram. Each entry is a
-        # list of millisecond samples. Populated opportunistically by
-        # tools that pass `latency_ms=` to `record_step`. Dumped into
-        # step_history.json so we can compare T1 vs T3 latency
-        # distributions for the same tool on the same site — the data
-        # any future "make T3 feel like T1" tuning has to start from.
-        self.tier_action_latency: dict[str, list[int]] = {}
 
     @property
     def backend(self) -> str:
@@ -1672,27 +1345,6 @@ class BrowserSessionState:
         # button bboxes, not navbar noise.
         self.task_instruction = (task_instruction or "")[:500]
         self.task_target_url = target_url or ""
-
-        # Build the subconscious task graph. One-shot LLM call; falls
-        # back to a trivial 1-node graph on any failure so the rest of
-        # the pipeline (vision plumbing, worker hook) keeps working.
-        try:
-            from superbrowser_bridge.task_graph import (
-                decompose_task as _decompose_task,
-                trivial_graph as _trivial_graph,
-            )
-            try:
-                self.task_graph = _decompose_task(
-                    self.task_instruction, self.task_target_url,
-                )
-            except Exception:
-                self.task_graph = _trivial_graph(self.task_instruction)
-        except Exception:
-            # task_graph module itself unavailable — leave None, downstream
-            # is None-safe and falls back to overall task_instruction.
-            self.task_graph = None
-        self.actions_on_active_subgoal = 0
-
         return self.max_screenshots
 
     def enter_captcha_mode(self) -> None:
@@ -1724,85 +1376,53 @@ class BrowserSessionState:
         self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
-        # Observation token is per-session. A new browser_open means a
-        # new page, so stale vision from the prior session must not gate
-        # the next click.
-        self.current_token = 0
-        self.last_vision_token = -1
-        self.last_token_source = "init"
-        # Vision epoch is per-session too — a frozen snapshot from a
-        # previous session is always wrong.
-        self._vision_epoch_id = 0
+        # Epoch from a prior session is meaningless for the new one.
         self._vision_epoch_response = None
+        self._vision_epoch_id = 0
         self._vision_epoch_url = ""
-        # Clear the sticky vision intent. A captcha intent from a
-        # previous session would otherwise poison the vision prompt
-        # on the first screenshot of the new session.
-        self._last_intent = ""
 
-    def advance_observation_token(self, source: str) -> int:
-        """Bump the token because the page just mutated.
+    def freeze_vision_epoch(self) -> None:
+        """Snapshot `_last_vision_response` as the current epoch.
 
-        Called from the success path of navigate / click / type / scroll
-        / rewind BEFORE scheduling the post-action vision prefetch. The
-        next mutation tool will block on `_require_fresh_vision` until
-        the prefetch stamps `last_vision_token` with this new value.
-        Returns the new token (for logging).
+        Called by `BrowserScreenshotTool` right after it emits the
+        vision bbox text to the brain. Subsequent `browser_click_at(
+        vision_index=V_n)` / `browser_type_at` calls resolve `V_n`
+        against THIS snapshot, not against the live
+        `_last_vision_response` (which a background prefetch may have
+        overwritten between screenshot-text-emit and click-dispatch —
+        that's the V_n drift bug).
+
+        Also captures the URL so `vision_for_target_resolution` can
+        invalidate the epoch when the page implicitly navigates
+        (browser_keys(Enter), button-clicks-that-submit-a-form, etc.)
+        — `state.current_url` will no longer match `_vision_epoch_url`
+        and the epoch falls through to the live response.
         """
-        self.current_token += 1
-        self.last_token_source = source or "unknown"
-        # Invalidate the frozen epoch on navigation / rewind — the
-        # previous brain-facing response belongs to a prior page and
-        # cannot be used to resolve V-indices anymore. For lighter
-        # mutations (click/type/scroll) we keep the epoch so in-flight
-        # tool calls can still resolve their own V-index; the NEXT
-        # tool reply will freeze a new epoch once its own vision lands.
-        if source in ("navigate", "rewind"):
-            self._vision_epoch_response = None
-            self._vision_epoch_url = ""
-            # Reset the sticky vision intent on URL transitions. An
-            # intent from a prior page (especially captcha-flavored
-            # intents from `browser_solve_captcha`) will otherwise
-            # bias the NEXT vision call on this new page — vision's
-            # prompt template branches on intent_bucket, so a stale
-            # "solve captcha step" intent makes Gemini emit captcha-
-            # tile bboxes instead of UI-label bboxes on a plain page.
-            self._last_intent = ""
-        try:
-            self.log_activity(
-                f"[token_advance src={self.last_token_source} tok={self.current_token}]"
-            )
-        except Exception:
-            pass
-        return self.current_token
-
-    def freeze_vision_epoch(self) -> int:
-        """Snapshot the current `_last_vision_response` as the brain-
-        facing epoch. Tools resolving V-indices read from this frozen
-        slot so a later prefetch can't retarget the brain's intent
-        mid-call. Returns the new epoch id (for debug/logging)."""
-        if self._last_vision_response is None:
-            return self._vision_epoch_id
-        self._vision_epoch_id += 1
         self._vision_epoch_response = self._last_vision_response
-        self._vision_epoch_url = self._last_vision_url
-        return self._vision_epoch_id
+        self._vision_epoch_url = self._last_vision_url or self.current_url or ""
+        self._vision_epoch_id += 1
 
     def vision_for_target_resolution(self) -> Any:
-        """Return the vision response V-index readers should resolve
-        against. Prefers the frozen epoch (the snapshot the brain saw
-        in its previous tool reply) and falls back to `_last_vision_response`
-        when no epoch has been captured yet (first turn, post-nav, etc.)."""
+        """Return the vision response V-index readers (click_at /
+        type_at / fix_text_at / the slider family) should resolve
+        against. Prefers the frozen epoch; falls back to the live
+        `_last_vision_response` when:
+          - no epoch has been captured yet (first turn / mocked test);
+          - the epoch's URL no longer matches `current_url` (the page
+            implicitly navigated since the brain saw the screenshot —
+            F5 fix; otherwise the brain's V_n picked from page A
+            resolves against page A's bbox list while the click lands
+            on page B, with bboxes that no longer apply).
+        """
         if self._vision_epoch_response is not None:
+            epoch_url = self._normalize_url(self._vision_epoch_url or "")
+            current_url = self._normalize_url(self.current_url or "")
+            if epoch_url and current_url and epoch_url != current_url:
+                # Page changed. Epoch is stale. Live response is the
+                # post-mutation prefetch and matches the current page.
+                return self._last_vision_response
             return self._vision_epoch_response
         return self._last_vision_response
-
-    def vision_is_fresh(self) -> bool:
-        """True when `_last_vision_response` observed `current_token`."""
-        return (
-            self._last_vision_response is not None
-            and self.last_vision_token == self.current_token
-        )
 
     def init_if_needed(self):
         if self.start_time == 0.0:
@@ -1967,58 +1587,15 @@ class BrowserSessionState:
         canonical = f"n={count}|h={hist}|a={attrs}|{scroll_bucket}"
         return hashlib.sha1(canonical.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
-    def record_step(
-        self,
-        tool_name: str,
-        args_summary: str,
-        result_summary: str,
-        latency_ms: int | None = None,
-    ) -> None:
-        """Record a step in the structured step history.
-
-        `latency_ms`, when passed, is appended to the step entry AND
-        aggregated into `tier_action_latency` keyed by (tool, tier). Per-
-        tier histograms get dumped in `step_history.json` so we can
-        diff T1 vs T3 latency for the same tool on the same site —
-        the data behind any future "agentic parity" optimisation
-        decisions. Tools that don't time themselves simply omit the
-        argument; aggregation is opportunistic and best-effort.
-        """
-        entry: dict = {
+    def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:
+        """Record a step in the structured step history."""
+        self.step_history.append({
             "tool": tool_name,
             "args": args_summary,
             "result": result_summary[:200],
             "url": self.current_url,
             "time": datetime.now().strftime("%H:%M:%S"),
-        }
-        if latency_ms is not None:
-            try:
-                entry["latency_ms"] = int(latency_ms)
-                self._aggregate_latency(tool_name, int(latency_ms))
-            except (TypeError, ValueError):
-                pass
-        self.step_history.append(entry)
-
-    def _aggregate_latency(self, tool_name: str, ms: int) -> None:
-        """Append a sample to the per-(tool, tier) histogram.
-
-        Lazy-initialises the dict on first use so old serialisations
-        still load without it. Capped at 200 samples per (tool, tier)
-        bucket so a long session doesn't grow the dict unbounded.
-        """
-        try:
-            buckets = getattr(self, "tier_action_latency", None)
-            if not isinstance(buckets, dict):
-                buckets = {}
-                self.tier_action_latency = buckets
-            tier = self.backend
-            key = f"{tool_name}@{tier}"
-            arr = buckets.setdefault(key, [])
-            arr.append(int(ms))
-            if len(arr) > 200:
-                del arr[: len(arr) - 200]
-        except Exception:
-            pass
+        })
 
     def check_dead_click(self, click_target: str) -> str | None:
         """Pre-flight check before dispatching a click.
@@ -2055,11 +1632,14 @@ class BrowserSessionState:
                 f"[dead_click_blocked] {click_target} has been clicked "
                 f"{self.MAX_CONSECUTIVE_SAME_TARGET} times in a row with "
                 "no DOM change. The previous clicks did not move the "
-                "page. Switch tactic: pick a different [V_n]/[index], "
-                "try a different role (e.g., the form's submit button "
-                "instead of the input), use browser_run_script to "
-                "simulate the action via JS, or browser_wait_for content "
-                "you expect to appear. Do NOT retry this exact target."
+                "page. Switch tactic: call browser_screenshot to "
+                "re-observe, then pick a different [V_n]/[index], try a "
+                "different role (e.g., the form's submit button instead "
+                "of the input), try browser_click_selector with a stable "
+                "CSS hook, or browser_wait_for content you expect to "
+                "appear. Do NOT retry this exact target, and do NOT "
+                "synthesize clicks via browser_run_script — JS clicks "
+                "are isTrusted=false and bot-detected."
             )
         return None
 
@@ -2068,6 +1648,16 @@ class BrowserSessionState:
         `check_dead_click` can compare against them."""
         self.last_click_target = click_target
         self.last_click_dom_hash = self._last_dom_hash
+
+    def advance_observation_token(self, source: str = "") -> None:
+        """No-op shim retained so kept tools (click_selector,
+        rewind_to_checkpoint, scroll_until, drag_slider_until) that
+        were ported forward from the validator era can still call it
+        without blowing up. The token machinery was part of the
+        deleted validator subsystem; in the reverted architecture the
+        in-tool freshness/blocker/confidence gates in click_at do
+        the same job."""
+        pass
 
     def get_last_checkpoint(self) -> dict | None:
         """Return the most recent checkpoint."""
@@ -2108,28 +1698,6 @@ class BrowserSessionState:
 
         # Structured JSON export for orchestrator consumption.
         import json as _json_export
-        # Summarize the per-(tool, tier) latency histogram into compact
-        # stats — full sample arrays explode the JSON unnecessarily.
-        latency_summary: dict[str, dict[str, int | float]] = {}
-        try:
-            for key, samples in (self.tier_action_latency or {}).items():
-                if not samples:
-                    continue
-                ordered = sorted(samples)
-                n = len(ordered)
-                p50 = ordered[n // 2]
-                p95 = ordered[min(n - 1, int(n * 0.95))]
-                latency_summary[key] = {
-                    "n": n,
-                    "min_ms": ordered[0],
-                    "p50_ms": p50,
-                    "p95_ms": p95,
-                    "max_ms": ordered[-1],
-                    "mean_ms": round(sum(ordered) / n, 1),
-                }
-        except Exception:
-            latency_summary = {}
-
         structured = {
             "task_id": self.task_id,
             "sessions_opened": self.sessions_opened,
@@ -2143,7 +1711,6 @@ class BrowserSessionState:
             "screenshots_used": self.max_screenshots - self.screenshot_budget,
             "steps": self.step_history,
             "activity_log": self.activity_log,
-            "tier_action_latency": latency_summary,
         }
         json_path = os.path.join(task_dir, "step_history.json")
         try:
@@ -2238,7 +1805,6 @@ class BrowserSessionState:
         elements: str | None = None,
         elements_with_bounds: list[dict] | None = None,
         device_pixel_ratio: float = 1.0,
-        fast: bool = False,
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -2252,14 +1818,6 @@ class BrowserSessionState:
         path. `elements` is the DOM element listing — hashed as a cache
         key so a re-screenshot on the same URL with identical DOM hits
         the cache.
-
-        `fast=True` returns the image + DOM blocks immediately and
-        starts the vision pass in the background — the brain sees
-        fresh bboxes on the NEXT tool reply via the prefetch path.
-        Useful for rapid exploration where 3-8s of Gemini latency
-        per screenshot adds up. Also honored via the
-        `SCREENSHOT_VISION_BUDGET_MS` env: when set to <= 100, any
-        screenshot acts as fast (the sync analyze is skipped).
         """
         # Lazy import: keeps the vision package optional at import time
         # so a broken VISION_API_KEY doesn't blow up sessions that never
@@ -2275,74 +1833,12 @@ class BrowserSessionState:
             get_vision_agent = None  # type: ignore[assignment]
             dom_hash_of = None  # type: ignore[assignment]
 
-        # Budget in milliseconds — how long the sync path will wait
-        # for agent.analyze() before bailing to the legacy image-blocks
-        # fallback (still useful; image is present, just no bboxes).
-        # Default 15s; env-tunable. fast=True forces budget=0 so the
-        # sync wait is skipped entirely.
-        if fast:
-            vision_budget_ms = 0
-        else:
-            try:
-                vision_budget_ms = int(
-                    os.environ.get("SCREENSHOT_VISION_BUDGET_MS") or "15000"
-                )
-            except ValueError:
-                vision_budget_ms = 15000
-
-        if vision_budget_ms <= 100:
-            # Fast path: skip the sync analyze entirely. Kick off a
-            # background prefetch so the NEXT tool reply picks up fresh
-            # bboxes via _append_fresh_vision, and return the legacy
-            # image-blocks response immediately (image + DOM elements).
-            if vision_agent_enabled() and get_vision_agent is not None:
-                try:
-                    _schedule_vision_prefetch(self, self.session_id)
-                except Exception:
-                    pass
-            fallback = self.build_image_blocks(
-                b64, caption,
-                elements_with_bounds=elements_with_bounds,
-                device_pixel_ratio=device_pixel_ratio,
-            )
-            # Flag the fast mode in the caption so the brain knows
-            # bboxes will arrive on the next turn.
-            if isinstance(fallback, list) and fallback and fallback[0].get("type") == "text":
-                fallback[0]["text"] = (
-                    "[FAST_SCREENSHOT] Image + DOM elements returned "
-                    "immediately; Gemini vision will land on your next "
-                    "tool reply. For V-index clicks, either wait one "
-                    "turn OR use browser_semantic_click(target='<label>') "
-                    "which takes its own fresh vision.\n\n"
-                    + fallback[0]["text"]
-                )
-            return fallback
-
         if vision_agent_enabled() and get_vision_agent is not None:
             dh = dom_hash_of(elements) if dom_hash_of else ""
             if dh:
                 self._last_dom_hash = dh
-            # R5.4 safety-net: if the sticky intent is captcha-flavored
-            # but the last vision pass didn't flag a captcha, drop the
-            # stickiness before we compute effective_intent. The captcha
-            # solver is done; a non-captcha tool should not inherit its
-            # intent. Explicit `intent=` kwarg on THIS call still wins.
-            if (
-                not intent
-                and self._last_intent
-                and _is_captcha_intent(self._last_intent)
-                and not _last_vision_has_captcha_flag(self)
-            ):
-                self._last_intent = ""
             if intent:
-                # R5.3: never let a captcha-flavored intent become
-                # sticky. Captcha tools always pass their intent per-
-                # call, so they don't need the stickiness; non-captcha
-                # tools would inherit it and get a captcha-mode vision
-                # prompt. Update _last_intent ONLY for non-captcha
-                # intents.
-                if not _is_captcha_intent(intent):
-                    self._last_intent = intent
+                self._last_intent = intent
             effective_intent = intent or self._last_intent or "observe page"
             effective_url = url or self.current_url
             try:
@@ -2352,41 +1848,29 @@ class BrowserSessionState:
                 # needs the source pixel dims to convert back to viewport
                 # coordinates accurately.
                 img_w, img_h = _read_image_dims(b64)
-                resp = await asyncio.wait_for(
-                    agent.analyze(
-                        screenshot_b64=b64,
-                        intent=effective_intent,
-                        session_id=self.session_id,
-                        url=effective_url,
-                        dom_hash=dh or self._last_dom_hash,
-                        previous_summary=self._last_vision_summary or None,
-                        image_width=img_w,
-                        image_height=img_h,
-                        task_instruction=self.task_instruction or None,
-                        current_subgoal=(
-                            self.task_graph.current()
-                            if getattr(self, "task_graph", None) is not None
-                            else None
-                        ),
-                    ),
-                    timeout=vision_budget_ms / 1000.0,
+                resp = await agent.analyze(
+                    screenshot_b64=b64,
+                    intent=effective_intent,
+                    session_id=self.session_id,
+                    url=effective_url,
+                    dom_hash=dh or self._last_dom_hash,
+                    previous_summary=self._last_vision_summary or None,
+                    image_width=img_w,
+                    image_height=img_h,
+                    task_instruction=self.task_instruction or None,
                 )
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
                 self._last_vision_ts = time.time()
                 self._last_vision_url = effective_url or self.current_url or ""
-                # Stamp the token this vision pass observed. The
-                # synchronous path runs inside a single tool's execute,
-                # so self.current_token cannot advance mid-analyze —
-                # whichever token was live at entry is still live now.
-                self.last_vision_token = self.current_token
-                # Freeze this response as the brain-facing epoch — the
-                # brain will plan its NEXT tool call against these
-                # bboxes, and V-index resolvers must read from this
-                # snapshot even if a later prefetch lands.
-                self.freeze_vision_epoch()
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
+                # Freeze this response as the current epoch. The brain
+                # is about to see `as_brain_text()` output — subsequent
+                # V_n references MUST resolve to this snapshot, not to
+                # whatever background prefetch writes into
+                # `_last_vision_response` before the brain's next turn.
+                self.freeze_vision_epoch()
                 label = (caption or "").split("\n")[0][:30].replace(" ", "-")
                 # Still save the raw screenshot locally for debugging —
                 # doesn't leave the box, doesn't reach the brain.
@@ -2433,35 +1917,8 @@ class BrowserSessionState:
                 brain_text = resp.as_brain_text()
                 if plan_text:
                     brain_text = f"{brain_text}\n\n{plan_text}"
-                # Subconscious map: prepend the task graph's compact
-                # one-line-per-subgoal summary so the brain re-anchors
-                # on what it's trying to accomplish before reading
-                # bboxes. Survives across turns because it regenerates
-                # on every tool result.
-                graph_text = ""
-                try:
-                    if self.task_graph is not None:
-                        graph_text = self.task_graph.to_brain_text() or ""
-                except Exception:
-                    graph_text = ""
                 text = f"{caption}\n\n{brain_text}" if caption else brain_text
-                if graph_text:
-                    text = f"{graph_text}\n\n{text}"
                 return [{"type": "text", "text": text}]
-            except asyncio.TimeoutError:
-                # Vision budget exhausted — fall through to the image
-                # blocks path. The prefetch we already scheduled will
-                # continue in the background; its result lands in
-                # `_last_vision_response` and the next tool reply can
-                # piggyback via `_append_fresh_vision`.
-                print(
-                    f"  [vision-agent: budget {vision_budget_ms}ms exceeded — "
-                    f"returning image blocks, vision will arrive next turn]"
-                )
-                try:
-                    _schedule_vision_prefetch(self, self.session_id)
-                except Exception:
-                    pass
             except Exception as exc:
                 # Never let a vision-layer failure break a tool result —
                 # fall through to the legacy image path.
@@ -2521,38 +1978,12 @@ class BrowserSessionState:
         self.action_count += 1
         self.text_calls += 1
         self.actions_since_screenshot += 1
-        # Strip backend-specific keys from the input dict before any
-        # caption logic reads them. T3 occasionally surfaces fields
-        # like `t3_event_id` or `t3_viewer_url` that the brain has no
-        # use for and which would create an invisible behavioral
-        # delta vs T1 if the LLM ever picked up on them. Mutates a
-        # shallow copy so the caller's dict isn't disturbed.
-        data = _strip_tier_specific_keys(data)
         parts = [prefix]
-        # Plan-always-visible: prepend the task graph so the brain has
-        # its "subconscious map" in front of every tool reply, not just
-        # after a screenshot. Without this the graph only surfaces when
-        # a vision pass runs — sub-goal state drops out of context as
-        # soon as the brain chains a few mutation tools.
-        plan_text = ""
-        try:
-            if self.task_graph is not None:
-                plan_text = self.task_graph.to_brain_text() or ""
-        except Exception:
-            plan_text = ""
         if data.get("url"):
             parts.append(f"Page: {data['url']}")
         if data.get("title"):
             parts.append(f"Title: {data['title']}")
         result = " | ".join(p for p in parts if p)
-        if plan_text:
-            result = f"{plan_text}\n{result}" if result else plan_text
-        # Surface scroll telemetry inline so the next vision pass and
-        # the brain itself see whether the page has more content to
-        # explore. Cheap — pulled from session state, no extra call.
-        scroll_state = _scroll_state_caption(self)
-        if scroll_state:
-            result += f"\n{scroll_state}"
         # Auto-include interactive elements so agent knows what's on page
         # (BrowserOS pattern: every action returns updated element snapshot)
         if data.get("elements"):
@@ -2571,7 +2002,14 @@ class BrowserSessionState:
         if cached:
             result += f"\n\n{cached}"
         if self.action_count >= 5:
-            result += "\n\n[HINT: Use browser_run_script to batch remaining steps into ONE script.]"
+            result += (
+                "\n\n[HINT: Keep using browser_click_at(vision_index=V_n) / "
+                "browser_type_at for every interaction — each fires a "
+                "real CDP mouse event with humanized motion, which "
+                "avoids bot-detection. Do NOT batch steps into "
+                "browser_run_script; JS clicks are isTrusted=false and "
+                "frequently rejected by WAF-protected sites.]"
+            )
         return result
 
     # How old a cached vision response can be before we stop piggybacking
@@ -2673,28 +2111,10 @@ def _build_network_block_message(
             f"so the orchestrator can escalate to residential proxy / "
             f"headful mode / search."
         )
-    # 404 is structurally different from 403/429/503 "we're being blocked":
-    # it means the URL you asked for doesn't exist on the origin, not that
-    # the origin refused you. Mixing them under NETWORK_BLOCKED causes
-    # the orchestrator to route to the search fallback when the fix is
-    # simply "try a corrected URL on the same site". Emit a distinct
-    # [PAGE_NOT_FOUND] marker so the routing logic can distinguish them.
-    if status_code == 404:
-        return (
-            f"\n\n[PAGE_NOT_FOUND status=404 url={url}]\n"
-            f"Page not found at this URL — the site is reachable, but this "
-            f"specific path does not exist. This is NOT a bot-block / "
-            f"NETWORK_BLOCKED / captcha condition.\n"
-            f"ACTION: pick a correct URL on the same site and retry "
-            f"browser_open / browser_navigate. Do NOT fall back to search "
-            f"unless the corrected URL also fails. If the task hinted at a "
-            f"specific sub-page (e.g. 'trending puzzles') that doesn't exist, "
-            f"navigate to the site's main equivalent (/puzzles, /puzzles/rated) "
-            f"instead."
-        )
     reason_hint = {
         401: "Authentication required — this page needs a logged-in session.",
         403: "Forbidden — site's bot detection refused at the network layer. No page interaction will help.",
+        404: "Page not found at this URL.",
         429: "Rate-limited — the site throttled our requests. Different IP may help.",
         451: "Blocked for legal reasons (geographic restriction likely).",
         503: "Service unavailable — could be bot detection (Cloudflare/Akamai) or real outage.",
@@ -2706,98 +2126,6 @@ def _build_network_block_message(
         f"done(success=False, final_answer='NETWORK_BLOCKED: HTTP {status_code} at {url}') "
         f"so the orchestrator can escalate (try a different approach, search worker, or request proxy)."
     )
-
-
-_TIER_SPECIFIC_RESPONSE_KEYS = frozenset({
-    # Internal T3 plumbing the brain shouldn't see. Add to this set
-    # whenever a new backend-specific field shows up in a tool response
-    # — the goal is identical LLM-visible shape across T1 and T3 so
-    # tier choice never drives behavioural divergence.
-    "t3_event_id",
-    "t3_viewer_url",
-    "t3_internal_state",
-    "patchright_session",
-    "playwright_context_id",
-})
-
-
-def _strip_tier_specific_keys(data: Any) -> dict:
-    """Return a shallow copy of `data` with tier-specific keys removed.
-
-    Tier parity matters because the brain's downstream behaviour can
-    quietly depend on which keys it sees in tool responses. This helper
-    enforces a single contract: T1 and T3 paths surface identical
-    field shapes regardless of the underlying infrastructure. The
-    fields we strip are listed above; the list grows as new ones land.
-    """
-    if not isinstance(data, dict):
-        return {}
-    if not any(k in data for k in _TIER_SPECIFIC_RESPONSE_KEYS):
-        return data  # fast path — nothing to strip, share the dict
-    return {k: v for k, v in data.items() if k not in _TIER_SPECIFIC_RESPONSE_KEYS}
-
-
-def _assert_brain_text_shape(text: str) -> None:
-    """Optional structural guard for tool-response text.
-
-    Enabled by `SUPERBROWSER_TIER_PARITY_CHECK=1` (default off — zero
-    runtime cost otherwise). Validates that brain-facing strings
-    don't accidentally surface tier-specific tags or backend names.
-    Raises AssertionError when violated so test runs catch regressions.
-    """
-    if os.environ.get("SUPERBROWSER_TIER_PARITY_CHECK") != "1":
-        return
-    forbidden = (
-        "[t3_internal", "patchright_event=", "playwright_context=",
-        "[t3_event_id ", "[t3_viewer_url ",
-    )
-    for marker in forbidden:
-        if marker in text:
-            raise AssertionError(
-                f"tier-specific marker {marker!r} leaked into brain text"
-            )
-
-
-def _scroll_state_caption(state: "BrowserSessionState | None") -> str:
-    """Render the [SCROLL_STATE …] caption from session telemetry.
-
-    Returns "" when there's nothing useful to say (no telemetry yet, or
-    a non-scrollable page). Vision reads this line to decide whether to
-    suggest scrolling, switch direction, or stop scrolling entirely
-    (see prompts.py act-bucket guidance).
-    """
-    if state is None:
-        return ""
-    tel = getattr(state, "scroll_telemetry", None)
-    if not isinstance(tel, dict) or not tel:
-        return ""
-    sy = int(tel.get("scrollY") or 0)
-    sh = int(tel.get("scrollHeight") or 0)
-    vp = int(tel.get("viewportHeight") or 0)
-    if sh <= vp:
-        # Page fits in viewport — no scroll context worth reporting.
-        return ""
-    history = tel.get("direction_history") or []
-    dir_summary = ""
-    if history:
-        last = history[-1]
-        run = 0
-        for d in reversed(history):
-            if d == last:
-                run += 1
-            else:
-                break
-        dir_summary = f" direction={last}(×{run})"
-    flags = []
-    if tel.get("reached_bottom"):
-        flags.append("reached_bottom=true")
-    if tel.get("reached_top"):
-        flags.append("reached_top=true")
-    last_reason = str(tel.get("last_scroll_reason") or "")
-    if last_reason:
-        flags.append(f"last_scroll={last_reason}")
-    flag_str = (" " + " ".join(flags)) if flags else ""
-    return f"[SCROLL_STATE pos={sy}/{sh} vp={vp}{dir_summary}{flag_str}]"
 
 
 def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
@@ -2816,9 +2144,6 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
             f'[SESSION_STATE session_id={session_id or "?"} '
             f'url={url or "?"} title="{title}" step={step}]'
         )
-    scroll_state = _scroll_state_caption(state)
-    if scroll_state:
-        parts.append(scroll_state)
     if data.get("url"):
         parts.append(f"URL: {data['url']}")
     if data.get("title"):
@@ -2862,33 +2187,12 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
 )
 class BrowserOpenTool(Tool):
     name = "browser_open"
-
-    def _build_description() -> str:
-        try:
-            from superbrowser_bridge.routing import learning_reads_enabled
-            _on = learning_reads_enabled()
-        except Exception:
-            _on = False
-        if not _on:
-            # Reads off → start fresh on t1 every time. Drop the t3 nudge
-            # so the worker LLM doesn't pre-emptively pick t3 for sites
-            # it "knows" are CF-protected. In-session escalation handles
-            # real failures.
-            return (
-                "Open a new browser session. Returns a screenshot and "
-                "interactive elements. For geo-restricted sites, pass "
-                "region='bd' (Bangladesh), 'in' (India), etc. Do NOT "
-                "set the tier parameter — the system will pick the "
-                "cheapest tier and escalate only on observed failure."
-            )
-        return (
-            "Open a new browser session. Returns a screenshot and interactive elements. "
-            "For geo-restricted sites, pass region='bd' (Bangladesh), 'in' (India), etc. "
-            "Pass tier='t3' for hardened anti-bot sites (Akamai/DataDome/PerimeterX); "
-            "'auto' reads the learning system."
-        )
-
-    description = _build_description()
+    description = (
+        "Open a new browser session. Returns a screenshot and interactive elements. "
+        "For geo-restricted sites, pass region='bd' (Bangladesh), 'in' (India), etc. "
+        "Pass tier='t3' for hardened anti-bot sites (Akamai/DataDome/PerimeterX); "
+        "'auto' reads the learning system."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
@@ -2957,18 +2261,6 @@ class BrowserOpenTool(Tool):
         # --- Tier selection ---------------------------------------------
         # 'auto' reads per-domain learnings; explicit 't1'/'t3' forces it.
         chosen_tier = (tier or "auto").lower()
-        try:
-            from superbrowser_bridge.routing import learning_reads_enabled
-            _reads_on = learning_reads_enabled()
-        except Exception:
-            _reads_on = False
-        # When learning reads are disabled, also ignore the worker LLM's
-        # explicit tier='t3' guess. The tool description nudges the LLM
-        # toward t3 for "hardened" sites, but with reads off we want
-        # every session to start fresh on t1 and let the in-session
-        # escalation ladder promote to t3 only on real evidence.
-        if not _reads_on and chosen_tier == "t3":
-            chosen_tier = "t1"
         if chosen_tier == "auto":
             try:
                 from urllib.parse import urlparse as _urlparse
@@ -3241,7 +2533,6 @@ class BrowserNavigateTool(Tool):
 
     async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
-        _t0 = time.monotonic()
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
@@ -3345,6 +2636,11 @@ class BrowserNavigateTool(Tool):
         actual_url = data.get("url", url)
         self.s.log_activity(f"navigate({url})", f"title={data.get('title', '?')}")
         self.s.record_url(actual_url)
+        # Drop the prior epoch — it belongs to the old page. The next
+        # click will fall back to `_last_vision_response` (blank or
+        # post-nav prefetch) via `vision_for_target_resolution`, and
+        # the very next `browser_screenshot` re-freezes the epoch.
+        self.s._vision_epoch_response = None
 
         # Set/clear the CF nav-guard based on what came back. `block_class`
         # is populated by interactive_session.py after the challenge wait
@@ -3393,13 +2689,9 @@ class BrowserNavigateTool(Tool):
                 self.s.record_step("browser_navigate", url, f"HTTP 404 at {actual_url}")
                 return caption
 
-        self.s.record_step(
-            "browser_navigate", url, f"title={data.get('title', '?')}",
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-        )
+        self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")
         # Prefetch vision so the LLM's next browser_screenshot finds the
         # bboxes already cached.
-        self.s.advance_observation_token("navigate")
         _schedule_vision_prefetch(self.s, session_id)
 
         if regression:
@@ -3438,19 +2730,6 @@ class BrowserNavigateTool(Tool):
             "VISION_ENABLED=1.",
             nullable=True,
         ),
-        fast=BooleanSchema(
-            description=(
-                "When true, return image + DOM elements immediately "
-                "without waiting for the Gemini vision pass (saves "
-                "~3-8s). Fresh bboxes arrive on the NEXT tool reply "
-                "via the background prefetch. Use this when you want "
-                "to iterate quickly and plan using DOM elements "
-                "(for click([n]) or click_selector) or semantic_click "
-                "(which takes its own fresh vision). Default false — "
-                "full vision pass included."
-            ),
-            default=False,
-        ),
         required=["session_id"],
     )
 )
@@ -3465,14 +2744,7 @@ class BrowserScreenshotTool(Tool):
     def read_only(self) -> bool:
         return True
 
-    async def execute(
-        self,
-        session_id: str,
-        intent: str | None = None,
-        fast: bool = False,
-        **kw: Any,
-    ) -> Any:
-        _t0 = time.monotonic()
+    async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""
@@ -3507,20 +2779,11 @@ class BrowserScreenshotTool(Tool):
                 self.s.hash_page_content(data.get("elements", "")),
             )
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
-        self.s.record_step(
-            "browser_screenshot", "",
-            f"url={actual_url[:60] if actual_url else '?'}",
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-        )
+        self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")
         caption = _format_state(data, self.s)
         caption += f"\n[Screenshots remaining: {self.s.screenshot_budget}]"
         if data.get("screenshot"):
             entries = data.get("selectorEntries") or []
-            # Cache for the validator's perception-fusion layer — the
-            # same entries the brain sees for overlays double as the
-            # DOM-side input to fused click resolution.
-            if isinstance(entries, list):
-                self.s.last_selector_entries = entries
             dpr = float(data.get("devicePixelRatio") or 1.0)
             # Rename tagName → tag for the overlay (both naming schemes work
             # but tag is the overlay's canonical key).
@@ -3542,7 +2805,6 @@ class BrowserScreenshotTool(Tool):
                 elements=data.get("elements"),
                 elements_with_bounds=overlay_elements,
                 device_pixel_ratio=dpr,
-                fast=fast,
             )
         return caption
 
@@ -3568,15 +2830,9 @@ class BrowserClickTool(Tool):
 
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_click([{index}])")
-        _t0 = time.monotonic()
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
-        ok, gate_msg = await _require_fresh_vision(
-            self.s, session_id, reason=f"browser_click([{index}])",
-        )
-        if not ok:
-            return gate_msg
         # Cross-index flail guard. If the last two clicks timed out,
         # force a re-screenshot before dispatching another HTTP click —
         # the backend is hung (blocker, loader, nav in flight) and
@@ -3709,21 +2965,11 @@ class BrowserClickTool(Tool):
         if isinstance(snap, dict) and snap.get("snapped") is False:
             self.s.snap_miss_count += 1
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
-        self.s.record_step(
-            "browser_click", f"index={index}",
-            f"url={actual_url[:60] if actual_url else '?'}",
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-        )
-        self.s.advance_observation_token("click")
+        self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                data, "browser_click",
-                self.s.build_text_only(data, f"Clicked [{index}]"),
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(data, f"Clicked [{index}]"),
         )
 
 
@@ -3741,18 +2987,6 @@ class BrowserClickTool(Tool):
         ),
         x=NumberSchema(description="X coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
         y=NumberSchema(description="Y coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
-        intent=StringSchema(
-            description=(
-                "A short natural-language description of what you're "
-                "clicking (e.g., 'Submit button', 'Accept cookies'). "
-                "When provided, the validator cross-checks this against "
-                "the resolved element's label and rejects mismatches — "
-                "this is the best defence against stale V-indices. "
-                "If omitted, the validator synthesizes intent from the "
-                "bbox label for back-compat."
-            ),
-            nullable=True,
-        ),
         required=["session_id"],
     )
 )
@@ -3762,11 +2996,7 @@ class BrowserClickAtTool(Tool):
         "Click using a vision bbox (vision_index=V_n) or raw (x,y) "
         "coordinates. Prefer vision_index whenever the vision agent "
         "labelled the target — the server snaps to the actual interactive "
-        "element inside the bbox, eliminating off-by-pixel misses. "
-        "HOWEVER, if the target has a stable CSS hook (chess square "
-        "`.square-54`, form `#email`, `data-test-id=...`), prefer "
-        "`browser_click_selector` — it's pixel-exact and skips the 3–8s "
-        "Gemini round-trip entirely."
+        "element inside the bbox, eliminating off-by-pixel misses."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -3778,87 +3008,154 @@ class BrowserClickAtTool(Tool):
         vision_index: int | None = None,
         x: float | None = None,
         y: float | None = None,
-        intent: str | None = None,
         **kw: Any,
     ) -> Any:
-        gate = await _feedback_gate("browser_click_at")
-        if gate:
-            return gate
-        # Mandatory validation gate (propose → validate → fire). Hard-
-        # enforce: if the validator rejects, we DO NOT dispatch. The
-        # validator internally runs `_require_fresh_vision` so that call
-        # is no longer needed here.
-        from superbrowser_bridge.validator import ProposedAction, validate
-        _v_result = await validate(
-            self.s, session_id,
-            ProposedAction(
-                tool="click_at",
-                bbox_index=int(vision_index) if vision_index is not None else None,
-                raw_x=float(x) if x is not None else None,
-                raw_y=float(y) if y is not None else None,
-                intent=(intent or "").strip(),
-                subgoal_id=(
-                    self.s.task_graph.active_id
-                    if getattr(self.s, "task_graph", None) is not None else None
-                ),
-            ),
-        )
-        if not _v_result.ok:
-            return _v_result.caption
-        _validated = _v_result.action
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
-            return f"[BLOCKED] browser_click_at used {self.s.click_at_count} times. Use browser_run_script instead."
+            return (
+                f"[BLOCKED] browser_click_at used "
+                f"{self.s.click_at_count} times in this session. The "
+                f"task is looping on clicks — call browser_screenshot "
+                f"to re-observe, then try browser_click_selector with "
+                f"a stable CSS hook, or browser_rewind_to_checkpoint "
+                f"if the page is stuck. Do NOT attempt "
+                f"browser_run_script to click — JS clicks are "
+                f"isTrusted=false and bot-detected."
+            )
+
+        # Build the target key BEFORE resolving the bbox, so the guard
+        # fires on intent (vision_index=V3) not on resolved coords (which
+        # could shift slightly between calls due to anti-aliasing).
+        if vision_index is not None:
+            target_key = f"click_at(V{int(vision_index)})"
+        elif x is not None and y is not None:
+            # Round to a 5px grid — micro-jitter shouldn't escape the guard.
+            target_key = f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
+        else:
+            target_key = "click_at(?)"
+        dead = self.s.check_dead_click(target_key)
+        if dead:
+            self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
+            return dead
+        self.s.register_click_attempt(target_key)
 
         payload: dict[str, Any]
         log_target: str
-        # All freshness/blocker/confidence/resolution checks already ran
-        # inside validate() above — this branch just unpacks the validated
-        # target into the dispatch payload the TS backend expects.
-        resolved = _validated.resolved
-        if resolved.bbox_pixels is not None:
-            x0, y0, x1, y1 = resolved.bbox_pixels
-            payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
-            if resolved.label:
-                payload["expected_label"] = resolved.label[:120]
-                payload["label"] = resolved.label[:120]
-            log_target = (
-                f"V{vision_index}({x0},{y0}→{x1},{y1})"
-                if vision_index is not None
-                else f"fused({x0},{y0}→{x1},{y1})"
-            )
-            print(
-                f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1}) "
-                f"[validator:{resolved.source} score={resolved.score:.2f}]"
-            )
-        else:
-            # No vision bbox on the validated target: either a fused-DOM
-            # element (use its click point) or a raw (x, y) call.
-            cx, cy = resolved.click_point_px
-            payload = {"x": float(cx), "y": float(cy)}
-            log_target = f"({cx},{cy})"
-            print(
-                f"\n>> browser_click_at({cx},{cy}) "
-                f"[validator:{resolved.source} score={resolved.score:.2f}]"
-            )
-        # Target-repetition dead-click guard keyed on the brain's intent
-        # (vision_index) not on jittery resolved coords.
         if vision_index is not None:
-            target_key_post = f"click_at(V{int(vision_index)})"
-        elif x is not None and y is not None:
-            target_key_post = (
-                f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
+            # Prefer the frozen epoch (what the brain SAW on its last
+            # screenshot), fall back to the live response only when no
+            # epoch is set yet (pre-first-screenshot path / tests).
+            resp = self.s.vision_for_target_resolution()
+            if resp is None:
+                return (
+                    "[click_at_failed:no_vision] No recent vision response "
+                    "to resolve vision_index against. Re-fetch state to "
+                    "trigger a fresh vision pass, or pass raw (x, y)."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[click_at_failed:bad_vision_index] V{vision_index} "
+                    f"is out of range (only {len(resp.bboxes)} bboxes in "
+                    "the last vision response)."
+                )
+            # Freshness gate — refuse to click when the last vision pass
+            # flagged the screenshot as stale or uncertain. The planner
+            # should re-screenshot before committing a click on a frame
+            # the model itself said it couldn't trust.
+            freshness = getattr(resp, "screenshot_freshness", "fresh")
+            if freshness != "fresh":
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
+                )
+                return (
+                    f"[click_at_failed:stale_vision freshness={freshness}] "
+                    "Vision flagged the last screenshot as not fresh "
+                    "(URL/page mismatch or loading overlay). Call "
+                    "browser_screenshot to refresh vision before clicking."
+                    + (f"\n{alts}" if alts else "")
+                )
+            # Blocker gate — if the scene has an active blocker layer
+            # (cookie banner, modal, consent dialog) and this bbox lives
+            # in a different layer, refuse. The planner must dismiss
+            # the blocker before acting on content beneath it.
+            scene = getattr(resp, "scene", None)
+            active_blocker = (
+                getattr(scene, "active_blocker_layer_id", None)
+                if scene is not None else None
             )
+            if active_blocker:
+                bbox_layer = getattr(bbox, "layer_id", None)
+                if bbox_layer and bbox_layer != active_blocker:
+                    # Find the dismiss hint from the blocker layer so
+                    # the brain has a concrete target to click first.
+                    dismiss_hint = ""
+                    try:
+                        for layer in (getattr(scene, "layers", []) or []):
+                            if getattr(layer, "id", None) == active_blocker:
+                                dismiss_hint = (
+                                    getattr(layer, "dismiss_hint", "") or ""
+                                )
+                                break
+                    except Exception:
+                        dismiss_hint = ""
+                    hint = f" Dismiss '{dismiss_hint}' first." if dismiss_hint else ""
+                    return (
+                        f"[click_at_failed:blocker_active layer={active_blocker}] "
+                        f"A blocker layer ({active_blocker}) is on top of "
+                        f"content, and V{vision_index} sits in a different "
+                        f"layer ({bbox_layer}).{hint} Then re-screenshot."
+                    )
+            # Confidence gate — a low-confidence bbox is Gemini's way of
+            # saying "I'm not sure this is really here". Clicking it
+            # lands on the wrong target more often than not. Threshold
+            # is tuned via VISION_MIN_CLICK_CONFIDENCE (default 0.45).
+            try:
+                min_conf = float(
+                    os.environ.get("VISION_MIN_CLICK_CONFIDENCE") or "0.45"
+                )
+            except ValueError:
+                min_conf = 0.45
+            if getattr(bbox, "confidence", 0.5) < min_conf:
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
+                )
+                return (
+                    f"[click_at_failed:low_confidence V{vision_index}] "
+                    f"bbox confidence={bbox.confidence:.2f} < "
+                    f"{min_conf:.2f}. Call browser_screenshot to re-run "
+                    "vision, then retry with a higher-confidence target."
+                    + (f"\n{alts}" if alts else "")
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return (
+                    "[click_at_failed:no_image_dims] Last vision response "
+                    "has no source image dimensions; cannot denormalize "
+                    "box_2d. Re-fetch state."
+                )
+            # CDP/JS expects CSS pixels; on retina/HiDPI viewports the
+            # screenshot is physical-pixel-sized so we divide by DPR.
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+            payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+            # Carry the vision label into the click payload so the T3
+            # backend can run a post-snap semantic match check. Empty
+            # label → the check is skipped on the backend, which is
+            # fine for raw-coord clicks further below.
+            bbox_label = (getattr(bbox, "label", "") or "").strip()
+            if bbox_label:
+                payload["expected_label"] = bbox_label[:120]
+                payload["label"] = bbox_label[:120]
+            log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
+            print(f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1})")
         else:
-            target_key_post = f"click_at_fused({resolved.label[:40]!r})"
-        dead = self.s.check_dead_click(target_key_post)
-        if dead:
-            self.s.log_activity(
-                f"click_at{target_key_post}(DEAD_CLICK_BLOCKED)", ""
-            )
-            return dead
-        self.s.register_click_attempt(target_key_post)
+            if x is None or y is None:
+                return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
+            payload = {"x": float(x), "y": float(y)}
+            log_target = f"({x},{y})"
+            print(f"\n>> browser_click_at({x}, {y})")
 
         r = await _request_with_backoff(
             "POST",
@@ -4025,16 +3322,10 @@ class BrowserClickAtTool(Tool):
             log_target,
             f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
         )
-        self.s.advance_observation_token("click_at")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                data, "browser_click_at",
-                self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
         )
 
     def _lookup_postcondition(
@@ -4105,16 +3396,6 @@ class BrowserClickAtTool(Tool):
             ),
             default=True,
         ),
-        intent=StringSchema(
-            description=(
-                "Short natural-language description of the field (e.g., "
-                "'Email address', 'Search destinations'). Cross-checked "
-                "by the validator so a stale V-index can't drop text "
-                "into the wrong input. Optional — synthesized from the "
-                "bbox label when omitted."
-            ),
-            nullable=True,
-        ),
         required=["session_id", "text"],
     )
 )
@@ -4156,48 +3437,50 @@ class BrowserTypeAtTool(Tool):
         x: float | None = None,
         y: float | None = None,
         clear: bool = True,
-        intent: str | None = None,
         **kw: Any,
     ) -> Any:
         if text is None:
             text = ""
-        gate = await _feedback_gate("browser_type_at")
-        if gate:
-            return gate
-        # Mandatory validation — same propose/validate/fire pipeline as
-        # click_at. Intent matters extra here: dropping text into the
-        # wrong input is silently destructive, so a label mismatch
-        # blocks dispatch even if the V-index points somewhere real.
-        from superbrowser_bridge.validator import ProposedAction, validate
-        _v_result = await validate(
-            self.s, session_id,
-            ProposedAction(
-                tool="type_at",
-                bbox_index=int(vision_index) if vision_index is not None else None,
-                raw_x=float(x) if x is not None else None,
-                raw_y=float(y) if y is not None else None,
-                intent=(intent or "").strip(),
-                value=text,
-                subgoal_id=(
-                    self.s.task_graph.active_id
-                    if getattr(self.s, "task_graph", None) is not None else None
-                ),
-            ),
-        )
-        if not _v_result.ok:
-            return _v_result.caption
-        _validated = _v_result.action
 
-        target_x, target_y = _validated.resolved.click_point_px
-        label = (
-            f"V{vision_index}" if vision_index is not None
-            else f"({int(target_x)},{int(target_y)})"
-        )
-        print(
-            f"\n>> browser_type_at({label}, text={text[:30]!r}) "
-            f"[validator:{_validated.resolved.source} "
-            f"score={_validated.resolved.score:.2f}]"
-        )
+        # Resolve target point: vision_index first, then (x, y).
+        target_x: float
+        target_y: float
+        label: str
+        if vision_index is not None:
+            resp = self.s.vision_for_target_resolution()
+            if resp is None:
+                return (
+                    "[type_at_failed:no_vision] No recent vision response "
+                    "to resolve vision_index against. Take a screenshot "
+                    "first, or pass raw (x, y)."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[type_at_failed:bad_vision_index] V{vision_index} "
+                    f"is out of range (only {len(resp.bboxes)} bboxes in "
+                    "the last vision response)."
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return (
+                    "[type_at_failed:no_image_dims] Last vision response "
+                    "has no source image dimensions; cannot denormalize "
+                    "box_2d. Take a fresh screenshot."
+                )
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+            target_x = (x0 + x1) / 2
+            target_y = (y0 + y1) / 2
+            label = f"V{vision_index}"
+            print(f"\n>> browser_type_at(V{vision_index}, text={text[:30]!r})")
+        elif x is not None and y is not None:
+            target_x = float(x)
+            target_y = float(y)
+            label = f"({int(target_x)},{int(target_y)})"
+            print(f"\n>> browser_type_at(({x},{y}), text={text[:30]!r})")
+        else:
+            return "[type_at_failed:bad_args] Provide either vision_index or both x and y."
 
         # Route through /evaluate (works on both t1 and t3) rather than
         # through a dedicated /type-at endpoint (t3-only). Mechanism is
@@ -4248,21 +3531,11 @@ class BrowserTypeAtTool(Tool):
             f"{label}, text={text[:30]!r}",
             "skip_match" if not changed else ("cleared_and_typed" if before else "typed_into_empty"),
         )
-        if changed:
-            self.s.advance_observation_token("type_at")
         synthetic_data = {
             "success": True,
             "before": before,
             "after": after,
             "changed": changed,
-            # Synthetic effect: type_at uses /evaluate so there's no TS-
-            # side snapshot; the `changed` bool is the authoritative
-            # no_effect signal for field-write tools.
-            "effect": {
-                "url_changed": False,
-                "mutation_delta": 1 if changed else 0,
-                "focused_changed": False,
-            },
         }
         # Post-type semantic verification. Returns a caption suffix and
         # may have already corrected the field in place.
@@ -4289,12 +3562,7 @@ class BrowserTypeAtTool(Tool):
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                synthetic_data, "browser_type_at",
-                self.s.build_text_only(synthetic_data, caption),
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(synthetic_data, caption),
         )
 
 
@@ -4446,22 +3714,13 @@ class BrowserFixTextAtTool(Tool):
             f"{label}, target={text[:30]!r}",
             diff,
         )
-        self.s.advance_observation_token("fix_text_at")
         # Wrap result in the same shape build_text_only expects.
-        synthetic_data: dict[str, Any] = {
+        synthetic_data = {
             "success": True,
             "before": before,
             "after": after,
             "changed": changed,
             "diff": diff,
-            # Synthetic effect: fix_text_at uses /evaluate so there's no
-            # TS-side snapshot; the `changed` bool is the authoritative
-            # no_effect signal.
-            "effect": {
-                "url_changed": False,
-                "mutation_delta": 1 if changed else 0,
-                "focused_changed": False,
-            },
         }
         if changed:
             from .type_verify import verify_and_correct
@@ -4486,12 +3745,7 @@ class BrowserFixTextAtTool(Tool):
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                synthetic_data, "browser_fix_text_at",
-                self.s.build_text_only(synthetic_data, caption),
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(synthetic_data, caption),
         )
 
 
@@ -4517,15 +3771,9 @@ class BrowserTypeTool(Tool):
 
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
         print(f'\n>> browser_type([{index}], "{text}")')
-        _t0 = time.monotonic()
         gate = await _feedback_gate("browser_type")
         if gate:
             return gate
-        ok, gate_msg = await _require_fresh_vision(
-            self.s, session_id, reason=f"browser_type([{index}])",
-        )
-        if not ok:
-            return gate_msg
 
         # --- Dead-type guard --------------------------------------------
         # The LLM's most destructive misread: type "khulna" → autocomplete
@@ -4666,7 +3914,6 @@ class BrowserTypeTool(Tool):
             "browser_type",
             f'index={index}, text="{text[:30]}"',
             f"ok ({len(suggestions)} suggestions)" if suggestions else "ok",
-            latency_ms=int((time.monotonic() - _t0) * 1000),
         )
 
         # Surface pre-type inspection info so the LLM knows whether we
@@ -4717,16 +3964,10 @@ class BrowserTypeTool(Tool):
             caption += outcome.caption_suffix
 
         # Prefetch vision so next screenshot call finds bboxes cached.
-        self.s.advance_observation_token("type")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                data, "browser_type",
-                self.s.build_text_only(data, caption),
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(data, caption),
         )
 
 
@@ -4750,14 +3991,6 @@ class BrowserKeysTool(Tool):
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
         print(f"\n>> browser_keys({keys})")
-        gate = await _feedback_gate("browser_keys")
-        if gate:
-            return gate
-        ok, gate_msg = await _require_fresh_vision(
-            self.s, session_id, reason=f"browser_keys({keys!r})",
-        )
-        if not ok:
-            return gate_msg
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/keys",
@@ -4771,16 +4004,10 @@ class BrowserKeysTool(Tool):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
-        self.s.advance_observation_token("keys")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            _maybe_no_effect_prefix(
-                data, "browser_keys",
-                self.s.build_text_only(data, f"Sent keys: {keys}"),
-            session_state=self.s,
-            ),
-            state=self.s,
+            self.s.build_text_only(data, f"Sent keys: {keys}"),
         )
 
 
@@ -4805,7 +4032,6 @@ class BrowserScrollTool(Tool):
 
     async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_scroll({direction or f'{percent}%'})")
-        _t0 = time.monotonic()
         gate = await _feedback_gate("browser_scroll")
         if gate:
             return gate
@@ -4827,255 +4053,12 @@ class BrowserScrollTool(Tool):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
-        # Update scroll telemetry so vision can read [SCROLL_STATE …] on
-        # the next pass and decide whether more scrolling makes sense.
-        _update_scroll_telemetry(
-            self.s, data.get("scrollInfo"), direction or ("down" if percent is None else None),
-        )
-        # Record scroll latency into the per-(tool, tier) histogram
-        # directly — browser_scroll doesn't call record_step in its
-        # happy path (keeps step_history from bloating with routine
-        # scrolls), but the histogram is still useful for T1/T3 parity
-        # comparisons.
-        self.s._aggregate_latency("browser_scroll", int((time.monotonic() - _t0) * 1000))
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
-        self.s.advance_observation_token("scroll")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
             self.s.build_text_only(data, action),
-            state=self.s,
         )
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        target_text=StringSchema(
-            "Text or regex of the element you want to scroll to. Substring "
-            "match if it's not a valid regex. Optional if target_role given.",
-            nullable=True,
-        ),
-        target_role=StringSchema(
-            "ARIA role / tagName to filter on (e.g. 'button', 'h2'). "
-            "Optional if target_text given.",
-            nullable=True,
-        ),
-        direction=StringSchema(
-            "'down' (default) or 'up'.",
-            nullable=True,
-        ),
-        max_iterations=IntegerSchema(
-            "Safety cap on scroll steps. Default 10, max 40.",
-            nullable=True,
-        ),
-        step_ratio=NumberSchema(
-            description="Fraction of viewport to scroll per step (0.1–1.0). Default 0.8.",
-            nullable=True,
-        ),
-        required=["session_id"],
-    )
-)
-class BrowserScrollUntilTool(Tool):
-    name = "browser_scroll_until"
-    description = (
-        "Closed-loop scroll. Walks the page in `direction` until an "
-        "element matching `target_text` (substring or regex) and/or "
-        "`target_role` becomes visible, the page can't scroll further, "
-        "or `max_iterations` elapses. Cheap — uses interactive-element "
-        "polling between steps, no screenshot per iteration. Returns a "
-        "structured outcome with `reason` ('matched' | 'page_end' | "
-        "'page_start' | 'max_iterations') so the brain knows whether "
-        "to act, retreat, or give up. Prefer this over browser_scroll "
-        "when you know what you're scrolling toward — it stops at the "
-        "right place AND tells you when content runs out, instead of "
-        "blindly scrolling and re-screenshotting."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    @property
-    def exclusive(self) -> bool:
-        return True
-
-    async def execute(
-        self,
-        session_id: str,
-        target_text: str | None = None,
-        target_role: str | None = None,
-        direction: str | None = None,
-        max_iterations: int | None = None,
-        step_ratio: float | None = None,
-        **kw: Any,
-    ) -> Any:
-        gate = await _feedback_gate("browser_scroll_until")
-        if gate:
-            return gate
-
-        if not (target_text and target_text.strip()) and not (target_role and target_role.strip()):
-            return (
-                "[scroll_until_failed:no_target] Provide target_text or "
-                "target_role. Substring match works for most cases — pass "
-                "the visible text of the element you want to find."
-            )
-
-        payload: dict[str, Any] = {
-            "direction": direction or "down",
-        }
-        if target_text and target_text.strip():
-            payload["targetText"] = target_text.strip()
-        if target_role and target_role.strip():
-            payload["targetRole"] = target_role.strip()
-        if max_iterations is not None:
-            payload["maxIterations"] = int(max_iterations)
-        if step_ratio is not None:
-            payload["stepRatio"] = float(step_ratio)
-
-        target_disp = target_text or f"role={target_role}"
-        print(
-            f"\n>> browser_scroll_until({target_disp!r}, dir={payload['direction']})"
-        )
-
-        try:
-            r = await _request_with_backoff(
-                "POST",
-                f"{SUPERBROWSER_URL}/session/{session_id}/scroll-until",
-                json=payload,
-                timeout=30.0,  # closed-loop can take 10 iterations × ~300ms
-            )
-        except Exception as exc:
-            return f"[scroll_until_failed] request error: {exc}"
-
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[scroll_until_failed] HTTP {r.status_code}: {err}"
-
-        data = r.json()
-        outcome = data.get("outcome") or {}
-        reason = str(outcome.get("reason") or "unknown")
-        iters = int(outcome.get("iterations") or 0)
-        scrolled = int(outcome.get("scrolledPx") or 0)
-
-        # Update scroll telemetry so the next vision pass sees a fresh
-        # [SCROLL_STATE …] line including reached_bottom/reached_top hints
-        # that came from this closed-loop call.
-        _update_scroll_telemetry(
-            self.s,
-            data.get("scrollInfo"),
-            payload["direction"],
-            extra={
-                "last_scroll_reason": reason,
-                "reached_bottom": reason == "page_end",
-                "reached_top": reason == "page_start",
-            },
-        )
-
-        # Mirror the BrowserDragSliderUntilTool record convention so
-        # step_history shows a clear summary line for downstream
-        # loop-detection and task-graph signal evaluation.
-        self.s.record_step(
-            "browser_scroll_until",
-            f"{target_disp!r} → {reason} in {iters} iters ({scrolled}px)",
-            data.get("url", ""),
-        )
-
-        lines: list[str] = []
-        if outcome.get("found"):
-            matched = outcome.get("matchedText") or ""
-            sel = outcome.get("matchedSelector") or ""
-            lines.append(
-                f"FOUND {target_disp!r} after {iters} iter(s), "
-                f"scrolled {scrolled}px. matched={matched[:80]!r} "
-                f"selector={sel}"
-            )
-        else:
-            tag = (
-                "page_end" if reason == "page_end"
-                else "page_start" if reason == "page_start"
-                else reason
-            )
-            lines.append(
-                f"[scroll_until_failed:{tag}] target {target_disp!r} not "
-                f"found after {iters} iter(s) ({scrolled}px). "
-                f"reason={reason}."
-            )
-            if reason == "page_end":
-                lines.append(
-                    "  Page can't scroll further down. The target may be "
-                    "above (try direction='up') or may not exist on this "
-                    "page — verify by checking the elements list below."
-                )
-            elif reason == "page_start":
-                lines.append(
-                    "  Already at top of page. Try direction='down' or "
-                    "verify the target text/role is correct."
-                )
-            elif reason == "max_iterations":
-                lines.append(
-                    "  Hit iteration cap. If you believe the target exists "
-                    "further on, raise max_iterations (cap is 40) or "
-                    "use a more specific target_text."
-                )
-
-        if data.get("elements"):
-            lines.append(str(data["elements"]))
-
-        # Schedule a vision prefetch so the next browser_screenshot is
-        # cached — same convention as the other scroll tools.
-        self.s.advance_observation_token("scroll_until")
-        _vision_task = _schedule_vision_prefetch(self.s, session_id)
-        return await _append_fresh_vision(
-            _vision_task, "\n".join(lines),
-            state=self.s,
-        )
-
-
-def _update_scroll_telemetry(
-    state: "BrowserSessionState",
-    scroll_info: Any,
-    direction: str | None,
-    extra: dict | None = None,
-) -> None:
-    """Record post-scroll geometry on the session state.
-
-    Read by `_format_state` (and the [SCROLL_STATE …] caption line in
-    `build_text_only`) so vision can reason about whether more scrolling
-    is plausible. Tolerant of missing scrollInfo — telemetry is best-
-    effort and must not break the tool path.
-    """
-    try:
-        if not isinstance(scroll_info, dict):
-            scroll_info = {}
-        scroll_y = int(scroll_info.get("scrollY") or 0)
-        scroll_h = int(scroll_info.get("scrollHeight") or 0)
-        vp_h = int(scroll_info.get("viewportHeight") or 0)
-        # 12px of slack at the bottom catches off-by-one rounding without
-        # falsely flagging "reached_bottom" mid-page.
-        reached_bottom = scroll_h > 0 and (scroll_y + vp_h) >= (scroll_h - 12)
-        reached_top = scroll_y <= 4
-        prev = getattr(state, "scroll_telemetry", None) or {}
-        history = list(prev.get("direction_history") or [])
-        if direction:
-            history.append(direction)
-            history = history[-6:]
-        tel = {
-            "scrollY": scroll_y,
-            "scrollHeight": scroll_h,
-            "viewportHeight": vp_h,
-            "direction_history": history,
-            "reached_bottom": reached_bottom,
-            "reached_top": reached_top,
-        }
-        if extra:
-            tel.update(extra)
-        state.scroll_telemetry = tel
-    except Exception:
-        # Telemetry is best-effort — never let it block the scroll tool.
-        pass
 
 
 @tool_parameters(
@@ -5111,11 +4094,7 @@ class BrowserSelectTool(Tool):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
-        return _maybe_no_effect_prefix(
-            data, "browser_select",
-            self.s.build_text_only(data, f'Selected "{value}" in [{index}]'),
-            session_state=self.s,
-        )
+        return self.s.build_text_only(data, f'Selected "{value}" in [{index}]')
 
 
 @tool_parameters(
@@ -5161,10 +4140,13 @@ class BrowserEvalTool(Tool):
         timeout=IntegerSchema(description="Script timeout in ms (default: 60000)", nullable=True),
         mutates=BooleanSchema(
             description=(
-                "Set true when the script will click, type, submit, or "
-                "otherwise mutate page state. When true the call blocks "
-                "until fresh vision has observed the current page. Read-"
-                "only scripts (scraping, measuring) should leave this false."
+                "Set true when the script mutates the page (click, "
+                "type, input.value=, dispatchEvent). Default false — "
+                "the sandbox rejects those operations and returns a "
+                "[blocked_op:…] error. Keep false for read-only "
+                "inspection (readyState, innerText, aria-labels). Only "
+                "flip true when no cursor tool can express the action; "
+                "isTrusted=false JS clicks are bot-detected by WAFs."
             ),
             default=False,
         ),
@@ -5175,15 +4157,8 @@ class BrowserRunScriptTool(Tool):
     name = "browser_run_script"
     description = (
         "Execute a Puppeteer script with full page API access. "
-        "LAST RESORT — use ONLY when: (a) no vision bbox or CSS "
-        "selector targets the goal, or (b) the action needs multi-step "
-        "JS orchestration that no single cursor call can achieve. "
-        "For clicking buttons / dismissing modals / typing into inputs, "
-        "PREFER browser_semantic_click(target='<label>') or "
-        "browser_click_at(vision_index=V_n) — they are atomic, use "
-        "fresh vision, and handle React event-dispatch correctly. "
-        "Sites with a WAF (SpotHero, Akamai-class) frequently return "
-        "403 to arbitrary scripts; cursor tools are rarely blocked."
+        "READ-ONLY by default — pass mutates=true to allow click/type/"
+        "dispatchEvent/value-setter operations (rare)."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -5193,20 +4168,16 @@ class BrowserRunScriptTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, script: str, context: dict | None = None, timeout: int | None = None, mutates: bool = False, **kw: Any) -> str:
+    async def execute(
+        self, session_id: str, script: str,
+        context: dict | None = None,
+        timeout: int | None = None,
+        mutates: bool = False,
+        **kw: Any,
+    ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
-        if mutates:
-            gate = await _feedback_gate("browser_run_script")
-            if gate:
-                return gate
-            ok, gate_msg = await _require_fresh_vision(
-                self.s, session_id, reason="browser_run_script(mutates=True)",
-            )
-            if not ok:
-                return gate_msg
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
-        self.s.consecutive_script_calls += 1
-        payload: dict[str, Any] = {"code": script}
+        payload: dict[str, Any] = {"code": script, "mutates": bool(mutates)}
         if context:
             payload["context"] = context
         if timeout:
@@ -5228,6 +4199,23 @@ class BrowserRunScriptTool(Tool):
             error = data.get("error", "Unknown error")
             self.s.log_activity("run_script(FAILED)", error[:100])
             self.s.record_step("browser_run_script", script[:60], f"FAILED: {error[:100]}")
+            # L1 sandbox rejected a mutation. Rewrite the reply so the
+            # brain gets a concrete cursor-tool recommendation instead
+            # of a raw JS error string (which it has been misreading
+            # as a server 403).
+            blocked_op = data.get("blocked_op")
+            if blocked_op or error.startswith("[blocked_op:"):
+                return (
+                    f"[script_mutation_blocked] {error} The script "
+                    f"tried to mutate the page from a mutates=false "
+                    f"run. Either (a) re-call with mutates=true IF "
+                    f"you genuinely need JS orchestration — rare, "
+                    f"and many sites reject isTrusted=false clicks "
+                    f"anyway — or (b) switch to "
+                    f"browser_click_at(vision_index=V_n) / "
+                    f"browser_type_at / browser_click_selector which "
+                    f"use humanized isTrusted=true events."
+                )
             # Fetch current elements so agent can see what's on the page and fix the script
             elements = await _fetch_elements(session_id, self.s)
             tip = "\n[TIP: Fix the script and retry in this SAME session. Do NOT navigate back to the start.]"
@@ -5258,16 +4246,7 @@ class BrowserRunScriptTool(Tool):
         if elements:
             parts.append(f"\nInteractive elements:\n{elements}")
 
-        # Script-usage guard — when the brain has run 3+ scripts in
-        # a row AND vision shows clickable bboxes on the current page,
-        # prepend a warning. The goal is to break the "script is my
-        # Swiss Army knife" reflex — if the target can be clicked,
-        # the cursor tool is faster, atomic, and WAF-safe.
-        warning = _maybe_script_usage_warning(self.s)
-        body = "\n".join(parts)
-        if warning:
-            return f"{warning}\n{body}"
-        return body
+        return "\n".join(parts)
 
 
 @tool_parameters(
@@ -5456,7 +4435,7 @@ class BrowserPlanNextStepsTool(Tool):
                 "(undetected Chromium) sessions. Call browser_screenshot "
                 "to get a fresh vision + suggested_actions instead."
             )
-        resp = self.s.vision_for_target_resolution()
+        resp = self.s._last_vision_response
         if resp is None:
             return (
                 "[plan_unavailable] No cached vision response. Run "
@@ -5513,111 +4492,6 @@ class BrowserCloseTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
-        required=["session_id"],
-    )
-)
-class BrowserRewindToCheckpointTool(Tool):
-    """Bail from the current page state back to the last known-good URL.
-
-    Session memory escape hatch: when the worker has exhausted local
-    retries and the brain is stuck, rewinding to `best_checkpoint_url`
-    (the last meaningful checkpoint the worker recorded) lets the plan
-    re-approach with a fresh vision pass. The tool forces the token
-    forward + busts the vision cache so the next mutation blocks on
-    genuinely fresh bboxes rather than any lingering cache from the
-    stuck-state page.
-    """
-
-    name = "browser_rewind_to_checkpoint"
-    description = (
-        "Navigate back to the last known-good checkpoint URL when the "
-        "current page is unresponsive or the plan is stuck. Invalidates "
-        "vision cache + element fingerprints so the next vision pass "
-        "reflects the rewound page."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(self, session_id: str, **kw: Any) -> str:
-        target = (self.s.best_checkpoint_url or "").strip()
-        print(f"\n>> browser_rewind_to_checkpoint(target={target[:80]!r})")
-        if not target:
-            return (
-                "[rewind_failed:no_checkpoint] No best_checkpoint_url has "
-                "been recorded for this session. Call browser_navigate "
-                "directly with a URL you know works, or report failure."
-            )
-
-        # Advance token FIRST — any vision prefetch already in flight
-        # will see the mismatch and drop its write; the next mutation
-        # cannot unblock on stale bboxes.
-        self.s.advance_observation_token("rewind")
-
-        # Clear local fingerprints/vision state so `vision_is_fresh()`
-        # cannot be true until a brand new pass lands.
-        self.s.element_fingerprints.clear()
-        self.s._last_vision_response = None
-        self.s._last_vision_ts = 0.0
-        self.s._last_vision_url = ""
-
-        # Bust the shared vision cache for this session so a replay
-        # won't resurrect the stuck-state bboxes.
-        try:
-            from vision_agent import get_vision_agent, vision_agent_enabled
-            if vision_agent_enabled():
-                agent = get_vision_agent()
-                cache = getattr(agent, "_cache", None)
-                if cache is not None and hasattr(cache, "bust_session"):
-                    await cache.bust_session(session_id)
-        except Exception as exc:
-            print(f"  [rewind: vision cache bust skipped — {exc}]")
-
-        # Navigate via the TS server — same endpoint BrowserNavigateTool
-        # uses. Skipping the full BrowserNavigateTool path to avoid
-        # re-triggering domain-pinning / CF guards that apply to forward
-        # nav but not to a known-good rewind URL.
-        try:
-            r = await _request_with_backoff(
-                "POST",
-                f"{SUPERBROWSER_URL}/session/{session_id}/navigate",
-                json={"url": target, "waitUntil": "domcontentloaded"},
-                timeout=30.0,
-            )
-        except Exception as exc:
-            return f"[rewind_failed:network] {exc}"
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[rewind_failed:http_{r.status_code}] {err}"
-
-        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-        self.s.record_url(target)
-        self.s.record_step(
-            "browser_rewind_to_checkpoint",
-            f"→ {target[:80]}",
-            f"title={data.get('title', '?')}" if isinstance(data, dict) else "ok",
-        )
-        self.s.log_activity(f"rewind → {target[:60]}")
-
-        # Fresh prefetch on the rewound page so the next mutation's gate
-        # unblocks quickly rather than hitting a cold cache.
-        _vision_task = _schedule_vision_prefetch(self.s, session_id)
-        return await _append_fresh_vision(
-            _vision_task,
-            self.s.build_text_only(
-                data if isinstance(data, dict) else {},
-                f"Rewound to checkpoint: {target[:80]}",
-            ),
-            state=self.s,
-        )
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
         startX=NumberSchema("Start X coordinate"),
         startY=NumberSchema("Start Y coordinate"),
         endX=NumberSchema("End X coordinate"),
@@ -5658,1243 +4532,7 @@ class BrowserDragTool(Tool):
         caption = f"Dragged from ({startX},{startY}) to ({endX},{endY})"
         if data.get("elements"):
             caption += f"\n{data['elements']}"
-        return _maybe_no_effect_prefix(data, "browser_drag", caption, session_state=self.s)
-
-
-# ── Selector-driven primitives (zero vision cost) ─────────────────────────
-#
-# These tools resolve CSS selectors to pixel-exact rectangles in the page
-# via getBoundingClientRect(), then dispatch clicks/drags at the centre.
-# No Gemini round-trip, no box_2d quantisation. Use them whenever the
-# target has a stable CSS hook — chess squares, slider handles, form
-# inputs, captcha widgets, grid puzzle items.
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selectors_json=StringSchema(
-            "JSON array of CSS selectors, e.g. '[\".square-54\",\"button.submit\"]'"
-        ),
-        ensure_visible=BooleanSchema(
-            description="If true, scroll missing elements into view before measuring. Default false.",
-            nullable=True,
-        ),
-        required=["session_id", "selectors_json"],
-    )
-)
-class BrowserGetRectTool(Tool):
-    name = "browser_get_rect"
-    description = (
-        "Return getBoundingClientRect() for one or more CSS selectors. "
-        "Pixel-exact, zero vision cost. Use to derive coordinates before "
-        "calling browser_click_selector / browser_drag_selectors. "
-        "Selectors ride as a JSON string (no ArraySchema in this layer)."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    @property
-    def read_only(self) -> bool:
-        return True
-
-    async def execute(
-        self,
-        session_id: str,
-        selectors_json: str,
-        ensure_visible: bool | None = None,
-        **kw: Any,
-    ) -> str:
-        try:
-            selectors = json.loads(selectors_json)
-        except (TypeError, ValueError) as exc:
-            return f"[get_rect_failed] selectors_json is not valid JSON: {exc}"
-        if not isinstance(selectors, list) or not all(isinstance(s, str) for s in selectors):
-            return "[get_rect_failed] selectors_json must decode to a list of strings."
-
-        print(f"\n>> browser_get_rect({len(selectors)} selectors)")
-        payload = {"selectors": selectors, "ensureVisible": bool(ensure_visible)}
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/rect",
-            json=payload,
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        data = r.json()
-        rects = data.get("rects") or []
-        lines = ["Selector rects:"]
-        for sel, rect in zip(selectors, rects):
-            if rect is None:
-                lines.append(f"  {sel} → NOT FOUND")
-                continue
-            lines.append(
-                f"  {sel} → cx={rect['cx']:.1f} cy={rect['cy']:.1f} "
-                f"w={rect['w']:.1f} h={rect['h']:.1f} "
-                f"visible={rect['visible']} inViewport={rect['inViewport']}"
-            )
-        return "\n".join(lines)
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selector=StringSchema("CSS selector of the element to click"),
-        button=StringSchema("Mouse button: left|right|middle", nullable=True),
-        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
-        linear=BooleanSchema(
-            description=(
-                "If true (default), use deterministic teleport click (pixel-exact). "
-                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
-            ),
-            nullable=True,
-        ),
-        required=["session_id", "selector"],
-    )
-)
-class BrowserClickSelectorTool(Tool):
-    name = "browser_click_selector"
-    description = (
-        "Click the centre of a DOM element by CSS selector. Pixel-exact, "
-        "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
-        "whenever the target has a stable hook — chess squares "
-        "(.square-54), form fields (#email), buttons with data-test-id, "
-        "captcha handles. Fails fast if the selector is missing or zero-size."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        selector: str,
-        button: str | None = None,
-        click_count: int | None = None,
-        linear: bool | None = None,
-        **kw: Any,
-    ) -> str:
-        print(f"\n>> browser_click_selector({selector!r})")
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls += 1
-
-        payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
-        if button is not None:
-            payload["button"] = button
-        if click_count is not None:
-            payload["clickCount"] = click_count
-        if linear is not None:
-            payload["linear"] = linear
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/click-selector",
-            json=payload,
-            timeout=15.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[click_selector_failed] {err}"
-        data = r.json()
-        clicked = data.get("clicked", {})
-        self.s.record_step(
-            "browser_click_selector",
-            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
-            data.get("url", ""),
-        )
-        caption = f"Clicked {selector} at ({clicked.get('x','?')},{clicked.get('y','?')})"
-        if data.get("elements"):
-            caption += f"\n{data['elements']}"
         return caption
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        from_selector=StringSchema("CSS selector of the drag source element"),
-        to_selector=StringSchema("CSS selector of the drag destination element"),
-        method=StringSchema(
-            "One of 'auto' (default: try click_click, fall back to drag), "
-            "'click_click' (two discrete clicks — more robust for chess/grid), "
-            "'drag' (mousedown → move → mouseup — classical drag). ",
-            nullable=True,
-        ),
-        hold_ms=IntegerSchema(
-            "Milliseconds to pause between the two clicks when method=click_click, "
-            "or to hold before drag start. Default 120.",
-            nullable=True,
-        ),
-        linear=BooleanSchema(
-            description="If true (default), deterministic paths. Set false for stealth-critical drags.",
-            nullable=True,
-        ),
-        required=["session_id", "from_selector", "to_selector"],
-    )
-)
-class BrowserDragSelectorsTool(Tool):
-    name = "browser_drag_selectors"
-    description = (
-        "Drag from one CSS-selected element to another. Pixel-exact. "
-        "Default method 'auto' tries click-click first (safer on react-dnd "
-        "and grid boards like chess.com) and falls back to classical drag "
-        "if the DOM didn't mutate. PREFER OVER browser_drag(x1,y1,x2,y2) "
-        "whenever both endpoints have stable selectors."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        from_selector: str,
-        to_selector: str,
-        method: str | None = None,
-        hold_ms: int | None = None,
-        linear: bool | None = None,
-        **kw: Any,
-    ) -> str:
-        method = method or "auto"
-        if method not in ("auto", "click_click", "drag"):
-            return f"[drag_selectors_failed] method must be auto|click_click|drag, got {method!r}"
-        print(f"\n>> browser_drag_selectors({from_selector!r} → {to_selector!r}, method={method})")
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls = 0
-
-        payload: dict[str, Any] = {
-            "fromSelector": from_selector,
-            "toSelector": to_selector,
-            "method": method,
-        }
-        if hold_ms is not None:
-            payload["holdMs"] = hold_ms
-        if linear is not None:
-            payload["linear"] = linear
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/drag-selectors",
-            json=payload,
-            timeout=30.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[drag_selectors_failed] {err}"
-        data = r.json()
-        outcome = data.get("outcome", {})
-        self.s.record_step(
-            "browser_drag_selectors",
-            f"{from_selector}→{to_selector} via {outcome.get('methodUsed','?')}",
-            data.get("url", ""),
-        )
-        frm = outcome.get("from", {})
-        to = outcome.get("to", {})
-        caption = (
-            f"Dragged {from_selector} → {to_selector} "
-            f"via {outcome.get('methodUsed','?')} "
-            f"({frm.get('x','?')},{frm.get('y','?')}) → ({to.get('x','?')},{to.get('y','?')}) "
-            f"mutated={outcome.get('mutated', False)}"
-        )
-        if data.get("elements"):
-            caption += f"\n{data['elements']}"
-        return caption
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        points_json=StringSchema(
-            "JSON array of {x, y} points, e.g. '[{\"x\":100,\"y\":200},{\"x\":150,\"y\":220}]'. "
-            "At least two points required."
-        ),
-        step_ms=IntegerSchema(
-            "Milliseconds between intermediate mouseMove events. Default 16 (~60fps).",
-            nullable=True,
-        ),
-        hold_ms=IntegerSchema("Pre-press hold duration at points[0]. Default 50.", nullable=True),
-        button=StringSchema("Mouse button: left|right|middle. Default left.", nullable=True),
-        required=["session_id", "points_json"],
-    )
-)
-class BrowserDragPathTool(Tool):
-    name = "browser_drag_path"
-    description = (
-        "Drag along an arbitrary polyline of (x,y) points. For jigsaw "
-        "captcha traces, connect-the-dots, signature drawing, or any "
-        "free-form gesture where a straight start→end drag won't work."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        points_json: str,
-        step_ms: int | None = None,
-        hold_ms: int | None = None,
-        button: str | None = None,
-        **kw: Any,
-    ) -> str:
-        try:
-            points = json.loads(points_json)
-        except (TypeError, ValueError) as exc:
-            return f"[drag_path_failed] points_json is not valid JSON: {exc}"
-        if not isinstance(points, list) or len(points) < 2:
-            return "[drag_path_failed] points_json must decode to a list of ≥2 {x,y} objects."
-        for i, p in enumerate(points):
-            if not isinstance(p, dict) or not isinstance(p.get("x"), (int, float)) \
-               or not isinstance(p.get("y"), (int, float)):
-                return f"[drag_path_failed] point[{i}] must be {{x: number, y: number}}"
-
-        print(f"\n>> browser_drag_path({len(points)} points)")
-        self.s.actions_since_screenshot += 1
-
-        payload: dict[str, Any] = {"points": points}
-        if step_ms is not None:
-            payload["stepMs"] = step_ms
-        if hold_ms is not None:
-            payload["holdMs"] = hold_ms
-        if button is not None:
-            payload["button"] = button
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/drag-path",
-            json=payload,
-            timeout=30.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[drag_path_failed] {err}"
-        data = r.json()
-        self.s.record_step(
-            "browser_drag_path",
-            f"{len(points)} points",
-            data.get("url", ""),
-        )
-        caption = f"Dragged along polyline of {len(points)} points"
-        if data.get("elements"):
-            caption += f"\n{data['elements']}"
-        return caption
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selector=StringSchema(
-            "CSS selector for the slider element (e.g. 'input[type=range][name=monthlyContribution]'). "
-            "Frame-aware: the backend probes every frame on the page."
-        ),
-        value_json=StringSchema(
-            "Target value as JSON. Examples: '300' for a single slider, '[25, 75]' for a "
-            "dual-thumb range. Values are absolute (use the slider's own units) unless "
-            "as='ratio' is set, in which case they are 0.0–1.0 positions along the track."
-        ),
-        value_mode=StringSchema(
-            "Value interpretation: 'absolute' (default; matches the slider's own min/max) "
-            "or 'ratio' (0.0-1.0 position along the track).",
-            nullable=True,
-        ),
-        method=StringSchema(
-            "Strategy: 'auto' (default), 'range-input' (direct value+input event), "
-            "'keyboard' (focus + arrow keys), 'drag' (pixel drag). Use 'auto' unless debugging.",
-            nullable=True,
-        ),
-        required=["session_id", "selector", "value_json"],
-    )
-)
-class BrowserSetSliderTool(Tool):
-    name = "browser_set_slider"
-    description = (
-        "Set a slider's value by number. Works for native <input type=range>, "
-        "ARIA sliders (role=slider / aria-valuenow), and CSS-custom widgets. "
-        "Prefer this over browser_drag for sliders — it auto-picks the most "
-        "reliable strategy and crosses iframe boundaries. For dual-thumb "
-        "sliders (e.g. an age range) pass value_json='[lo, hi]'. Returns the "
-        "strategy used plus before/after values so you can verify the slide."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        selector: str,
-        value_json: str,
-        value_mode: str | None = None,
-        method: str | None = None,
-        **kw: Any,
-    ) -> str:
-        try:
-            parsed = json.loads(value_json)
-        except (TypeError, ValueError) as exc:
-            return f"[set_slider_failed] value_json is not valid JSON: {exc}"
-        if isinstance(parsed, (int, float)):
-            value_payload: Any = float(parsed)
-        elif (
-            isinstance(parsed, list)
-            and len(parsed) == 2
-            and all(isinstance(n, (int, float)) for n in parsed)
-        ):
-            value_payload = [float(parsed[0]), float(parsed[1])]
-        else:
-            return "[set_slider_failed] value_json must decode to a number or [lo, hi] list"
-
-        print(f"\n>> browser_set_slider({selector!r} → {value_payload})")
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls = 0
-
-        payload: dict[str, Any] = {"selector": selector, "value": value_payload}
-        if value_mode is not None:
-            payload["as"] = value_mode
-        if method is not None:
-            payload["method"] = method
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/set-slider",
-            json=payload,
-            timeout=30.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[set_slider_failed] {err}"
-        data = r.json()
-        outcome = data.get("outcome", {}) or {}
-        strategy = outcome.get("strategy", "?")
-        before = outcome.get("before")
-        after = outcome.get("after")
-        err = outcome.get("error")
-        self.s.record_step(
-            "browser_set_slider",
-            f"{selector} → {value_payload} via {strategy}",
-            data.get("url", ""),
-        )
-        if strategy == "unresolved" or err:
-            return f"[set_slider_failed] {err or 'unresolved'} (selector={selector})"
-        caption = (
-            f"Set slider {selector} via {strategy}: {before} → {after} "
-            f"(min={outcome.get('min')}, max={outcome.get('max')})"
-        )
-        if data.get("elements"):
-            caption += f"\n{data['elements']}"
-        return caption
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        vision_index=IntegerSchema(
-            description=(
-                "1-based vision bbox index of the slider HANDLE (the "
-                "draggable thumb), as shown in the latest screenshot's "
-                "`V_n` listing. The tool automatically finds the adjacent "
-                "slider_widget bbox (the track) for target-x computation."
-            ),
-        ),
-        value=NumberSchema(
-            description=(
-                "Target value. Interpreted per value_mode. For 'absolute' "
-                "pass the actual reading (e.g. 300 for $300/month); the "
-                "tool reads min/max from the adjacent rendered label text. "
-                "For 'ratio' pass 0.0–1.0 position along the track."
-            ),
-        ),
-        value_mode=StringSchema(
-            "'absolute' (default) or 'ratio'. Use 'ratio' when you can't "
-            "read the min/max from the page.",
-            nullable=True,
-        ),
-        value_min=NumberSchema(
-            "Override for the slider's minimum if vision didn't surface it. "
-            "Only used when value_mode='absolute'.",
-            nullable=True,
-        ),
-        value_max=NumberSchema(
-            "Override for the slider's maximum if vision didn't surface it. "
-            "Only used when value_mode='absolute'.",
-            nullable=True,
-        ),
-        required=["session_id", "vision_index", "value"],
-    )
-)
-class BrowserSetSliderAtTool(Tool):
-    name = "browser_set_slider_at"
-    description = (
-        "Drag a slider to a target value using its VISION bbox index. "
-        "Prefer this over browser_set_slider when the page uses custom "
-        "slider widgets (Chase/JPM calculators, filter ranges, any "
-        "React/Angular slider with no native range input or aria-valuenow). "
-        "Workflow: (1) call browser_screenshot → the vision agent emits "
-        "role=slider_handle / slider_widget / text_block bboxes per "
-        "slider; (2) pick the V_n of the HANDLE you want to move; (3) "
-        "call this tool with the target numeric value. The tool finds "
-        "the adjacent track, dispatches a humanised bezier drag, and "
-        "returns the post-drag rendered label text so you can verify."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        vision_index: int,
-        value: float,
-        value_mode: str | None = None,
-        value_min: float | None = None,
-        value_max: float | None = None,
-        **kw: Any,
-    ) -> str:
-        # Share the same lock as browser_drag_slider_until: the CDP/patchright
-        # cursor is session-scoped, parallel drags clobber each other.
-        if self.s.slider_drag_lock is None:
-            self.s.slider_drag_lock = asyncio.Lock()
-        async with self.s.slider_drag_lock:
-            return await self._execute_inner(
-                session_id, vision_index, value,
-                value_mode, value_min, value_max,
-            )
-
-    async def _execute_inner(
-        self,
-        session_id: str,
-        vision_index: int,
-        value: float,
-        value_mode: str | None,
-        value_min: float | None,
-        value_max: float | None,
-    ) -> str:
-        print(
-            f"\n>> browser_set_slider_at(V{vision_index} → {value} "
-            f"mode={value_mode or 'absolute'})"
-        )
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls = 0
-
-        resp = self.s.vision_for_target_resolution()
-        if resp is None:
-            return (
-                "[set_slider_at_failed:no_vision] No recent vision response. "
-                "Call browser_screenshot first so slider bboxes are indexed."
-            )
-
-        handle_bbox = resp.get_bbox(int(vision_index))
-        if handle_bbox is None:
-            return (
-                f"[set_slider_at_failed:bad_vision_index] V{vision_index} "
-                f"is out of range (only {len(resp.bboxes)} bboxes cached)."
-            )
-        handle_role = (getattr(handle_bbox, "role", "") or "").lower()
-        if handle_role not in ("slider_handle", "slider", "input"):
-            # Accept other roles loudly but keep going — vision may
-            # mis-tag a handle as 'input' or 'other'.
-            print(
-                f"   (note: V{vision_index} role={handle_role!r}, "
-                "expected slider_handle — continuing)"
-            )
-
-        iw, ih = resp.image_width, resp.image_height
-        if iw <= 0 or ih <= 0:
-            return "[set_slider_at_failed:no_image_dims] Re-screenshot first."
-        dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
-        hx0, hy0, hx1, hy1 = handle_bbox.to_pixels(iw, ih, dpr=dpr_val)
-        handle_pix = {"x": hx0, "y": hy0, "w": hx1 - hx0, "h": hy1 - hy0}
-        handle_cy = hy0 + (hy1 - hy0) / 2.0
-
-        # Find the associated track: nearest role=slider_widget whose
-        # vertical centre sits within ±handle.h of the handle centre and
-        # whose horizontal span encloses the handle.
-        track_pix: dict[str, int] | None = None
-        track_bbox = None
-        best_dy: float | None = None
-        for cand in resp.bboxes:
-            if (getattr(cand, "role", "") or "").lower() != "slider_widget":
-                continue
-            cx0, cy0, cx1, cy1 = cand.to_pixels(iw, ih, dpr=dpr_val)
-            ccy = cy0 + (cy1 - cy0) / 2.0
-            dy = abs(ccy - handle_cy)
-            if dy > max(hy1 - hy0, 24):
-                continue
-            if cx0 > hx0 or cx1 < hx1:
-                # Track must enclose the handle horizontally.
-                # (Handles at either extreme still sit within the track
-                # bounds because the track includes min→max span.)
-                continue
-            if best_dy is None or dy < best_dy:
-                best_dy = dy
-                track_bbox = cand
-                track_pix = {
-                    "x": cx0, "y": cy0, "w": cx1 - cx0, "h": cy1 - cy0,
-                }
-
-        # Find the adjacent value-label text_block for min/max parsing +
-        # before-readback. Heuristic: role=text_block whose centre Y is
-        # within ±(handle.h + 40) of the handle's centre.
-        label_text: str = ""
-        for cand in resp.bboxes:
-            if (getattr(cand, "role", "") or "").lower() != "text_block":
-                continue
-            cx0, cy0, cx1, cy1 = cand.to_pixels(iw, ih, dpr=dpr_val)
-            ccy = cy0 + (cy1 - cy0) / 2.0
-            if abs(ccy - handle_cy) <= (hy1 - hy0) + 40:
-                label_text = (getattr(cand, "label", "") or "").strip()
-                break
-
-        mode = (value_mode or "absolute").lower()
-        if mode == "ratio":
-            ratio = max(0.0, min(1.0, float(value)))
-        else:
-            mn, mx = value_min, value_max
-            if (mn is None or mx is None) and label_text:
-                # Parse "0 to 10" / "$0 — $583" / "25 to 75" / "0 - 100"
-                import re as _re
-                nums = _re.findall(
-                    r"-?\d+(?:\.\d+)?",
-                    label_text.replace("$", "").replace("%", ""),
-                )
-                if len(nums) >= 2:
-                    try:
-                        parsed = [float(n) for n in nums[:2]]
-                        mn = parsed[0] if mn is None else mn
-                        mx = parsed[1] if mx is None else mx
-                    except ValueError:
-                        pass
-            if mn is None or mx is None:
-                return (
-                    "[set_slider_at_failed:no_minmax] Cannot infer min/max "
-                    "from adjacent label; pass value_min/value_max or use "
-                    "value_mode='ratio'. label_seen="
-                    + (repr(label_text) if label_text else "none")
-                )
-            span = float(mx) - float(mn)
-            if abs(span) < 1e-9:
-                ratio = 0.5
-            else:
-                ratio = (float(value) - float(mn)) / span
-                ratio = max(0.0, min(1.0, ratio))
-
-        if track_pix is None:
-            # Fall back: use the handle's bbox as a tiny pseudo-track.
-            # The drag still fires from the handle centre, but end = start,
-            # so this is effectively a no-op. Return diagnostic.
-            return (
-                f"[set_slider_at_failed:no_track] Could not find a "
-                f"role='slider_widget' bbox adjacent to V{vision_index}. "
-                "Re-screenshot; if the issue persists, use browser_set_slider "
-                "with a DOM selector instead."
-            )
-
-        payload = {"handle": handle_pix, "track": track_pix, "ratio": ratio}
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/set-slider-at",
-            json=payload,
-            timeout=30.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[set_slider_at_failed] {err}"
-        data = r.json()
-        outcome = data.get("outcome", {}) or {}
-        self.s.record_step(
-            "browser_set_slider_at",
-            f"V{vision_index} → {value} (ratio={ratio:.3f})",
-            data.get("url", ""),
-        )
-        lines = [
-            f"Dragged slider V{vision_index} to {value} "
-            f"(ratio={ratio:.2f}) via vision-drag",
-            f"  handle={outcome.get('handle_bbox')}",
-            f"  track={outcome.get('track_bbox')}",
-            f"  target_px={outcome.get('target_px')}",
-        ]
-        if label_text:
-            lines.append(f"  label_before={label_text!r}")
-        lines.append(
-            "  NEXT: call browser_screenshot to read "
-            "the rendered post-drag value label."
-        )
-        if data.get("elements"):
-            lines.append(str(data["elements"]))
-        return "\n".join(lines)
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        required=["session_id"],
-    )
-)
-class BrowserListSliderHandlesTool(Tool):
-    name = "browser_list_slider_handles"
-    description = (
-        "Enumerate all slider handles on the page via DOM introspection "
-        "(NO vision). Walks every frame, including cross-origin ones, "
-        "and returns each handle's index, frame_url, kind, bbox (in "
-        "document CSS pixels), and the closest row-level label text. "
-        "Use this when vision is flaky or returning empty bboxes, or "
-        "when you already know the slider's logical label (e.g. "
-        "'Monthly contribution') and want to pick by text. Then pass "
-        "the bbox directly into browser_drag_slider_until via the "
-        "`handle_bbox` arg — skips the vision lookup entirely."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    @property
-    def read_only(self) -> bool:
-        return True
-
-    async def execute(self, session_id: str, **kw: Any) -> str:
-        print("\n>> browser_list_slider_handles()")
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/list-slider-handles",
-            json={},
-            timeout=20.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[list_slider_handles_failed] {err}"
-        data = r.json() or {}
-        handles = data.get("handles") or []
-        if not handles:
-            return (
-                "[list_slider_handles:empty] No slider handles found in "
-                "any frame. Page may still be loading — scroll or wait, "
-                "then retry. If the page clearly has sliders, they may "
-                "use non-standard markup; fall back to vision via "
-                "browser_screenshot."
-            )
-        lines = [f"Found {len(handles)} slider handle(s):"]
-        for h in handles:
-            lines.append(
-                f"  [{h.get('index')}] kind={h.get('kind')} "
-                f"bbox={h.get('bbox')} "
-                f"label={h.get('label', '')!r} "
-                f"frame={(h.get('frame_url') or '')[:80]}"
-            )
-        return "\n".join(lines)
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        vision_index=IntegerSchema(
-            description=(
-                "1-based vision bbox index of the slider HANDLE "
-                "(the draggable thumb) from the most recent screenshot. "
-                "Either this OR handle_bbox_json is required."
-            ),
-            nullable=True,
-        ),
-        handle_bbox_json=StringSchema(
-            description=(
-                "Alternative to vision_index: pass the handle bbox "
-                "directly as a JSON object {\"x\":.., \"y\":.., \"w\":.., \"h\":..} "
-                "in CSS pixel document coords. Use this when vision is "
-                "unreliable — call browser_list_slider_handles to get "
-                "bboxes straight from the DOM, then pass one here."
-            ),
-            nullable=True,
-        ),
-        label_hint=StringSchema(
-            description=(
-                "Alternative discovery: a substring of the slider's label "
-                "(e.g. 'Monthly contribution'). The tool will call "
-                "browser_list_slider_handles, pick the handle whose label "
-                "contains this hint (case-insensitive, whitespace collapsed), "
-                "and use its bbox. Use when neither vision_index nor "
-                "handle_bbox_json is convenient."
-            ),
-            nullable=True,
-        ),
-        target_value=NumberSchema(
-            description=(
-                "The numeric value to slide to. The tool drags the handle "
-                "while watching the rendered label text, stopping when the "
-                "label shows this value (±tolerance)."
-            ),
-        ),
-        label_pattern=StringSchema(
-            description=(
-                "JS regex matching the rendered label — the FIRST capture "
-                "group must be the numeric value. Example for Chase: "
-                "'Monthly contribution[^:]*:\\s*\\$?(\\d+(?:\\.\\d+)?)'. "
-                "If omitted, matches any number in a text node on the same "
-                "visual row as the handle (works for most sliders with a "
-                "single value near the track)."
-            ),
-            nullable=True,
-        ),
-        tolerance=NumberSchema(
-            "Allowed |target - observed| gap. Default 0 (exact match).",
-            nullable=True,
-        ),
-        max_iterations=IntegerSchema(
-            "Safety cap on step iterations. Default 25.",
-            nullable=True,
-        ),
-        step_px=IntegerSchema(
-            "Initial pixel step. The tool auto-adapts from observed "
-            "value-per-pixel sensitivity. Default 8.",
-            nullable=True,
-        ),
-        direction=StringSchema(
-            "'auto' (default; inferred from current vs target), 'left', 'right'.",
-            nullable=True,
-        ),
-        required=["session_id", "target_value"],
-    )
-)
-class BrowserDragSliderUntilTool(Tool):
-    name = "browser_drag_slider_until"
-    description = (
-        "Closed-loop slider drag. Holds the mouse down on the handle, "
-        "steps incrementally, reads the rendered value label from the "
-        "iframe DOM after each step, and stops when the label shows the "
-        "target value. THE right tool for custom widgets where vision "
-        "can't reliably identify the full track geometry (Chase/JPM "
-        "calculators, React/Angular sliders with no aria-valuenow). "
-        "Unlike browser_set_slider_at (open-loop), this never overshoots "
-        "and recovers automatically from non-linear widget scaling. "
-        "Workflow: (1) browser_screenshot → vision returns slider_handle "
-        "V_n values; (2) call this tool with vision_index=V_n and your "
-        "numeric target; (3) inspect the returned trace + final_value to "
-        "verify the label reached the target."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        target_value: float,
-        vision_index: int | None = None,
-        handle_bbox_json: str | None = None,
-        label_hint: str | None = None,
-        label_pattern: str | None = None,
-        tolerance: float | None = None,
-        max_iterations: int | None = None,
-        step_px: int | None = None,
-        direction: str | None = None,
-        **kw: Any,
-    ) -> str:
-        gate = await _feedback_gate("browser_drag_slider_until")
-        if gate:
-            return gate
-        ok, gate_msg = await _require_fresh_vision(
-            self.s, session_id,
-            reason=f"browser_drag_slider_until(target={target_value})",
-        )
-        if not ok:
-            return gate_msg
-        # Serialize drags on this session. If the LLM fired this tool in
-        # parallel for multiple sliders, we queue them up so the cursor
-        # owns one slider at a time. Without this lock, concurrent drags
-        # fight for the same CDP mouse and produce garbage.
-        if self.s.slider_drag_lock is None:
-            self.s.slider_drag_lock = asyncio.Lock()
-        async with self.s.slider_drag_lock:
-            return await self._execute_inner(
-                session_id, target_value, vision_index, handle_bbox_json,
-                label_hint, label_pattern, tolerance, max_iterations,
-                step_px, direction,
-            )
-
-    async def _resolve_handle_bbox(
-        self, session_id: str,
-        vision_index: int | None,
-        handle_bbox_json: str | None,
-        label_hint: str | None,
-    ) -> tuple[dict[str, float] | None, str]:
-        """Returns (bbox | None, source_description). Tries, in order:
-        direct handle_bbox_json → label_hint via DOM enum → vision_index.
-        Returns None + reason string on failure."""
-        # 1. Direct bbox — highest priority, no indirection.
-        if handle_bbox_json:
-            try:
-                bb = json.loads(handle_bbox_json)
-            except (TypeError, ValueError) as exc:
-                return None, f"bad handle_bbox_json: {exc}"
-            if not isinstance(bb, dict):
-                return None, "handle_bbox_json must decode to a dict"
-            for k in ("x", "y", "w", "h"):
-                if not isinstance(bb.get(k), (int, float)):
-                    return None, f"handle_bbox_json missing numeric {k!r}"
-            return bb, "handle_bbox_json"
-
-        # 2. Label hint — DOM enum, pick best fuzzy match.
-        if label_hint:
-            try:
-                r = await _request_with_backoff(
-                    "POST",
-                    f"{SUPERBROWSER_URL}/session/{session_id}/list-slider-handles",
-                    json={},
-                    timeout=20.0,
-                )
-                handles = (r.json() or {}).get("handles") or [] if r.status_code < 400 else []
-            except Exception as exc:
-                return None, f"list-slider-handles failed: {exc}"
-            if not handles:
-                return None, "list-slider-handles returned no sliders"
-            norm = label_hint.lower().strip()
-            # Score each handle: label contains hint → big win; else token overlap.
-            best = None
-            best_score = -1.0
-            for h in handles:
-                lab = (h.get("label") or "").lower().strip()
-                if not lab:
-                    continue
-                if norm in lab:
-                    score = 1.0 + min(1.0, len(norm) / max(1, len(lab)))
-                else:
-                    ht = set(norm.split())
-                    lt = set(lab.split())
-                    if not ht:
-                        continue
-                    score = len(ht & lt) / len(ht)
-                if score > best_score:
-                    best_score = score
-                    best = h
-            if not best or best_score < 0.5:
-                sample = [f"[{h.get('index')}] {h.get('label')!r}" for h in handles[:8]]
-                return None, (
-                    f"no handle label matched {label_hint!r}. "
-                    f"candidates: {sample}"
-                )
-            return best.get("bbox"), f"label_hint={label_hint!r}"
-
-        # 3. Vision index — legacy path.
-        if vision_index is not None:
-            resp = self.s.vision_for_target_resolution()
-            if resp is None:
-                return None, (
-                    "no cached vision response (call browser_screenshot "
-                    "first, or pass handle_bbox_json / label_hint)"
-                )
-            handle_bbox = resp.get_bbox(int(vision_index))
-            if handle_bbox is None:
-                return None, (
-                    f"V{vision_index} out of range "
-                    f"({len(resp.bboxes)} bboxes cached)"
-                )
-            iw, ih = resp.image_width, resp.image_height
-            if iw <= 0 or ih <= 0:
-                return None, "vision has no image dims; re-screenshot first"
-            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
-            hx0, hy0, hx1, hy1 = handle_bbox.to_pixels(iw, ih, dpr=dpr_val)
-            return (
-                {"x": hx0, "y": hy0, "w": hx1 - hx0, "h": hy1 - hy0},
-                f"vision_index=V{vision_index}",
-            )
-
-        return None, "provide vision_index, handle_bbox_json, or label_hint"
-
-    async def _execute_inner(
-        self,
-        session_id: str,
-        target_value: float,
-        vision_index: int | None,
-        handle_bbox_json: str | None,
-        label_hint: str | None,
-        label_pattern: str | None,
-        tolerance: float | None,
-        max_iterations: int | None,
-        step_px: int | None,
-        direction: str | None,
-    ) -> str:
-        src = (
-            f"V{vision_index}" if vision_index is not None
-            else (f"hint={label_hint!r}" if label_hint
-                  else ("bbox=json" if handle_bbox_json else "?"))
-        )
-        print(
-            f"\n>> browser_drag_slider_until({src} → {target_value}"
-            f"{' pattern=' + repr(label_pattern) if label_pattern else ''})"
-        )
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls = 0
-
-        handle_pix, source_desc = await self._resolve_handle_bbox(
-            session_id, vision_index, handle_bbox_json, label_hint,
-        )
-        if handle_pix is None:
-            msg = f"[drag_slider_until_failed:no_handle] {source_desc}"
-            print(f"   {msg}")
-            return msg
-        print(f"   resolved handle via {source_desc}: {handle_pix}")
-
-        payload: dict[str, Any] = {
-            "handle": handle_pix,
-            "target_value": float(target_value),
-        }
-        if label_pattern is not None:
-            payload["label_pattern"] = label_pattern
-        if tolerance is not None:
-            payload["tolerance"] = float(tolerance)
-        if max_iterations is not None:
-            payload["max_iterations"] = int(max_iterations)
-        if step_px is not None:
-            payload["step_px"] = int(step_px)
-        if direction is not None:
-            payload["direction"] = direction
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/drag-slider-until",
-            json=payload,
-            timeout=60.0,  # longer — closed-loop can take a few seconds
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[drag_slider_until_failed] {err}"
-        data = r.json()
-        out = data.get("outcome", {}) or {}
-        self.s.record_step(
-            "browser_drag_slider_until",
-            f"{source_desc} → {target_value} in {out.get('iterations')} iters",
-            data.get("url", ""),
-        )
-        # The drag moved the handle — treat as a page mutation so the
-        # next click waits for fresh vision of the post-drag DOM.
-        self.s.advance_observation_token("drag_slider_until")
-        _schedule_vision_prefetch(self.s, session_id)
-        final_v = out.get("final_value")
-        init_v = out.get("initial_value")
-        completed = bool(out.get("completed"))
-        lines: list[str] = []
-        if not completed:
-            # Prefix with the FAILED tag so the agent treats this as a
-            # loud failure (same convention as all other _failed returns).
-            if init_v is None:
-                reason = "initial_readback_failed"
-            elif final_v is None:
-                reason = "value_lost_mid_drag"
-            else:
-                reason = "target_not_reached"
-            lines.append(
-                f"[drag_slider_until_failed:{reason}] "
-                f"{source_desc} target={target_value} "
-                f"final={final_v} initial={init_v}"
-            )
-        else:
-            lines.append(
-                f"Closed-loop slider {source_desc} → target={target_value} "
-                f"COMPLETED in {out.get('iterations')} iterations: "
-                f"{init_v} → {final_v}"
-            )
-        lines.append(f"  label_text={out.get('label_text')!r}")
-        trace = out.get("trace") or []
-        if trace:
-            lines.append("  trace (last 4):")
-            for row in trace[-4:]:
-                lines.append(
-                    f"    iter={row.get('iter')} "
-                    f"cursor_x={row.get('cursor_x')} "
-                    f"value={row.get('value')}"
-                )
-        if not completed:
-            lines.append(
-                "  Fix: if label_text shows NO_MATCH, your label_pattern "
-                "regex didn't match any nearby text — the 'nearby text' "
-                "list in label_text shows what IS there. Adjust the regex. "
-                "If label_text looks right but target wasn't reached, widen "
-                "tolerance or raise max_iterations. Always call sliders "
-                "SEQUENTIALLY — never in a parallel batch."
-            )
-        if data.get("elements"):
-            lines.append(str(data["elements"]))
-        return _maybe_no_effect_prefix(
-            data, "browser_drag_slider_until", "\n".join(lines),
-            session_state=self.s,
-        )
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        bbox_json=StringSchema(
-            "JSON object {x, y, w, h} describing the viewport region to crop, in CSS pixels."
-        ),
-        quality=IntegerSchema("JPEG quality 1–100, default 80.", nullable=True),
-        required=["session_id", "bbox_json"],
-    )
-)
-class BrowserImageRegionTool(Tool):
-    name = "browser_image_region"
-    description = (
-        "Screenshot a bounded region of the viewport and return base64 JPEG. "
-        "Cheaper than a full-page Gemini pass for solvers that need to "
-        "template-match a captcha piece, OCR a small area, or run a tiny "
-        "focused vision query."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    @property
-    def read_only(self) -> bool:
-        return True
-
-    async def execute(
-        self,
-        session_id: str,
-        bbox_json: str,
-        quality: int | None = None,
-        **kw: Any,
-    ) -> str:
-        try:
-            bbox = json.loads(bbox_json)
-        except (TypeError, ValueError) as exc:
-            return f"[image_region_failed] bbox_json is not valid JSON: {exc}"
-        for k in ("x", "y", "w", "h"):
-            if not isinstance(bbox.get(k), (int, float)):
-                return f"[image_region_failed] bbox must have numeric {k}"
-
-        payload: dict[str, Any] = {"bbox": bbox}
-        if quality is not None:
-            payload["quality"] = quality
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/image-region",
-            json=payload,
-            timeout=15.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            return f"[image_region_failed] {err}"
-        data = r.json()
-        b64 = data.get("base64", "")
-        return (
-            f"image_region: {bbox['w']}x{bbox['h']} at ({bbox['x']},{bbox['y']}), "
-            f"base64_len={len(b64)}\n{b64[:200]}..."
-        )
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        hint=StringSchema(
-            "Optional solver name to force (chess_com, slider_captcha, jigsaw_captcha, "
-            "rotation_captcha, grid_drag). Skip for auto-detect.",
-            nullable=True,
-        ),
-        max_steps=IntegerSchema(
-            "Maximum solver iterations. Default 10 — enough for most chess puzzles "
-            "and captchas; increase for long puzzle lines.",
-            nullable=True,
-        ),
-        required=["session_id"],
-    )
-)
-class BrowserSolvePuzzleTool(Tool):
-    name = "browser_solve_puzzle"
-    description = (
-        "Auto-detect the puzzle on the current page (chess position, "
-        "slider/jigsaw/rotation captcha, generic grid-drag) and run a "
-        "dedicated solver through extract → plan → execute → verify. "
-        "Uses selector- and coordinate-exact primitives under the hood "
-        "(zero Gemini round-trips in the move loop). Use whenever the "
-        "page presents a puzzle-like challenge."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        hint: str | None = None,
-        max_steps: int | None = None,
-        **kw: Any,
-    ) -> str:
-        print(f"\n>> browser_solve_puzzle(session={session_id}, hint={hint!r}, max_steps={max_steps})")
-        from superbrowser_bridge.puzzle_solvers import detect as _detect, solve as _solve
-        from superbrowser_bridge.puzzle_solvers.browser import HttpSolverBrowser
-
-        # Pull a DOM snapshot + URL to feed the detector (cheap GET).
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                state_resp = await client.get(
-                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                    params={"vision": "false"},
-                )
-                state_resp.raise_for_status()
-                state_data = state_resp.json()
-        except Exception as exc:
-            return f"[solve_puzzle_failed] cannot read session state: {exc}"
-
-        url = state_data.get("url", "") or ""
-        dom_snippet = state_data.get("elements") or ""
-
-        solver, conf = _detect(url, dom_snippet, hint=hint)
-        if solver is None:
-            return (
-                "[solve_puzzle_no_match] No solver matched the current page "
-                f"(url={url!r}, confidence={conf:.2f}). Pass hint=<solver name> "
-                "to force, or implement a new solver for this page type."
-            )
-
-        print(f">> selected solver: {solver.name} (confidence={conf:.2f})")
-        async with HttpSolverBrowser(session_id, SUPERBROWSER_URL) as browser:
-            result = await _solve(solver, browser, max_steps=max_steps or 10)
-
-        self.s.record_step(
-            "browser_solve_puzzle",
-            f"{solver.name} success={result.success} steps={result.steps_taken}",
-            url,
-        )
-        lines = [
-            f"Puzzle solver: {result.solver}",
-            f"Success: {result.success}",
-            f"Steps taken: {result.steps_taken}",
-        ]
-        if result.error:
-            lines.append(f"Error: {result.error}")
-        if result.actions:
-            lines.append(f"Actions ({len(result.actions)}):")
-            for a in result.actions[:8]:
-                lines.append(f"  - {a.kind}: {a.reason or ''}")
-            if len(result.actions) > 8:
-                lines.append(f"  … ({len(result.actions) - 8} more)")
-        if result.final_state:
-            # Strip large base64 payloads before logging.
-            redacted = {
-                k: (f"<{len(v)} bytes>" if isinstance(v, str) and len(v) > 200 else v)
-                for k, v in result.final_state.items()
-            }
-            lines.append(f"Final state: {redacted}")
-        return "\n".join(lines)
 
 
 @tool_parameters(
@@ -8570,6 +6208,1801 @@ class BrowserEscalateTool(Tool):
         )
 
 
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        target_text=StringSchema(
+            "Text or regex of the element you want to scroll to. Substring "
+            "match if it's not a valid regex. Optional if target_role given.",
+            nullable=True,
+        ),
+        target_role=StringSchema(
+            "ARIA role / tagName to filter on (e.g. 'button', 'h2'). "
+            "Optional if target_text given.",
+            nullable=True,
+        ),
+        direction=StringSchema(
+            "'down' (default) or 'up'.",
+            nullable=True,
+        ),
+        max_iterations=IntegerSchema(
+            "Safety cap on scroll steps. Default 10, max 40.",
+            nullable=True,
+        ),
+        step_ratio=NumberSchema(
+            description="Fraction of viewport to scroll per step (0.1–1.0). Default 0.8.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserScrollUntilTool(Tool):
+    name = "browser_scroll_until"
+    description = (
+        "Closed-loop scroll. Walks the page in `direction` until an "
+        "element matching `target_text` (substring or regex) and/or "
+        "`target_role` becomes visible, the page can't scroll further, "
+        "or `max_iterations` elapses. Cheap — uses interactive-element "
+        "polling between steps, no screenshot per iteration. Returns a "
+        "structured outcome with `reason` ('matched' | 'page_end' | "
+        "'page_start' | 'max_iterations') so the brain knows whether "
+        "to act, retreat, or give up. Prefer this over browser_scroll "
+        "when you know what you're scrolling toward — it stops at the "
+        "right place AND tells you when content runs out, instead of "
+        "blindly scrolling and re-screenshotting."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        target_text: str | None = None,
+        target_role: str | None = None,
+        direction: str | None = None,
+        max_iterations: int | None = None,
+        step_ratio: float | None = None,
+        **kw: Any,
+    ) -> Any:
+        gate = await _feedback_gate("browser_scroll_until")
+        if gate:
+            return gate
+
+        if not (target_text and target_text.strip()) and not (target_role and target_role.strip()):
+            return (
+                "[scroll_until_failed:no_target] Provide target_text or "
+                "target_role. Substring match works for most cases — pass "
+                "the visible text of the element you want to find."
+            )
+
+        payload: dict[str, Any] = {
+            "direction": direction or "down",
+        }
+        if target_text and target_text.strip():
+            payload["targetText"] = target_text.strip()
+        if target_role and target_role.strip():
+            payload["targetRole"] = target_role.strip()
+        if max_iterations is not None:
+            payload["maxIterations"] = int(max_iterations)
+        if step_ratio is not None:
+            payload["stepRatio"] = float(step_ratio)
+
+        target_disp = target_text or f"role={target_role}"
+        print(
+            f"\n>> browser_scroll_until({target_disp!r}, dir={payload['direction']})"
+        )
+
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/scroll-until",
+                json=payload,
+                timeout=30.0,  # closed-loop can take 10 iterations × ~300ms
+            )
+        except Exception as exc:
+            return f"[scroll_until_failed] request error: {exc}"
+
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[scroll_until_failed] HTTP {r.status_code}: {err}"
+
+        data = r.json()
+        outcome = data.get("outcome") or {}
+        reason = str(outcome.get("reason") or "unknown")
+        iters = int(outcome.get("iterations") or 0)
+        scrolled = int(outcome.get("scrolledPx") or 0)
+
+        # Update scroll telemetry so the next vision pass sees a fresh
+        # [SCROLL_STATE …] line including reached_bottom/reached_top hints
+        # that came from this closed-loop call.
+        _update_scroll_telemetry(
+            self.s,
+            data.get("scrollInfo"),
+            payload["direction"],
+            extra={
+                "last_scroll_reason": reason,
+                "reached_bottom": reason == "page_end",
+                "reached_top": reason == "page_start",
+            },
+        )
+
+        # Mirror the BrowserDragSliderUntilTool record convention so
+        # step_history shows a clear summary line for downstream
+        # loop-detection and task-graph signal evaluation.
+        self.s.record_step(
+            "browser_scroll_until",
+            f"{target_disp!r} → {reason} in {iters} iters ({scrolled}px)",
+            data.get("url", ""),
+        )
+
+        lines: list[str] = []
+        if outcome.get("found"):
+            matched = outcome.get("matchedText") or ""
+            sel = outcome.get("matchedSelector") or ""
+            lines.append(
+                f"FOUND {target_disp!r} after {iters} iter(s), "
+                f"scrolled {scrolled}px. matched={matched[:80]!r} "
+                f"selector={sel}"
+            )
+        else:
+            tag = (
+                "page_end" if reason == "page_end"
+                else "page_start" if reason == "page_start"
+                else reason
+            )
+            lines.append(
+                f"[scroll_until_failed:{tag}] target {target_disp!r} not "
+                f"found after {iters} iter(s) ({scrolled}px). "
+                f"reason={reason}."
+            )
+            if reason == "page_end":
+                lines.append(
+                    "  Page can't scroll further down. The target may be "
+                    "above (try direction='up') or may not exist on this "
+                    "page — verify by checking the elements list below."
+                )
+            elif reason == "page_start":
+                lines.append(
+                    "  Already at top of page. Try direction='down' or "
+                    "verify the target text/role is correct."
+                )
+            elif reason == "max_iterations":
+                lines.append(
+                    "  Hit iteration cap. If you believe the target exists "
+                    "further on, raise max_iterations (cap is 40) or "
+                    "use a more specific target_text."
+                )
+
+        if data.get("elements"):
+            lines.append(str(data["elements"]))
+
+        # Schedule a vision prefetch so the next browser_screenshot is
+        # cached — same convention as the other scroll tools.
+        self.s.advance_observation_token("scroll_until")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task, "\n".join(lines),
+            state=self.s,
+        )
+
+
+def _update_scroll_telemetry(
+    state: "BrowserSessionState",
+    scroll_info: Any,
+    direction: str | None,
+    extra: dict | None = None,
+) -> None:
+    """Record post-scroll geometry on the session state.
+
+    Read by `_format_state` (and the [SCROLL_STATE …] caption line in
+    `build_text_only`) so vision can reason about whether more scrolling
+    is plausible. Tolerant of missing scrollInfo — telemetry is best-
+    effort and must not break the tool path.
+    """
+    try:
+        if not isinstance(scroll_info, dict):
+            scroll_info = {}
+        scroll_y = int(scroll_info.get("scrollY") or 0)
+        scroll_h = int(scroll_info.get("scrollHeight") or 0)
+        vp_h = int(scroll_info.get("viewportHeight") or 0)
+        # 12px of slack at the bottom catches off-by-one rounding without
+        # falsely flagging "reached_bottom" mid-page.
+        reached_bottom = scroll_h > 0 and (scroll_y + vp_h) >= (scroll_h - 12)
+        reached_top = scroll_y <= 4
+        prev = getattr(state, "scroll_telemetry", None) or {}
+        history = list(prev.get("direction_history") or [])
+        if direction:
+            history.append(direction)
+            history = history[-6:]
+        tel = {
+            "scrollY": scroll_y,
+            "scrollHeight": scroll_h,
+            "viewportHeight": vp_h,
+            "direction_history": history,
+            "reached_bottom": reached_bottom,
+            "reached_top": reached_top,
+        }
+        if extra:
+            tel.update(extra)
+        state.scroll_telemetry = tel
+    except Exception:
+        # Telemetry is best-effort — never let it block the scroll tool.
+        pass
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        index=IntegerSchema(description="Element index of the select/dropdown"),
+        value=StringSchema("Option value or visible text to select"),
+        required=["session_id", "index", "value"],
+    )
+)
+
+class BrowserRewindToCheckpointTool(Tool):
+    """Bail from the current page state back to the last known-good URL.
+
+    Session memory escape hatch: when the worker has exhausted local
+    retries and the brain is stuck, rewinding to `best_checkpoint_url`
+    (the last meaningful checkpoint the worker recorded) lets the plan
+    re-approach with a fresh vision pass. The tool forces the token
+    forward + busts the vision cache so the next mutation blocks on
+    genuinely fresh bboxes rather than any lingering cache from the
+    stuck-state page.
+    """
+
+    name = "browser_rewind_to_checkpoint"
+    description = (
+        "Navigate back to the last known-good checkpoint URL when the "
+        "current page is unresponsive or the plan is stuck. Invalidates "
+        "vision cache + element fingerprints so the next vision pass "
+        "reflects the rewound page."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, session_id: str, **kw: Any) -> str:
+        target = (self.s.best_checkpoint_url or "").strip()
+        print(f"\n>> browser_rewind_to_checkpoint(target={target[:80]!r})")
+        if not target:
+            return (
+                "[rewind_failed:no_checkpoint] No best_checkpoint_url has "
+                "been recorded for this session. Call browser_navigate "
+                "directly with a URL you know works, or report failure."
+            )
+
+        # Advance token FIRST — any vision prefetch already in flight
+        # will see the mismatch and drop its write; the next mutation
+        # cannot unblock on stale bboxes.
+        self.s.advance_observation_token("rewind")
+
+        # Clear local fingerprints/vision state so `vision_is_fresh()`
+        # cannot be true until a brand new pass lands.
+        self.s.element_fingerprints.clear()
+        self.s._last_vision_response = None
+        self.s._last_vision_ts = 0.0
+        self.s._last_vision_url = ""
+
+        # Bust the shared vision cache for this session so a replay
+        # won't resurrect the stuck-state bboxes.
+        try:
+            from vision_agent import get_vision_agent, vision_agent_enabled
+            if vision_agent_enabled():
+                agent = get_vision_agent()
+                cache = getattr(agent, "_cache", None)
+                if cache is not None and hasattr(cache, "bust_session"):
+                    await cache.bust_session(session_id)
+        except Exception as exc:
+            print(f"  [rewind: vision cache bust skipped — {exc}]")
+
+        # Navigate via the TS server — same endpoint BrowserNavigateTool
+        # uses. Skipping the full BrowserNavigateTool path to avoid
+        # re-triggering domain-pinning / CF guards that apply to forward
+        # nav but not to a known-good rewind URL.
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/navigate",
+                json={"url": target, "waitUntil": "domcontentloaded"},
+                timeout=30.0,
+            )
+        except Exception as exc:
+            return f"[rewind_failed:network] {exc}"
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[rewind_failed:http_{r.status_code}] {err}"
+
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        self.s.record_url(target)
+        self.s.record_step(
+            "browser_rewind_to_checkpoint",
+            f"→ {target[:80]}",
+            f"title={data.get('title', '?')}" if isinstance(data, dict) else "ok",
+        )
+        self.s.log_activity(f"rewind → {target[:60]}")
+
+        # Fresh prefetch on the rewound page so the next mutation's gate
+        # unblocks quickly rather than hitting a cold cache.
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(
+                data if isinstance(data, dict) else {},
+                f"Rewound to checkpoint: {target[:80]}",
+            ),
+            state=self.s,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        startX=NumberSchema("Start X coordinate"),
+        startY=NumberSchema("Start Y coordinate"),
+        endX=NumberSchema("End X coordinate"),
+        endY=NumberSchema("End Y coordinate"),
+        steps=IntegerSchema("Number of intermediate steps (default 25, higher = smoother)", nullable=True),
+        required=["session_id", "startX", "startY", "endX", "endY"],
+    )
+)
+
+class BrowserGetRectTool(Tool):
+    name = "browser_get_rect"
+    description = (
+        "Return getBoundingClientRect() for one or more CSS selectors. "
+        "Pixel-exact, zero vision cost. Use to derive coordinates before "
+        "calling browser_click_selector / browser_drag_selectors. "
+        "Selectors ride as a JSON string (no ArraySchema in this layer)."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        selectors_json: str,
+        ensure_visible: bool | None = None,
+        **kw: Any,
+    ) -> str:
+        try:
+            selectors = json.loads(selectors_json)
+        except (TypeError, ValueError) as exc:
+            return f"[get_rect_failed] selectors_json is not valid JSON: {exc}"
+        if not isinstance(selectors, list) or not all(isinstance(s, str) for s in selectors):
+            return "[get_rect_failed] selectors_json must decode to a list of strings."
+
+        print(f"\n>> browser_get_rect({len(selectors)} selectors)")
+        payload = {"selectors": selectors, "ensureVisible": bool(ensure_visible)}
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/rect",
+            json=payload,
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+        rects = data.get("rects") or []
+        lines = ["Selector rects:"]
+        for sel, rect in zip(selectors, rects):
+            if rect is None:
+                lines.append(f"  {sel} → NOT FOUND")
+                continue
+            lines.append(
+                f"  {sel} → cx={rect['cx']:.1f} cy={rect['cy']:.1f} "
+                f"w={rect['w']:.1f} h={rect['h']:.1f} "
+                f"visible={rect['visible']} inViewport={rect['inViewport']}"
+            )
+        return "\n".join(lines)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        selector=StringSchema("CSS selector of the element to click"),
+        button=StringSchema("Mouse button: left|right|middle", nullable=True),
+        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
+        linear=BooleanSchema(
+            description=(
+                "If true (default), use deterministic teleport click (pixel-exact). "
+                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
+            ),
+            nullable=True,
+        ),
+        required=["session_id", "selector"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        selector=StringSchema("CSS selector of the element to click"),
+        button=StringSchema("Mouse button: left|right|middle", nullable=True),
+        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
+        linear=BooleanSchema(
+            description=(
+                "If true (default), use deterministic teleport click (pixel-exact). "
+                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
+            ),
+            nullable=True,
+        ),
+        required=["session_id", "selector"],
+    )
+)
+class BrowserClickSelectorTool(Tool):
+    name = "browser_click_selector"
+    description = (
+        "Click the centre of a DOM element by CSS selector. Pixel-exact, "
+        "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
+        "whenever the target has a stable hook — chess squares "
+        "(.square-54), form fields (#email), buttons with data-test-id, "
+        "captcha handles. Fails fast if the selector is missing or zero-size."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        selector: str,
+        button: str | None = None,
+        click_count: int | None = None,
+        linear: bool | None = None,
+        **kw: Any,
+    ) -> str:
+        print(f"\n>> browser_click_selector({selector!r})")
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls += 1
+
+        payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
+        if button is not None:
+            payload["button"] = button
+        if click_count is not None:
+            payload["clickCount"] = click_count
+        if linear is not None:
+            payload["linear"] = linear
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/click-selector",
+            json=payload,
+            timeout=15.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[click_selector_failed] {err}"
+        data = r.json()
+        clicked = data.get("clicked", {})
+        self.s.record_step(
+            "browser_click_selector",
+            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
+            data.get("url", ""),
+        )
+        # click_selector is a mutation — advance the observation token
+        # and schedule a vision prefetch so the next screenshot is warm.
+        self.s.advance_observation_token("click_selector")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        caption = (
+            f"Clicked {selector} at "
+            f"({clicked.get('x','?')},{clicked.get('y','?')})"
+        )
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        return await _append_fresh_vision(
+            _vision_task,
+            _maybe_no_effect_prefix(
+                data, "browser_click_selector", caption,
+                session_state=self.s,
+            ),
+            state=self.s,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        from_selector=StringSchema("CSS selector of the drag source element"),
+        to_selector=StringSchema("CSS selector of the drag destination element"),
+        method=StringSchema(
+            "One of 'auto' (default: try click_click, fall back to drag), "
+            "'click_click' (two discrete clicks — more robust for chess/grid), "
+            "'drag' (mousedown → move → mouseup — classical drag). ",
+            nullable=True,
+        ),
+        hold_ms=IntegerSchema(
+            "Milliseconds to pause between the two clicks when method=click_click, "
+            "or to hold before drag start. Default 120.",
+            nullable=True,
+        ),
+        linear=BooleanSchema(
+            description="If true (default), deterministic paths. Set false for stealth-critical drags.",
+            nullable=True,
+        ),
+        required=["session_id", "from_selector", "to_selector"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        from_selector=StringSchema("CSS selector of the drag source element"),
+        to_selector=StringSchema("CSS selector of the drag destination element"),
+        method=StringSchema(
+            "One of 'auto' (default: try click_click, fall back to drag), "
+            "'click_click' (two discrete clicks — more robust for chess/grid), "
+            "'drag' (mousedown → move → mouseup — classical drag). ",
+            nullable=True,
+        ),
+        hold_ms=IntegerSchema(
+            "Milliseconds to pause between the two clicks when method=click_click, "
+            "or to hold before drag start. Default 120.",
+            nullable=True,
+        ),
+        linear=BooleanSchema(
+            description="If true (default), deterministic paths. Set false for stealth-critical drags.",
+            nullable=True,
+        ),
+        required=["session_id", "from_selector", "to_selector"],
+    )
+)
+class BrowserDragSelectorsTool(Tool):
+    name = "browser_drag_selectors"
+    description = (
+        "Drag from one CSS-selected element to another. Pixel-exact. "
+        "Default method 'auto' tries click-click first (safer on react-dnd "
+        "and grid boards like chess.com) and falls back to classical drag "
+        "if the DOM didn't mutate. PREFER OVER browser_drag(x1,y1,x2,y2) "
+        "whenever both endpoints have stable selectors."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        from_selector: str,
+        to_selector: str,
+        method: str | None = None,
+        hold_ms: int | None = None,
+        linear: bool | None = None,
+        **kw: Any,
+    ) -> str:
+        method = method or "auto"
+        if method not in ("auto", "click_click", "drag"):
+            return f"[drag_selectors_failed] method must be auto|click_click|drag, got {method!r}"
+        print(f"\n>> browser_drag_selectors({from_selector!r} → {to_selector!r}, method={method})")
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls = 0
+
+        payload: dict[str, Any] = {
+            "fromSelector": from_selector,
+            "toSelector": to_selector,
+            "method": method,
+        }
+        if hold_ms is not None:
+            payload["holdMs"] = hold_ms
+        if linear is not None:
+            payload["linear"] = linear
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/drag-selectors",
+            json=payload,
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[drag_selectors_failed] {err}"
+        data = r.json()
+        outcome = data.get("outcome", {})
+        self.s.record_step(
+            "browser_drag_selectors",
+            f"{from_selector}→{to_selector} via {outcome.get('methodUsed','?')}",
+            data.get("url", ""),
+        )
+        frm = outcome.get("from", {})
+        to = outcome.get("to", {})
+        caption = (
+            f"Dragged {from_selector} → {to_selector} "
+            f"via {outcome.get('methodUsed','?')} "
+            f"({frm.get('x','?')},{frm.get('y','?')}) → ({to.get('x','?')},{to.get('y','?')}) "
+            f"mutated={outcome.get('mutated', False)}"
+        )
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        return caption
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        points_json=StringSchema(
+            "JSON array of {x, y} points, e.g. '[{\"x\":100,\"y\":200},{\"x\":150,\"y\":220}]'. "
+            "At least two points required."
+        ),
+        step_ms=IntegerSchema(
+            "Milliseconds between intermediate mouseMove events. Default 16 (~60fps).",
+            nullable=True,
+        ),
+        hold_ms=IntegerSchema("Pre-press hold duration at points[0]. Default 50.", nullable=True),
+        button=StringSchema("Mouse button: left|right|middle. Default left.", nullable=True),
+        required=["session_id", "points_json"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        points_json=StringSchema(
+            "JSON array of {x, y} points, e.g. '[{\"x\":100,\"y\":200},{\"x\":150,\"y\":220}]'. "
+            "At least two points required."
+        ),
+        step_ms=IntegerSchema(
+            "Milliseconds between intermediate mouseMove events. Default 16 (~60fps).",
+            nullable=True,
+        ),
+        hold_ms=IntegerSchema("Pre-press hold duration at points[0]. Default 50.", nullable=True),
+        button=StringSchema("Mouse button: left|right|middle. Default left.", nullable=True),
+        required=["session_id", "points_json"],
+    )
+)
+class BrowserDragPathTool(Tool):
+    name = "browser_drag_path"
+    description = (
+        "Drag along an arbitrary polyline of (x,y) points. For jigsaw "
+        "captcha traces, connect-the-dots, signature drawing, or any "
+        "free-form gesture where a straight start→end drag won't work."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        points_json: str,
+        step_ms: int | None = None,
+        hold_ms: int | None = None,
+        button: str | None = None,
+        **kw: Any,
+    ) -> str:
+        try:
+            points = json.loads(points_json)
+        except (TypeError, ValueError) as exc:
+            return f"[drag_path_failed] points_json is not valid JSON: {exc}"
+        if not isinstance(points, list) or len(points) < 2:
+            return "[drag_path_failed] points_json must decode to a list of ≥2 {x,y} objects."
+        for i, p in enumerate(points):
+            if not isinstance(p, dict) or not isinstance(p.get("x"), (int, float)) \
+               or not isinstance(p.get("y"), (int, float)):
+                return f"[drag_path_failed] point[{i}] must be {{x: number, y: number}}"
+
+        print(f"\n>> browser_drag_path({len(points)} points)")
+        self.s.actions_since_screenshot += 1
+
+        payload: dict[str, Any] = {"points": points}
+        if step_ms is not None:
+            payload["stepMs"] = step_ms
+        if hold_ms is not None:
+            payload["holdMs"] = hold_ms
+        if button is not None:
+            payload["button"] = button
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/drag-path",
+            json=payload,
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[drag_path_failed] {err}"
+        data = r.json()
+        self.s.record_step(
+            "browser_drag_path",
+            f"{len(points)} points",
+            data.get("url", ""),
+        )
+        caption = f"Dragged along polyline of {len(points)} points"
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        return caption
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        selector=StringSchema(
+            "CSS selector for the slider element (e.g. 'input[type=range][name=monthlyContribution]'). "
+            "Frame-aware: the backend probes every frame on the page."
+        ),
+        value_json=StringSchema(
+            "Target value as JSON. Examples: '300' for a single slider, '[25, 75]' for a "
+            "dual-thumb range. Values are absolute (use the slider's own units) unless "
+            "as='ratio' is set, in which case they are 0.0–1.0 positions along the track."
+        ),
+        value_mode=StringSchema(
+            "Value interpretation: 'absolute' (default; matches the slider's own min/max) "
+            "or 'ratio' (0.0-1.0 position along the track).",
+            nullable=True,
+        ),
+        method=StringSchema(
+            "Strategy: 'auto' (default), 'range-input' (direct value+input event), "
+            "'keyboard' (focus + arrow keys), 'drag' (pixel drag). Use 'auto' unless debugging.",
+            nullable=True,
+        ),
+        required=["session_id", "selector", "value_json"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        selector=StringSchema(
+            "CSS selector for the slider element (e.g. 'input[type=range][name=monthlyContribution]'). "
+            "Frame-aware: the backend probes every frame on the page."
+        ),
+        value_json=StringSchema(
+            "Target value as JSON. Examples: '300' for a single slider, '[25, 75]' for a "
+            "dual-thumb range. Values are absolute (use the slider's own units) unless "
+            "as='ratio' is set, in which case they are 0.0–1.0 positions along the track."
+        ),
+        value_mode=StringSchema(
+            "Value interpretation: 'absolute' (default; matches the slider's own min/max) "
+            "or 'ratio' (0.0-1.0 position along the track).",
+            nullable=True,
+        ),
+        method=StringSchema(
+            "Strategy: 'auto' (default), 'range-input' (direct value+input event), "
+            "'keyboard' (focus + arrow keys), 'drag' (pixel drag). Use 'auto' unless debugging.",
+            nullable=True,
+        ),
+        required=["session_id", "selector", "value_json"],
+    )
+)
+class BrowserSetSliderTool(Tool):
+    name = "browser_set_slider"
+    description = (
+        "Set a slider's value by number. Works for native <input type=range>, "
+        "ARIA sliders (role=slider / aria-valuenow), and CSS-custom widgets. "
+        "Prefer this over browser_drag for sliders — it auto-picks the most "
+        "reliable strategy and crosses iframe boundaries. For dual-thumb "
+        "sliders (e.g. an age range) pass value_json='[lo, hi]'. Returns the "
+        "strategy used plus before/after values so you can verify the slide."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        selector: str,
+        value_json: str,
+        value_mode: str | None = None,
+        method: str | None = None,
+        **kw: Any,
+    ) -> str:
+        try:
+            parsed = json.loads(value_json)
+        except (TypeError, ValueError) as exc:
+            return f"[set_slider_failed] value_json is not valid JSON: {exc}"
+        if isinstance(parsed, (int, float)):
+            value_payload: Any = float(parsed)
+        elif (
+            isinstance(parsed, list)
+            and len(parsed) == 2
+            and all(isinstance(n, (int, float)) for n in parsed)
+        ):
+            value_payload = [float(parsed[0]), float(parsed[1])]
+        else:
+            return "[set_slider_failed] value_json must decode to a number or [lo, hi] list"
+
+        print(f"\n>> browser_set_slider({selector!r} → {value_payload})")
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls = 0
+
+        payload: dict[str, Any] = {"selector": selector, "value": value_payload}
+        if value_mode is not None:
+            payload["as"] = value_mode
+        if method is not None:
+            payload["method"] = method
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/set-slider",
+            json=payload,
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[set_slider_failed] {err}"
+        data = r.json()
+        outcome = data.get("outcome", {}) or {}
+        strategy = outcome.get("strategy", "?")
+        before = outcome.get("before")
+        after = outcome.get("after")
+        err = outcome.get("error")
+        self.s.record_step(
+            "browser_set_slider",
+            f"{selector} → {value_payload} via {strategy}",
+            data.get("url", ""),
+        )
+        if strategy == "unresolved" or err:
+            return f"[set_slider_failed] {err or 'unresolved'} (selector={selector})"
+        caption = (
+            f"Set slider {selector} via {strategy}: {before} → {after} "
+            f"(min={outcome.get('min')}, max={outcome.get('max')})"
+        )
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        return caption
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index of the slider HANDLE (the "
+                "draggable thumb), as shown in the latest screenshot's "
+                "`V_n` listing. The tool automatically finds the adjacent "
+                "slider_widget bbox (the track) for target-x computation."
+            ),
+        ),
+        value=NumberSchema(
+            description=(
+                "Target value. Interpreted per value_mode. For 'absolute' "
+                "pass the actual reading (e.g. 300 for $300/month); the "
+                "tool reads min/max from the adjacent rendered label text. "
+                "For 'ratio' pass 0.0–1.0 position along the track."
+            ),
+        ),
+        value_mode=StringSchema(
+            "'absolute' (default) or 'ratio'. Use 'ratio' when you can't "
+            "read the min/max from the page.",
+            nullable=True,
+        ),
+        value_min=NumberSchema(
+            "Override for the slider's minimum if vision didn't surface it. "
+            "Only used when value_mode='absolute'.",
+            nullable=True,
+        ),
+        value_max=NumberSchema(
+            "Override for the slider's maximum if vision didn't surface it. "
+            "Only used when value_mode='absolute'.",
+            nullable=True,
+        ),
+        required=["session_id", "vision_index", "value"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index of the slider HANDLE (the "
+                "draggable thumb), as shown in the latest screenshot's "
+                "`V_n` listing. The tool automatically finds the adjacent "
+                "slider_widget bbox (the track) for target-x computation."
+            ),
+        ),
+        value=NumberSchema(
+            description=(
+                "Target value. Interpreted per value_mode. For 'absolute' "
+                "pass the actual reading (e.g. 300 for $300/month); the "
+                "tool reads min/max from the adjacent rendered label text. "
+                "For 'ratio' pass 0.0–1.0 position along the track."
+            ),
+        ),
+        value_mode=StringSchema(
+            "'absolute' (default) or 'ratio'. Use 'ratio' when you can't "
+            "read the min/max from the page.",
+            nullable=True,
+        ),
+        value_min=NumberSchema(
+            "Override for the slider's minimum if vision didn't surface it. "
+            "Only used when value_mode='absolute'.",
+            nullable=True,
+        ),
+        value_max=NumberSchema(
+            "Override for the slider's maximum if vision didn't surface it. "
+            "Only used when value_mode='absolute'.",
+            nullable=True,
+        ),
+        required=["session_id", "vision_index", "value"],
+    )
+)
+class BrowserSetSliderAtTool(Tool):
+    name = "browser_set_slider_at"
+    description = (
+        "Drag a slider to a target value using its VISION bbox index. "
+        "Prefer this over browser_set_slider when the page uses custom "
+        "slider widgets (Chase/JPM calculators, filter ranges, any "
+        "React/Angular slider with no native range input or aria-valuenow). "
+        "Workflow: (1) call browser_screenshot → the vision agent emits "
+        "role=slider_handle / slider_widget / text_block bboxes per "
+        "slider; (2) pick the V_n of the HANDLE you want to move; (3) "
+        "call this tool with the target numeric value. The tool finds "
+        "the adjacent track, dispatches a humanised bezier drag, and "
+        "returns the post-drag rendered label text so you can verify."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        vision_index: int,
+        value: float,
+        value_mode: str | None = None,
+        value_min: float | None = None,
+        value_max: float | None = None,
+        **kw: Any,
+    ) -> str:
+        # Share the same lock as browser_drag_slider_until: the CDP/patchright
+        # cursor is session-scoped, parallel drags clobber each other.
+        if self.s.slider_drag_lock is None:
+            self.s.slider_drag_lock = asyncio.Lock()
+        async with self.s.slider_drag_lock:
+            return await self._execute_inner(
+                session_id, vision_index, value,
+                value_mode, value_min, value_max,
+            )
+
+    async def _execute_inner(
+        self,
+        session_id: str,
+        vision_index: int,
+        value: float,
+        value_mode: str | None,
+        value_min: float | None,
+        value_max: float | None,
+    ) -> str:
+        print(
+            f"\n>> browser_set_slider_at(V{vision_index} → {value} "
+            f"mode={value_mode or 'absolute'})"
+        )
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls = 0
+
+        resp = self.s.vision_for_target_resolution()
+        if resp is None:
+            return (
+                "[set_slider_at_failed:no_vision] No recent vision response. "
+                "Call browser_screenshot first so slider bboxes are indexed."
+            )
+
+        handle_bbox = resp.get_bbox(int(vision_index))
+        if handle_bbox is None:
+            return (
+                f"[set_slider_at_failed:bad_vision_index] V{vision_index} "
+                f"is out of range (only {len(resp.bboxes)} bboxes cached)."
+            )
+        handle_role = (getattr(handle_bbox, "role", "") or "").lower()
+        if handle_role not in ("slider_handle", "slider", "input"):
+            # Accept other roles loudly but keep going — vision may
+            # mis-tag a handle as 'input' or 'other'.
+            print(
+                f"   (note: V{vision_index} role={handle_role!r}, "
+                "expected slider_handle — continuing)"
+            )
+
+        iw, ih = resp.image_width, resp.image_height
+        if iw <= 0 or ih <= 0:
+            return "[set_slider_at_failed:no_image_dims] Re-screenshot first."
+        dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+        hx0, hy0, hx1, hy1 = handle_bbox.to_pixels(iw, ih, dpr=dpr_val)
+        handle_pix = {"x": hx0, "y": hy0, "w": hx1 - hx0, "h": hy1 - hy0}
+        handle_cy = hy0 + (hy1 - hy0) / 2.0
+
+        # Find the associated track: nearest role=slider_widget whose
+        # vertical centre sits within ±handle.h of the handle centre and
+        # whose horizontal span encloses the handle.
+        track_pix: dict[str, int] | None = None
+        track_bbox = None
+        best_dy: float | None = None
+        for cand in resp.bboxes:
+            if (getattr(cand, "role", "") or "").lower() != "slider_widget":
+                continue
+            cx0, cy0, cx1, cy1 = cand.to_pixels(iw, ih, dpr=dpr_val)
+            ccy = cy0 + (cy1 - cy0) / 2.0
+            dy = abs(ccy - handle_cy)
+            if dy > max(hy1 - hy0, 24):
+                continue
+            if cx0 > hx0 or cx1 < hx1:
+                # Track must enclose the handle horizontally.
+                # (Handles at either extreme still sit within the track
+                # bounds because the track includes min→max span.)
+                continue
+            if best_dy is None or dy < best_dy:
+                best_dy = dy
+                track_bbox = cand
+                track_pix = {
+                    "x": cx0, "y": cy0, "w": cx1 - cx0, "h": cy1 - cy0,
+                }
+
+        # Find the adjacent value-label text_block for min/max parsing +
+        # before-readback. Heuristic: role=text_block whose centre Y is
+        # within ±(handle.h + 40) of the handle's centre.
+        label_text: str = ""
+        for cand in resp.bboxes:
+            if (getattr(cand, "role", "") or "").lower() != "text_block":
+                continue
+            cx0, cy0, cx1, cy1 = cand.to_pixels(iw, ih, dpr=dpr_val)
+            ccy = cy0 + (cy1 - cy0) / 2.0
+            if abs(ccy - handle_cy) <= (hy1 - hy0) + 40:
+                label_text = (getattr(cand, "label", "") or "").strip()
+                break
+
+        mode = (value_mode or "absolute").lower()
+        if mode == "ratio":
+            ratio = max(0.0, min(1.0, float(value)))
+        else:
+            mn, mx = value_min, value_max
+            if (mn is None or mx is None) and label_text:
+                # Parse "0 to 10" / "$0 — $583" / "25 to 75" / "0 - 100"
+                import re as _re
+                nums = _re.findall(
+                    r"-?\d+(?:\.\d+)?",
+                    label_text.replace("$", "").replace("%", ""),
+                )
+                if len(nums) >= 2:
+                    try:
+                        parsed = [float(n) for n in nums[:2]]
+                        mn = parsed[0] if mn is None else mn
+                        mx = parsed[1] if mx is None else mx
+                    except ValueError:
+                        pass
+            if mn is None or mx is None:
+                return (
+                    "[set_slider_at_failed:no_minmax] Cannot infer min/max "
+                    "from adjacent label; pass value_min/value_max or use "
+                    "value_mode='ratio'. label_seen="
+                    + (repr(label_text) if label_text else "none")
+                )
+            span = float(mx) - float(mn)
+            if abs(span) < 1e-9:
+                ratio = 0.5
+            else:
+                ratio = (float(value) - float(mn)) / span
+                ratio = max(0.0, min(1.0, ratio))
+
+        if track_pix is None:
+            # Fall back: use the handle's bbox as a tiny pseudo-track.
+            # The drag still fires from the handle centre, but end = start,
+            # so this is effectively a no-op. Return diagnostic.
+            return (
+                f"[set_slider_at_failed:no_track] Could not find a "
+                f"role='slider_widget' bbox adjacent to V{vision_index}. "
+                "Re-screenshot; if the issue persists, use browser_set_slider "
+                "with a DOM selector instead."
+            )
+
+        payload = {"handle": handle_pix, "track": track_pix, "ratio": ratio}
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/set-slider-at",
+            json=payload,
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[set_slider_at_failed] {err}"
+        data = r.json()
+        outcome = data.get("outcome", {}) or {}
+        self.s.record_step(
+            "browser_set_slider_at",
+            f"V{vision_index} → {value} (ratio={ratio:.3f})",
+            data.get("url", ""),
+        )
+        lines = [
+            f"Dragged slider V{vision_index} to {value} "
+            f"(ratio={ratio:.2f}) via vision-drag",
+            f"  handle={outcome.get('handle_bbox')}",
+            f"  track={outcome.get('track_bbox')}",
+            f"  target_px={outcome.get('target_px')}",
+        ]
+        if label_text:
+            lines.append(f"  label_before={label_text!r}")
+        lines.append(
+            "  NEXT: call browser_screenshot to read "
+            "the rendered post-drag value label."
+        )
+        if data.get("elements"):
+            lines.append(str(data["elements"]))
+        return "\n".join(lines)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        required=["session_id"],
+    )
+)
+
+class BrowserListSliderHandlesTool(Tool):
+    name = "browser_list_slider_handles"
+    description = (
+        "Enumerate all slider handles on the page via DOM introspection "
+        "(NO vision). Walks every frame, including cross-origin ones, "
+        "and returns each handle's index, frame_url, kind, bbox (in "
+        "document CSS pixels), and the closest row-level label text. "
+        "Use this when vision is flaky or returning empty bboxes, or "
+        "when you already know the slider's logical label (e.g. "
+        "'Monthly contribution') and want to pick by text. Then pass "
+        "the bbox directly into browser_drag_slider_until via the "
+        "`handle_bbox` arg — skips the vision lookup entirely."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, **kw: Any) -> str:
+        print("\n>> browser_list_slider_handles()")
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/list-slider-handles",
+            json={},
+            timeout=20.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[list_slider_handles_failed] {err}"
+        data = r.json() or {}
+        handles = data.get("handles") or []
+        if not handles:
+            return (
+                "[list_slider_handles:empty] No slider handles found in "
+                "any frame. Page may still be loading — scroll or wait, "
+                "then retry. If the page clearly has sliders, they may "
+                "use non-standard markup; fall back to vision via "
+                "browser_screenshot."
+            )
+        lines = [f"Found {len(handles)} slider handle(s):"]
+        for h in handles:
+            lines.append(
+                f"  [{h.get('index')}] kind={h.get('kind')} "
+                f"bbox={h.get('bbox')} "
+                f"label={h.get('label', '')!r} "
+                f"frame={(h.get('frame_url') or '')[:80]}"
+            )
+        return "\n".join(lines)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index of the slider HANDLE "
+                "(the draggable thumb) from the most recent screenshot. "
+                "Either this OR handle_bbox_json is required."
+            ),
+            nullable=True,
+        ),
+        handle_bbox_json=StringSchema(
+            description=(
+                "Alternative to vision_index: pass the handle bbox "
+                "directly as a JSON object {\"x\":.., \"y\":.., \"w\":.., \"h\":..} "
+                "in CSS pixel document coords. Use this when vision is "
+                "unreliable — call browser_list_slider_handles to get "
+                "bboxes straight from the DOM, then pass one here."
+            ),
+            nullable=True,
+        ),
+        label_hint=StringSchema(
+            description=(
+                "Alternative discovery: a substring of the slider's label "
+                "(e.g. 'Monthly contribution'). The tool will call "
+                "browser_list_slider_handles, pick the handle whose label "
+                "contains this hint (case-insensitive, whitespace collapsed), "
+                "and use its bbox. Use when neither vision_index nor "
+                "handle_bbox_json is convenient."
+            ),
+            nullable=True,
+        ),
+        target_value=NumberSchema(
+            description=(
+                "The numeric value to slide to. The tool drags the handle "
+                "while watching the rendered label text, stopping when the "
+                "label shows this value (±tolerance)."
+            ),
+        ),
+        label_pattern=StringSchema(
+            description=(
+                "JS regex matching the rendered label — the FIRST capture "
+                "group must be the numeric value. Example for Chase: "
+                "'Monthly contribution[^:]*:\\s*\\$?(\\d+(?:\\.\\d+)?)'. "
+                "If omitted, matches any number in a text node on the same "
+                "visual row as the handle (works for most sliders with a "
+                "single value near the track)."
+            ),
+            nullable=True,
+        ),
+        tolerance=NumberSchema(
+            "Allowed |target - observed| gap. Default 0 (exact match).",
+            nullable=True,
+        ),
+        max_iterations=IntegerSchema(
+            "Safety cap on step iterations. Default 25.",
+            nullable=True,
+        ),
+        step_px=IntegerSchema(
+            "Initial pixel step. The tool auto-adapts from observed "
+            "value-per-pixel sensitivity. Default 8.",
+            nullable=True,
+        ),
+        direction=StringSchema(
+            "'auto' (default; inferred from current vs target), 'left', 'right'.",
+            nullable=True,
+        ),
+        required=["session_id", "target_value"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description=(
+                "1-based vision bbox index of the slider HANDLE "
+                "(the draggable thumb) from the most recent screenshot. "
+                "Either this OR handle_bbox_json is required."
+            ),
+            nullable=True,
+        ),
+        handle_bbox_json=StringSchema(
+            description=(
+                "Alternative to vision_index: pass the handle bbox "
+                "directly as a JSON object {\"x\":.., \"y\":.., \"w\":.., \"h\":..} "
+                "in CSS pixel document coords. Use this when vision is "
+                "unreliable — call browser_list_slider_handles to get "
+                "bboxes straight from the DOM, then pass one here."
+            ),
+            nullable=True,
+        ),
+        label_hint=StringSchema(
+            description=(
+                "Alternative discovery: a substring of the slider's label "
+                "(e.g. 'Monthly contribution'). The tool will call "
+                "browser_list_slider_handles, pick the handle whose label "
+                "contains this hint (case-insensitive, whitespace collapsed), "
+                "and use its bbox. Use when neither vision_index nor "
+                "handle_bbox_json is convenient."
+            ),
+            nullable=True,
+        ),
+        target_value=NumberSchema(
+            description=(
+                "The numeric value to slide to. The tool drags the handle "
+                "while watching the rendered label text, stopping when the "
+                "label shows this value (±tolerance)."
+            ),
+        ),
+        label_pattern=StringSchema(
+            description=(
+                "JS regex matching the rendered label — the FIRST capture "
+                "group must be the numeric value. Example for Chase: "
+                "'Monthly contribution[^:]*:\\s*\\$?(\\d+(?:\\.\\d+)?)'. "
+                "If omitted, matches any number in a text node on the same "
+                "visual row as the handle (works for most sliders with a "
+                "single value near the track)."
+            ),
+            nullable=True,
+        ),
+        tolerance=NumberSchema(
+            "Allowed |target - observed| gap. Default 0 (exact match).",
+            nullable=True,
+        ),
+        max_iterations=IntegerSchema(
+            "Safety cap on step iterations. Default 25.",
+            nullable=True,
+        ),
+        step_px=IntegerSchema(
+            "Initial pixel step. The tool auto-adapts from observed "
+            "value-per-pixel sensitivity. Default 8.",
+            nullable=True,
+        ),
+        direction=StringSchema(
+            "'auto' (default; inferred from current vs target), 'left', 'right'.",
+            nullable=True,
+        ),
+        required=["session_id", "target_value"],
+    )
+)
+class BrowserDragSliderUntilTool(Tool):
+    name = "browser_drag_slider_until"
+    description = (
+        "Closed-loop slider drag. Holds the mouse down on the handle, "
+        "steps incrementally, reads the rendered value label from the "
+        "iframe DOM after each step, and stops when the label shows the "
+        "target value. THE right tool for custom widgets where vision "
+        "can't reliably identify the full track geometry (Chase/JPM "
+        "calculators, React/Angular sliders with no aria-valuenow). "
+        "Unlike browser_set_slider_at (open-loop), this never overshoots "
+        "and recovers automatically from non-linear widget scaling. "
+        "Workflow: (1) browser_screenshot → vision returns slider_handle "
+        "V_n values; (2) call this tool with vision_index=V_n and your "
+        "numeric target; (3) inspect the returned trace + final_value to "
+        "verify the label reached the target."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        target_value: float,
+        vision_index: int | None = None,
+        handle_bbox_json: str | None = None,
+        label_hint: str | None = None,
+        label_pattern: str | None = None,
+        tolerance: float | None = None,
+        max_iterations: int | None = None,
+        step_px: int | None = None,
+        direction: str | None = None,
+        **kw: Any,
+    ) -> str:
+        gate = await _feedback_gate("browser_drag_slider_until")
+        if gate:
+            return gate
+        ok, gate_msg = await _require_fresh_vision(
+            self.s, session_id,
+            reason=f"browser_drag_slider_until(target={target_value})",
+        )
+        if not ok:
+            return gate_msg
+        # Serialize drags on this session. If the LLM fired this tool in
+        # parallel for multiple sliders, we queue them up so the cursor
+        # owns one slider at a time. Without this lock, concurrent drags
+        # fight for the same CDP mouse and produce garbage.
+        if self.s.slider_drag_lock is None:
+            self.s.slider_drag_lock = asyncio.Lock()
+        async with self.s.slider_drag_lock:
+            return await self._execute_inner(
+                session_id, target_value, vision_index, handle_bbox_json,
+                label_hint, label_pattern, tolerance, max_iterations,
+                step_px, direction,
+            )
+
+    async def _resolve_handle_bbox(
+        self, session_id: str,
+        vision_index: int | None,
+        handle_bbox_json: str | None,
+        label_hint: str | None,
+    ) -> tuple[dict[str, float] | None, str]:
+        """Returns (bbox | None, source_description). Tries, in order:
+        direct handle_bbox_json → label_hint via DOM enum → vision_index.
+        Returns None + reason string on failure."""
+        # 1. Direct bbox — highest priority, no indirection.
+        if handle_bbox_json:
+            try:
+                bb = json.loads(handle_bbox_json)
+            except (TypeError, ValueError) as exc:
+                return None, f"bad handle_bbox_json: {exc}"
+            if not isinstance(bb, dict):
+                return None, "handle_bbox_json must decode to a dict"
+            for k in ("x", "y", "w", "h"):
+                if not isinstance(bb.get(k), (int, float)):
+                    return None, f"handle_bbox_json missing numeric {k!r}"
+            return bb, "handle_bbox_json"
+
+        # 2. Label hint — DOM enum, pick best fuzzy match.
+        if label_hint:
+            try:
+                r = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/list-slider-handles",
+                    json={},
+                    timeout=20.0,
+                )
+                handles = (r.json() or {}).get("handles") or [] if r.status_code < 400 else []
+            except Exception as exc:
+                return None, f"list-slider-handles failed: {exc}"
+            if not handles:
+                return None, "list-slider-handles returned no sliders"
+            norm = label_hint.lower().strip()
+            # Score each handle: label contains hint → big win; else token overlap.
+            best = None
+            best_score = -1.0
+            for h in handles:
+                lab = (h.get("label") or "").lower().strip()
+                if not lab:
+                    continue
+                if norm in lab:
+                    score = 1.0 + min(1.0, len(norm) / max(1, len(lab)))
+                else:
+                    ht = set(norm.split())
+                    lt = set(lab.split())
+                    if not ht:
+                        continue
+                    score = len(ht & lt) / len(ht)
+                if score > best_score:
+                    best_score = score
+                    best = h
+            if not best or best_score < 0.5:
+                sample = [f"[{h.get('index')}] {h.get('label')!r}" for h in handles[:8]]
+                return None, (
+                    f"no handle label matched {label_hint!r}. "
+                    f"candidates: {sample}"
+                )
+            return best.get("bbox"), f"label_hint={label_hint!r}"
+
+        # 3. Vision index — legacy path.
+        if vision_index is not None:
+            resp = self.s.vision_for_target_resolution()
+            if resp is None:
+                return None, (
+                    "no cached vision response (call browser_screenshot "
+                    "first, or pass handle_bbox_json / label_hint)"
+                )
+            handle_bbox = resp.get_bbox(int(vision_index))
+            if handle_bbox is None:
+                return None, (
+                    f"V{vision_index} out of range "
+                    f"({len(resp.bboxes)} bboxes cached)"
+                )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return None, "vision has no image dims; re-screenshot first"
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            hx0, hy0, hx1, hy1 = handle_bbox.to_pixels(iw, ih, dpr=dpr_val)
+            return (
+                {"x": hx0, "y": hy0, "w": hx1 - hx0, "h": hy1 - hy0},
+                f"vision_index=V{vision_index}",
+            )
+
+        return None, "provide vision_index, handle_bbox_json, or label_hint"
+
+    async def _execute_inner(
+        self,
+        session_id: str,
+        target_value: float,
+        vision_index: int | None,
+        handle_bbox_json: str | None,
+        label_hint: str | None,
+        label_pattern: str | None,
+        tolerance: float | None,
+        max_iterations: int | None,
+        step_px: int | None,
+        direction: str | None,
+    ) -> str:
+        src = (
+            f"V{vision_index}" if vision_index is not None
+            else (f"hint={label_hint!r}" if label_hint
+                  else ("bbox=json" if handle_bbox_json else "?"))
+        )
+        print(
+            f"\n>> browser_drag_slider_until({src} → {target_value}"
+            f"{' pattern=' + repr(label_pattern) if label_pattern else ''})"
+        )
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls = 0
+
+        handle_pix, source_desc = await self._resolve_handle_bbox(
+            session_id, vision_index, handle_bbox_json, label_hint,
+        )
+        if handle_pix is None:
+            msg = f"[drag_slider_until_failed:no_handle] {source_desc}"
+            print(f"   {msg}")
+            return msg
+        print(f"   resolved handle via {source_desc}: {handle_pix}")
+
+        payload: dict[str, Any] = {
+            "handle": handle_pix,
+            "target_value": float(target_value),
+        }
+        if label_pattern is not None:
+            payload["label_pattern"] = label_pattern
+        if tolerance is not None:
+            payload["tolerance"] = float(tolerance)
+        if max_iterations is not None:
+            payload["max_iterations"] = int(max_iterations)
+        if step_px is not None:
+            payload["step_px"] = int(step_px)
+        if direction is not None:
+            payload["direction"] = direction
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/drag-slider-until",
+            json=payload,
+            timeout=60.0,  # longer — closed-loop can take a few seconds
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[drag_slider_until_failed] {err}"
+        data = r.json()
+        out = data.get("outcome", {}) or {}
+        self.s.record_step(
+            "browser_drag_slider_until",
+            f"{source_desc} → {target_value} in {out.get('iterations')} iters",
+            data.get("url", ""),
+        )
+        # The drag moved the handle — treat as a page mutation so the
+        # next click waits for fresh vision of the post-drag DOM.
+        self.s.advance_observation_token("drag_slider_until")
+        _schedule_vision_prefetch(self.s, session_id)
+        final_v = out.get("final_value")
+        init_v = out.get("initial_value")
+        completed = bool(out.get("completed"))
+        lines: list[str] = []
+        if not completed:
+            # Prefix with the FAILED tag so the agent treats this as a
+            # loud failure (same convention as all other _failed returns).
+            if init_v is None:
+                reason = "initial_readback_failed"
+            elif final_v is None:
+                reason = "value_lost_mid_drag"
+            else:
+                reason = "target_not_reached"
+            lines.append(
+                f"[drag_slider_until_failed:{reason}] "
+                f"{source_desc} target={target_value} "
+                f"final={final_v} initial={init_v}"
+            )
+        else:
+            lines.append(
+                f"Closed-loop slider {source_desc} → target={target_value} "
+                f"COMPLETED in {out.get('iterations')} iterations: "
+                f"{init_v} → {final_v}"
+            )
+        lines.append(f"  label_text={out.get('label_text')!r}")
+        trace = out.get("trace") or []
+        if trace:
+            lines.append("  trace (last 4):")
+            for row in trace[-4:]:
+                lines.append(
+                    f"    iter={row.get('iter')} "
+                    f"cursor_x={row.get('cursor_x')} "
+                    f"value={row.get('value')}"
+                )
+        if not completed:
+            lines.append(
+                "  Fix: if label_text shows NO_MATCH, your label_pattern "
+                "regex didn't match any nearby text — the 'nearby text' "
+                "list in label_text shows what IS there. Adjust the regex. "
+                "If label_text looks right but target wasn't reached, widen "
+                "tolerance or raise max_iterations. Always call sliders "
+                "SEQUENTIALLY — never in a parallel batch."
+            )
+        if data.get("elements"):
+            lines.append(str(data["elements"]))
+        return _maybe_no_effect_prefix(
+            data, "browser_drag_slider_until", "\n".join(lines),
+            session_state=self.s,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        bbox_json=StringSchema(
+            "JSON object {x, y, w, h} describing the viewport region to crop, in CSS pixels."
+        ),
+        quality=IntegerSchema("JPEG quality 1–100, default 80.", nullable=True),
+        required=["session_id", "bbox_json"],
+    )
+)
+
+class BrowserImageRegionTool(Tool):
+    name = "browser_image_region"
+    description = (
+        "Screenshot a bounded region of the viewport and return base64 JPEG. "
+        "Cheaper than a full-page Gemini pass for solvers that need to "
+        "template-match a captcha piece, OCR a small area, or run a tiny "
+        "focused vision query."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        bbox_json: str,
+        quality: int | None = None,
+        **kw: Any,
+    ) -> str:
+        try:
+            bbox = json.loads(bbox_json)
+        except (TypeError, ValueError) as exc:
+            return f"[image_region_failed] bbox_json is not valid JSON: {exc}"
+        for k in ("x", "y", "w", "h"):
+            if not isinstance(bbox.get(k), (int, float)):
+                return f"[image_region_failed] bbox must have numeric {k}"
+
+        payload: dict[str, Any] = {"bbox": bbox}
+        if quality is not None:
+            payload["quality"] = quality
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/image-region",
+            json=payload,
+            timeout=15.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[image_region_failed] {err}"
+        data = r.json()
+        b64 = data.get("base64", "")
+        return (
+            f"image_region: {bbox['w']}x{bbox['h']} at ({bbox['x']},{bbox['y']}), "
+            f"base64_len={len(b64)}\n{b64[:200]}..."
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        hint=StringSchema(
+            "Optional solver name to force (chess_com, slider_captcha, jigsaw_captcha, "
+            "rotation_captcha, grid_drag). Skip for auto-detect.",
+            nullable=True,
+        ),
+        max_steps=IntegerSchema(
+            "Maximum solver iterations. Default 10 — enough for most chess puzzles "
+            "and captchas; increase for long puzzle lines.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        hint=StringSchema(
+            "Optional solver name to force (chess_com, slider_captcha, jigsaw_captcha, "
+            "rotation_captcha, grid_drag). Skip for auto-detect.",
+            nullable=True,
+        ),
+        max_steps=IntegerSchema(
+            "Maximum solver iterations. Default 10 — enough for most chess puzzles "
+            "and captchas; increase for long puzzle lines.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserSolvePuzzleTool(Tool):
+    name = "browser_solve_puzzle"
+    description = (
+        "Auto-detect the puzzle on the current page (chess position, "
+        "slider/jigsaw/rotation captcha, generic grid-drag) and run a "
+        "dedicated solver through extract → plan → execute → verify. "
+        "Uses selector- and coordinate-exact primitives under the hood "
+        "(zero Gemini round-trips in the move loop). Use whenever the "
+        "page presents a puzzle-like challenge."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        hint: str | None = None,
+        max_steps: int | None = None,
+        **kw: Any,
+    ) -> str:
+        print(f"\n>> browser_solve_puzzle(session={session_id}, hint={hint!r}, max_steps={max_steps})")
+        from superbrowser_bridge.puzzle_solvers import detect as _detect, solve as _solve
+        from superbrowser_bridge.puzzle_solvers.browser import HttpSolverBrowser
+
+        # Pull a DOM snapshot + URL to feed the detector (cheap GET).
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                state_resp = await client.get(
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "false"},
+                )
+                state_resp.raise_for_status()
+                state_data = state_resp.json()
+        except Exception as exc:
+            return f"[solve_puzzle_failed] cannot read session state: {exc}"
+
+        url = state_data.get("url", "") or ""
+        dom_snippet = state_data.get("elements") or ""
+
+        solver, conf = _detect(url, dom_snippet, hint=hint)
+        if solver is None:
+            return (
+                "[solve_puzzle_no_match] No solver matched the current page "
+                f"(url={url!r}, confidence={conf:.2f}). Pass hint=<solver name> "
+                "to force, or implement a new solver for this page type."
+            )
+
+        print(f">> selected solver: {solver.name} (confidence={conf:.2f})")
+        async with HttpSolverBrowser(session_id, SUPERBROWSER_URL) as browser:
+            result = await _solve(solver, browser, max_steps=max_steps or 10)
+
+        self.s.record_step(
+            "browser_solve_puzzle",
+            f"{solver.name} success={result.success} steps={result.steps_taken}",
+            url,
+        )
+        lines = [
+            f"Puzzle solver: {result.solver}",
+            f"Success: {result.success}",
+            f"Steps taken: {result.steps_taken}",
+        ]
+        if result.error:
+            lines.append(f"Error: {result.error}")
+        if result.actions:
+            lines.append(f"Actions ({len(result.actions)}):")
+            for a in result.actions[:8]:
+                lines.append(f"  - {a.kind}: {a.reason or ''}")
+            if len(result.actions) > 8:
+                lines.append(f"  … ({len(result.actions) - 8} more)")
+        if result.final_state:
+            # Strip large base64 payloads before logging.
+            redacted = {
+                k: (f"<{len(v)} bytes>" if isinstance(v, str) and len(v) > 200 else v)
+                for k, v in result.final_state.items()
+            }
+            lines.append(f"Final state: {redacted}")
+        return "\n".join(lines)
+
+
+@tool_parameters(
+    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+)
+
 def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
     """Register all browser session tools with a nanobot instance.
 
@@ -8583,13 +8016,6 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
     if state is None:
         state = BrowserSessionState()
 
-    # Lazy-import semantic tools so the circular dependency (they import
-    # helpers FROM this module) doesn't bite at module load time.
-    from superbrowser_bridge.semantic_tools import (
-        BrowserSemanticClickTool as _SemanticClickTool,
-        BrowserSemanticTypeTool as _SemanticTypeTool,
-    )
-
     tools = [
         BrowserOpenTool(state),
         BrowserNavigateTool(state),
@@ -8600,39 +8026,34 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserFixTextAtTool(state),
         BrowserTypeTool(state),
         BrowserKeysTool(state),
-        # Atomic semantic-target tools (Round 3). The brain describes
-        # the target by label/role; the tool takes a fresh vision pass
-        # and dispatches in the same turn — no V-index drift.
-        _SemanticClickTool(state),
-        _SemanticTypeTool(state),
         BrowserScrollTool(state),
-        BrowserScrollUntilTool(state),
+        BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
         BrowserSelectTool(state),
         BrowserEvalTool(state),
         BrowserRunScriptTool(state),
         BrowserWaitForTool(state),
         BrowserDragTool(state),
-        BrowserGetRectTool(state),
-        BrowserClickSelectorTool(state),
-        BrowserDragSelectorsTool(state),
-        BrowserDragPathTool(state),
-        BrowserSetSliderTool(state),
+        BrowserGetRectTool(state),         # kept: DOM rect helper
+        BrowserClickSelectorTool(state),   # kept: DOM-selector fast path
+        BrowserDragSelectorsTool(state),   # kept: selector-based drag
+        BrowserDragPathTool(state),        # kept: polyline drag
+        BrowserSetSliderTool(state),       # kept: slider family for ChaseIRA calc
         BrowserSetSliderAtTool(state),
         BrowserListSliderHandlesTool(state),
         BrowserDragSliderUntilTool(state),
-        BrowserImageRegionTool(state),
-        BrowserSolvePuzzleTool(state),
-        BrowserGetMarkdownTool(),        # stateless
-        BrowserDialogTool(),             # stateless
+        BrowserImageRegionTool(state),     # kept: image region helper
+        BrowserSolvePuzzleTool(state),     # kept: puzzle solver
+        BrowserGetMarkdownTool(),          # stateless
+        BrowserDialogTool(),               # stateless
         BrowserDetectCaptchaTool(state),
         BrowserCaptchaScreenshotTool(state),
         BrowserSolveCaptchaTool(state),
         BrowserAskUserTool(state),
         BrowserVerifyFactTool(state),
         BrowserRequestHelpTool(state),
-        BrowserEscalateTool(state),       # NEW — t1 → t3 migration
-        BrowserPlanNextStepsTool(state),  # NEW — hierarchical planner
-        BrowserRewindToCheckpointTool(state),  # session-memory escape hatch
+        BrowserEscalateTool(state),        # t1 → t3 migration
+        BrowserPlanNextStepsTool(state),   # hierarchical planner
+        BrowserRewindToCheckpointTool(state),  # kept: session-memory escape hatch
         BrowserCloseTool(state),
     ]
     for tool in tools:

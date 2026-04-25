@@ -233,6 +233,29 @@ export class BrowserEngine extends EventEmitter {
     // excluded (fires on every text tick in chat apps, would tank CPU
     // on Slack/Notion); childList+subtree+attributes is sufficient for
     // React re-renders and DOM-level autocomplete state changes.
+    // Shim `__name` so arrow functions compiled by tsx/esbuild (which
+    // wraps every function in `__name(fn, 'name')` for name
+    // preservation) don't hit `ReferenceError: __name is not defined`
+    // when Puppeteer serializes them into the browser context. This
+    // manifested as HTTP 500s on /session/:id/click — semantic_click
+    // couldn't dismiss any popup. Keep it before the mutation observer
+    // install so that instrumentation itself doesn't trip the shim
+    // load order. `fn => fn` preserves behaviour — the `__name` helper
+    // is a decorator-style identity wrapper in practice.
+    await page.evaluateOnNewDocument(`
+      (function () {
+        try {
+          if (typeof window === 'undefined') return;
+          if (typeof window.__name !== 'function') {
+            Object.defineProperty(window, '__name', {
+              value: function (fn) { return fn; },
+              configurable: true, writable: true,
+            });
+          }
+        } catch (_) { /* silent */ }
+      })();
+    `);
+
     await page.evaluateOnNewDocument(`
       (function () {
         try {

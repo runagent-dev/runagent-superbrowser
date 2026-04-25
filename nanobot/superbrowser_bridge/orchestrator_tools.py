@@ -696,35 +696,68 @@ class DelegateBrowserTaskTool(Tool):
         # Strategy block — bias the brain toward cursor-based actions
         # over scripts. Empirically the LLM reaches for
         # `browser_run_script` as a Swiss Army knife whenever a click
-        # feels complicated, but scripts get 403'd by site WAFs and
-        # produce multi-turn coordination bugs that `browser_semantic_click`
-        # handles in one atomic call. Keep this block EARLY in the
-        # prompt so it frames every tool choice that follows.
+        # feels complicated, but JS clicks are isTrusted=false and
+        # bot-detected by Cloudflare / hCaptcha / Akamai-class WAFs.
+        # Keep this block EARLY in the prompt so it frames every tool
+        # choice that follows.
         parts.append(
             "\n## Strategy — Prefer cursor over scripts\n"
-            "Tool preference order for element interaction:\n"
-            "  1. **FIRST** `browser_semantic_click(target='<label>')` — "
-            "atomic fresh vision + dispatch; React-safe; no V-index "
-            "drift. Your default for any click where you can describe "
-            "the target in a phrase.\n"
-            "  2. `browser_click_at(vision_index=V_n)` — precise when "
-            "the bbox list is short and unambiguous.\n"
-            "  3. `browser_click_selector(<css>)` — when the target "
-            "has a stable CSS hook (id, data-test-id, unique class).\n"
+            "The vision agent gives you `[V_n]` bbox indices in every "
+            "screenshot reply. Pick targets from that list — the cursor "
+            "tools below all dispatch via humanized CDP mouse events "
+            "(isTrusted=true), which WAF-protected sites don't flag.\n"
+            "\n"
+            "Tool preference for element interaction:\n"
+            "  1. **FIRST** `browser_click_at(vision_index=V_n)` — "
+            "humanized cursor click on the bbox vision just pointed at. "
+            "`V_n` MUST come from the most recent screenshot's vision "
+            "output; do NOT invent indices or coords.\n"
+            "  2. `browser_click_selector(<css>)` — zero-Gemini click "
+            "when the target has a stable hook (id, data-test-id, "
+            "unique class). Chess squares, form fields, captcha "
+            "handles.\n"
+            "  3. `browser_click(index=N)` — DOM-index click when "
+            "the brain sees the element in the interactive elements "
+            "listing but vision didn't surface it.\n"
             "  4. **LAST RESORT** `browser_run_script(mutates=true)` — "
             "only when no bbox/selector works or the action requires "
-            "multi-step orchestration. Sites with a WAF (SpotHero, "
-            "Akamai-class) frequently 403 this; don't reach for it "
-            "reflexively.\n\n"
-            "For text input: `browser_semantic_type(target='<field label>', "
-            "text='<text>')` is the React-safe cursor path; avoids the "
-            "\"dispatched events React ignored\" failure class.\n\n"
+            "multi-step orchestration. JS clicks are isTrusted=false; "
+            "many sites 403 this; don't reach for it reflexively.\n"
+            "\n"
+            "For text input: `browser_type_at(vision_index=V_n, "
+            "text=...)` is the React-safe cursor path.\n"
+            "\n"
             "**Popups / modals / country gates:** when vision reports a "
             "blocker layer (cookie banner, region modal, consent), "
-            "dismiss it with `browser_semantic_click(target='<visible "
-            "label>')` — e.g. 'Accept', 'Close', 'Continue Anyway', "
-            "'Reject all'. Do NOT try to script-close them; the label "
-            "IS in the bbox list."
+            "dismiss it FIRST with `browser_click_at(V_n)` on the "
+            "visible dismiss label — e.g. 'Accept', 'Close', 'Continue "
+            "Anyway', 'Reject all'. The label IS in the bbox list.\n"
+            "\n"
+            "**Missing control? Scroll and re-screenshot.** Vision "
+            "only sees the current viewport. On dense pages — search "
+            "results with filter sidebars, long forms, booking UIs "
+            "with vehicle/amenity selectors — the control you need "
+            "may be below or beside the fold. If a control mentioned "
+            "in your task (vehicle type, in-and-out toggle, filter "
+            "chip, amenity checkbox, sort dropdown) is NOT in the "
+            "current `[V_n]` list, do NOT invent a selector or click "
+            "at guessed coords. Instead: `browser_scroll(percent=...)` "
+            "or `browser_scroll_until(target_text='<label>')` to "
+            "bring it into view, then `browser_screenshot` for a "
+            "fresh bbox list. Repeat until the control appears or "
+            "the page can't scroll further.\n"
+            "\n"
+            "**Still missing after scrolling?** Use "
+            "`browser_get_markdown` (free) to inspect the page text "
+            "— the interactive elements listing at the bottom of "
+            "every tool reply also exposes controls vision culled. "
+            "If you see the target in the elements listing as "
+            "`[N] tag text=…`, click it via `browser_click(index=N)` "
+            "— bypasses vision entirely for stable DOM-indexed "
+            "targets. `browser_image_region(bbox_json=...)` can grab "
+            "a tight JPEG of a specific viewport region if you need "
+            "to OCR/inspect something closely (captcha tiles, price "
+            "text near a specific card)."
         )
 
         # Auto-inject learnings so the worker follows known patterns
@@ -885,10 +918,10 @@ CRITICAL RULES:
 - NEVER fabricate URLs — only visit URLs found in Google search results
 - Search snippets are NOT sufficient — you MUST visit actual pages to read full content
 - Use BROAD natural queries first, then narrow. Do NOT put all constraints in one query.
-- You have {max_iter} iterations total. Use them to obtain REAL data — do not pre-announce a bail-out.
+- There is no fixed iteration budget. Keep trying concrete tactics until you succeed or genuinely exhaust options — do not pre-announce a bail-out after a few failed tries.
 - If you see [GUIDANCE: ...] messages, follow them IMMEDIATELY.
 - Return ALL findings with source URLs.
-- NEVER invent, estimate, or guess values. If a data point genuinely cannot be retrieved, say so explicitly and return done(success=False) with a brief honest reason. Fabricated numbers with plausible-sounding disclaimers are a FAILURE.""".format(max_iter=max_iterations))
+- NEVER invent, estimate, or guess values. If a data point genuinely cannot be retrieved, say so explicitly and return done(success=False) with a brief honest reason. Fabricated numbers with plausible-sounding disclaimers are a FAILURE.""")
         else:
             # When a resumption artifact pre-seeded the worker's session_id,
             # `browser_open` is NOT AVAILABLE — calling it would discard the
@@ -953,11 +986,13 @@ CRITICAL RULES:
   extraction — no paraphrasing, no rounding "$1,234.56" to "around $1,200".
 - If `all_candidates` has multiple prices, say so: "Page showed $X (crossed
   out) and $Y (selected); reporting $Y."
-- You have {max_iter} iterations. If a script fails, FIX IT and retry on the
-  same page — do NOT navigate backward or browser_open again.
+- There is no fixed iteration budget. If a script fails, FIX IT and retry on
+  the same page — do NOT navigate backward or browser_open again.
 - If [GUIDANCE: ...] messages appear, follow them IMMEDIATELY.
-- If stuck after 3 tries, call browser_request_help with a concrete new
-  tactic, then call done(success=False).""".format(max_iter=max_iterations))
+- If stuck, try concrete ALTERNATIVE tactics before giving up: different
+  selector, keyboard navigation (Tab/ArrowDown/Enter), browser_screenshot
+  to re-observe, browser_rewind_to_checkpoint. Call browser_request_help
+  only after multiple concrete alternatives failed.""")
 
         prompt = "\n".join(parts)
 

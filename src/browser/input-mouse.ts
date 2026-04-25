@@ -19,6 +19,9 @@ export const Modifiers = {
 
 export type MouseButton = 'left' | 'right' | 'middle';
 
+/** One-shot latch so the linear-mode-ignored warning doesn't spam every click. */
+let warnedLinearModeIgnored = false;
+
 /**
  * Dispatch a full click sequence via CDP.
  *
@@ -59,10 +62,24 @@ export async function dispatchClick(
   // humanClick doesn't forward modifiers or clickCount>1. Fall back to the
   // deterministic path when those are needed or when the caller opted out.
   // Env escape hatch: SUPERBROWSER_CLICK_MODE=linear kills humanization
-  // for every click in the process — noticeable speed-up on test runs
-  // where you don't need bot-detection stealth and the pre-click
-  // hesitation (50–150ms) feels laggy during vision-loop debugging.
-  const envLinear = process.env.SUPERBROWSER_CLICK_MODE === 'linear';
+  // for the process — useful during vision-loop debugging. Restricted to
+  // NODE_ENV=test so a prod config can't silently disable stealth; outside
+  // tests we warn once and ignore.
+  const envLinear =
+    process.env.SUPERBROWSER_CLICK_MODE === 'linear'
+    && process.env.NODE_ENV === 'test';
+  if (
+    process.env.SUPERBROWSER_CLICK_MODE === 'linear'
+    && process.env.NODE_ENV !== 'test'
+    && !warnedLinearModeIgnored
+  ) {
+    console.warn(
+      '[input-mouse] SUPERBROWSER_CLICK_MODE=linear ignored: only honored '
+      + 'when NODE_ENV=test. Humanized click path stays active to avoid '
+      + 'bot-detection flags. Unset the env var to silence this warning.',
+    );
+    warnedLinearModeIgnored = true;
+  }
   const useHumanized = !options?.linear && !envLinear
     && clickCount === 1 && modifiers === 0;
 

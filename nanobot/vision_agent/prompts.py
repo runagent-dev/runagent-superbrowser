@@ -116,6 +116,28 @@ General rules:
 - Do NOT hallucinate elements. If you cannot read it, leave it out.
 - `intent_relevant` is true for bboxes that most directly serve the
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
+- Return up to 50 bboxes. Do not cap yourself lower on dense pages —
+  the caller's brain can't click what isn't in the list.
+
+Page-type coverage rules (CRITICAL for dense filter/booking UIs):
+- On `search_results` / `product_listing` / `checkout_form` /
+  `map_or_booking` pages, ALWAYS include EVERY visible:
+    * filter chip / facet checkbox / amenity toggle (even as a group
+      of similar-looking items — emit each separately, not once);
+    * sort-by dropdown, group-by selector, map/list switcher;
+    * vehicle / guest / party-size / room-count selector;
+    * date-range picker, time picker;
+    * in-and-out / re-entry / cancellation-policy toggle or badge;
+    * per-result "Details" / "Book" / "Select" action button.
+  These controls often look like "chrome" next to the main content
+  cards, but without them the caller CANNOT complete a booking task.
+  They are `role_in_scene = "target"` or `"content"`, not "chrome".
+- On any page, if the caller's task phrases name specific
+  attributes ("Ford F-150", "in-and-out", "wheelchair accessible",
+  "pet-friendly", "king bed"), include every bbox whose label touches
+  those words, even if they look like filter-sidebar noise. The
+  caller's downstream scorer will re-rank; your job is comprehensive
+  coverage, not brevity.
 - For captcha tiles, emit one bbox per tile with role='captcha_tile' and
   label like 'tile 1,1'. For captcha sliders, include role='slider_handle'
   for the draggable handle and role='captcha_widget' for the outer track.
@@ -210,7 +232,20 @@ def intent_bucket(intent: str) -> str:
     # swallowed into the generic "solve_captcha" bucket.
     if "captcha step" in s or "captcha_step" in s:
         return "solve_captcha_step"
-    if any(k in s for k in ("captcha", "challenge", "prove you")):
+    # F4 — captcha bucket only fires when the intent expresses an
+    # ACTION on a captcha (solve / click / complete / submit / pick a
+    # tile / drag a slider). The brain often writes "find search box
+    # and any captcha" or "watch for captcha or modal" as a passive
+    # awareness hint — that historically tripped the bucket and put
+    # Gemini into tile-grid mode for normal pages, mislabeling search
+    # inputs as captcha tiles. Require both a noun and a verb to fire.
+    _captcha_nouns = ("captcha", "challenge", "prove you", "i'm not a robot")
+    _captcha_verbs = (
+        "solve", "click tile", "click on tile", "select tile", "pick tile",
+        "complete the captcha", "complete captcha", "drag slider",
+        "verify human", "verify i'm human", "submit captcha",
+    )
+    if any(n in s for n in _captcha_nouns) and any(v in s for v in _captcha_verbs):
         return "solve_captcha"
     if any(k in s for k in ("click", "fill", "type", "select", "choose", "interact", "dismiss", "submit")):
         return "act"
@@ -219,6 +254,40 @@ def intent_bucket(intent: str) -> str:
     if any(k in s for k in ("observe", "what", "read", "describe")):
         return "observe"
     return "other"
+
+
+_TASK_KEEP_STOPWORDS: frozenset[str] = frozenset({
+    "the", "and", "for", "with", "from", "into", "this", "that",
+    "next", "near", "find", "need", "want", "going", "use", "using",
+    "please", "make", "get", "show", "list", "tell", "give", "page",
+    "site", "button", "click", "type", "write", "fill", "enter",
+    "submit", "search", "open", "view", "your", "you", "our", "its",
+    "there", "here", "then", "now", "all", "one", "two", "three",
+    "zero", "can", "will", "would", "should", "must",
+})
+
+
+def _task_keep_keywords(task_instruction: str) -> list[str]:
+    """Extract up to 20 content tokens from the task description to
+    show the vision agent as a KEEP list. Matches the token logic in
+    `vision_agent.client._task_keep_tokens` so prompt guidance and
+    post-hoc cap-override agree on what's "task-critical"."""
+    if not task_instruction:
+        return []
+    import re as _re
+    seen: list[str] = []
+    for tok in _re.split(r"[\s,.;:!?()\[\]{}\"']+", task_instruction.lower()):
+        tok = tok.strip().strip("-/")
+        if len(tok) < 3:
+            continue
+        if tok in _TASK_KEEP_STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.append(tok)
+        if len(seen) >= 20:
+            break
+    return seen
 
 
 def build_user_prompt(
@@ -260,6 +329,20 @@ def build_user_prompt(
 
     if task_instruction:
         context += f"Overall task: {task_instruction}\n"
+        # B: surface task keywords as an explicit KEEP list so vision
+        # preserves bboxes whose labels touch the caller's concrete
+        # requirements (vehicle make/model, amenity, filter name),
+        # even when they look like filter-sidebar chrome.
+        _keep = _task_keep_keywords(task_instruction)
+        if _keep:
+            context += (
+                "KEEP keywords (task-critical — emit a bbox for any "
+                "visible control whose label, aria, or visible text "
+                "touches ANY of these, even if it otherwise looks like "
+                "filter/sidebar chrome): "
+                + ", ".join(_keep[:20])
+                + "\n"
+            )
 
     if current_subgoal is not None:
         sg_id = str(getattr(current_subgoal, "id", "") or "")

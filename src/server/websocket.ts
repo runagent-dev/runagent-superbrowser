@@ -408,6 +408,7 @@ async function handleCommand(
         code,
         data.context as Record<string, unknown> | undefined,
         data.timeout as number | undefined,
+        { mutates: Boolean(data.mutates) },
       );
       sendEvent(ws, 'script_result', scriptResult);
       break;

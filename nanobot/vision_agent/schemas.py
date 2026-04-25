@@ -813,7 +813,7 @@ class VisionResponse(BaseModel):
         }
         return aliases.get(s, "uncertain")
 
-    def as_brain_text(self, max_bboxes: int = 30) -> str:
+    def as_brain_text(self, max_bboxes: int = 50) -> str:
         """Render into a compact text block the nanobot brain consumes.
 
         Bboxes are ranked intent-relevant first, then clickable, then by

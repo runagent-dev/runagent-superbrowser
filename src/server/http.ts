@@ -370,7 +370,13 @@ export function createHttpServer(
         }
 
         // Execute Puppeteer code with full page API access (goto, click, type, etc.)
-        const scriptResult = await runPuppeteerScript(rawPage, code, context, req.body.timeout);
+        // /function is the stealth one-shot endpoint — callers use it
+        // for genuine automation (rendering, scraping, seeded clicks);
+        // keep mutations enabled here. The sandbox default only applies
+        // to the agent-facing /session/:id/script path.
+        const scriptResult = await runPuppeteerScript(
+          rawPage, code, context, req.body.timeout, { mutates: true },
+        );
 
         await page.close();
 
@@ -1403,7 +1409,10 @@ export function createHttpServer(
 
     try {
       const rawPage = page.getRawPage();
-      const scriptResult = await runPuppeteerScript(rawPage, code, context, timeout);
+      const mutates = Boolean(req.body.mutates);
+      const scriptResult = await runPuppeteerScript(
+        rawPage, code, context, timeout, { mutates },
+      );
       res.set('X-Script-Duration', String(scriptResult.duration));
       res.json(scriptResult);
     } catch (err) {

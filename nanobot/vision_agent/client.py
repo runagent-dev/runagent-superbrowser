@@ -350,24 +350,45 @@ class VisionAgent:
         parsed.model = raw.model
         parsed.provider = raw.provider
         parsed.with_image_dims(image_width, image_height)
-        # Server-side bbox cap (P3.11). Gemini occasionally returns 50+
-        # bboxes despite the prompt asking for 10-25. Trim to top-N so
-        # the brain's selectorMap and overlay UI don't drown in noise.
-        # Ranking mirrors as_brain_text(): intent_relevant first, then
+        # Server-side bbox cap. Trim to top-N so the brain's
+        # selectorMap and overlay UI don't drown in noise. Ranking
+        # mirrors as_brain_text(): intent_relevant first, then
         # clickable, then confidence.
+        #
+        # A: raised the default from 25 → 50. Dense pages (SpotHero
+        # search results with per-garage amenity icons, ChaseIRA
+        # calculator, flight comparison tables) have 50-80 interactive
+        # controls; the old cap silently dropped half of them — exactly
+        # the filter/vehicle-type/amenity bboxes the brain needs.
+        #
+        # B: task-keyword override. Any bbox whose label contains a
+        # token from the task instruction is retained even when the
+        # cap would otherwise exclude it, so "in-and-out", "F-150",
+        # and "Ford" controls survive the trim.
         try:
-            max_bboxes = int(os.environ.get("VISION_MAX_BBOXES") or "25")
+            max_bboxes = int(os.environ.get("VISION_MAX_BBOXES") or "50")
         except ValueError:
-            max_bboxes = 25
+            max_bboxes = 50
         if max_bboxes > 0 and len(parsed.bboxes) > max_bboxes:
-            parsed.bboxes = sorted(
-                parsed.bboxes,
-                key=lambda b: (
+            # Build a token set from the task instruction (alphanum,
+            # ≥3 chars) so we can protect bboxes whose labels touch it.
+            keep_tokens: set[str] = set()
+            if task_instruction:
+                for tok in _task_keep_tokens(task_instruction):
+                    keep_tokens.add(tok)
+
+            def _rank(b: Any) -> tuple[int, int, int, int, float]:
+                label_l = (getattr(b, "label", "") or "").lower()
+                matches_task = any(k in label_l for k in keep_tokens) if keep_tokens else False
+                return (
+                    0 if matches_task else 1,
                     0 if getattr(b, "intent_relevant", False) else 1,
                     0 if getattr(b, "clickable", False) else 1,
+                    0 if (getattr(b, "role_in_scene", "") == "target") else 1,
                     -float(getattr(b, "confidence", 0.0) or 0.0),
-                ),
-            )[:max_bboxes]
+                )
+
+            parsed.bboxes = sorted(parsed.bboxes, key=_rank)[:max_bboxes]
         # Older Gemini outputs (and model families without scene training)
         # omit `scene` entirely. The planner assumes a non-null scene, so
         # synthesize a degenerate one here from flags + label heuristics.
@@ -462,6 +483,52 @@ class VisionAgent:
                     f"url={(url or '')[:60]}"
                 )
         return parsed
+
+
+_TASK_TOKEN_STOPWORDS: frozenset[str] = frozenset({
+    # Generic words that would trivially match any page.
+    "the", "and", "for", "with", "from", "into", "this", "that",
+    "next", "near", "find", "need", "want", "going", "use", "using",
+    "please", "make", "get", "show", "list", "tell", "give", "page",
+    "site", "button", "click", "type", "write", "fill", "enter",
+    "submit", "search", "open", "view", "go",
+    # Pronouns + filler.
+    "your", "you", "i'm", "i'd", "i'll", "our", "we", "its",
+    "there", "here", "then", "now", "all",
+    # Common number words.
+    "one", "two", "three", "zero",
+})
+
+
+def _task_keep_tokens(task_instruction: str) -> set[str]:
+    """Extract lowercased tokens from the caller's task description
+    that should cause matching bboxes to be retained past the
+    VISION_MAX_BBOXES cap.
+
+    Keeps alphanumeric tokens of length >= 3, drops a short stopword
+    list, preserves hyphenated / decimal-bearing tokens like `F-150`
+    or `$16.49` intact (only splits on whitespace + common
+    punctuation). The result is small (~10-30 tokens for a typical
+    user request) and used as a substring match against each bbox
+    label, so partial hits count (e.g. `ford` matches `Ford F-150`).
+    """
+    if not task_instruction:
+        return set()
+    import re as _re
+    out: set[str] = set()
+    for tok in _re.split(r"[\s,.;:!?()\[\]{}\"']+", task_instruction.lower()):
+        tok = tok.strip()
+        if len(tok) < 3:
+            continue
+        if tok in _TASK_TOKEN_STOPWORDS:
+            continue
+        # Strip leading/trailing slashes/hyphens that can survive a
+        # naive split.
+        tok = tok.strip("-/")
+        if len(tok) < 3:
+            continue
+        out.add(tok)
+    return out
 
 
 def _decode_dims(screenshot_b64: str) -> tuple[int, int]:

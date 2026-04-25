@@ -331,7 +331,7 @@ def _get_llm_client() -> tuple[Any, str] | None:
     if not api_key:
         return None
     model = (os.environ.get("VERIFY_MODEL")
-             or "gemini-2.0-flash-exp").strip()
+             or "gemini-2.5-flash").strip()
     base_url = (os.environ.get("VERIFY_BASE_URL")
                 or _GEMINI_OPENAI_COMPAT_BASE_URL).strip()
     timeout_s = _verify_timeout_s()
