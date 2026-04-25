@@ -1,11 +1,18 @@
 """TTL-bounded LRU cache for VisionResponses.
 
-Keyed on (session_id, url, dom_hash, intent_bucket, subgoal_id). The
-subgoal_id is included because subgoal-aware vision returns different
-bbox emphasis per subgoal even on an identical screenshot — caching
-across transitions would defeat the targeting. In-process, no disk
-persistence — vision analyses are stale after minutes anyway, so
-there's no point in paying serialization cost.
+Keyed on (session_id, url, dom_hash, dom_text_hash, intent_bucket,
+subgoal_id). The subgoal_id is included because subgoal-aware vision
+returns different bbox emphasis per subgoal even on an identical
+screenshot — caching across transitions would defeat the targeting.
+The dom_text_hash (Phase 1.2) extends the original dom_hash key:
+two pages can share the same structural DOM (same element listing)
+but differ in visible content — e.g. a dismissed cookie banner
+replaced by an autocomplete dropdown with similar tag structure, or
+a search-results page after vs before applying a filter. Without
+the text-content hash, the cache hits and serves stale bboxes that
+manifest as the vision agent "hallucinating" targets. In-process,
+no disk persistence — vision analyses are stale after minutes
+anyway, so there's no point in paying serialization cost.
 
 Thread-safe via a single asyncio.Lock because the cache is read and
 written from async tool handlers that may interleave.
@@ -22,7 +29,8 @@ from dataclasses import dataclass
 from .schemas import VisionResponse
 
 
-CacheKey = tuple[str, str, str, str, str]  # (session_id, url, dom_hash, intent_bucket, subgoal_id)
+# (session_id, url, dom_hash, dom_text_hash, intent_bucket, subgoal_id)
+CacheKey = tuple[str, str, str, str, str, str]
 
 
 @dataclass

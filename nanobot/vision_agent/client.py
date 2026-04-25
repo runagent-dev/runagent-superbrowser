@@ -54,6 +54,44 @@ def dom_hash_of(dom_elements: str | None) -> str:
     return hashlib.sha256(dom_elements.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def dom_text_hash_of(
+    dom_elements: str | None,
+    *,
+    scroll_info: Any | None = None,
+) -> str:
+    """Phase 1.2: secondary cache-key component. Captures viewport state
+    on top of structural element listing.
+
+    `dom_hash_of` already hashes the full elements string, so two pages
+    with identical interactive elements (text + tags + indices) collide
+    by design. This is correct for "same content, repeated query" but
+    wrong for cases like:
+      - same SPA route but different scroll position (different bboxes
+        are visible in the viewport, so vision must re-emit);
+      - URL with only query-string change but identical above-fold DOM
+        snapshot (cached bboxes would point at old result tiles).
+
+    We mix in the scroll info dict (scrollY, scrollHeight, viewportHeight)
+    so the cache distinguishes these cases. Falling through to "" preserves
+    legacy behavior when no scroll info is available — the cache still
+    works exactly as before.
+    """
+    if not scroll_info:
+        return ""
+    try:
+        if isinstance(scroll_info, dict):
+            sig = (
+                f"{scroll_info.get('scrollY', 0)}|"
+                f"{scroll_info.get('scrollHeight', 0)}|"
+                f"{scroll_info.get('viewportHeight', 0)}"
+            )
+        else:
+            sig = str(scroll_info)
+    except Exception:
+        return ""
+    return hashlib.sha256(sig.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
 class VisionAgent:
     # Suppress SoM overlay when the previous pass is older than this.
     # A cold overlay from a minute ago more often misleads Gemini
@@ -113,6 +151,7 @@ class VisionAgent:
         session_id: str,
         url: str,
         dom_hash: str,
+        dom_text_hash: str = "",
         previous_summary: str | None = None,
         image_width: int | None = None,
         image_height: int | None = None,
@@ -131,10 +170,16 @@ class VisionAgent:
                 subgoal_key = str(getattr(current_subgoal, "id", "") or "")
             except Exception:
                 subgoal_key = ""
+        # Phase 1.2: dom_text_hash extends the cache key with viewport
+        # state so two snapshots of the same page at different scroll
+        # positions get separate cache entries (different bboxes are
+        # visible). Empty string when caller doesn't supply scroll info,
+        # which preserves legacy 5-tuple behavior in unit tests.
         key: CacheKey = (
             session_id or "_",
             url or "_",
             dom_hash or "_",
+            dom_text_hash or "_",
             intent_bucket(intent),
             subgoal_key,
         )
@@ -369,6 +414,21 @@ class VisionAgent:
             max_bboxes = int(os.environ.get("VISION_MAX_BBOXES") or "50")
         except ValueError:
             max_bboxes = 50
+        # Phase 2.3: dense filter / search / checkout pages routinely
+        # have 60+ controls (filter chips, amenity toggles, range
+        # selectors, sort menus). Capping at 50 forces the rank-and-trim
+        # to drop mid-priority fields the brain needs for completion.
+        # Lift the cap on these page types so coverage matches reality.
+        page_type_now = (getattr(parsed, "page_type", "") or "").strip()
+        if page_type_now in {"checkout_form", "search_results", "product_listing", "map_or_booking"}:
+            try:
+                max_bboxes_form = int(
+                    os.environ.get("VISION_FORM_MAX_BBOXES") or "80"
+                )
+            except ValueError:
+                max_bboxes_form = 80
+            if max_bboxes_form > max_bboxes:
+                max_bboxes = max_bboxes_form
         if max_bboxes > 0 and len(parsed.bboxes) > max_bboxes:
             # Build a token set from the task instruction (alphanum,
             # ≥3 chars) so we can protect bboxes whose labels touch it.

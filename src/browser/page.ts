@@ -11,6 +11,7 @@ import type { BrowserConfig } from './engine.js';
 import { buildDomTree, type PageState, type DialogInfo, type DOMElementNode } from './dom.js';
 import { getAccessibilitySnapshot } from './accessibility.js';
 import { dispatchClick, dispatchHover, dispatchDrag, dispatchScroll } from './input-mouse.js';
+import { humanClick } from './humanize.js';
 import { typeText as cdpTypeText, pressKeyCombo, clearField, dispatchKey } from './input-keyboard.js';
 import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
@@ -425,7 +426,13 @@ export class PageWrapper {
     }
 
     // Tier 1: CDP mouse dispatch at computed coordinates (isTrusted=true)
+    // Phase 3.2: route through humanClick (Bezier-curve mouse motion +
+    // pre-click hesitation + click-point jitter) by default. The raw
+    // dispatchClick path skips humanization, which is fine for tests
+    // but trips Cloudflare/Akamai's behavioral signals on real targets.
+    // Opt out via SUPERBROWSER_HUMANIZE_ALL_CLICKS=0 (defaults to on).
     let coverReason: FailureReason | null = null;
+    const humanizeAll = process.env.SUPERBROWSER_HUMANIZE_ALL_CLICKS !== '0';
     try {
       const coords = await getElementCenterBySelector(this.page, selector);
       if (coords) {
@@ -441,11 +448,18 @@ export class PageWrapper {
           // the same screencast frame the user sees the page change in.
           this._emitClickTargetForElement(coords.x, coords.y, postScroll.rect, selector);
           const client = await this.getCDPSession();
-          await dispatchClick(client, coords.x, coords.y, {
-            button: options?.button,
-            clickCount: options?.clickCount,
-            sessionId: this.sessionId,
-          });
+          if (humanizeAll && (options?.clickCount ?? 1) === 1) {
+            await humanClick(client, coords.x, coords.y, {
+              button: options?.button,
+              sessionId: this.sessionId,
+            });
+          } else {
+            await dispatchClick(client, coords.x, coords.y, {
+              button: options?.button,
+              clickCount: options?.clickCount,
+              sessionId: this.sessionId,
+            });
+          }
           await this.waitForIdle(1500).catch(() => {});
           return { success: true, tried };
         }

@@ -240,6 +240,48 @@ class BrowserWorkerHook(AgentHook):
                     "fingerprint."
                 )
 
+        # --- Phase 2: form-fill checklist reminder ----------------------
+        # While a form_session is active, remind the brain at every
+        # iteration which fields still need filling. The session itself
+        # tracks state via browser_type_at + form_commit; this hook is
+        # the persistent visual nudge so the brain can't forget the
+        # field hidden behind an autocomplete dropdown.
+        form_sess = getattr(self.state, "form_session", None)
+        if form_sess is not None:
+            try:
+                checklist = form_sess.remaining_checklist(max_lines=10)
+                if checklist:
+                    needs = form_sess.needs_screenshot(
+                        getattr(self.state, "_brain_turn_counter", 0)
+                    )
+                    pieces = [checklist]
+                    if needs:
+                        pieces.append(needs)
+                    guidance_parts.append("\n".join(pieces))
+            except Exception:
+                pass
+
+        # --- Phase 3.1: cursor-failure ledger reminder ------------------
+        # When the brain has failed at least one cursor strategy, surface
+        # the ledger so it knows to try a DIFFERENT cursor strategy next
+        # rather than reach for browser_run_script (which the lockout
+        # gate will refuse anyway until a second strategy fails).
+        try:
+            recs = getattr(self.state, "cursor_failure_records", None) or []
+            distinct = len(getattr(self.state, "cursor_failure_strategies", set()) or set())
+            if recs and distinct < 2:
+                tried = ", ".join(sorted(self.state.cursor_failure_strategies)) or "(none)"
+                guidance_parts.append(
+                    "[CURSOR_FAILURES_SO_FAR strategies_tried="
+                    f"{tried} distinct={distinct}/2]\n"
+                    "Try a DIFFERENT cursor strategy before considering "
+                    "browser_run_script(mutates=true). The script lockout "
+                    "will refuse it until 2 distinct cursor strategies have "
+                    "failed."
+                )
+        except Exception:
+            pass
+
         # --- Inject guidance into the last tool result message ---
         if guidance_parts and context.messages:
             guidance_text = "\n" + "\n".join(guidance_parts)

@@ -141,6 +141,23 @@ Page-type coverage rules (CRITICAL for dense filter/booking UIs):
 - For captcha tiles, emit one bbox per tile with role='captcha_tile' and
   label like 'tile 1,1'. For captcha sliders, include role='slider_handle'
   for the draggable handle and role='captcha_widget' for the outer track.
+- AUTOCOMPLETE / SUGGESTION OVERLAYS — these are the single biggest source
+  of "form filling missed a field" errors. When a list of suggestions
+  appears below or above a recently-focused text input (city autocomplete,
+  search-suggest, address autofill, date-picker calendar, dropdown menu
+  rendered as a popover), classify it as a TRANSIENT BLOCKER:
+    * Set `flags.autocomplete_open = true`
+    * Set `flags.autocomplete_anchor_index` to the 1-based V_n of the
+      input that opened it (so the brain can re-target after dismiss).
+    * Each suggestion is its OWN bbox with role='content' and
+      `clickable=true` — picking one dismisses the overlay.
+    * The overlay layer (if any) gets `kind='drawer'` with
+      `blocks_interaction_below=true` and `dismiss_hint='press Escape'`
+      OR the label of the best-matching suggestion when one is obvious
+      from the user task.
+    * Inputs covered by the overlay must STILL be emitted (with
+      role_in_scene='target' or 'content'); the brain needs to know
+      they exist so it can return to them after picking.
 - For FORM sliders (retirement calculators, filter ranges, volume controls,
   any <input type=range>, role=slider, or visual track+thumb pair that is
   NOT a captcha), emit THREE bboxes per slider in this order so their V_n

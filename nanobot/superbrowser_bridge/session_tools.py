@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import (
+    ArraySchema,
     BooleanSchema,
     IntegerSchema,
     NumberSchema,
@@ -688,6 +689,12 @@ def _schedule_vision_prefetch(
             get_vision_agent,
             vision_agent_enabled,
         )
+        try:
+            from vision_agent import (  # type: ignore[import-not-found]
+                dom_text_hash_of,
+            )
+        except ImportError:
+            dom_text_hash_of = None  # type: ignore[assignment]
     except ImportError:
         return None
     if not vision_agent_enabled() or get_vision_agent is None:
@@ -720,6 +727,18 @@ def _schedule_vision_prefetch(
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")
             dh = dom_hash_of(elements) if dom_hash_of else ""
+            # Phase 1.2: viewport-aware secondary cache-key signal so
+            # the same page at different scroll positions doesn't reuse
+            # bboxes captured for the previous viewport.
+            dth = ""
+            if dom_text_hash_of is not None:
+                try:
+                    dth = dom_text_hash_of(
+                        elements,
+                        scroll_info=data.get("scrollInfo"),
+                    )
+                except Exception:
+                    dth = ""
             dispatched = time.monotonic()
             # DPR: when the viewport runs at deviceScaleFactor > 1 the
             # screenshot is physical-pixel sized. Pass it through so
@@ -734,6 +753,7 @@ def _schedule_vision_prefetch(
                 session_id=session_id,
                 url=data.get("url", "") or state.current_url,
                 dom_hash=dh,
+                dom_text_hash=dth,
                 previous_summary=state._last_vision_summary or None,
                 image_width=img_w,
                 image_height=img_h,
@@ -765,9 +785,24 @@ def _schedule_vision_prefetch(
             return None
 
     try:
-        return asyncio.create_task(_run())
+        new_task = asyncio.create_task(_run())
     except Exception:
         return None
+    # Phase 1.1: store the task on state so the NEXT mutating tool call
+    # can wait for it via ensure_vision_synced(). Cancel any prior
+    # in-flight prefetch — only one is meaningful at a time, and a
+    # never-awaited older task is just wasted Gemini latency. Best
+    # effort; if cancellation is too late, the older task will write
+    # into _last_vision_response then the newer task overwrites, so
+    # correctness is preserved.
+    prev = state._pending_vision_task
+    if prev is not None and not prev.done():
+        try:
+            prev.cancel()
+        except Exception:
+            pass
+    state._pending_vision_task = new_task
+    return new_task
 
 
 async def _append_fresh_vision(
@@ -775,6 +810,10 @@ async def _append_fresh_vision(
     result: str,
     *,
     budget_ms: int | None = None,
+    expected_label: str | None = None,
+    pre_url: str | None = None,
+    pre_dom_hash: str | None = None,
+    state: "BrowserSessionState | None" = None,
 ) -> str:
     """Wait for the prefetched vision pass (up to the budget) and
     append a one-line brain-facing hint to `result` when it arrives.
@@ -784,19 +823,112 @@ async def _append_fresh_vision(
     screenshot call. If the vision pass didn't finish in time, the
     task keeps running in the background (shielded) and the overlay
     will update on the next push.
+
+    Phase 3.3: when `expected_label` + `pre_url` + `pre_dom_hash` are
+    supplied (the click_at tool fills these in), compare the post-click
+    vision pass against them. If the label is STILL visible AND the
+    URL/DOM didn't change, the click missed — surface
+    `[click_missed:label_still_visible]` so the brain stops assuming
+    success after a no-op click on a `pointer-events:none` overlay or
+    a covered element. This converts a class of silent failures into
+    explicit signals.
     """
     resp = await _await_vision_prefetch(task, budget_ms=budget_ms)
     if resp is None:
         return result
     summary = (getattr(resp, "summary", "") or "").strip()
-    if not summary:
+    note_parts: list[str] = []
+    if summary:
+        note_parts.append(summary[:240])
+        freshness = getattr(resp, "screenshot_freshness", "fresh") or "fresh"
+        if freshness != "fresh":
+            note_parts[-1] = f"{note_parts[-1]} [freshness={freshness}]"
+    # Phase 3.3 click-hit verification.
+    if expected_label and state is not None:
+        try:
+            label_lower = expected_label.strip().lower()
+            relevant = (getattr(resp, "relevant_text", "") or "").lower()
+            current_url = (state.current_url or "")
+            same_url = (
+                pre_url is not None
+                and pre_url == current_url
+            )
+            same_dom = (
+                pre_dom_hash is not None
+                and pre_dom_hash == (state._last_dom_hash or "")
+            )
+            if (
+                label_lower
+                and label_lower in relevant
+                and same_url
+                and same_dom
+            ):
+                # Record the cursor failure so the script-lockout gate
+                # counts this as a tried-and-failed cursor strategy.
+                try:
+                    state.record_cursor_failure(
+                        strategy="click_at",
+                        target=expected_label[:80],
+                        reason="label_still_visible (no URL/DOM delta)",
+                    )
+                except Exception:
+                    pass
+                miss_note = (
+                    f"[click_missed:label_still_visible expected="
+                    f"{expected_label[:40]!r}] The clicked target is "
+                    f"still visible on the page and neither the URL "
+                    f"nor DOM hash changed — the click likely landed "
+                    f"on a covered or pointer-events:none surface. Re-"
+                    f"observe vision (pick a fresh V_n) before trying "
+                    f"again with a different strategy."
+                )
+                note_parts.append(miss_note)
+        except Exception:
+            pass
+    if not note_parts:
         return result
-    note = summary[:240]
-    freshness = getattr(resp, "screenshot_freshness", "fresh") or "fresh"
-    if freshness != "fresh":
-        note = f"{note} [freshness={freshness}]"
     sep = "" if result.endswith("\n") else "\n"
-    return f"{result}{sep}[vision] {note}"
+    return f"{result}{sep}[vision] {' | '.join(note_parts)}"
+
+
+async def _await_vision_required(
+    task: "asyncio.Task[Any] | None",
+    timeout_ms: int | None = None,
+) -> "Any":
+    """Phase 1.1 hard sync. Block until `task` resolves or `timeout_ms`
+    elapses. Default timeout is VISION_HARD_SYNC_TIMEOUT_MS (8000ms).
+
+    Unlike `_await_vision_prefetch`, this is intended to be called from
+    the START of a mutating tool to guarantee fresh state — not from the
+    END to opportunistically attach a hint. On timeout the task is left
+    running (shielded), but the caller is responsible for surfacing
+    that timeout to the brain so it can retry rather than dispatch on
+    cached vision.
+    """
+    if task is None:
+        return None
+    if task.done():
+        try:
+            return task.result()
+        except Exception:
+            return None
+    if timeout_ms is None:
+        try:
+            timeout_ms = int(
+                os.environ.get("VISION_HARD_SYNC_TIMEOUT_MS") or "8000"
+            )
+        except ValueError:
+            timeout_ms = 8000
+    if timeout_ms <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=timeout_ms / 1000.0,
+        )
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
 
 
 async def _await_vision_prefetch(
@@ -1315,6 +1447,45 @@ class BrowserSessionState:
         self._last_action_queue: Any = None  # Optional[ActionQueue]
         self._pending_postcondition: Optional[dict] = None
 
+        # Phase 3.1: cursor-failure ledger. Each cursor-based interaction
+        # tool that returns a failure caption records its strategy here
+        # so BrowserRunScriptTool(mutates=true) can refuse to run until
+        # at least 2 distinct cursor strategies have been tried and
+        # failed. Eliminates the brain's reflex of "click failed → run
+        # JS to click" which trips Cloudflare/Akamai isTrusted=false
+        # detection. `cursor_failure_strategies` records DISTINCT
+        # strategies for the lockout decision; `cursor_failure_records`
+        # keeps the last few entries for the prompt-side hint.
+        self.cursor_failure_strategies: set[str] = set()
+        self.cursor_failure_records: list[dict[str, Any]] = []
+
+        # Phase 2: per-form orchestration. None when no form_begin has
+        # been called; populated with a FormFillSession instance while
+        # the brain is filling a multi-field form. The worker hook
+        # injects a remaining-fields checklist into every tool result
+        # while this is set, and form_commit verifies field values
+        # before allowing submit.
+        self.form_session: Any = None  # Optional[FormFillSession]
+
+        # Phase 1: hard sync gate. Tracks the most recent prefetch task
+        # so the NEXT mutating tool can wait for it before acting on
+        # potentially-stale state. Replaces the soft 2s budget that
+        # otherwise lets the brain proceed on cached vision when the
+        # prefetch hasn't landed.
+        self._pending_vision_task: Optional["asyncio.Task[Any]"] = None
+        # Wall-clock + brain-turn stamp captured each time the screenshot
+        # tool freezes a new vision epoch. Used by the freshness gate to
+        # reject clicks against an epoch that's older than
+        # VISION_MAX_AGE_TURNS brain turns. Counts MUTATING tool calls
+        # rather than wall time so a 30s "thinking" pause doesn't
+        # invalidate vision but two intermediate actions do.
+        self._vision_epoch_taken_at: float = 0.0
+        self._vision_epoch_turn: int = 0
+        # Brain turn counter. Incremented at the top of every mutating
+        # tool (click/type/click_at/scroll/navigate). Read by the
+        # freshness gate to compute epoch age in turns.
+        self._brain_turn_counter: int = 0
+
     @property
     def backend(self) -> str:
         """Tier of the active session. `t3` for patchright (undetected
@@ -1380,6 +1551,19 @@ class BrowserSessionState:
         self._vision_epoch_response = None
         self._vision_epoch_id = 0
         self._vision_epoch_url = ""
+        self._vision_epoch_taken_at = 0.0
+        self._vision_epoch_turn = 0
+        # Drop any in-flight prefetch from the previous session — the
+        # task references the old session_id and would write into
+        # _last_vision_response under a context the new session doesn't
+        # care about.
+        if self._pending_vision_task is not None and not self._pending_vision_task.done():
+            try:
+                self._pending_vision_task.cancel()
+            except Exception:
+                pass
+        self._pending_vision_task = None
+        self._brain_turn_counter = 0
 
     def freeze_vision_epoch(self) -> None:
         """Snapshot `_last_vision_response` as the current epoch.
@@ -1401,6 +1585,13 @@ class BrowserSessionState:
         self._vision_epoch_response = self._last_vision_response
         self._vision_epoch_url = self._last_vision_url or self.current_url or ""
         self._vision_epoch_id += 1
+        # Phase 1.3: stamp the epoch with wall + turn counter so the
+        # freshness gate can reject clicks against an epoch that's older
+        # than VISION_MAX_AGE_TURNS mutating actions ago. Reset epoch_turn
+        # to current counter — the brain just saw this screenshot, so
+        # zero turns elapsed since the snapshot it's reasoning on.
+        self._vision_epoch_taken_at = time.time()
+        self._vision_epoch_turn = self._brain_turn_counter
 
     def vision_for_target_resolution(self) -> Any:
         """Return the vision response V-index readers (click_at /
@@ -1423,6 +1614,76 @@ class BrowserSessionState:
                 return self._last_vision_response
             return self._vision_epoch_response
         return self._last_vision_response
+
+    def record_cursor_failure(
+        self, *, strategy: str, target: str, reason: str,
+    ) -> None:
+        """Phase 3.1: log that a cursor-based interaction returned a
+        non-success caption. Bounded ledger (last 12 entries) with a
+        distinct-strategies set used by the script lockout.
+        """
+        if not strategy:
+            return
+        self.cursor_failure_strategies.add(strategy)
+        self.cursor_failure_records.append({
+            "strategy": strategy,
+            "target": target[:120] if target else "",
+            "reason": reason[:120] if reason else "",
+            "turn": self._brain_turn_counter,
+        })
+        if len(self.cursor_failure_records) > 12:
+            self.cursor_failure_records = self.cursor_failure_records[-12:]
+
+    def cursor_lockout_summary(self) -> str:
+        """Render the current cursor-failure ledger for prompt hints."""
+        if not self.cursor_failure_records:
+            return ""
+        last = self.cursor_failure_records[-3:]
+        rows = [
+            f"  - {r['strategy']}({r['target']!r}): {r['reason']}"
+            for r in last
+        ]
+        return "\n".join(rows)
+
+    async def ensure_vision_synced(self, *, reason: str = "pre_action") -> "str | None":
+        """Phase 1.1 hard sync gate. Block until the most recent vision
+        prefetch lands. Returns None on success (caller proceeds), or a
+        structured error string the caller should return as its tool
+        result so the brain re-tries on a fresh state.
+
+        Skipped entirely when VISION_HARD_SYNC=0 — preserves the legacy
+        soft-budget behavior for rollback.
+
+        Page-type-aware timeout: if VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES
+        is a JSON dict and the last vision response's page_type matches
+        a key, that timeout (ms) is used instead of the global default.
+        Useful for slow form/search pages where 8s isn't enough.
+        """
+        if os.environ.get("VISION_HARD_SYNC", "1") in ("0", "false", "no", "False"):
+            return None
+        task = self._pending_vision_task
+        if task is None or task.done():
+            return None
+        timeout_ms: int | None = None
+        try:
+            overrides_raw = os.environ.get("VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES")
+            if overrides_raw:
+                overrides = json.loads(overrides_raw)
+                last_resp = self._last_vision_response
+                page_type = getattr(last_resp, "page_type", "") if last_resp else ""
+                if page_type and page_type in overrides:
+                    timeout_ms = int(overrides[page_type])
+        except Exception:
+            timeout_ms = None
+        await _await_vision_required(task, timeout_ms=timeout_ms)
+        if not task.done():
+            return (
+                f"[vision_unavailable:{reason}] Vision prefetch from the "
+                f"previous action did not land in time. Re-issue the same "
+                f"tool call — the prefetch is still running and will "
+                f"complete shortly. Do NOT proceed on stale vision."
+            )
+        return None
 
     def init_if_needed(self):
         if self.start_time == 0.0:
@@ -1828,15 +2089,27 @@ class BrowserSessionState:
                 get_vision_agent,
                 vision_agent_enabled,
             )
+            try:
+                from vision_agent import dom_text_hash_of
+            except ImportError:
+                dom_text_hash_of = None  # type: ignore[assignment]
         except ImportError:
             vision_agent_enabled = lambda: False  # type: ignore[assignment]
             get_vision_agent = None  # type: ignore[assignment]
             dom_hash_of = None  # type: ignore[assignment]
+            dom_text_hash_of = None  # type: ignore[assignment]
 
         if vision_agent_enabled() and get_vision_agent is not None:
             dh = dom_hash_of(elements) if dom_hash_of else ""
             if dh:
                 self._last_dom_hash = dh
+            # Phase 1.2: viewport-aware secondary key — left empty here
+            # because build_tool_result_blocks doesn't receive scroll
+            # info. The prefetch path in _schedule_vision_prefetch
+            # populates it from the live /state response. Empty string
+            # falls through to legacy 5-tuple-equivalent caching, which
+            # is correct (just less granular than the prefetch path).
+            dth = ""
             if intent:
                 self._last_intent = intent
             effective_intent = intent or self._last_intent or "observe page"
@@ -1854,6 +2127,7 @@ class BrowserSessionState:
                     session_id=self.session_id,
                     url=effective_url,
                     dom_hash=dh or self._last_dom_hash,
+                    dom_text_hash=dth,
                     previous_summary=self._last_vision_summary or None,
                     image_width=img_w,
                     image_height=img_h,
@@ -1978,6 +2252,14 @@ class BrowserSessionState:
         self.action_count += 1
         self.text_calls += 1
         self.actions_since_screenshot += 1
+        # Phase 1.2: pick up implicit navigations. The TS bridge reports
+        # the live URL on every action response; if the page navigated
+        # without us calling browser_navigate (form submit, JS redirect,
+        # history.pushState), record it here so the freshness logic can
+        # invalidate the vision epoch.
+        actual_url = data.get("url") or ""
+        if actual_url and actual_url != self.current_url:
+            self.record_url(actual_url)
         parts = [prefix]
         if data.get("url"):
             parts.append(f"Page: {data['url']}")
@@ -2073,6 +2355,15 @@ async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" =
             if isinstance(fps, dict):
                 # JSON keys come back as strings; coerce to int for direct index lookup.
                 state.element_fingerprints = {int(k): v for k, v in fps.items() if isinstance(v, str)}
+            # Phase 1.2: propagate the URL the TS bridge actually sees.
+            # Form submits / history.pushState / JS redirects don't go
+            # through browser_navigate so state.current_url would otherwise
+            # stay stuck on the URL we last typed into navigate. Updating
+            # here lets `vision_for_target_resolution` correctly invalidate
+            # the epoch when the page changed under us.
+            actual_url = data.get("url") or ""
+            if actual_url and actual_url != state.current_url:
+                state.record_url(actual_url)
         return data.get("elements", "")
     except Exception:
         return ""
@@ -2833,6 +3124,12 @@ class BrowserClickTool(Tool):
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
+        # Phase 1.1: hard sync gate. Wait for any in-flight vision
+        # prefetch from the previous action before dispatching.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_click")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
         # Cross-index flail guard. If the last two clicks timed out,
         # force a re-screenshot before dispatching another HTTP click —
         # the backend is hung (blocker, loader, nav in flight) and
@@ -2916,6 +3213,12 @@ class BrowserClickTool(Tool):
                 self.s.log_activity(f"click([{index}])({reason})", err[:60])
                 alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
                 fresh_hint = "\nElements have been re-read above — pick a current [index]."
+                # Phase 3.1: cursor failure ledger.
+                self.s.record_cursor_failure(
+                    strategy="click",
+                    target=f"[{index}]",
+                    reason=f"{reason}: {err[:80]}",
+                )
                 return (
                     f"[click_failed:{reason}] {err}"
                     + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
@@ -3010,6 +3313,14 @@ class BrowserClickAtTool(Tool):
         y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Phase 1.1: hard sync gate. Block until the in-flight vision
+        # prefetch from the previous action lands — without this the
+        # brain's V_n resolves against a frozen epoch but the freshness
+        # gate has no fresh post-action vision to validate against.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_click_at")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
@@ -3066,6 +3377,11 @@ class BrowserClickAtTool(Tool):
             # the model itself said it couldn't trust.
             freshness = getattr(resp, "screenshot_freshness", "fresh")
             if freshness != "fresh":
+                self.s.record_cursor_failure(
+                    strategy="click_at",
+                    target=f"V{vision_index}",
+                    reason=f"stale_vision freshness={freshness}",
+                )
                 alts = _vision_alternatives_hint(
                     self.s, exclude_index=int(vision_index), limit=3,
                 )
@@ -3076,6 +3392,42 @@ class BrowserClickAtTool(Tool):
                     "browser_screenshot to refresh vision before clicking."
                     + (f"\n{alts}" if alts else "")
                 )
+            # Phase 1.3 turn-based age gate. Beyond
+            # VISION_MAX_AGE_TURNS mutating actions since the last
+            # screenshot, the V_n indices the brain captured no longer
+            # reliably point at the elements they did when the
+            # screenshot was taken. The brain MUST re-screenshot. Wall-
+            # clock isn't a useful proxy because a long thinking pause
+            # doesn't mutate the page; the right unit is "actions
+            # taken between epoch and now". _brain_turn_counter was
+            # bumped by ensure_vision_synced for THIS click already, so
+            # subtract 1 to count actions BEFORE this one.
+            try:
+                max_age_turns = int(
+                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
+                )
+            except ValueError:
+                max_age_turns = 1
+            if max_age_turns > 0:
+                age_turns = max(
+                    0,
+                    self.s._brain_turn_counter - 1
+                    - self.s._vision_epoch_turn,
+                )
+                if age_turns > max_age_turns:
+                    alts = _vision_alternatives_hint(
+                        self.s, exclude_index=int(vision_index), limit=3,
+                    )
+                    return (
+                        f"[click_at_failed:epoch_too_old age_turns="
+                        f"{age_turns} max={max_age_turns}] V"
+                        f"{vision_index} resolves against a vision "
+                        f"snapshot taken {age_turns} actions ago — the "
+                        f"page state may have shifted. Call "
+                        f"browser_screenshot to refresh the V_n "
+                        f"indices before clicking."
+                        + (f"\n{alts}" if alts else "")
+                    )
             # Blocker gate — if the scene has an active blocker layer
             # (cookie banner, modal, consent dialog) and this bbox lives
             # in a different layer, refuse. The planner must dismiss
@@ -3322,10 +3674,29 @@ class BrowserClickAtTool(Tool):
             log_target,
             f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
         )
+        # Phase 3.3 click-hit verification: capture pre-click signals
+        # so the post-click vision pass can flag a no-op click that
+        # left the labeled target still visible.
+        _expected_label = ""
+        if vision_index is not None:
+            try:
+                _expected_label = (
+                    payload.get("expected_label")
+                    or payload.get("label")
+                    or ""
+                )
+            except Exception:
+                _expected_label = ""
+        _pre_url = self.s.current_url or ""
+        _pre_dom_hash = self.s._last_dom_hash or ""
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
             self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
+            expected_label=_expected_label or None,
+            pre_url=_pre_url,
+            pre_dom_hash=_pre_dom_hash,
+            state=self.s,
         )
 
     def _lookup_postcondition(
@@ -3439,6 +3810,11 @@ class BrowserTypeAtTool(Tool):
         clear: bool = True,
         **kw: Any,
     ) -> Any:
+        # Phase 1.1: hard sync gate before mutation.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_type_at")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
         if text is None:
             text = ""
 
@@ -3461,6 +3837,27 @@ class BrowserTypeAtTool(Tool):
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
+            # Phase 1.3 turn-based age gate (mirrors BrowserClickAtTool).
+            try:
+                _max_age = int(
+                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
+                )
+            except ValueError:
+                _max_age = 1
+            if _max_age > 0:
+                _age = max(
+                    0,
+                    self.s._brain_turn_counter - 1
+                    - self.s._vision_epoch_turn,
+                )
+                if _age > _max_age:
+                    return (
+                        f"[type_at_failed:epoch_too_old age_turns={_age} "
+                        f"max={_max_age}] V{vision_index} resolves "
+                        f"against a vision snapshot taken {_age} actions "
+                        f"ago. Call browser_screenshot to refresh before "
+                        f"typing."
+                    )
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return (
@@ -3559,6 +3956,27 @@ class BrowserTypeAtTool(Tool):
                 synthetic_data["auto_corrected"] = True
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
+        # Phase 2.1: notify the active form_session that this field was
+        # typed into. Promotes its FieldStatus to FILLED (or
+        # AWAIT_AUTOCOMPLETE if declared with autocomplete=true at
+        # form_begin). The worker hook reads the updated state on the
+        # next iteration so the brain sees a refreshed checklist.
+        if self.s.form_session is not None:
+            try:
+                if vision_index is not None:
+                    self.s.form_session.mark_typed(
+                        label_or_index=int(vision_index),
+                        value_typed=text,
+                        turn=self.s._brain_turn_counter,
+                    )
+                if label:
+                    self.s.form_session.mark_typed(
+                        label_or_index=label,
+                        value_typed=text,
+                        turn=self.s._brain_turn_counter,
+                    )
+            except Exception:
+                pass
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
@@ -3774,6 +4192,11 @@ class BrowserTypeTool(Tool):
         gate = await _feedback_gate("browser_type")
         if gate:
             return gate
+        # Phase 1.1: hard sync gate.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_type")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
 
         # --- Dead-type guard --------------------------------------------
         # The LLM's most destructive misread: type "khulna" → autocomplete
@@ -4176,6 +4599,47 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Phase 3.1: cursor-first lockout. Read-only scripts always
+        # allowed (data extraction). Mutating scripts require evidence
+        # that the brain has tried — and failed — at least 2 distinct
+        # cursor strategies in this session. This forces the cursor →
+        # selector → script ladder rather than letting the brain
+        # short-cut to JS clicks (isTrusted=false; tripped by every
+        # bot-detection edge).
+        if (
+            bool(mutates)
+            and os.environ.get("CURSOR_FIRST_LOCKOUT", "1") not in ("0", "false", "no")
+        ):
+            try:
+                min_strategies = int(
+                    os.environ.get("CURSOR_LOCKOUT_MIN_STRATEGIES") or "2"
+                )
+            except ValueError:
+                min_strategies = 2
+            distinct = len(self.s.cursor_failure_strategies)
+            if distinct < min_strategies:
+                ledger = self.s.cursor_lockout_summary()
+                tried_str = (
+                    ", ".join(sorted(self.s.cursor_failure_strategies))
+                    or "(none)"
+                )
+                return (
+                    "[run_script_blocked:cursor_path_untried] You haven't "
+                    f"exhausted cursor strategies for this session "
+                    f"({distinct}/{min_strategies} distinct strategies "
+                    f"failed; tried={tried_str}).\n"
+                    "Try in order BEFORE running mutating JS:\n"
+                    "  1. browser_click_at(vision_index=V_n) on the "
+                    "target's bbox.\n"
+                    "  2. browser_click_selector(<stable-css>) if the "
+                    "target has a hook.\n"
+                    "  3. browser_type_at / browser_scroll_until.\n"
+                    "Only when 2+ DIFFERENT strategies have failed with "
+                    "concrete error captions can mutates=true scripts "
+                    "run. JS clicks are isTrusted=false and routinely "
+                    "rejected by Cloudflare / Akamai."
+                    + (f"\nRecent cursor failures:\n{ledger}" if ledger else "")
+                )
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
         payload: dict[str, Any] = {"code": script, "mutates": bool(mutates)}
         if context:
@@ -4394,6 +4858,228 @@ class BrowserDialogTool(Tool):
         )
         r.raise_for_status()
         return f"Dialog {'accepted' if accept else 'dismissed'}"
+
+
+# ─── Phase 2: form-fill orchestration tools ──────────────────────────────
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        intent=StringSchema(
+            "What this form does — e.g. 'apartment search filters', "
+            "'flight booking', 'signup'. Used by the worker hook to "
+            "phrase the per-turn checklist."
+        ),
+        fields=ArraySchema(
+            description=(
+                "Ordered list of fields to fill. Each entry is an object "
+                "with `label` (human-readable name to match against vision "
+                "bboxes), `value` (target text to type), and optional "
+                "`autocomplete` (true if this field opens a suggestions "
+                "overlay that must be picked from)."
+            ),
+            items=ObjectSchema(
+                label=StringSchema("Field name shown to the user"),
+                value=StringSchema("Value to type"),
+                autocomplete=BooleanSchema(
+                    description="Whether this field opens an autocomplete dropdown",
+                    nullable=True,
+                ),
+                required=["label", "value"],
+            ),
+        ),
+        submit_label=StringSchema(
+            "Optional label of the submit button (e.g. 'Search'). "
+            "If provided, browser_form_commit will look for it in vision.",
+            nullable=True,
+        ),
+        required=["session_id", "intent", "fields"],
+    )
+)
+class BrowserFormBeginTool(Tool):
+    """Phase 2.1: open a form-fill session.
+
+    Tracks pending/filled/verified state for each declared field. While
+    a session is active the worker hook injects a remaining-fields
+    checklist into every tool result, and browser_form_commit refuses
+    to dispatch the submit click until every field's typed value is
+    visible on the page.
+
+    Use this on dense filter/booking/signup forms where the brain
+    routinely loses track of fields below an autocomplete dropdown.
+    """
+
+    name = "browser_form_begin"
+    description = (
+        "Open a tracked form-fill session. After calling, fill each "
+        "field with browser_type_at — the session tracks progress and "
+        "warns when a field is missed. Conclude with browser_form_commit "
+        "to verify all values stuck before submitting."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        intent: str,
+        fields: list[dict[str, Any]],
+        submit_label: str | None = None,
+        **kw: Any,
+    ) -> str:
+        if os.environ.get("FORM_SESSION_ENABLED", "1") in ("0", "false", "no"):
+            return (
+                "[form_begin_disabled] FORM_SESSION_ENABLED=0 — fall "
+                "back to ad-hoc filling. Track remaining fields yourself."
+            )
+        if not isinstance(fields, list) or not fields:
+            return "[form_begin_failed] `fields` must be a non-empty list."
+        try:
+            from superbrowser_bridge.form_session import FormFillSession
+        except ImportError as exc:
+            return f"[form_begin_failed:import] {exc}"
+        sess = FormFillSession.begin(
+            intent=intent,
+            fields=fields,
+            started_at_turn=self.s._brain_turn_counter,
+            submit_label=submit_label,
+        )
+        self.s.form_session = sess
+        labels = ", ".join(fs.label for fs in sess.fields.values())
+        return (
+            f"[form_begin] intent={intent!r} fields=[{labels}]\n"
+            f"Now: call browser_screenshot once to anchor every field's "
+            f"bbox, then for each field call browser_type_at(vision_index="
+            f"V_n, text=...). After typing into a field that opens "
+            f"autocomplete, click the matching suggestion (or press "
+            f"Escape) BEFORE moving on. When every field is filled, "
+            f"call browser_form_commit to verify."
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+)
+class BrowserFormStatusTool(Tool):
+    """Phase 2.1: report the current form-fill checklist."""
+
+    name = "browser_form_status"
+    description = (
+        "Report status of the active form-fill session: which fields are "
+        "still pending, which are filled, which need autocomplete picks. "
+        "Cheap / no screenshot. Returns [no_form_session] if none active."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, **kw: Any) -> str:
+        sess = self.s.form_session
+        if sess is None:
+            return (
+                "[no_form_session] No form-fill session active. Call "
+                "browser_form_begin to start tracking a multi-field form."
+            )
+        return sess.remaining_checklist(max_lines=20)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        force=BooleanSchema(
+            description=(
+                "Skip the verify-all-fields check and close the session anyway. "
+                "Use only when you intentionally want to submit a partial form."
+            ),
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserFormCommitTool(Tool):
+    """Phase 2.1: verify and close a form-fill session.
+
+    Forces a fresh screenshot, then for each tracked field checks that
+    the typed value appears in the page's relevant_text. Returns a
+    structured pass/fail report — the brain decides whether to refill
+    mismatched fields or submit.
+    """
+
+    name = "browser_form_commit"
+    description = (
+        "Verify every tracked field's typed value appears on screen, "
+        "then close the form-fill session. Returns the per-field "
+        "verdict so the brain can refill any mismatches before "
+        "clicking submit."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        force: bool = False,
+        **kw: Any,
+    ) -> str:
+        sess = self.s.form_session
+        if sess is None:
+            return (
+                "[form_commit_failed:no_session] No form session is "
+                "active. Call browser_form_begin first."
+            )
+        # Refresh vision so we verify against the latest screenshot.
+        resp = self.s._last_vision_response
+        text_hay = ""
+        if resp is not None:
+            text_hay = (getattr(resp, "relevant_text", "") or "").lower()
+        for fs in sess.fields.values():
+            if fs.status == FieldStatus.SKIPPED:
+                continue
+            target_lower = (fs.target_value or "").strip().lower()
+            if not target_lower:
+                continue
+            if target_lower in text_hay:
+                sess.mark_verified(fs.label, fs.target_value)
+            else:
+                # Don't overwrite VERIFIED set during typing flow.
+                if fs.status not in (FieldStatus.VERIFIED,):
+                    fs.status = FieldStatus.MISMATCH
+        summary = sess.commit_summary()
+        if not force and not sess.is_complete():
+            return (
+                f"[form_commit_incomplete] {summary}\n"
+                f"{sess.remaining_checklist(max_lines=10)}\n"
+                f"Refill the mismatched / pending fields, then call "
+                f"browser_form_commit again. Use force=true ONLY if you "
+                f"intentionally want to submit a partial form."
+            )
+        # Success — clear the session so the next form starts clean.
+        result = (
+            f"[form_commit_ok] {summary}\n"
+            f"You may now click the submit button "
+            + (f"('{sess.submit_label}') " if sess.submit_label else "")
+            + "via browser_click_at(vision_index=V_n)."
+        )
+        self.s.form_session = None
+        return result
+
+
+# Re-export FieldStatus into module scope so the commit tool can refer to
+# it without importing locally on every call.
+try:
+    from superbrowser_bridge.form_session import FieldStatus  # noqa: F401
+except ImportError:
+    class FieldStatus:  # type: ignore[no-redef]
+        VERIFIED = "verified"
+        SKIPPED = "skipped"
+        MISMATCH = "mismatch"
 
 
 @tool_parameters(
@@ -6668,6 +7354,11 @@ class BrowserClickSelectorTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_click_selector({selector!r})")
+        # Phase 1.1: hard sync gate.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_click_selector")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls += 1
 
@@ -6690,6 +7381,13 @@ class BrowserClickSelectorTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
+            # Phase 3.1: record cursor failure so the script lockout
+            # gate counts this as a tried-and-failed cursor strategy.
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason=str(err)[:120],
+            )
             return f"[click_selector_failed] {err}"
         data = r.json()
         clicked = data.get("clicked", {})
@@ -8053,6 +8751,9 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserRequestHelpTool(state),
         BrowserEscalateTool(state),        # t1 → t3 migration
         BrowserPlanNextStepsTool(state),   # hierarchical planner
+        BrowserFormBeginTool(state),       # Phase 2.1: form-fill orchestration
+        BrowserFormStatusTool(state),
+        BrowserFormCommitTool(state),
         BrowserRewindToCheckpointTool(state),  # kept: session-memory escape hatch
         BrowserCloseTool(state),
     ]

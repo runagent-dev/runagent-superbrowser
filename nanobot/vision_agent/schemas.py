@@ -412,9 +412,16 @@ class PageFlags(BaseModel):
     error_banner: Optional[str] = Field(default=None)
     loading: bool = False
     login_wall: bool = Field(default=False)
+    # Phase 2.2: autocomplete dropdown detection. Set True when a
+    # suggestion list is open below/above a recently-focused input.
+    # `autocomplete_anchor_index` (1-based) points at the input that
+    # opened the overlay so the brain can re-target it after dismiss.
+    autocomplete_open: bool = Field(default=False)
+    autocomplete_anchor_index: Optional[int] = Field(default=None)
 
     @field_validator(
         "captcha_present", "modal_open", "loading", "login_wall",
+        "autocomplete_open",
         mode="before",
     )
     @classmethod
