@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import os
+import re as _re
 import time as _time
 import uuid
 from pathlib import Path
@@ -26,12 +27,58 @@ from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 # domain is what gets counted — an orchestrator legitimately delegating two
 # different browser tasks against the same site is fine.
 #
-# Each value is (attempt_count, first_seen_ts). Entries older than one hour
-# are treated as stale and reset to 1 on next touch; the orchestrator may
-# have recovered and the user may be retrying something intentional.
-_DELEGATION_ATTEMPTS: dict[str, tuple[int, float]] = {}
+# Each value is (attempt_count, first_seen_ts, last_worker_result). Entries
+# older than one hour are treated as stale and reset on next touch; the
+# orchestrator may have recovered and the user may be retrying something
+# intentional. The result text is kept so a 2nd-delegation gate can inspect
+# it for structured-data markers and refuse re-delegation when the previous
+# run actually answered the question.
+_DELEGATION_ATTEMPTS: dict[str, tuple[int, float, str]] = {}
 _DELEGATION_MAX_ATTEMPTS = 2
 _DELEGATION_WINDOW_SEC = 60 * 60
+
+
+# Phase 4: result-quality detector. A worker result is "substantive" when it
+# contains markers of verified live data — concrete prices, named addresses,
+# specific time stamps, or boolean flags from the page. The orchestrator's
+# default reflex on a hedged "Unable to complete this truthfully" phrasing
+# is to re-delegate, even when the worker returned 1500+ chars of verified
+# findings; that re-delegation throws away progress and starts a fresh
+# session that usually fares worse. This signal lets us intercept that
+# reflex.
+_SUBSTANTIVE_PRICE_RE = _re.compile(r"\$\s?\d+(?:[.,]\d+)?")
+_SUBSTANTIVE_KEYWORDS = (
+    "in & out", "in&out", "in and out", "in-and-out",
+    "garage", "verified", "found", "options",
+)
+
+
+def _result_is_substantive(text: str) -> tuple[bool, list[str]]:
+    """Return (is_substantive, reasons) for a worker result.
+
+    Substantive means: ≥ 400 chars AND at least one of:
+      - contains a price token like "$15.72" or "$ 6"
+      - contains a numbered list of options ("1.", "2.")
+      - contains domain-specific keywords ("In & Out", "garage", "verified")
+    Used to refuse a 2nd re-delegation that would discard verified work.
+    The 400-char floor avoids false positives from short error captions
+    that happen to contain a price or keyword (e.g. "[error: $0 returned"
+    on a 50-char failure).
+    """
+    if not text:
+        return False, []
+    reasons: list[str] = []
+    if len(text) < 400:
+        return False, []
+    if _SUBSTANTIVE_PRICE_RE.search(text):
+        reasons.append("price_tokens")
+    lower = text.lower()
+    kw_hits = [kw for kw in _SUBSTANTIVE_KEYWORDS if kw in lower]
+    if kw_hits:
+        reasons.append(f"keywords({','.join(kw_hits[:3])})")
+    if "1." in text and "2." in text:
+        reasons.append("numbered_list")
+    return (bool(reasons), reasons)
 
 from superbrowser_bridge.routing import (
     LEARNINGS_DIR,
@@ -379,6 +426,51 @@ class DelegateBrowserTaskTool(Tool):
         if _prev is not None and (_now - _prev[1]) > _DELEGATION_WINDOW_SEC:
             _prev = None  # window expired, treat as fresh
         _attempts_so_far = _prev[0] if _prev else 0
+        # Phase 4: refuse a 2nd-or-later delegation when the prior worker
+        # returned a substantive result (verified prices/addresses/options).
+        # Reflexive re-delegation in that case discards verified progress.
+        # The orchestrator must instead present the prior findings to the
+        # user — possibly with caveats — rather than spawn a fresh worker
+        # that loses all context.
+        if (
+            _prev is not None
+            and _attempts_so_far >= 1
+            and len(_prev) >= 3
+            and os.environ.get("REDELEGATION_SUBSTANCE_GUARD", "1") not in ("0", "false", "no")
+        ):
+            _prev_result = _prev[2] or ""
+            _is_sub, _reasons = _result_is_substantive(_prev_result)
+            if _is_sub:
+                # Don't pop the entry — keep it so a 3rd reflex retry also
+                # gets blocked. The orchestrator may still proceed if it
+                # explicitly passes force=True with an explanation of WHY
+                # the previous result was insufficient.
+                if not bool(force):
+                    print(
+                        f"\n>> [REDELEGATION_BLOCKED domain={_attempt_domain}] "
+                        f"prev result substantive (reasons={_reasons}); "
+                        f"refusing re-delegation"
+                    )
+                    return (
+                        f"[REDELEGATION_BLOCKED domain={_attempt_domain} "
+                        f"prev_chars={len(_prev_result)} signals={','.join(_reasons)}]\n"
+                        f"The previous worker returned {len(_prev_result)} chars "
+                        f"of structured findings — re-delegating typically "
+                        f"discards that progress and starts a fresh session "
+                        f"that fares worse.\n\n"
+                        f"Before calling delegate_browser_task again:\n"
+                        f"  1. **Read the previous worker result above this "
+                        f"call** — it likely already answers the user's "
+                        f"question (possibly with caveats).\n"
+                        f"  2. Present that result to the user with any "
+                        f"caveats the worker raised. Honest hedged answers "
+                        f"with verified data are SUCCESS, not failure.\n"
+                        f"  3. Only re-delegate if the previous result was "
+                        f"genuinely empty / network-blocked / captcha-blocked "
+                        f"with NO data extracted — and in that case, pass "
+                        f"force=true and explain in your reasoning what "
+                        f"specifically the prior run missed."
+                    )
         if _attempts_so_far >= _DELEGATION_MAX_ATTEMPTS:
             # Clear the resumption artifact so whatever task follows this
             # one starts from a clean slate — the artifact may well be
@@ -408,6 +500,7 @@ class DelegateBrowserTaskTool(Tool):
         _DELEGATION_ATTEMPTS[_dedup_key] = (
             _attempts_so_far + 1,
             _prev[1] if _prev else _now,
+            (_prev[2] if (_prev is not None and len(_prev) >= 3) else ""),
         )
 
         # --- Pre-validation probe (Layer 1.5) ----------------------------
@@ -788,7 +881,23 @@ class DelegateBrowserTaskTool(Tool):
             "haven't appeared, the lockout will refuse the script. "
             "JS clicks are isTrusted=false; Cloudflare/Akamai reject "
             "them and the page navigates to a challenge URL, "
-            "poisoning the run."
+            "poisoning the run.\n"
+            "\n"
+            "**How to phrase your final `done()` call:** if you "
+            "extracted ANY verified live data from the page (prices, "
+            "named addresses, options, booleans like 'In & Out "
+            "Allowed'), START your final_answer with the verified "
+            "findings — not with 'Unable to complete this truthfully'. "
+            "Hedged-with-data is a SUCCESS, not a failure. Example "
+            "good phrasing: 'Found 3 SpotHero options for SFMOMA on "
+            "May 3 1pm-5pm: [list with prices]. Caveat: could not "
+            "verify Ford F-150 fit at option B; the others either "
+            "block trucks or have no In & Out.' Example BAD phrasing "
+            "(triggers reflex re-delegation): 'Unable to complete "
+            "this truthfully. I reached results but couldn't verify "
+            "everything…'. The orchestrator reads the first sentence "
+            "as your verdict — open with what you DID confirm, then "
+            "list caveats."
         )
 
         # Auto-inject learnings so the worker follows known patterns
@@ -1434,6 +1543,19 @@ CRITICAL RULES:
             # old budget.
             if success:
                 _DELEGATION_ATTEMPTS.pop(_dedup_key, None)
+            else:
+                # Phase 4: stash the worker's content for the substantive-
+                # result guard. Next call will inspect this on the 2nd
+                # attempt and refuse re-delegation if it contains verified
+                # findings (prices/addresses/etc.) the orchestrator should
+                # be presenting to the user instead of discarding.
+                _entry = _DELEGATION_ATTEMPTS.get(_dedup_key)
+                if _entry is not None:
+                    _DELEGATION_ATTEMPTS[_dedup_key] = (
+                        _entry[0],
+                        _entry[1],
+                        content[:8000],  # cap so memory stays bounded
+                    )
 
             return content
 
