@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ must go to this site https://www.bestbuy.com/. Discover the trade-in value of my Intel 7th generation i3 Windows 10, HP laptop in fair condition, which has 8 GB memory and can be powered on, proceed for the in-store trade-in. Use browser tools."""
+        """ must go to this site https://www.bestbuy.com/. Discover the trade-in value of my Intel 7th generation i3 Windows 10, Dell laptop in fair condition, which has 8 GB memory and can be powered on, proceed for the in-store trade-in. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

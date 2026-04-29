@@ -313,7 +313,32 @@ export class PageWrapper {
       console.log('[stealth] Title cleared but no clearance cookie seen — treating as resolved');
       return true;
     }
-    console.log('[stealth] Bot-challenge did not resolve within timeout');
+    // Attribute the failure to a specific WAF so the caller knows whether
+    // 2captcha applies (Cloudflare Turnstile) or whether human handoff is
+    // the only option (Akamai sensor_data).
+    const cookies = await this.page.cookies().catch(() => [] as Array<{ name: string }>);
+    const names = new Set(cookies.map((c) => c.name));
+    let kind = 'unknown';
+    if (names.has('cf_clearance') || names.has('__cf_bm') || finalTitle.includes('just a moment')) {
+      kind = 'cloudflare';
+    } else if (names.has('_abck') || names.has('ak_bmsc') || finalTitle.includes('access denied')) {
+      kind = 'akamai';
+    } else if (names.has('datadome')) {
+      kind = 'datadome';
+    } else if ([...names].some((n) => n.startsWith('incap_ses_') || n.startsWith('visid_incap_'))) {
+      kind = 'imperva';
+    } else if ([...names].some((n) => /^px-?/.test(n))) {
+      kind = 'perimeterx';
+    } else if (names.has('reese84')) {
+      kind = 'kasada';
+    }
+    const remediation =
+      kind === 'cloudflare' ? '2captcha-solvable (browser_solve_captcha auto)'
+      : kind === 'akamai'   ? 'NOT 2captcha-solvable — needs humanized-mouse pass or human handoff'
+      : kind === 'datadome' ? 'partially 2captcha-solvable; may need human handoff'
+      : kind === 'kasada'   ? 'NOT 2captcha-solvable — needs human handoff'
+      : 'unknown remediation — try browser_solve_captcha(auto), then human handoff';
+    console.log(`[stealth] Bot-challenge did not resolve within timeout (kind=${kind}, ${remediation})`);
     return false;
   }
 
