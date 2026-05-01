@@ -30,7 +30,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .session_tools import BrowserSessionState
@@ -392,13 +392,72 @@ async def _reflect_typo(
         print(f"  [verify] reflector failed: {type(e).__name__}: {e!s:.80}")
         return None
 
-    try:
-        content = completion.choices[0].message.content or "{}"
-        parsed = json.loads(content)
-    except Exception as e:
-        print(f"  [verify] reflector returned invalid JSON: {e}")
+    content = completion.choices[0].message.content or "{}"
+    parsed = _salvage_json(content)
+    if parsed is None:
+        print(f"  [verify] reflector returned unsalvageable content: {content[:120]!r}")
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _salvage_json(text: str) -> Optional[dict[str, Any]]:
+    """Best-effort JSON parse for LLMs that occasionally emit prose or
+    extra text after a valid object.
+
+    Tries in order:
+      1. plain ``json.loads`` — the happy path.
+      2. ``json.loads`` of ``text[:e.pos]`` when the failure is "Extra data"
+         (Gemini-flash sometimes appends a trailing comment after a valid
+         object).
+      3. Brace-balanced extraction of the first ``{...}`` block — handles
+         "Expecting value" failures where the model wrote a sentence first.
+
+    Returns ``None`` when nothing balances. Callers should treat that as
+    "verifier abstained" and fall through to their default verdict.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Salvage 1: extra-data — truncate at e.pos and retry.
+        msg = str(e)
+        if "Extra data" in msg:
+            try:
+                return json.loads(text[: e.pos])
+            except json.JSONDecodeError:
+                pass
+        # Salvage 2: brace-balanced extract.
+        depth = 0
+        start = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidate = text[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        start = -1
+                        continue
+        return None
 
 
 # --- Cache helpers -----------------------------------------------------------

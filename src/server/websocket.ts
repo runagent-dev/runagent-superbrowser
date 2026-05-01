@@ -76,15 +76,27 @@ export function attachWebSocketServer(
       return;
     }
 
-    // Token auth on upgrade
+    // Token auth on upgrade. Loopback callers bypass — same exemption as
+    // tokenAuth in auth.ts; without it the local live-viewer can't open
+    // the screencast WebSocket once TOKEN is set, so the page renders
+    // but never streams cursor / typing frames.
     const token = process.env.TOKEN;
     if (token) {
-      const authHeader = req.headers.authorization;
-      const queryToken = url.searchParams.get('token');
-      if (authHeader !== `Bearer ${token}` && queryToken !== token) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
+      const remote = (req.socket.remoteAddress || '') as string;
+      const isLoopback =
+        process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false' &&
+        (remote === '127.0.0.1' ||
+          remote === '::1' ||
+          remote === '::ffff:127.0.0.1' ||
+          remote.startsWith('127.'));
+      if (!isLoopback) {
+        const authHeader = req.headers.authorization;
+        const queryToken = url.searchParams.get('token');
+        if (authHeader !== `Bearer ${token}` && queryToken !== token) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
       }
     }
 

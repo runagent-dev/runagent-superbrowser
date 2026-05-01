@@ -32,6 +32,17 @@ SUPERBROWSER_URL = "http://localhost:3100"
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
 
+def _auth_headers() -> dict[str, str]:
+    """Bearer header injected on every TS-server request when token is set.
+
+    The TS server (src/server/auth.ts:tokenAuth) gates `/session/:id/script` and
+    `/function` behind TOKEN; without this header those endpoints 403, which
+    historically broke the deterministic-script escape hatch on hard sites.
+    """
+    tok = os.environ.get("SUPERBROWSER_TOKEN") or os.environ.get("TOKEN")
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
 # --- Tier 3 (patchright) HTTP-shaped shim -----------------------------------
 #
 # Sessions whose IDs start with `t3-` are served by the in-process
@@ -527,7 +538,8 @@ async def _request_with_backoff(
 
     import random
     last_exc: Exception | None = None
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    headers = _auth_headers()
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         for attempt in range(max_retries + 1):
             try:
                 if method.upper() == "GET":
@@ -2499,11 +2511,19 @@ class BrowserOpenTool(Tool):
         url: str | None,
         region: str | None,
         proxy: str | None,
+        max_stealth: bool = False,
     ) -> Any:
         """Open a session on the given tier. Returns the raw data dict on
         success, or a plain string when the tier-open itself fails (rate
         limit, T3 launch exception). String returns bubble up unchanged
         so the caller can surface them to the agent.
+
+        `max_stealth=True` is forwarded to the T3 manager and forces the
+        heaviest fingerprint config (persistent profile + headful + auto-
+        Xvfb). Used by the T1-failure escalation path to maximize the
+        chance of getting through where the default T3 config still
+        trips. Ignored for tier_name="t1" (TS-side stack has no
+        equivalent knob).
         """
         if tier_name == "t3":
             from superbrowser_bridge.antibot import interactive_session as _t3mgr
@@ -2512,6 +2532,7 @@ class BrowserOpenTool(Tool):
                     url,
                     task_id=self.s.task_id,
                     timeout_s=45.0,
+                    max_stealth=max_stealth,
                 )
             except Exception as exc:
                 return (
@@ -2637,6 +2658,51 @@ class BrowserOpenTool(Tool):
             # (transient rate limit, t3 launch failure). Surface it.
             return data
 
+        # --- T1 retry on soft failures -----------------------------------
+        # A single 401/403/429/503 from T1 is almost never strong enough
+        # evidence that the site needs the heavyweight T3 stack: it can be
+        # a fingerprint flicker, a rate-limit hiccup, or a one-off WAF
+        # challenge. Retry T1 once on a fresh session before paying the
+        # cost of patchright + residential proxy. 502 is upstream-broken
+        # — neither a retry nor T3 will help, so skip retry on 502 and
+        # fall through to the escalation block (which itself handles 502).
+        T1_SOFT_RETRY_CODES = (401, 403, 429, 503)
+        status_code = data.get("statusCode") if isinstance(data, dict) else None
+        if (
+            allow_escalation
+            and chosen_tier == "t1"
+            and isinstance(status_code, int)
+            and status_code in T1_SOFT_RETRY_CODES
+        ):
+            print(
+                f"  [T1 retry after HTTP {status_code}] first attempt "
+                f"flagged; retrying T1 with a fresh session before "
+                f"escalating..."
+            )
+            t1_sid = (data or {}).get("sessionId", "")
+            if t1_sid:
+                try:
+                    await _request_with_backoff(
+                        "DELETE",
+                        f"{SUPERBROWSER_URL}/session/{t1_sid}",
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            # Brief backoff so the second attempt is not back-to-back
+            # against the same edge. 750ms is enough to clear most
+            # short-lived WAF rate-limit windows.
+            await asyncio.sleep(0.75)
+            retry_data = await self._open_session_on_tier(
+                "t1", url=url, region=region, proxy=proxy,
+            )
+            if isinstance(retry_data, str):
+                # Tier-open itself failed (rate limit / launch error).
+                # Surface the message — same contract as the first try.
+                return retry_data
+            data = retry_data
+            status_code = data.get("statusCode") if isinstance(data, dict) else None
+
         # --- T1 → T3 auto-escalation -------------------------------------
         # When the Tier-1 Puppeteer path hits a hard anti-bot block
         # (401/403/429/502/503) before any content loads, the Tier-3
@@ -2644,8 +2710,9 @@ class BrowserOpenTool(Tool):
         # doomed T1 session, record the block so choose_starting_tier
         # prefers T3 next time, and re-open on T3 within this tool call
         # — the caller sees one consistent result regardless of which
-        # tier actually served it.
-        status_code = data.get("statusCode") if isinstance(data, dict) else None
+        # tier actually served it. Only reached if the T1 retry above
+        # also failed (or the original status was 502, which we don't
+        # bother retrying).
         if (
             allow_escalation
             and chosen_tier == "t1"
@@ -2653,8 +2720,8 @@ class BrowserOpenTool(Tool):
             and status_code in (401, 403, 429, 502, 503)
         ):
             print(
-                f"  [T1→T3 auto-escalation] HTTP {status_code} on T1; "
-                f"retrying with patchright (T3)..."
+                f"  [T1→T3 auto-escalation] HTTP {status_code} on T1 "
+                f"after retry; retrying with patchright (T3)..."
             )
             # Clean up the blocked T1 session.
             t1_sid = (data or {}).get("sessionId", "")
@@ -2668,6 +2735,8 @@ class BrowserOpenTool(Tool):
                 except Exception:
                     pass
             # Record the T1 block so next task on this domain starts on T3.
+            # Deferred to here (post-retry) so a single transient 403 does
+            # not poison the routing ledger.
             try:
                 from urllib.parse import urlparse as _up
                 from superbrowser_bridge.routing import _record_routing_outcome
@@ -2683,10 +2752,16 @@ class BrowserOpenTool(Tool):
                     )
             except Exception:
                 pass
-            # Re-open on T3.
+            # Re-open on T3 with MAX stealth (persistent profile +
+            # headful + auto-Xvfb). The lighter T3 default is fine when
+            # the agent picks tier="t3" up-front, but on escalation we've
+            # already burned two T1 attempts on this domain — pay the
+            # extra launch cost for the heaviest fingerprint we can ship
+            # rather than risk a third stuck attempt.
             chosen_tier = "t3"
             data = await self._open_session_on_tier(
                 "t3", url=url, region=region, proxy=proxy,
+                max_stealth=True,
             )
             if isinstance(data, str):
                 return data
@@ -4518,6 +4593,363 @@ class BrowserSelectTool(Tool):
             if elements:
                 data["elements"] = elements
         return self.s.build_text_only(data, f'Selected "{value}" in [{index}]')
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        label=StringSchema(
+            "Human-readable label of the dropdown trigger (e.g. 'Brand', "
+            "'Processor Brand', 'Year of Release'). Matched via accessible-name "
+            "/ <label for=> / aria-labelledby / visible text."
+        ),
+        value=StringSchema(
+            "Visible text or value of the option to pick (e.g. 'Dell', 'Intel', "
+            "'2017'). Matching is exact-ci → startsWith → contains → fuzzy."
+        ),
+        fuzzy=BooleanSchema(
+            description="Allow fuzzy match (Levenshtein ≥0.7). Default true.",
+            default=True,
+        ),
+        timeout=IntegerSchema(
+            description="Max ms to wait for listbox/options to render (default 4000).",
+            nullable=True,
+        ),
+        extra_option_selectors=ArraySchema(
+            description=(
+                "Optional CSS selectors to add to the option-discovery list, "
+                "for bespoke widgets that don't expose [role=option]."
+            ),
+            items=StringSchema(""),
+            nullable=True,
+        ),
+        required=["session_id", "label", "value"],
+    )
+)
+class BrowserSelectOptionTool(Tool):
+    """Pick a dropdown option by *label* + *value*, hiding DOM-index churn.
+
+    Use this for ANY dropdown/listbox/combobox — native <select>, ARIA
+    combobox+listbox, Headless-UI Listbox, etc. You never pass an index or
+    vision V-index, so re-renders between cascade steps don't matter.
+
+    On ambiguity (no exact/fuzzy match) the tool returns the candidate list
+    instead of guessing — retry with a corrected `value`. For ≥2 dependent
+    dropdowns prefer `browser_form_plan` so progress is tracked structurally.
+    """
+
+    name = "browser_select_option"
+    description = (
+        "Pick a dropdown option by label+value. Works on native <select> "
+        "AND custom listbox/combobox widgets. Returns {ok, picked_text, "
+        "verified, candidates?} — on ambiguity, retry with one of the "
+        "candidates instead of clicking blindly."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        label: str,
+        value: str,
+        fuzzy: bool = True,
+        timeout: int | None = None,
+        extra_option_selectors: list[str] | None = None,
+        **kw: Any,
+    ) -> str:
+        print(f"\n>> browser_select_option(label={label!r}, value={value!r})")
+        payload: dict[str, Any] = {"label": label, "value": value, "fuzzy": bool(fuzzy)}
+        if timeout is not None:
+            payload["timeout"] = int(timeout)
+        if extra_option_selectors:
+            payload["extra_option_selectors"] = list(extra_option_selectors)
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/select_option",
+            json=payload,
+            timeout=20.0,
+        )
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            self.s.record_step("browser_select_option", f"{label}={value}", f"HTTP error: {e}")
+            return f"[select_option_http_error] {e}"
+        data = r.json() or {}
+        ok = bool(data.get("ok"))
+        picked = data.get("picked_text") or value
+        verified = bool(data.get("verified"))
+        reason = data.get("reason")
+        candidates = data.get("candidates") or []
+
+        # Cursor strategy ledger — counts as a real cursor attempt for the
+        # cursor-first lockout in browser_run_script.
+        try:
+            self.s.cursor_failure_strategies  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        else:
+            if not ok and reason:
+                self.s.cursor_failure_strategies.add(f"select_option:{reason}")
+
+        if ok:
+            note = f"Picked '{picked}' for '{label}'" + ("" if verified else " (verify pending)")
+            print(f"   [select_option] ok -> {picked!r} (verified={verified})")
+            self.s.log_activity(f"select_option({label})", picked[:40])
+            self.s.record_step("browser_select_option", f"{label}={picked}", "ok")
+            return self.s.build_text_only(data, note)
+
+        # Ambiguity / failure path — surface candidates so the LLM corrects
+        # the value rather than re-screenshotting and click-looping.
+        cand_preview = (
+            (" candidates=" + str([c[:30] for c in candidates[:6]]))
+            if candidates else ""
+        )
+        print(f"   [select_option] FAIL reason={reason or '?'}{cand_preview}")
+
+        msg_parts = [f"[select_option_failed] reason={reason or 'unknown'} label={label!r} value={value!r}"]
+        if reason == "trigger_not_found":
+            msg_parts.append(
+                "The label was not found on this page. Two common causes:\n"
+                "  (a) the cascading dropdown stage is over and the page "
+                "transitioned to a results grid / model picker — in which "
+                "case STOP using browser_form_plan / browser_select_option "
+                "and instead browser_get_markdown to inspect the result list, "
+                "then browser_click on the matching item.\n"
+                "  (b) the label text in the page is different from what "
+                "you passed — call browser_screenshot to read actual labels, "
+                "then retry with the exact text."
+            )
+        if candidates:
+            shown = ", ".join(repr(c) for c in candidates[:15])
+            msg_parts.append(f"candidates: {shown}")
+            msg_parts.append(
+                "Retry browser_select_option with one of the candidates above. "
+                "Do NOT fall back to raw clicking — DOM indices change after "
+                "each pick; this tool re-anchors on the label."
+            )
+        elif reason and reason != "trigger_not_found":
+            msg_parts.append(
+                "No options were collected. The listbox may use a non-ARIA "
+                "pattern — retry with a more specific label, or pass "
+                "extra_option_selectors=[...] (e.g. ['li.option', '.dropdown-item'])."
+            )
+        self.s.log_activity(f"select_option({label}, FAIL)", (reason or "")[:60])
+        self.s.record_step("browser_select_option", f"{label}={value}", f"FAIL:{reason or '?'}")
+        return "\n".join(msg_parts)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        intent=StringSchema(
+            "Short description of what this filter form is for "
+            "(e.g. 'Best Buy laptop trade-in valuation')."
+        ),
+        fields=ArraySchema(
+            description=(
+                "Ordered list of dropdowns to fill. Each entry: "
+                "{label, value, kind?}. Order is the cascade order — later "
+                "fields are filled only after earlier ones succeed. Use "
+                "the *visible label text* (e.g. 'Brand', 'Processor Brand') "
+                "and the *visible option text* (e.g. 'Dell', 'Intel')."
+            ),
+            items=ObjectSchema(
+                label=StringSchema("Visible label text of the dropdown"),
+                value=StringSchema("Visible option text to pick"),
+                kind=StringSchema(
+                    "Optional: 'select' | 'cascade_select' (default).",
+                    nullable=True,
+                ),
+                required=["label", "value"],
+            ),
+        ),
+        per_step_timeout=IntegerSchema(
+            description="Per-field listbox-render timeout (ms, default 4000).",
+            nullable=True,
+        ),
+        stop_on_failure=BooleanSchema(
+            description=(
+                "If true (default), stop and return on first failed field "
+                "with the candidate list. If false, continue past failures "
+                "to fill what's possible."
+            ),
+            default=True,
+        ),
+        required=["session_id", "intent", "fields"],
+    )
+)
+class BrowserFormPlanTool(Tool):
+    """Plan + execute a cascading filter form in one tool call.
+
+    The LLM declares the *whole* form once — Brand=Dell, Processor=Intel,
+    RAM=8GB, Year=2017, etc. — and the runtime fills each field by
+    label-anchored selection (browser_select_option), settling between
+    steps so the next dropdown's options can populate. Removes the
+    "stale V-index, regress, retry" loop on multi-step filter forms.
+
+    Returns a structured progress string. On per-field failure (no match,
+    listbox didn't render) the tool surfaces the candidate list so the
+    LLM can retry with a corrected value.
+    """
+
+    name = "browser_form_plan"
+    description = (
+        "Fill a cascading filter form (≥2 dependent dropdowns) in one "
+        "call. Pass an ordered list of {label, value} pairs. The runtime "
+        "label-anchors each pick (no DOM index, no V-index) and settles "
+        "between steps. Strongly preferred over manual click-loops on "
+        "trade-in / search-filter / quote forms."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        intent: str,
+        fields: list[dict[str, Any]],
+        per_step_timeout: int | None = None,
+        stop_on_failure: bool = True,
+        **kw: Any,
+    ) -> str:
+        if not isinstance(fields, list) or not fields:
+            return "[form_plan_failed] `fields` must be a non-empty list."
+        # Defensive: coerce to plain dicts; reject malformed entries early.
+        clean: list[dict[str, Any]] = []
+        for i, f in enumerate(fields):
+            if not isinstance(f, dict):
+                return f"[form_plan_failed] fields[{i}] is not a dict."
+            label = (f.get("label") or "").strip()
+            value = (f.get("value") or "").strip()
+            if not label or not value:
+                return (
+                    f"[form_plan_failed] fields[{i}] missing label or value: "
+                    f"{f!r}"
+                )
+            clean.append({"label": label, "value": value, "kind": (f.get("kind") or "cascade_select")})
+
+        try:
+            from superbrowser_bridge.form_session import FormFillSession, FieldStatus
+        except ImportError as exc:
+            return f"[form_plan_failed:import] {exc}"
+
+        sess = FormFillSession.begin_cascade(
+            intent=intent, fields=clean,
+            started_at_turn=self.s._brain_turn_counter,
+        )
+        self.s.form_session = sess
+
+        print(f"\n>> browser_form_plan({len(clean)} fields)")
+        progress: list[str] = [
+            f"[form_plan] intent={intent!r} planning {len(clean)} fields"
+        ]
+        failures: list[str] = []
+
+        # Best-effort: close any open dropdown / modal before we start.
+        # If the previous tool call left a listbox/menu open, the next
+        # trigger lookup will land inside the overlay rather than on the
+        # field's own combobox button.
+        try:
+            await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+                json={"keys": "Escape"},
+                timeout=5.0,
+            )
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+        for entry in clean:
+            label = entry["label"]
+            value = entry["value"]
+            payload = {"label": label, "value": value, "fuzzy": True}
+            if per_step_timeout is not None:
+                payload["timeout"] = int(per_step_timeout)
+            print(f"   [form_plan] -> {label}={value!r}")
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/select_option",
+                json=payload,
+                timeout=20.0,
+            )
+            try:
+                r.raise_for_status()
+            except Exception as e:
+                failures.append(f"{label}={value} → HTTP error: {e}")
+                if stop_on_failure:
+                    break
+                continue
+            data = r.json() or {}
+            ok = bool(data.get("ok"))
+            picked = data.get("picked_text") or value
+            reason = data.get("reason")
+            candidates = data.get("candidates") or []
+
+            if ok:
+                sess.mark_picked(label, picked)
+                progress.append(f"  [+] {label} = {picked!r}")
+                print(f"   [form_plan]   ok -> picked {picked!r}")
+                # Settle so dependent dropdown's options can populate
+                # before the next iteration. 350ms covers most React
+                # state-update + listbox-render flows; tune via per_step_timeout.
+                await asyncio.sleep(0.35)
+                # And close any lingering listbox before the next trigger lookup.
+                try:
+                    await _request_with_backoff(
+                        "POST",
+                        f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+                        json={"keys": "Escape"},
+                        timeout=5.0,
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    pass
+            else:
+                cand_str = ""
+                if candidates:
+                    cand_str = (
+                        " candidates=" + ", ".join(repr(c) for c in candidates[:10])
+                    )
+                msg = f"{label}={value} → {reason or 'no_match'}{cand_str}"
+                failures.append(msg)
+                progress.append(f"  [!] {msg}")
+                print(f"   [form_plan]   FAIL -> {reason or '?'} {('cands=' + str(candidates[:6])) if candidates else ''}")
+                if stop_on_failure:
+                    break
+
+        # Final progress summary
+        progress.append("")
+        progress.append(sess.cascade_progress())
+        if failures and stop_on_failure:
+            progress.append(
+                "Stopped on first failure. Retry browser_form_plan with "
+                "corrected values for the remaining fields, OR retry just "
+                "the failed field with browser_select_option using one of "
+                "the listed candidates."
+            )
+        elif failures:
+            progress.append(
+                f"Continued past {len(failures)} failure(s). Use "
+                "browser_select_option to retry each."
+            )
+
+        self.s.log_activity(
+            f"form_plan({intent[:30]})",
+            f"verified {sum(1 for fs in sess.fields.values() if fs.status == FieldStatus.VERIFIED)}/{len(sess.fields)}",
+        )
+        return "\n".join(progress)
 
 
 @tool_parameters(
@@ -8727,6 +9159,8 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserScrollTool(state),
         BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
         BrowserSelectTool(state),
+        BrowserSelectOptionTool(state),
+        BrowserFormPlanTool(state),
         BrowserEvalTool(state),
         BrowserRunScriptTool(state),
         BrowserWaitForTool(state),

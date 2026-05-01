@@ -11,12 +11,31 @@ import type { Request, Response, NextFunction } from 'express';
  * Bearer token authentication middleware.
  * If TOKEN env var is set, all requests must include it.
  * If TOKEN is not set, auth is disabled (development mode).
+ *
+ * Loopback callers (127.0.0.1, ::1) are bypassed so the local live-viewer
+ * UI and the same-host nanobot bridge work without smuggling tokens into
+ * every <img>/<script>/WebSocket fetch. This mirrors the loopback bypass
+ * already in `RateLimiter.isLoopback`. Set
+ * `TOKEN_AUTH_LOOPBACK_BYPASS=false` to enforce auth for local traffic too.
  */
 export function tokenAuth(req: Request, res: Response, next: NextFunction): void {
   const token = process.env.TOKEN;
   if (!token) {
     next();
     return;
+  }
+
+  if (process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false') {
+    const ip = req.ip || req.socket.remoteAddress || '';
+    if (
+      ip === '127.0.0.1' ||
+      ip === '::1' ||
+      ip === '::ffff:127.0.0.1' ||
+      ip.startsWith('127.')
+    ) {
+      next();
+      return;
+    }
   }
 
   const authHeader = req.headers.authorization;

@@ -577,11 +577,22 @@ class T3SessionManager:
         task_id: str = "",
         import_state: Optional[dict] = None,
         timeout_s: float = 45.0,
+        max_stealth: bool = False,
     ) -> dict[str, Any]:
         """Create a new session. Returns the same dict shape the TS server
         returns from POST /session/create.
+
+        `max_stealth=True` (used by the T1-failure escalation path) forces
+        the heaviest fingerprint config for this session: persistent
+        per-domain profile + headful via auto-Xvfb, regardless of env
+        defaults. The cost is launch latency and CPU; the benefit is
+        getting past sites where plain headless patchright still trips
+        Cloudflare/Akamai. Direct `tier="t3"` callers leave it False to
+        get the fast default.
         """
         persist = os.environ.get("T3_PERSIST_PROFILE", "0") != "0"
+        if max_stealth:
+            persist = True
         if not persist:
             await self._ensure_browser()
             assert self._browser is not None
@@ -635,6 +646,15 @@ class T3SessionManager:
             if os.environ.get("T3_DISABLE_HTTP2", "1") != "0":
                 persist_args.append("--disable-http2")
             persist_headless = os.environ.get("T3_HEADLESS", "1") != "0"
+            # NB: max_stealth deliberately does NOT flip headless here.
+            # The auto-Xvfb path has a startup race (Popen returns
+            # immediately, Chrome connects before Xvfb is ready, dies
+            # with TargetClosedError on launch_persistent_context). The
+            # persistent profile alone (forced above when max_stealth)
+            # carries the bulk of the stealth signal — cf_clearance /
+            # localStorage / IndexedDB / service-worker continuity.
+            # Operators who want headful should set T3_HEADLESS=0 in env
+            # and ensure DISPLAY/Xvfb is verified-ready before launch.
             _maybe_start_xvfb(persist_headless)
             persist_kwargs: dict[str, Any] = {
                 "user_data_dir": str(profile_dir),

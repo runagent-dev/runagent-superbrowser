@@ -12,6 +12,8 @@ services:
       - LLM_MODEL=${LLM_MODEL:-gpt-4o}
       - PORT=3100
       - HEADLESS=true
+      - TOKEN=${TOKEN}
+      - SUPERBROWSER_TOKEN=${SUPERBROWSER_TOKEN}
     cap_add:
       - SYS_ADMIN
     restart: unless-stopped

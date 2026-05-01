@@ -63,9 +63,21 @@ class ProxyTiers:
             return self._domain_tier.get(domain, 0)
 
     def pick(self, domain: str) -> Optional[str]:
-        """Return a proxy URL for this domain, or None for direct."""
+        """Return a proxy URL for this domain, or None for direct.
+
+        First-contact policy: if the domain has not been demoted yet
+        (tier == 0) and tier-0 has no datacenter proxies configured,
+        return None (go direct) instead of jumping straight to the
+        residential pool. Residential ranges are on more WAF blocklists
+        than a clean home/datacenter egress, and we should only pay
+        that cost after a T3 attempt actually fails. Once `demote()`
+        bumps the domain to tier >= 1, the original skip-up-empty-tiers
+        behavior kicks in and the residential pool is used.
+        """
         with self._lock:
             tier = self._domain_tier.get(domain, 0)
+            if tier == 0 and not self._tiers[0]:
+                return None
             # Skip empty tiers up the ladder.
             while tier < len(self._tiers) and not self._tiers[tier]:
                 tier += 1

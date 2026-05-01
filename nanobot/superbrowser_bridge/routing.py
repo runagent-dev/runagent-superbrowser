@@ -454,19 +454,28 @@ def _looks_blocked(content: str) -> tuple[bool, str]:
     if not content:
         return True, "empty_response"
     text = content.strip()
-    if len(text) < 500:
-        return True, f"too_short:{len(text)}"
     lower = text.lower()
-    for marker in _BLOCK_MARKERS:
-        if marker in lower:
-            return True, f"marker:{marker}"
+    # A short body is only "blocked" if it ALSO carries a known block
+    # marker. Modern SPAs legitimately ship < 500 chars of HTML and
+    # hydrate the rest via JS; flagging those as blocked was poisoning
+    # the routing ledger and triggering unnecessary tier escalations.
+    has_marker = any(m in lower for m in _BLOCK_MARKERS)
+    if len(text) < 200 and has_marker:
+        return True, f"short_with_marker:{len(text)}"
+    if has_marker:
+        for marker in _BLOCK_MARKERS:
+            if marker in lower:
+                return True, f"marker:{marker}"
     stripped = _re.sub(
         r"<script[\s\S]*?</script>|<style[\s\S]*?</style>",
         "", text, flags=_re.IGNORECASE,
     )
     stripped = _re.sub(r"<[^>]+>", " ", stripped)
     visible = _re.sub(r"\s+", " ", stripped).strip()
-    if len(visible) < 200:
+    # Only call empty/near-empty bodies blocked when the visible text is
+    # truly negligible. SPAs and JSON endpoints can render < 200 chars
+    # of visible text legitimately, so combine with the marker check.
+    if len(visible) < 50:
         return True, f"no_visible_text:{len(visible)}"
     return False, ""
 

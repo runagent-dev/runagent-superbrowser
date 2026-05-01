@@ -56,6 +56,23 @@ class FieldStatus(str, Enum):
     MISMATCH = "mismatch"
 
 
+class FieldKind(str, Enum):
+    """How a field is filled.
+
+    TEXT — free-text input via browser_type / browser_type_at.
+    AUTOCOMPLETE — type-then-pick-suggestion (existing flow).
+    SELECT — single dropdown pick via browser_select_option.
+    CASCADE_SELECT — dropdown whose options depend on a prior pick (e.g.
+        Best Buy Model Family is only valid after Brand). Driven by
+        browser_form_plan; later steps re-anchor on label, not index.
+    """
+
+    TEXT = "text"
+    AUTOCOMPLETE = "autocomplete"
+    SELECT = "select"
+    CASCADE_SELECT = "cascade_select"
+
+
 @dataclass
 class FieldState:
     label: str
@@ -67,6 +84,9 @@ class FieldState:
     autocomplete_pick_required: bool = False
     fill_attempts: int = 0
     last_attempt_turn: int = -1
+    kind: FieldKind = FieldKind.TEXT
+    depends_on: Optional[str] = None
+    resolved_value: Optional[str] = None  # what the picker actually selected
 
 
 @dataclass
@@ -115,12 +135,78 @@ class FormFillSession:
             label = (f.get("label") or "").strip()
             if not label:
                 continue
+            kind_raw = (f.get("kind") or "").strip().lower()
+            try:
+                kind = FieldKind(kind_raw) if kind_raw else FieldKind.TEXT
+            except ValueError:
+                kind = FieldKind.TEXT
             sess.fields[label.lower()] = FieldState(
                 label=label,
                 target_value=str(f.get("value", "") or ""),
                 autocomplete_pick_required=bool(f.get("autocomplete", False)),
+                kind=kind,
+                depends_on=(f.get("depends_on") or None),
             )
         return sess
+
+    @classmethod
+    def begin_cascade(
+        cls,
+        *,
+        intent: str,
+        fields: list[dict[str, Any]],
+        started_at_turn: int,
+    ) -> "FormFillSession":
+        """Convenience factory for a pure cascading-dropdown form.
+
+        Each entry MUST have {label, value}; kind defaults to CASCADE_SELECT.
+        Order is the cascade order — later fields are filled only after all
+        previous fields are VERIFIED.
+        """
+        normalized = []
+        prev: Optional[str] = None
+        for f in fields:
+            entry = dict(f)
+            if not entry.get("kind"):
+                entry["kind"] = FieldKind.CASCADE_SELECT.value
+            if prev and not entry.get("depends_on"):
+                entry["depends_on"] = prev
+            normalized.append(entry)
+            prev = (entry.get("label") or "").strip().lower() or prev
+        return cls.begin(
+            intent=intent, fields=normalized, started_at_turn=started_at_turn,
+        )
+
+    def is_cascade(self) -> bool:
+        return any(
+            fs.kind in (FieldKind.SELECT, FieldKind.CASCADE_SELECT)
+            for fs in self.fields.values()
+        )
+
+    def cascade_progress(self) -> str:
+        verified = sum(
+            1 for fs in self.fields.values() if fs.status == FieldStatus.VERIFIED
+        )
+        total = len(self.fields)
+        picked = ", ".join(
+            f"{fs.label}={fs.resolved_value or fs.target_value}"
+            for fs in self.fields.values()
+            if fs.status == FieldStatus.VERIFIED
+        )
+        nxt = self.next_pending()
+        nxt_str = f" Next: {nxt.label}" if nxt else " (all done)"
+        return f"Filled {verified}/{total} ({picked or '—'}).{nxt_str}"
+
+    def mark_picked(self, label: str, picked_value: str) -> Optional[FieldState]:
+        """Record a successful select_option pick for a SELECT/CASCADE_SELECT field."""
+        fs = self._match_field(label)
+        if fs is None:
+            return None
+        fs.resolved_value = picked_value
+        fs.last_observed_value = picked_value
+        fs.fill_attempts += 1
+        fs.status = FieldStatus.VERIFIED
+        return fs
 
     def next_pending(self) -> Optional[FieldState]:
         """Return the first field still requiring action, or None."""

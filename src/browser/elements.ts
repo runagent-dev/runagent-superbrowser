@@ -231,3 +231,325 @@ export async function domSearchCDP(
 
   return results;
 }
+
+/**
+ * Result of selectOptionByLabel.
+ */
+export interface SelectOptionByLabelResult {
+  ok: boolean;
+  picked_text?: string;
+  trigger_selector?: string;
+  option_selector?: string;
+  candidates?: string[];
+  reason?: string;
+  verified?: boolean;
+  took_ms: number;
+}
+
+/**
+ * Select an option in any dropdown — native <select>, ARIA combobox/listbox,
+ * or Headless-UI/Reach style custom widget — by matching a *label* to the
+ * trigger and a *value* (visible text) to the option.
+ *
+ * The LLM never sees a DOM index or vision-bbox V-index; index churn is
+ * absorbed entirely server-side. Returns either a successful pick or the
+ * candidate list so the caller can retry with a corrected value.
+ */
+export async function selectOptionByLabel(
+  page: Page,
+  opts: {
+    label: string;
+    value: string;
+    fuzzy?: boolean;
+    timeout?: number;
+    extraOpenSelectors?: string[];
+    extraOptionSelectors?: string[];
+  },
+): Promise<SelectOptionByLabelResult> {
+  const start = Date.now();
+  const label = opts.label;
+  const value = opts.value;
+  const fuzzy = opts.fuzzy !== false;
+  const timeout = Math.max(500, Math.min(20000, opts.timeout ?? 4000));
+  const extraOptionSelectors = opts.extraOptionSelectors ?? [];
+
+  // 1. Locate trigger by label text (label-for, aria-labelledby, aria-label,
+  //    or text). Tag it with data-sb-trigger so subsequent calls survive
+  //    DOM-index renumbering.
+  const trigger = await page.evaluate((lbl: string) => {
+    const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+    const lower = (s: string) => norm(s).toLowerCase();
+    const target = lower(lbl);
+    if (!target) return null;
+
+    const tag = (el: Element) => {
+      const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
+      el.setAttribute('data-sb-trigger', id);
+      const isSelect = el.tagName.toLowerCase() === 'select';
+      return {
+        selector: `[data-sb-trigger="${id}"]`,
+        isNativeSelect: isSelect,
+        currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
+        role: el.getAttribute('role') || '',
+        ariaExpanded: el.getAttribute('aria-expanded') || '',
+      };
+    };
+
+    // A. <label for="x">Lbl</label> + #x
+    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label[for]'))) {
+      if (lower(lab.textContent || '').includes(target)) {
+        const ctrl = document.getElementById(lab.htmlFor);
+        if (ctrl) return tag(ctrl);
+      }
+    }
+
+    // B. aria-labelledby
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-labelledby]'))) {
+      const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+      const labText = ids
+        .map((id) => lower(document.getElementById(id)?.textContent || ''))
+        .join(' ');
+      if (labText.includes(target)) return tag(el);
+    }
+
+    // C. aria-label on combobox/button/listbox/input
+    const interactive = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="combobox"], [role="listbox"], [role="button"], [aria-haspopup], button, select, input',
+    ));
+    for (const el of interactive) {
+      const aria = lower(el.getAttribute('aria-label') || '');
+      if (aria.includes(target)) {
+        // Skip elements that are clearly off-screen / hidden.
+        if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') continue;
+        return tag(el);
+      }
+    }
+
+    // D. Visible text — prefer the smallest interactive element whose text
+    //    contains the label. Walk parents from the matching text node.
+    for (const el of interactive) {
+      if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') continue;
+      const txt = lower((el as HTMLElement).textContent || '').slice(0, 200);
+      if (txt.includes(target)) return tag(el);
+    }
+
+    // E. Wrapping <label> — <label>Lbl <input/></label>
+    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label'))) {
+      if (lower(lab.textContent || '').includes(target)) {
+        const ctrl = lab.querySelector<HTMLElement>('select, input, [role="combobox"], [role="listbox"]');
+        if (ctrl) return tag(ctrl);
+      }
+    }
+
+    return null;
+  }, label);
+
+  if (!trigger) {
+    return { ok: false, reason: 'trigger_not_found', took_ms: Date.now() - start };
+  }
+
+  // 2. Native <select>: dispatch a real change event via page.select().
+  if (trigger.isNativeSelect) {
+    try {
+      const optionValue = await page.evaluate((sel: string, val: string) => {
+        const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const tgt = norm(val);
+        const sel_el = document.querySelector(sel) as HTMLSelectElement | null;
+        if (!sel_el) return null;
+        const optsArr = Array.from(sel_el.options);
+        let m = optsArr.find((o) => o.value.toLowerCase() === tgt);
+        if (!m) m = optsArr.find((o) => norm(o.textContent || '') === tgt);
+        if (!m) m = optsArr.find((o) => norm(o.textContent || '').startsWith(tgt));
+        if (!m) m = optsArr.find((o) => norm(o.textContent || '').includes(tgt));
+        return m ? m.value : null;
+      }, trigger.selector, value);
+
+      if (optionValue == null) {
+        const candidates = await page.evaluate((sel: string) => {
+          const sel_el = document.querySelector(sel) as HTMLSelectElement | null;
+          return sel_el ? Array.from(sel_el.options).slice(0, 30).map((o) => (o.textContent || '').trim()) : [];
+        }, trigger.selector);
+        return {
+          ok: false, reason: 'option_not_in_native_select',
+          trigger_selector: trigger.selector, candidates,
+          took_ms: Date.now() - start,
+        };
+      }
+      await page.select(trigger.selector, optionValue);
+      return {
+        ok: true, picked_text: value,
+        trigger_selector: trigger.selector, verified: true,
+        took_ms: Date.now() - start,
+      };
+    } catch (e) {
+      return {
+        ok: false, reason: `native_select_failed: ${(e as Error).message}`,
+        trigger_selector: trigger.selector, took_ms: Date.now() - start,
+      };
+    }
+  }
+
+  // 3. Custom widget: scroll trigger into view and click it.
+  try {
+    await page.$eval(trigger.selector, (el: Element) =>
+      (el as HTMLElement).scrollIntoView({ block: 'center' }),
+    );
+    await page.click(trigger.selector);
+  } catch (e) {
+    return {
+      ok: false, reason: `trigger_click_failed: ${(e as Error).message}`,
+      trigger_selector: trigger.selector, took_ms: Date.now() - start,
+    };
+  }
+
+  // 4. Wait for listbox/menu to render.
+  const optionSelectors = [
+    '[role="listbox"]:not([aria-hidden="true"]) [role="option"]',
+    '[role="menu"]:not([aria-hidden="true"]) [role="menuitem"]',
+    'ul[role="listbox"] li[role="option"]',
+    '[data-headlessui-state] [role="option"]',
+    ...extraOptionSelectors,
+  ];
+
+  const checkOptionsPresent = () => page.evaluate((sels: string[]) => {
+    for (const s of sels) {
+      try {
+        if (document.querySelectorAll(s).length > 0) return true;
+      } catch { /* bad selector — continue */ }
+    }
+    return false;
+  }, optionSelectors);
+
+  let rendered = false;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await checkOptionsPresent().catch(() => false)) { rendered = true; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!rendered) {
+    // Headless-UI / Reach UI sometimes need keyboard activation.
+    try {
+      await page.focus(trigger.selector);
+      await page.keyboard.press('ArrowDown');
+      await new Promise((r) => setTimeout(r, 300));
+      rendered = await checkOptionsPresent().catch(() => false);
+    } catch { /* nope */ }
+  }
+  if (!rendered) {
+    return {
+      ok: false, reason: 'options_did_not_render',
+      trigger_selector: trigger.selector, took_ms: Date.now() - start,
+    };
+  }
+
+  // 5. Pick option by exact-ci → startsWith → contains → fuzzy.
+  const pick = await page.evaluate((sels: string[], val: string, fz: boolean) => {
+    const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+    const lower = (s: string) => norm(s).toLowerCase();
+    const tgt = lower(val);
+
+    const seen: HTMLElement[] = [];
+    for (const s of sels) {
+      try {
+        for (const el of Array.from(document.querySelectorAll<HTMLElement>(s))) {
+          if (!seen.includes(el)) seen.push(el);
+        }
+      } catch { /* skip bad selector */ }
+    }
+    const items = seen
+      .map((el) => ({ el, txt: norm(el.textContent || '') }))
+      .filter((it) => it.txt.length > 0);
+    if (items.length === 0) {
+      return { ok: false as const, reason: 'no_options_collected', candidates: [] as string[] };
+    }
+    let match = items.find((it) => lower(it.txt) === tgt);
+    if (!match) match = items.find((it) => lower(it.txt).startsWith(tgt));
+    if (!match) match = items.find((it) => lower(it.txt).includes(tgt));
+    if (!match && fz) {
+      const lev = (a: string, b: string): number => {
+        if (a === b) return 0;
+        const m = a.length, n = b.length;
+        if (m === 0) return n; if (n === 0) return m;
+        const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+        for (let i = 0; i <= m; i++) dp[i][0] = i;
+        for (let j = 0; j <= n; j++) dp[0][j] = j;
+        for (let i = 1; i <= m; i++) {
+          for (let j = 1; j <= n; j++) {
+            const c = a[i-1] === b[j-1] ? 0 : 1;
+            dp[i][j] = Math.min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+c);
+          }
+        }
+        return dp[m][n];
+      };
+      let best: { it: { el: HTMLElement; txt: string }; score: number } | null = null;
+      for (const it of items) {
+        const a = lower(it.txt);
+        if (!a) continue;
+        const d = lev(a, tgt);
+        const sim = 1 - d / Math.max(a.length, tgt.length);
+        if (sim >= 0.7 && (!best || sim > best.score)) best = { it, score: sim };
+      }
+      if (best) match = best.it;
+    }
+
+    if (!match) {
+      return {
+        ok: false as const,
+        reason: 'no_option_match',
+        candidates: items.slice(0, 25).map((it) => it.txt),
+      };
+    }
+
+    const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+    match.el.setAttribute('data-sb-opt', optTag);
+    return {
+      ok: true as const,
+      option_selector: `[data-sb-opt="${optTag}"]`,
+      picked_text: match.txt,
+    };
+  }, optionSelectors, value, fuzzy);
+
+  if (!pick.ok) {
+    return {
+      ok: false, reason: pick.reason, candidates: pick.candidates,
+      trigger_selector: trigger.selector, took_ms: Date.now() - start,
+    };
+  }
+
+  // 6. Click the chosen option.
+  try {
+    await page.$eval(pick.option_selector, (el: Element) =>
+      (el as HTMLElement).scrollIntoView({ block: 'center' }),
+    );
+    await page.click(pick.option_selector);
+  } catch (e) {
+    return {
+      ok: false, reason: `option_click_failed: ${(e as Error).message}`,
+      trigger_selector: trigger.selector, option_selector: pick.option_selector,
+      took_ms: Date.now() - start,
+    };
+  }
+
+  // 7. Settle, then verify trigger reflects the pick.
+  await new Promise((r) => setTimeout(r, 250));
+  const verify = await page.evaluate((sel: string, picked: string) => {
+    const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (!el) return { contains_pick: false, current_text: '', closed: true };
+    const cur = norm(el.textContent || '');
+    return {
+      closed: el.getAttribute('aria-expanded') !== 'true',
+      contains_pick: cur.includes(norm(picked)),
+      current_text: cur.slice(0, 200),
+    };
+  }, trigger.selector, pick.picked_text);
+
+  return {
+    ok: true,
+    picked_text: pick.picked_text,
+    trigger_selector: trigger.selector,
+    option_selector: pick.option_selector,
+    verified: verify.contains_pick,
+    took_ms: Date.now() - start,
+  };
+}

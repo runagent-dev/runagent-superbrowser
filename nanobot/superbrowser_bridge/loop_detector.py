@@ -95,13 +95,23 @@ class LoopDetector:
         if repeats < REPEAT_THRESHOLD:
             return None
 
+        # Cascading-dropdown context detector. Repeated clicks on a
+        # listbox/combobox/option neighborhood is the dominant failure
+        # mode (DOM indices renumber after each pick; V-indices go stale
+        # past 10s). Tell the brain to abandon raw clicks BEFORE the
+        # generic "switch selector" fallback.
+        cascade_hint = _cascade_dropdown_hint(tool_name, args)
+
         self._action_nudge_count += 1
         if self._action_nudge_count == 1:
-            return (
+            base = (
                 f"[LOOP: you have called {tool_name}({str(args)[:80]}) "
                 f"{repeats} times in a row. Change tactic — try a different "
                 "selector, a different tool, or browser_wait_for the expected content.]"
             )
+            if cascade_hint:
+                return cascade_hint + "\n" + base
+            return base
         if self._action_nudge_count == 2:
             return (
                 "[LOOP-ESCALATE: same action repeated again. Try a DIFFERENT "
@@ -147,3 +157,44 @@ class LoopDetector:
     def reset_action_nudge(self) -> None:
         """Called when the agent actually varies its action; resets soft counter."""
         self._action_nudge_count = 0
+
+
+# Tools whose repetition typically indicates a stuck cascading-dropdown
+# loop. Anchored to the click family — eval/screenshot are normal polls.
+_CLICK_TOOLS = frozenset({
+    "browser_click",
+    "browser_click_at",
+    "browser_click_selector",
+    "browser_type_at",
+    "browser_type",
+})
+
+
+def _cascade_dropdown_hint(tool_name: str, args: dict | None) -> str | None:
+    """Detect "stuck on a custom listbox" and steer toward
+    browser_select_option / browser_form_plan.
+
+    Triggers when the repeated tool is a click variant whose serialized
+    args mention a combobox/listbox/option role or trade-in-style filter
+    URL — i.e. exactly the pattern the user observed on Best Buy where
+    DOM indices kept shifting between picks.
+    """
+    if tool_name not in _CLICK_TOOLS:
+        return None
+    try:
+        blob = json.dumps(args or {}, default=str).lower()
+    except Exception:
+        blob = str(args or "").lower()
+    needles = ("combobox", "listbox", "option", "select", "dropdown", "trade-in")
+    if not any(n in blob for n in needles):
+        return None
+    return (
+        "[CASCADE-DROPDOWN-LOOP] You are click-looping on what looks like "
+        "a custom dropdown / cascading filter form. Vision V-indices go "
+        "stale after 10s and DOM `[index]` values renumber after every "
+        "pick — that's why these clicks keep regressing. Switch to:\n"
+        "  • browser_select_option(label='Brand', value='Dell')   — for ONE dropdown\n"
+        "  • browser_form_plan(intent=..., fields=[{label,value}, ...])  — for ≥2 dependent dropdowns\n"
+        "Both tools label-anchor the trigger (no index, no V-index) and "
+        "settle between steps so the next listbox can populate."
+    )

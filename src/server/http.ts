@@ -21,6 +21,7 @@ import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
+import { selectOptionByLabel } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
 import { renderCaptchaViewHtml } from './captcha-ui-html.js';
@@ -1451,6 +1452,54 @@ export function createHttpServer(
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Select a dropdown option by *label text* (not DOM index).
+   *
+   * Handles native <select>, ARIA combobox+listbox, Headless-UI Listbox,
+   * and similar custom widgets. The agent passes a human-readable label
+   * (e.g. "Brand") and value (e.g. "Dell"); the server resolves the
+   * trigger via the accessibility tree, opens the listbox if needed,
+   * fuzzy-matches the option, clicks it with real Puppeteer events, and
+   * verifies the trigger now reflects the pick. On ambiguity it returns
+   * a candidate list instead of guessing — preventing the "wrong dropdown
+   * picked, regress, retry" hallucination loop on cascading filter forms.
+   */
+  app.post('/session/:id/select_option', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const { label, value, fuzzy, timeout, extra_option_selectors } = req.body || {};
+    if (typeof label !== 'string' || !label.trim()) {
+      res.status(400).json({ error: 'label (string) is required' });
+      return;
+    }
+    if (typeof value !== 'string' || !value.trim()) {
+      res.status(400).json({ error: 'value (string) is required' });
+      return;
+    }
+
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      const result = await selectOptionByLabel(page.getRawPage(), {
+        label,
+        value,
+        fuzzy: fuzzy !== false,
+        timeout: typeof timeout === 'number' ? timeout : undefined,
+        extraOptionSelectors: Array.isArray(extra_option_selectors) ? extra_option_selectors : undefined,
+      });
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false }).catch(() => null);
+      res.json({
+        ...result,
+        elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
         effect: diffEffect(effectBefore, effectAfter),
       });
     } catch (err) {
