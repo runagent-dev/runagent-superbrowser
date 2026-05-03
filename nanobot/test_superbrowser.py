@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ must go to this site https://www.student.com/ .View the cheapest apartment available for students at the University of California, Los Angeles with bills that include WIFI and cleaning services. use browser tools."""
+        """ must go to this site https://www.wineaccess.com/ .Find all the wines for the highest critic-scored red wine, from Oregon, priced under $40, that pairs well with dessert and fish both. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

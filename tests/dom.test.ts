@@ -85,4 +85,76 @@ describe('DOMElementNode', () => {
     const formatted = root.clickableElementsToString();
     expect(formatted).toContain('*[0]');
   });
+
+  it('should attach group context to tabs inside a tablist (aria-label)', () => {
+    const tabNew = new DOMElementNode(
+      'button', '/tablist/button[1]',
+      { role: 'tab' }, 'New',
+      true, true, true, 32, [],
+    );
+    const tabOpenBox = new DOMElementNode(
+      'button', '/tablist/button[2]',
+      { role: 'tab' }, 'Open-Box',
+      true, true, true, 33, [],
+    );
+    const tablist = new DOMElementNode(
+      'div', '/tablist',
+      { role: 'tablist', 'aria-label': 'Condition' }, '',
+      false, true, true, null, [tabNew, tabOpenBox],
+    );
+    const root = new DOMElementNode(
+      'div', '/root', {}, '',
+      false, true, true, null, [tablist],
+    );
+
+    const formatted = root.clickableElementsToString();
+    expect(formatted).toContain('[32]<button');
+    expect(formatted).toContain('[33]<button');
+    expect(formatted).toContain('group=Condition');
+    // Both tabs should carry the group attribution.
+    const groupCount = (formatted.match(/group=Condition/g) || []).length;
+    expect(groupCount).toBe(2);
+  });
+
+  it('should resolve group label from <fieldset><legend>', () => {
+    const radioM = new DOMElementNode(
+      'input', '/fieldset/input[1]',
+      { type: 'radio', name: 'g' }, '',
+      true, true, true, 0, [],
+    );
+    const radioL = new DOMElementNode(
+      'input', '/fieldset/input[2]',
+      { type: 'radio', name: 'g' }, '',
+      true, true, true, 1, [],
+    );
+    const legend = new DOMElementNode(
+      'legend', '/fieldset/legend', {}, 'Size',
+      false, true, true, null, [],
+    );
+    const fieldset = new DOMElementNode(
+      'fieldset', '/fieldset', {}, '',
+      false, true, true, null, [legend, radioM, radioL],
+    );
+    const root = new DOMElementNode(
+      'div', '/root', {}, '',
+      false, true, true, null, [fieldset],
+    );
+
+    const formatted = root.clickableElementsToString();
+    expect(formatted).toContain('group=Size');
+  });
+
+  it('should NOT attach group to elements outside a group container', () => {
+    const button = new DOMElementNode(
+      'button', '/button[1]', {}, 'Submit',
+      true, true, true, 0, [],
+    );
+    const root = new DOMElementNode(
+      'div', '/root', {}, '',
+      false, true, true, null, [button],
+    );
+
+    const formatted = root.clickableElementsToString();
+    expect(formatted).not.toContain('group=');
+  });
 });

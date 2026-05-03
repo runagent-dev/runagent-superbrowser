@@ -58,6 +58,16 @@ class LoopDetector:
     _stagnation_count: int = 0
     _stagnation_nudge_count: int = 0
 
+    # --- stale-screenshot streak ---
+    # Counts consecutive screenshots that produce the same (url, fingerprint)
+    # as the previous one. Read by the impasse-tool refusal logic
+    # (BrowserSessionState.must_screenshot_before_giving_up) as a release
+    # valve: if the brain has 3+ stale screenshots in a row the page is
+    # genuinely stuck and `browser_request_help` is allowed.
+    _last_screenshot_fp: str = ""
+    _last_screenshot_url: str = ""
+    stale_screenshot_count: int = 0
+
     # --- hashing helpers -------------------------------------------------
 
     @staticmethod
@@ -157,6 +167,22 @@ class LoopDetector:
     def reset_action_nudge(self) -> None:
         """Called when the agent actually varies its action; resets soft counter."""
         self._action_nudge_count = 0
+
+    def record_screenshot(self, url: str, fingerprint: str) -> int:
+        """Record one screenshot and return the stale-streak count.
+
+        Stale streak increments when (url, fingerprint) matches the previous
+        screenshot. Resets on any change. Read by the impasse-tool refusal
+        logic — when ≥3 the brain is genuinely stuck and may call
+        `browser_request_help`.
+        """
+        if url == self._last_screenshot_url and fingerprint == self._last_screenshot_fp:
+            self.stale_screenshot_count += 1
+        else:
+            self.stale_screenshot_count = 0
+            self._last_screenshot_url = url
+            self._last_screenshot_fp = fingerprint
+        return self.stale_screenshot_count
 
 
 # Tools whose repetition typically indicates a stuck cascading-dropdown

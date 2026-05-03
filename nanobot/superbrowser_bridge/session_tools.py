@@ -334,6 +334,237 @@ async def _t3_dispatch_from_http(
         )
 
 
+def _detect_playwright_pseudo(selector: str) -> str | None:
+    """Reject selectors that use Playwright-specific pseudo-classes the
+    Puppeteer-backed bridge cannot evaluate.
+
+    `:has-text(...)` / `:text(...)` / `:contains(...)` / `:visible` /
+    `:hidden` / `:nth-match(...)` look like CSS but are Playwright
+    extensions. document.querySelector silently returns null on them, so
+    the click reports "no element found" with no hint that the SELECTOR
+    syntax was the problem. Catching this pre-dispatch saves the brain's
+    iteration budget AND points at correct alternatives.
+
+    `>>` is Playwright's selector-chaining operator (`button >> text=Foo`).
+    Same issue.
+
+    Native CSS `:has(...)` is allowed (Chromium 105+). We only reject
+    the Playwright extensions.
+    """
+    if not selector or not isinstance(selector, str):
+        return None
+    s = selector
+    sl = s.lower()
+    bad: list[tuple[str, str]] = []
+    for pseudo, hint in (
+        (":has-text(", "Use [aria-label*='X'] OR browser_click_at(V_n)."),
+        (":text(", "Use [aria-label*='X'] OR browser_click_at(V_n)."),
+        (":contains(", "Use [aria-label*='X'] OR browser_click_at(V_n)."),
+        (":visible", "Visibility filter is implicit; drop it."),
+        (":hidden", "Hidden elements aren't clickable; pick a visible target."),
+        (":nth-match(", "Use :nth-of-type(N) (standard CSS) instead."),
+    ):
+        if pseudo in sl:
+            bad.append((pseudo, hint))
+    if " >> " in s or s.strip().startswith(">>"):
+        bad.append((
+            ">>",
+            "`>>` is Playwright's selector chain. Use a single CSS selector or "
+            "browser_click_at(V_n).",
+        ))
+    if not bad:
+        return None
+    lines = ["[click_selector_failed:playwright_pseudo] Selector uses non-CSS extensions Puppeteer can't evaluate:"]
+    for pseudo, hint in bad:
+        lines.append(f"  - {pseudo!r}: {hint}")
+    lines.append(
+        "Recovery: take a fresh browser_screenshot then "
+        "browser_click_at(vision_index=V_n), OR rewrite using only "
+        "standard CSS (id, class, attribute selectors, :nth-of-type, "
+        ":has() — but NOT :has-text/:text/:contains/:visible)."
+    )
+    return "\n".join(lines)
+
+
+import re as _re_sel
+
+# Strong discriminators: presence of any one of these in the selector
+# is enough to mark it specific (no match-count pre-flight needed).
+# These are inherently unique-anchoring on real sites: id, data-testid,
+# name, for, aria-label.
+_STRONG_DISCRIMINATOR_PATTERNS = [
+    # Real id selectors: `#foo`, `div#foo`, ` #foo`, `>#foo`, etc.
+    # Anchored to start, whitespace, or combinator — never inside quotes.
+    _re_sel.compile(r"(?:^|[\s>+~,(])#[A-Za-z_][\w-]*"),
+    _re_sel.compile(r"[A-Za-z_-]+#[A-Za-z_][\w-]*"),
+    _re_sel.compile(r"\[id[*^$~|]?="),
+    _re_sel.compile(r"\[data-testid"),
+    _re_sel.compile(r"\[data-test"),
+    _re_sel.compile(r"\[data-cy"),
+    _re_sel.compile(r"\[name[*^$~|]?="),
+    _re_sel.compile(r"\[for[*^$~|]?="),
+    _re_sel.compile(r"\[aria-label[*^$~|]?="),
+]
+
+# Weak discriminators: nth-of-type / nth-child are POSITIONAL — they
+# pick the Nth child relative to the immediate parent. They only make
+# the whole selector specific when the parent is itself uniquely
+# anchored. So `:nth-of-type(N)` ALONE is vague; `#foo li:nth-of-type(2)`
+# is specific (parent has an id).
+#
+# Observed wineaccess pattern that bypassed the prior check:
+# `a[role='button'][aria-expanded='false']:nth-of-type(2)` — has
+# `:nth-of-type(` but no parent anchor, points at "the 2nd `<a>` among
+# siblings matching the role/aria filters", which on a real DOM matches
+# multiple unrelated accordion toggles.
+_WEAK_DISCRIMINATOR_PATTERNS = [
+    _re_sel.compile(
+        r":nth-of-type\(|:nth-child\(|:nth-last-of-type\(|:nth-last-child\("
+        r"|:first-of-type|:last-of-type|:first-child|:last-child"
+        r"|:only-child|:only-of-type"
+    ),
+]
+
+
+# Patterns indicating a script is exploring the DOM (read-only). When
+# any of these appear AND no write op is detected, the eval is refused
+# while vision is fresh — the brain should be reading bbox labels, not
+# re-querying.
+_EVAL_EXPLORATION_PATTERNS = _re_sel.compile(
+    r"\bquerySelectorAll\b|\bquerySelector\b|"
+    r"\bgetElementById\b|\bgetElementsByClassName\b|"
+    r"\bgetElementsByTagName\b|\bgetElementsByName\b|"
+    r"\bdocument\.body\.innerText\b|\bdocument\.body\.textContent\b"
+)
+
+# Write operations. If ANY of these appear in the script, exploration
+# refusal is bypassed — even an exploration-shaped query is fine when
+# it's part of a click-and-verify or value-set flow.
+_EVAL_WRITE_PATTERNS = _re_sel.compile(
+    r"\.click\(|\.focus\(|\.blur\(|"
+    r"\.setAttribute\(|\.removeAttribute\(|"
+    r"\.value\s*=|\.checked\s*=|\.selected\s*=|"
+    r"\.dispatchEvent\(|"
+    r"\.scrollTo\(|\.scrollIntoView\(|window\.scroll[BTL]"
+)
+
+# Probes that don't query selectors at all (just read browser-level
+# state). Always allowed regardless of vision freshness.
+_EVAL_PROBE_PATTERNS = _re_sel.compile(
+    r"\bdocument\.readyState\b|\bdocument\.title\b|"
+    r"\blocation\.(href|pathname|search|hostname|origin)\b|"
+    r"\bwindow\.(innerWidth|innerHeight|scrollY|scrollX)\b|"
+    r"\bdocument\.cookie\b|\bnavigator\.userAgent\b"
+)
+
+
+def _eval_looks_like_exploration(script: str) -> bool:
+    """True when the script is read-only DOM exploration that the brain
+    should be doing via vision bboxes instead. Excludes:
+      • scripts containing any write op (.click, .value=, dispatchEvent, …)
+      • scripts that only probe browser-level state (location, readyState)
+      • short scripts (under 40 chars after strip — likely a tiny check)
+    """
+    if not script or not isinstance(script, str):
+        return False
+    s = script.strip()
+    if len(s) < 40:
+        return False
+    if _EVAL_WRITE_PATTERNS.search(s):
+        return False
+    if not _EVAL_EXPLORATION_PATTERNS.search(s):
+        return False
+    # A pure browser-state probe is fine even if it incidentally uses
+    # querySelector elsewhere (rare). Conservative: only skip if NO
+    # exploration pattern appears outside the probe regions.
+    if _EVAL_PROBE_PATTERNS.search(s) and not _EVAL_EXPLORATION_PATTERNS.search(s):
+        return False
+    return True
+
+
+def _looks_vague_selector(selector: str) -> bool:
+    """True when the selector has no STRONG discriminator. Weak-only
+    discriminators (`:nth-of-type` etc.) without a strong-anchored
+    parent are still treated as vague — they're positional and the
+    parent context isn't pinned.
+
+    Triggers a match-count pre-flight in BrowserClickSelectorTool — if
+    querySelectorAll would match >1, refuse with [selector_too_vague].
+
+    Specific (no pre-flight):
+      "#submit"                            (strong: id)
+      "[data-testid=cart]"                 (strong: data-testid)
+      "label[for='oregon']"                (strong: for)
+      "#accordion li:nth-of-type(3)"       (id parent + nth child)
+      "button[name='go']"                  (strong: name)
+
+    Vague (pre-flight + refuse if matches >1):
+      "button"
+      "a[role='button']"
+      "a[aria-expanded='false'][href='#']"
+      "[role=checkbox]"
+      ":nth-of-type(2)"                                (weak alone)
+      "a[role='button']:nth-of-type(2)"                (weak alone, no parent anchor)
+    """
+    if not selector or not isinstance(selector, str):
+        return False
+    has_strong = any(p.search(selector) for p in _STRONG_DISCRIMINATOR_PATTERNS)
+    return not has_strong
+
+
+def _stale_dom_index_block(
+    state: "BrowserSessionState",
+    *,
+    tool_name: str,
+    target_disp: str,
+) -> str | None:
+    """Shared stale-index guard for any tool that takes a DOM `[N]` index
+    or absolute coordinates. Returns a structured `[*_failed:stale_dom_index]`
+    string when the brain has made at least `VISION_MAX_AGE_TURNS` mutating
+    actions since the last screenshot; otherwise returns None.
+
+    Why a single helper rather than per-tool blocks: keeping the message
+    format identical across click/type/select/fix_text means the brain
+    learns one recovery pattern (re-screenshot → use selector OR V_n)
+    instead of memorizing each tool's variant.
+
+    Opt-out via DOM_INDEX_STALE_GUARD=0 for unusual flows that genuinely
+    chain index-based actions on a confirmed-static page.
+    """
+    if os.environ.get("DOM_INDEX_STALE_GUARD", "1") == "0":
+        return None
+    if state.actions_since_screenshot < 1:
+        return None
+    try:
+        max_age = int(os.environ.get("VISION_MAX_AGE_TURNS") or "1")
+    except ValueError:
+        max_age = 1
+    if state.actions_since_screenshot < max_age:
+        return None
+    state.log_activity(
+        f"{tool_name}({target_disp})(STALE_DOM_INDEX)",
+        f"actions_since_screenshot={state.actions_since_screenshot}",
+    )
+    fail_tag = (
+        "click_failed" if "click" in tool_name
+        else "type_failed" if "type" in tool_name
+        else f"{tool_name}_failed"
+    )
+    return (
+        f"[{fail_tag}:stale_dom_index] You have made "
+        f"{state.actions_since_screenshot} mutating action(s) since the "
+        f"last screenshot. DOM `{target_disp}` no longer reliably refers "
+        f"to the element you saw — the tree has shifted. Call "
+        f"browser_screenshot first, then either:\n"
+        f"  • browser_click_selector(<stable selector>) — survives DOM "
+        f"mutations.\n"
+        f"  • browser_click_at(vision_index=V_n) — fresh vision indices "
+        f"from the new screenshot.\n"
+        f"Do not chain index/coords-based actions without a screenshot "
+        f"between."
+    )
+
+
 def _vision_alternatives_hint(
     state: "BrowserSessionState",
     *,
@@ -491,6 +722,111 @@ async def _push_vision_pending(session_id: str) -> None:
             )
     except Exception:
         pass
+
+
+async def _decorate_bboxes_with_dom_check(
+    session_id: str,
+    resp: "Any",
+    image_width: int,
+    image_height: int,
+) -> None:
+    """Cross-check each bbox center against DOM truth and decorate.
+
+    For every bbox in `resp`, compute the pixel center, ask the browser
+    what's under that point, and if the DOM element disagrees with the
+    vision label / role, attach a `dom_check` payload onto the bbox so
+    `as_brain_text()` can render `[DOM_DISAGREE …]`. Only flags real
+    disagreements — agreements leave `dom_check = None`.
+
+    Heuristic for "disagree":
+      * Vision claims an interactive role (button / link / input) but DOM
+        bubble-up resolved to nothing interactive (ok=false), OR
+      * Vision label has no token in common with DOM text AND vision role
+        differs from DOM tag/role.
+
+    Soft-fails: any exception leaves all bboxes un-decorated. The render
+    path never relies on `dom_check` being populated.
+    """
+    bboxes = list(getattr(resp, "bboxes", None) or [])
+    if not bboxes:
+        return
+    points: list[dict[str, int]] = []
+    for b in bboxes:
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_width, image_height)
+        except Exception:
+            points.append({"x": 0, "y": 0})
+            continue
+        points.append({"x": int((x0 + x1) // 2), "y": int((y0 + y1) // 2)})
+    try:
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/elements-at-points",
+            json={"points": points},
+            timeout=8.0,
+        )
+    except Exception:
+        return
+    if r.status_code >= 400:
+        return
+    try:
+        results = (r.json() or {}).get("results") or []
+    except Exception:
+        return
+    if not isinstance(results, list) or len(results) != len(bboxes):
+        return
+
+    def _tokens(s: str) -> set[str]:
+        out: set[str] = set()
+        for tok in (s or "").lower().replace("-", " ").split():
+            tok = "".join(ch for ch in tok if ch.isalnum())
+            if len(tok) >= 3:
+                out.add(tok)
+        return out
+
+    interactive_roles = {"button", "link", "input", "checkbox", "radio",
+                         "textbox", "combobox", "menuitem", "tab", "switch"}
+
+    for b, dr in zip(bboxes, results):
+        if not isinstance(dr, dict) or not dr.get("ok"):
+            # Vision claimed something interactive at this point but DOM
+            # found nothing — that's a disagreement worth surfacing.
+            v_role = (getattr(b, "role", "") or "").lower()
+            if v_role in interactive_roles:
+                b.dom_check = {
+                    "tag": "",
+                    "role": "",
+                    "text": "",
+                    "disagree": True,
+                }
+            continue
+        dom_tag = (dr.get("tag") or "").lower()
+        dom_role = (dr.get("role") or "").lower()
+        dom_text = (dr.get("text") or "")
+        v_role = (getattr(b, "role", "") or "").lower()
+        v_label = (getattr(b, "label", "") or "")
+
+        # Token overlap between vision label and DOM text — strong agree
+        # signal even when the literal strings differ.
+        text_overlap = bool(_tokens(v_label) & _tokens(dom_text))
+        # Role/tag agreement — many sites tag <button> with role=button
+        # explicitly so accept either match path.
+        role_agree = (
+            v_role == dom_role
+            or v_role == dom_tag
+            or (v_role in interactive_roles and dom_role in interactive_roles)
+            or (v_role in interactive_roles and dom_tag in {"a", "button", "input", "select", "textarea"})
+        )
+        # Disagree only when neither the label tokens nor the role
+        # match — keeps the false-positive rate down on reactive UIs.
+        if text_overlap or role_agree:
+            continue
+        b.dom_check = {
+            "tag": dom_tag,
+            "role": dom_role,
+            "text": dom_text[:60],
+            "disagree": True,
+        }
 
 
 def _read_image_dims(b64: str) -> tuple[int, int]:
@@ -1385,6 +1721,11 @@ class BrowserSessionState:
         # to alternative sites when the target blocks it.
         self.pinned_domain: str = ""
 
+        # Session alias: maps old T1 session IDs to new T3 session IDs
+        # after mid-session escalation. Transparent to the LLM — it keeps
+        # using the original session_id and we reroute internally.
+        self._session_alias: dict[str, str] = {}
+
         # Vision preprocessor bookkeeping. Populated inside
         # build_tool_result_blocks so tools that don't pass an intent
         # explicitly inherit the last one used — useful when the brain
@@ -1459,6 +1800,40 @@ class BrowserSessionState:
         self._last_action_queue: Any = None  # Optional[ActionQueue]
         self._pending_postcondition: Optional[dict] = None
 
+        # Persistent multi-step task plan (task_plan.py). Populated once
+        # per task when the brain calls browser_set_task_plan; consumed
+        # by the worker_hook (renders checklist) and verify_action
+        # (auto-checks active step's success_criteria after each click /
+        # type / navigate). None for single-step or no-plan tasks.
+        self.task_plan: Any = None  # Optional[task_plan.TaskPlan]
+
+        # URL-hallucination guard: a ring of href values observed in
+        # recent state.elements / tool result snapshots. browser_navigate
+        # uses it to reject same-domain URLs the brain dreamt up
+        # (UUID-suffixed product slugs, made-up paths) that didn't
+        # actually appear on any page we've seen. Bounded to keep
+        # memory flat across long sessions.
+        self.observed_anchor_urls: set[str] = set()
+        self._OBSERVED_ANCHOR_CAP = 1024
+
+        # Loop / stagnation detector. Lives on state so both
+        # BrowserScreenshotTool (records each screenshot) and
+        # BrowserWorkerHook (records each tool call + reads guidance)
+        # can reach it. The hook keeps `self._loop` as an alias for
+        # backward compat.
+        from superbrowser_bridge.loop_detector import LoopDetector as _LD
+        self.loop_detector = _LD()
+
+        # Refusal-tool gate: True after any state-change tool returned
+        # a non-success caption ([*_failed], [*_timeout], [click_silent],
+        # [navigate_unverified], [VERIFY_MISS], [click_selector_failed]).
+        # browser_screenshot clears it. browser_request_help and
+        # browser_run_script(mutates=true) consult it via
+        # must_screenshot_before_giving_up — refuse if the brain is
+        # trying to escape without first looking at the page.
+        self.last_failure_without_screenshot: bool = False
+        self.last_failure_summary: str = ""
+
         # Phase 3.1: cursor-failure ledger. Each cursor-based interaction
         # tool that returns a failure caption records its strategy here
         # so BrowserRunScriptTool(mutates=true) can refuse to run until
@@ -1478,6 +1853,13 @@ class BrowserSessionState:
         # while this is set, and form_commit verifies field values
         # before allowing submit.
         self.form_session: Any = None  # Optional[FormFillSession]
+
+        # Most recent filter manifest produced by browser_inventory_filters,
+        # cached so browser_form_begin(inventory=true) can resolve user
+        # labels to UI labels without a second scan. Shape:
+        # {session_id, scope, options: [{label,kind,selector,group,selected}],
+        #  captured_at: float}.
+        self.last_filter_manifest: dict | None = None
 
         # Phase 1: hard sync gate. Tracks the most recent prefetch task
         # so the NEXT mutating tool can wait for it before acting on
@@ -1552,6 +1934,10 @@ class BrowserSessionState:
         if self.captcha_mode_remaining <= 0:
             self.captcha_mode = False
             self.captcha_mode_remaining = 0
+
+    def resolve_session_id(self, session_id: str) -> str:
+        """Resolve a session ID through the alias chain (T1→T3 escalation)."""
+        return self._session_alias.get(session_id, session_id)
 
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
@@ -1799,6 +2185,14 @@ class BrowserSessionState:
             self.screenshotted_keys.add((norm, content_hash or ""))
         self.last_screenshot_url = norm
         self.last_page_content_hash = content_hash or ""
+        # Feed the loop detector's stale-screenshot streak counter and
+        # clear the impasse-tool failure flag — the brain has now looked
+        # at the page since whatever last failed.
+        try:
+            self.loop_detector.record_screenshot(norm, content_hash or "")
+        except Exception:
+            pass
+        self.clear_action_failed()
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:
@@ -1869,6 +2263,232 @@ class BrowserSessionState:
             "url": self.current_url,
             "time": datetime.now().strftime("%H:%M:%S"),
         })
+
+    def mark_action_failed(self, summary: str) -> None:
+        """Set the failure flag consumed by the impasse-tool refusal.
+
+        Called by every state-change tool that returns a non-success
+        caption ([*_failed], [*_timeout], [click_silent],
+        [navigate_unverified], [VERIFY_MISS]). browser_screenshot clears
+        the flag. While set, browser_request_help and
+        browser_run_script(mutates=true) refuse — the brain MUST take
+        another screenshot before giving up.
+        """
+        self.last_failure_without_screenshot = True
+        self.last_failure_summary = (summary or "")[:160]
+
+    def clear_action_failed(self) -> None:
+        """Clear the failure flag — called by browser_screenshot."""
+        self.last_failure_without_screenshot = False
+        self.last_failure_summary = ""
+
+    def must_screenshot_before_giving_up(self) -> str | None:
+        """Refusal message for browser_request_help /
+        browser_run_script(mutates=true) when the brain is trying to
+        escape the screenshot→click loop without first looking at the
+        page. Returns None when the call is allowed.
+
+        Three exit conditions allow the impasse tools through:
+          1. No active task plan (single-step task — no loop to enforce).
+          2. Active step is already `unsatisfiable` (the brain has
+             genuinely earned the give-up via 2 verify_action misses).
+          3. Loop detector reports ≥3 stale screenshots in a row (the
+             page is genuinely stuck; not a brain choice).
+        Otherwise: refuse if `last_failure_without_screenshot` is set.
+        """
+        if os.environ.get("LOOP_REFUSAL_GUARD", "1") == "0":
+            return None
+        plan = self.task_plan
+        if plan is None:
+            return None
+        active = None
+        try:
+            active = plan.peek_active()
+        except Exception:
+            return None
+        if active is None:
+            return None
+        if active.status == "unsatisfiable":
+            return None
+        try:
+            stale = int(getattr(self.loop_detector, "stale_screenshot_count", 0))
+        except Exception:
+            stale = 0
+        if stale >= 3:
+            return None
+        if not self.last_failure_without_screenshot:
+            return None
+        return (
+            f"[refused: take a screenshot first] The active task-plan step "
+            f"({active.name!r}) is still in_progress and the last action "
+            f"failed ({self.last_failure_summary[:80]}). Call "
+            f"browser_screenshot(session_id='{self.session_id}') to see "
+            f"what actually happened on the page, then pick a different "
+            f"V_n or selector. Calling this impasse tool without first "
+            f"looking at the page is the failure mode this guard exists "
+            f"to prevent. If the page is genuinely stuck, take 3 "
+            f"screenshots in a row that produce identical state and the "
+            f"refusal will lift. Override: LOOP_REFUSAL_GUARD=0."
+        )
+
+    def hydrate_from_handoff(self, h: Any) -> None:
+        """Restore state from a `handoff_store.WorkerHandoff` snapshot.
+
+        Called when `delegate_browser_task` is invoked with a non-empty
+        `resume_from_task_id` and the prior worker saved state. Restores
+        the browser session_id, URL, task_plan, ledgers, and observed
+        anchors so the new worker continues from where the previous one
+        gave up instead of opening a fresh browser.
+        """
+        if h is None:
+            return
+        self.session_id = getattr(h, "session_id", "") or self.session_id
+        self.current_url = getattr(h, "current_url", "") or self.current_url
+        self.pinned_domain = getattr(h, "pinned_domain", "") or self.pinned_domain
+        self.task_instruction = (
+            getattr(h, "task_instruction", "") or self.task_instruction
+        )
+        self.task_target_url = (
+            getattr(h, "task_target_url", "") or self.task_target_url
+        )
+        if getattr(h, "task_plan", None) is not None:
+            self.task_plan = h.task_plan
+        self.cursor_failure_strategies = set(
+            getattr(h, "cursor_failure_strategies", set()) or set()
+        )
+        self.cursor_failure_records = list(
+            getattr(h, "cursor_failure_records", []) or []
+        )
+        self.observed_anchor_urls = set(
+            getattr(h, "observed_anchor_urls", set()) or set()
+        )
+        manifest = getattr(h, "last_filter_manifest", None)
+        if manifest is not None:
+            self.last_filter_manifest = manifest
+        # Mark the session as "already opened" so the BrowserOpenTool
+        # idempotency guard refuses a redundant open and steers the
+        # brain to browser_screenshot instead.
+        if self.session_id:
+            self.sessions_opened = max(self.sessions_opened, 1)
+
+    def harvest_anchor_urls(self, blob: str) -> int:
+        """Extract `href="..."` URLs from a tool result blob and add them
+        to `observed_anchor_urls`. Used by the URL-hallucination guard
+        in browser_navigate to refuse same-domain URLs the brain made
+        up. Returns the number of new URLs added (for tests).
+        """
+        if not blob or not isinstance(blob, str):
+            return 0
+        import re as _re
+        added = 0
+        for m in _re.finditer(r'href=[\'"]([^\'"\s<>]+)[\'"]', blob):
+            href = m.group(1)
+            if not href or href.startswith(("javascript:", "mailto:", "#")):
+                continue
+            if href in self.observed_anchor_urls:
+                continue
+            self.observed_anchor_urls.add(href)
+            added += 1
+        # Also extract bare URLs from common element listings like
+        # `[12]<a href=https://...>` or `link: https://...` so we
+        # capture data even when the format isn't standard HTML.
+        for m in _re.finditer(r'https?://[^\s\'"<>\)]+', blob):
+            url = m.group(0).rstrip(".,);")
+            if url in self.observed_anchor_urls:
+                continue
+            self.observed_anchor_urls.add(url)
+            added += 1
+        # Bound the set to avoid unbounded growth on long sessions.
+        if len(self.observed_anchor_urls) > self._OBSERVED_ANCHOR_CAP:
+            # Drop arbitrary half — order is fine since we only need
+            # "recent enough"; the next tool result will repopulate.
+            extra = len(self.observed_anchor_urls) - self._OBSERVED_ANCHOR_CAP // 2
+            for _ in range(extra):
+                self.observed_anchor_urls.pop()
+        return added
+
+    async def check_active_task_step(
+        self, session_id: str, *, pre_url: str = "",
+    ) -> str:
+        """Verify the active TaskPlan step's success_criteria.
+
+        Called by state-change tools (click_at, click_selector, navigate,
+        type_at) right before returning their result. Surfaces one of:
+          • [subgoal_advanced: <name>] — criterion satisfied; step
+            marked done; the next step (if any) becomes active.
+          • [subgoal_not_satisfied: <criterion> attempt N/M] — criterion
+            not met yet; brain should keep trying or replan.
+          • [subgoal_unsatisfiable: <name> after M attempts] — step
+            flipped to unsatisfiable; brain MUST call browser_plan_skip_step
+            or browser_plan_replan or done(success=False) before next click.
+        Returns "" when there's no active plan or no active step.
+        """
+        plan = self.task_plan
+        if plan is None:
+            return ""
+        step = plan.peek_active()
+        if step is None:
+            return ""
+        # Don't check criteria for terminal extraction steps that have
+        # no observable side effect; the brain reports completion via
+        # the message tool.
+        if step.delegate is not None and step.delegate.kind == "extraction":
+            return ""
+        # Fast path for URL-shape criteria — answer locally from
+        # state.current_url instead of round-tripping through
+        # backend.state(sid). Cheaper, and works in unit tests / when
+        # the network state probe is briefly down. Only the actual
+        # verification is local; the result is still routed through
+        # mark_attempt for consistent advance / unsatisfiable handling.
+        kind = step.success_criteria.kind
+        if kind == "url_changed":
+            cur = (self.current_url or "").strip()
+            before = (pre_url or "").strip()
+            verified = bool(cur) and bool(before) and cur != before
+            reason = "url_changed" if verified else "url_same"
+            from superbrowser_bridge.task_plan import MAX_STEP_ATTEMPTS
+            return _format_subgoal_note(self, step, verified, reason, MAX_STEP_ATTEMPTS)
+        if kind == "url_matches":
+            cur = (self.current_url or "").strip()
+            pat = str(step.success_criteria.payload.get("pattern")
+                      or step.success_criteria.payload.get("substring") or "")
+            if not pat:
+                return "\n[subgoal_check_skipped: url_matches has no pattern]"
+            verified = pat in cur
+            reason = "url_matches" if verified else "url_mismatch"
+            from superbrowser_bridge.task_plan import MAX_STEP_ATTEMPTS
+            return _format_subgoal_note(self, step, verified, reason, MAX_STEP_ATTEMPTS)
+        try:
+            from superbrowser_bridge.tier_evaluate import get_backend as _get_backend
+            from superbrowser_bridge.verify_action import verify_after, PreState
+        except Exception as exc:
+            return f"\n[subgoal_check_skipped: import_failed:{exc!s:.40s}]"
+        try:
+            backend = _get_backend(session_id)
+            vr = await verify_after(
+                backend, session_id,
+                step.success_criteria.to_dict(),
+                pre_state=PreState(url=pre_url or self.current_url or ""),
+                state=self,
+            )
+        except Exception as exc:
+            # Probe error is non-blocking; let the brain continue.
+            return f"\n[subgoal_check_skipped: probe_error:{exc!s:.60s}]"
+        # Failed probes (network down, missing pre-state, fail-open
+        # exception path) shouldn't count toward the 2-strike attempt
+        # budget — that would flip steps to unsatisfiable on transient
+        # errors. Only count attempts when the probe actually ran.
+        _probe_failed_reasons = (
+            "error:", "state_fetch_failed", "captcha_probe_failed",
+            "blocker_probe_failed", "no_pre_url", "no_pre_hash",
+        )
+        reason_str = vr.reason or ""
+        if not vr.verified and any(
+            reason_str.startswith(p) for p in _probe_failed_reasons
+        ):
+            return f"\n[subgoal_check_skipped: {reason_str[:80]}]"
+        from superbrowser_bridge.task_plan import MAX_STEP_ATTEMPTS
+        return _format_subgoal_note(self, step, vr.verified, reason_str, MAX_STEP_ATTEMPTS)
 
     def check_dead_click(self, click_target: str) -> str | None:
         """Pre-flight check before dispatching a click.
@@ -2078,6 +2698,9 @@ class BrowserSessionState:
         elements: str | None = None,
         elements_with_bounds: list[dict] | None = None,
         device_pixel_ratio: float = 1.0,
+        coverage_mode: bool = False,
+        expected_labels: list[str] | None = None,
+        force_fresh: bool = False,
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -2144,6 +2767,9 @@ class BrowserSessionState:
                     image_width=img_w,
                     image_height=img_h,
                     task_instruction=self.task_instruction or None,
+                    coverage_mode=coverage_mode,
+                    expected_labels=expected_labels,
+                    force_fresh=force_fresh,
                 )
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
@@ -2173,20 +2799,49 @@ class BrowserSessionState:
                 except Exception as exc:
                     print(f"  [vision-overlay push failed: {exc}]")
 
-                # Hierarchical planner pass — DOM-side blocker scan +
-                # action sequencing. Only runs for t3 sessions (t1
-                # Puppeteer sessions would need a TS-side blocker
-                # endpoint; deferred). Soft-fails: any exception here
-                # falls back to the vision-only caption.
-                plan_text = ""
-                if self.session_id.startswith("t3-") and \
-                        os.environ.get("ACTION_PLANNER_AUTO", "1") != "0":
+                # DOM cross-check pass — for each bbox center, ask the
+                # browser what's actually under that point. When vision's
+                # label disagrees with DOM truth, the bbox gets a
+                # dom_check payload that the render path surfaces as
+                # [DOM_DISAGREE …] so the brain can avoid the bad target.
+                # Gated by env so a misbehaving endpoint can be killed
+                # without redeploy. Soft-fails: cross-check exceptions
+                # never break the render path.
+                if (
+                    os.environ.get("VISION_DOM_CROSSCHECK", "1") != "0"
+                    and resp.bboxes
+                    and img_w > 0
+                    and img_h > 0
+                ):
                     try:
-                        from superbrowser_bridge.antibot import interactive_session as _t3mgr
+                        await _decorate_bboxes_with_dom_check(
+                            self.session_id, resp, img_w, img_h,
+                        )
+                    except Exception as exc:
+                        print(f"  [dom-crosscheck: skipped — {exc}]")
+
+                # Hierarchical planner pass — DOM-side blocker scan +
+                # action sequencing. Now runs for both t1 and t3 via
+                # tier_evaluate.get_backend, which routes evaluate /
+                # state through the right transport per session_id.
+                # Kill switch: ACTION_PLANNER_T1=0 disables on t1 only;
+                # ACTION_PLANNER_AUTO=0 disables everywhere. Soft-fails:
+                # any exception falls back to the vision-only caption.
+                plan_text = ""
+                _planner_on = (
+                    os.environ.get("ACTION_PLANNER_AUTO", "1") != "0"
+                    and (
+                        self.session_id.startswith("t3-")
+                        or os.environ.get("ACTION_PLANNER_T1", "1") != "0"
+                    )
+                )
+                if _planner_on:
+                    try:
+                        from superbrowser_bridge.tier_evaluate import get_backend as _get_backend
                         from superbrowser_bridge.antibot.ui_blockers import detect as _detect_blockers
                         from superbrowser_bridge.action_planner import plan as _plan_actions
-                        mgr = _t3mgr.default()
-                        blockers = await _detect_blockers(mgr, self.session_id)
+                        backend = _get_backend(self.session_id)
+                        blockers = await _detect_blockers(backend, self.session_id)
                         self._last_blockers = blockers
                         queue = _plan_actions(
                             vresp=resp,
@@ -2200,7 +2855,15 @@ class BrowserSessionState:
                     except Exception as exc:
                         print(f"  [action-planner: skipped — {exc}]")
 
-                brain_text = resp.as_brain_text()
+                try:
+                    _max_age = int(os.environ.get("VISION_MAX_AGE_TURNS") or "1")
+                except ValueError:
+                    _max_age = 1
+                brain_text = resp.as_brain_text(
+                    current_turn=self._brain_turn_counter,
+                    epoch_turn=self._vision_epoch_turn,
+                    max_age_turns=_max_age,
+                )
                 if plan_text:
                     brain_text = f"{brain_text}\n\n{plan_text}"
                 text = f"{caption}\n\n{brain_text}" if caption else brain_text
@@ -2337,7 +3000,16 @@ class BrowserSessionState:
         if tool_url and _strip_query(tool_url) != _strip_query(self._last_vision_url):
             return ""
         try:
-            return "[CACHED VISION — bboxes still valid; use vision_index=V_n to click]\n" + resp.as_brain_text()
+            try:
+                _max_age = int(os.environ.get("VISION_MAX_AGE_TURNS") or "1")
+            except ValueError:
+                _max_age = 1
+            cached_text = resp.as_brain_text(
+                current_turn=self._brain_turn_counter,
+                epoch_turn=self._vision_epoch_turn,
+                max_age_turns=_max_age,
+            )
+            return "[CACHED VISION — bboxes still valid; use vision_index=V_n to click]\n" + cached_text
         except Exception:
             return ""
 
@@ -2431,6 +3103,41 @@ def _build_network_block_message(
     )
 
 
+def _format_subgoal_note(
+    state: "BrowserSessionState",
+    step: Any,
+    verified: bool,
+    reason: str,
+    max_attempts: int,
+) -> str:
+    """Compose the [subgoal_*] note that follows a state-change tool's
+    caption when a TaskPlan is active. Mutates the step (mark_attempt +
+    plan-cursor advance on success). Both the URL fast-path and the
+    verify_after slow-path in `BrowserSessionState.check_active_task_step`
+    funnel through here so the brain sees a uniform format.
+    """
+    step.mark_attempt(verified, reason=reason or "")
+    if step.status == "satisfied":
+        # Advance the cursor so the next tool sees the new active.
+        next_step = state.task_plan.active_step() if state.task_plan else None
+        tail = (
+            f" Next: {next_step.name!r}" if next_step else " Plan complete."
+        )
+        return f"\n[subgoal_advanced: {step.name!r}]{tail}"
+    if step.status == "unsatisfiable":
+        return (
+            f"\n[subgoal_unsatisfiable: {step.name!r} after "
+            f"{step.attempts} attempts — last reason: "
+            f"{step.last_failure_reason[:80]}] "
+            f"Call browser_plan_skip_step / browser_plan_replan / "
+            f"done(success=False) before the next click."
+        )
+    return (
+        f"\n[subgoal_not_satisfied: {step.success_criteria.kind} "
+        f"reason={reason} attempt {step.attempts}/{max_attempts}]"
+    )
+
+
 def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
     parts: list[str] = []
     # Leading structured marker that survives tool-result truncation. Even
@@ -2456,6 +3163,14 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
         parts.append(f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} (viewport: {si.get('viewportHeight', 0)})")
     if data.get("elements"):
         parts.append(f"\nInteractive elements:\n{data['elements']}")
+        # Harvest hrefs into the URL-hallucination guard's seen set so
+        # browser_navigate can recognise legit links the brain saw and
+        # reject same-domain URLs the brain made up.
+        if state is not None:
+            try:
+                state.harvest_anchor_urls(data["elements"])
+            except Exception:
+                pass
     if data.get("consoleErrors"):
         parts.append(f"\nConsole errors: {data['consoleErrors']}")
     if data.get("pendingDialogs"):
@@ -2898,10 +3613,14 @@ class BrowserNavigateTool(Tool):
         return True
 
     async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_navigate({url})")
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
+        # Capture pre-nav URL for the per-step subgoal verification at
+        # the bottom of this function (task_plan.py).
+        _pre_url_for_subgoal = self.s.current_url or ""
 
         # --- Domain-pinning guard -----------------------------------------
         # When pinned_domain is set, only allow navigation to the target
@@ -2955,6 +3674,66 @@ class BrowserNavigateTool(Tool):
                     f"or browser_ask_user, or report failure via "
                     f"done(success=False)."
                 )
+
+        # --- URL-hallucination guard --------------------------------------
+        # Same-domain navigations to URLs that contain a UUID-looking
+        # segment (8+ hex chars with dashes) AND were never observed
+        # in any element listing get refused. This blocks the failure
+        # mode where the brain abandons the filter UI and dreams up a
+        # product slug like
+        # `/catalog/2022-chefs-table-pinot-noir-willamette-valley_3f41d384-c690-4bbb-b493-b22fa16c87e3/`
+        # that 404s and burns the screenshot budget. Conservative on
+        # purpose: legitimate non-UUID paths pass through.
+        if (
+            self.s.pinned_domain
+            and os.environ.get("NAVIGATE_HALLUCINATION_GUARD", "1") != "0"
+        ):
+            try:
+                from urllib.parse import urlparse as _urlparse2
+                _p = _urlparse2(url)
+                _host = (_p.hostname or "").lower().replace("www.", "")
+                _is_pin = _host == self.s.pinned_domain or _host.endswith(
+                    "." + self.s.pinned_domain
+                )
+                if _is_pin:
+                    import re as _re_uuid
+                    # Match a UUID v4-ish slug or any hex run ≥ 12 chars in
+                    # the path. The wineaccess hallucination matched the
+                    # full UUID; shorter hash-like ids are also a strong
+                    # signal of a slug the brain didn't observe.
+                    _has_uuid = bool(_re_uuid.search(
+                        r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                        r"|[0-9a-f]{16,})",
+                        (_p.path or "").lower(),
+                    ))
+                    if _has_uuid and url not in self.s.observed_anchor_urls:
+                        # Also tolerate the URL appearing as a substring
+                        # within a longer observed href (some sites
+                        # rewrite URLs across renders).
+                        _seen_substr = any(
+                            url in seen or seen in url
+                            for seen in self.s.observed_anchor_urls
+                            if isinstance(seen, str)
+                        )
+                        if not _seen_substr:
+                            self.s.record_step(
+                                "browser_navigate", url,
+                                "BLOCKED: navigate_unverified (UUID-like path "
+                                "not seen in any observed link)",
+                            )
+                            return (
+                                f"[navigate_unverified] {url} contains a UUID-like "
+                                f"segment that was NEVER observed in any element "
+                                f"listing on this session. Refusing to navigate — "
+                                f"the brain may be hallucinating a product slug.\n"
+                                f"  Recovery: call browser_screenshot to see the "
+                                f"current page, then browser_click_at(vision_index=V_n) "
+                                f"or browser_click_selector on a real link, OR set "
+                                f"NAVIGATE_HALLUCINATION_GUARD=0 to bypass."
+                            )
+            except Exception as exc:
+                # Guard must never break a legitimate navigate.
+                print(f"   [navigate_hallucination_guard skipped: {exc}]")
 
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
@@ -3025,6 +3804,92 @@ class BrowserNavigateTool(Tool):
             self.s.last_nav_cf_blocked_url = ""
             self.s.nav_solve_called_since_block = False
 
+        # --- Chrome-error one-shot retry + T1→T3 escalation ---------------
+        # T1 may hit chrome-error:// on deep links (ERR_HTTP2_PROTOCOL_ERROR
+        # from Akamai/Imperva JA3 rejection). Retry once on the same
+        # session; if that also fails and this is a T1 session, escalate
+        # to T3 transparently.
+        if (
+            _block_class == "chrome_error"
+            and os.environ.get("T1_NAV_CHROME_ERROR_RETRY", "1") != "0"
+        ):
+            _chrome_err = data.get("chrome_error_code", "")
+            print(f"  [T1 chrome-error retry] {_chrome_err} — retrying once")
+            await asyncio.sleep(1.0)
+            try:
+                _r2 = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/navigate",
+                    json={"url": url},
+                    timeout=30.0,
+                )
+                _r2.raise_for_status()
+                data = _r2.json()
+                actual_url = data.get("url", url)
+                self.s.record_url(actual_url)
+                _block_class = (
+                    str(data.get("block_class") or data.get("blockClass") or "")
+                    .lower()
+                )
+            except Exception as _exc:
+                print(f"  [T1 chrome-error retry failed] {_exc}")
+
+            # If retry still failed and session is T1, escalate to T3.
+            if (
+                _block_class == "chrome_error"
+                and not session_id.startswith("t3-")
+                and os.environ.get("T1_NAV_ESCALATION", "1") != "0"
+            ):
+                print(
+                    f"  [T1→T3 navigate escalation] {_chrome_err} — "
+                    f"opening T3 session for {url}"
+                )
+                _old_sid = session_id
+                try:
+                    from superbrowser_bridge.antibot import interactive_session as _t3mgr
+                    _t3_data = await _t3mgr.default().open(
+                        url,
+                        task_id=self.s.task_id,
+                        timeout_s=45.0,
+                        max_stealth=True,
+                    )
+                    if isinstance(_t3_data, dict):
+                        _new_sid = _t3_data.get("sessionId", "")
+                        if _new_sid:
+                            try:
+                                await _request_with_backoff(
+                                    "DELETE",
+                                    f"{SUPERBROWSER_URL}/session/{_old_sid}",
+                                    timeout=10.0,
+                                )
+                            except Exception:
+                                pass
+                            self.s._session_alias[_old_sid] = _new_sid
+                            self.s.session_id = _new_sid
+                            session_id = _new_sid
+                            data = _t3_data
+                            actual_url = data.get("url", url)
+                            self.s.record_url(actual_url)
+                            _block_class = (
+                                str(data.get("block_class") or "").lower()
+                            )
+                            try:
+                                from urllib.parse import urlparse as _up
+                                from superbrowser_bridge.routing import _record_routing_outcome
+                                _host = (_up(url or "").hostname or "").lower()
+                                if _host:
+                                    _record_routing_outcome(
+                                        _host, approach="browser", success=False,
+                                        tier=1, block_class=_chrome_err or "chrome_error",
+                                    )
+                            except Exception:
+                                pass
+                            print(
+                                f"  [T1→T3 escalation OK] new session={_new_sid}"
+                            )
+                except Exception as _exc:
+                    print(f"  [T1→T3 escalation failed] {_exc}")
+
         caption = _format_state(data, self.s)
 
         # Network-layer block detection — same logic as browser_open. Exit
@@ -3071,6 +3936,15 @@ class BrowserNavigateTool(Tool):
                 f"Call browser_solve_captcha(session_id='{session_id}', method='auto') to solve it."
             )
 
+        # Per-step subgoal verification — many TaskPlan steps are
+        # navigation-shaped ("apply filter X" → URL gains a query
+        # param), so check the active step's success_criteria here too.
+        # Uses the in-memory pre_url captured before the navigation.
+        subgoal_note = await self.s.check_active_task_step(
+            session_id, pre_url=_pre_url_for_subgoal,
+        )
+        if subgoal_note:
+            caption += subgoal_note
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
             if actual_url:
@@ -3111,6 +3985,7 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""
@@ -3178,6 +4053,125 @@ class BrowserScreenshotTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
+        intent=StringSchema(
+            "What you're trying to find this time. The careful pass uses "
+            "this to bias bbox emphasis — be specific: 'find the WiFi "
+            "filter checkbox', not 'look at the page'.",
+            nullable=True,
+        ),
+        expected_labels=ArraySchema(
+            description=(
+                "Optional list of element labels you EXPECT to be on the "
+                "screen but didn't see in the previous pass (e.g. "
+                "['WiFi included', 'Cleaning service']). Threaded into "
+                "the coverage prompt so Gemini specifically searches for "
+                "them and emits a tight bbox if it can find them."
+            ),
+            items=StringSchema("Expected label"),
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserLookAgainTool(Tool):
+    name = "browser_look_again"
+    description = (
+        "Take a fresh screenshot and run a CAREFUL vision pass on it: "
+        "bypass the cache, lift the bbox cap to 60, disable page-type "
+        "culling, and use the larger fallback model if VISION_FALLBACK_MODEL "
+        "is configured. Optional `expected_labels` are threaded into the "
+        "coverage prompt so vision specifically looks for them. "
+        "Use this when: (1) the previous render showed [VISION_MAY_BE_STALE], "
+        "(2) browser_click_at failed twice with stale_index, (3) an element "
+        "you know exists isn't in the bbox list, or (4) confidence on the "
+        "candidate target is below 0.6. Higher-cost than browser_screenshot "
+        "(more tokens, possibly the larger model) — don't reach for it as a "
+        "default."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        intent: str | None = None,
+        expected_labels: list[str] | None = None,
+        **kw: Any,
+    ) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
+        eff_intent = intent or "look again carefully — coverage pass"
+        labels_disp = (
+            f", expected={expected_labels[:5]}"
+            if expected_labels else ""
+        )
+        print(f"\n>> browser_look_again({eff_intent!r}{labels_disp})")
+
+        # Skip the budget-guarded fast path; this tool is meant for
+        # recovery, so the brain pays one screenshot cost regardless of
+        # the dedup state.
+        self.s.screenshot_budget -= 1
+        r = await _request_with_backoff(
+            "GET",
+            f"{SUPERBROWSER_URL}/session/{session_id}/state",
+            params={"vision": "true", "bounds": "true"},
+            timeout=20.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[look_again_failed] HTTP {r.status_code}: {err}"
+        data = r.json()
+        actual_url = data.get("url", self.s.current_url)
+        if actual_url:
+            self.s.mark_screenshot_taken(
+                actual_url,
+                self.s.hash_page_content(data.get("elements", "")),
+            )
+        self.s.record_step(
+            "browser_look_again",
+            f"intent={eff_intent[:60]} labels={(expected_labels or [])[:3]}",
+            f"url={actual_url[:60] if actual_url else '?'}",
+        )
+        caption = _format_state(data, self.s)
+        caption += f"\n[Look-again: coverage_mode + force_fresh{' + tier-up' if os.environ.get('VISION_FALLBACK_MODEL') else ''}]"
+        if not data.get("screenshot"):
+            return caption
+        entries = data.get("selectorEntries") or []
+        dpr = float(data.get("devicePixelRatio") or 1.0)
+        overlay_elements = [
+            {
+                "index": e.get("index"),
+                "tag": e.get("tagName") or e.get("tag"),
+                "role": e.get("role") or (e.get("attributes") or {}).get("role"),
+                "bounds": e.get("bounds"),
+            }
+            for e in entries
+            if e.get("bounds") and e.get("index") is not None
+        ]
+        return await self.s.build_tool_result_blocks(
+            data["screenshot"],
+            caption,
+            intent=eff_intent,
+            url=actual_url,
+            elements=data.get("elements"),
+            elements_with_bounds=overlay_elements,
+            device_pixel_ratio=dpr,
+            coverage_mode=True,
+            expected_labels=expected_labels,
+            force_fresh=True,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
         index=IntegerSchema(description="Element index"),
         button=StringSchema("Mouse button: left, right, middle", nullable=True),
         required=["session_id", "index"],
@@ -3195,7 +4189,51 @@ class BrowserClickTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_click([{index}])")
+        # DOM-index click refusal: refuse whenever ANY vision response
+        # exists for this session. The prior age-≤2-turns gate let
+        # browser_click([N]) through after a few intermediate actions
+        # (observed wineaccess Worker 2 step 13: clicked [26] when
+        # vision was 4+ turns old). Loosening to "always refuse if
+        # vision has bboxes" matches the prompt's AVOID-tier ranking
+        # for this tool — the brain can always browser_screenshot to
+        # refresh V_n. Kill switch CLICK_INDEX_REFUSAL=0.
+        if os.environ.get("CLICK_INDEX_REFUSAL", "1") != "0":
+            try:
+                resp = self.s._last_vision_response
+                bbox_count = len(getattr(resp, "bboxes", []) or []) if resp else 0
+                if bbox_count > 0:
+                    age_turns = max(
+                        0,
+                        self.s._brain_turn_counter - self.s._vision_epoch_turn,
+                    )
+                    age_note = (
+                        f"{age_turns} turns old"
+                        if age_turns > 0
+                        else "fresh"
+                    )
+                    return (
+                        f"[click_index_refused: vision has {bbox_count} "
+                        f"bboxes ({age_note})] browser_click(index={index}) "
+                        f"uses the volatile DOM-index path AND dispatches "
+                        f"via el.click() (isTrusted=false; rejected by "
+                        f"Cloudflare/Akamai). The latest vision pass "
+                        f"labelled targets as [V_1]..[V_{bbox_count}]. "
+                        f"Recovery:\n"
+                        f"  1. If vision is older than this turn, "
+                        f"browser_screenshot first to refresh.\n"
+                        f"  2. Read the V_n LABELS in the screenshot reply "
+                        f"— pick the V_n whose label matches your intent "
+                        f"(NOT just V_1).\n"
+                        f"  3. browser_click_at(vision_index=V_n) — "
+                        f"humanized cursor, isTrusted=true, pixel-exact.\n"
+                        f"  4. OR browser_click_selector(<#id-or-data-testid>) "
+                        f"for a stable hook from browser_inventory_filters.\n"
+                        f"Override: CLICK_INDEX_REFUSAL=0."
+                    )
+            except Exception:
+                pass
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
@@ -3223,6 +4261,11 @@ class BrowserClickTool(Tool):
                 f"click."
                 + (f"\n{alts}" if alts else "")
             )
+        stale = _stale_dom_index_block(
+            self.s, tool_name="browser_click", target_disp=f"[{index}]",
+        )
+        if stale:
+            return stale
         target_key = f"click[{index}]"
         dead = self.s.check_dead_click(target_key)
         if dead:
@@ -3446,6 +4489,46 @@ class BrowserClickAtTool(Tool):
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
+            # Oversized-bbox guard. Vision sometimes emits a bbox covering
+            # an entire hero/banner/CTA band instead of the specific
+            # control inside it; clicks land at the geometric center of
+            # that swath, hitting whitespace or the wrong element. box_2d
+            # is normalized to [0, 1000], so the threshold math is
+            # viewport-independent.
+            #   - "banner shape": >40% width AND <8% height (very wide,
+            #     thin band — almost always wrong target)
+            #   - "huge area": area > 40% of viewport (whole sections,
+            #     not a single control)
+            # Recovery: browser_look_again with the intended label as
+            # expected_labels — coverage mode usually emits tighter per-
+            # element bboxes. Opt-out via VISION_BBOX_SIZE_GUARD=0.
+            if os.environ.get("VISION_BBOX_SIZE_GUARD", "1") != "0":
+                try:
+                    ymin, xmin, ymax, xmax = bbox.box_2d
+                    bb_w = max(0, int(xmax) - int(xmin))
+                    bb_h = max(0, int(ymax) - int(ymin))
+                    bb_area = bb_w * bb_h
+                    is_banner = bb_w > 400 and bb_h < 80
+                    is_huge_area = bb_area > 400_000  # >40% of 1000x1000
+                    if is_banner or is_huge_area:
+                        shape = "banner" if is_banner else "huge_area"
+                        label = (getattr(bbox, "label", "") or "?")[:40]
+                        return (
+                            f"[click_at_failed:bbox_too_wide shape={shape} "
+                            f"w={bb_w} h={bb_h} area={bb_area}] V{vision_index} "
+                            f"({label!r}) covers a {shape}-shaped region "
+                            f"too large to be a precise click target. "
+                            f"Vision likely grouped multiple controls "
+                            f"under one bbox.\n"
+                            f"Recovery: call "
+                            f"`browser_look_again(intent='find <X>', "
+                            f"expected_labels=['<exact target label>'])` "
+                            f"— coverage mode usually emits a tight bbox "
+                            f"per element. If the target genuinely IS the "
+                            f"whole banner (rare), set VISION_BBOX_SIZE_GUARD=0."
+                        )
+                except Exception:
+                    pass  # Never let the guard's own bug block a click.
             # Freshness gate — refuse to click when the last vision pass
             # flagged the screenshot as stale or uncertain. The planner
             # should re-screenshot before committing a click on a frame
@@ -3489,7 +4572,13 @@ class BrowserClickAtTool(Tool):
                     self.s._brain_turn_counter - 1
                     - self.s._vision_epoch_turn,
                 )
-                if age_turns > max_age_turns:
+                # Strict `>=`: any mutating action between vision epoch
+                # and now invalidates V_n. Matches the DOM stale-index
+                # guard so the brain can't sneak through one path while
+                # the other refuses. Loose `>` here previously let the
+                # wineaccess pattern (click_selector → click_at(V_n) on
+                # an oversized bbox) succeed past the guard.
+                if age_turns >= max_age_turns:
                     alts = _vision_alternatives_hint(
                         self.s, exclude_index=int(vision_index), limit=3,
                     )
@@ -3639,19 +4728,27 @@ class BrowserClickAtTool(Tool):
 
         # Post-click verification — look up the postcondition the planner
         # attached to this target (by vision_index or by coord match)
-        # and run it via verify_action. Runs only for t3 sessions and
-        # when VERIFY_AFTER_CLICK is enabled (default on). A miss is
-        # reported in the caption so the brain can decide to retry with
-        # a different strategy or call browser_plan_next_steps.
+        # and run it via verify_action. Runs for both t1 and t3 via
+        # tier_evaluate.get_backend; gated by VERIFY_AFTER_CLICK
+        # (default on) and VERIFY_AFTER_CLICK_T1 (default on, separate
+        # kill switch for t1 rollout). A miss is reported in the
+        # caption so the brain can decide to retry with a different
+        # strategy or call browser_plan_next_steps.
         verify_note = ""
-        if session_id.startswith("t3-") and \
-                os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
+        _verify_on = (
+            os.environ.get("VERIFY_AFTER_CLICK", "1") != "0"
+            and (
+                session_id.startswith("t3-")
+                or os.environ.get("VERIFY_AFTER_CLICK_T1", "1") != "0"
+            )
+        )
+        if _verify_on:
             postcond = self._lookup_postcondition(vision_index, x, y)
             if postcond is not None:
                 try:
-                    from superbrowser_bridge.antibot import interactive_session as _t3mgr
+                    from superbrowser_bridge.tier_evaluate import get_backend as _get_backend
                     from superbrowser_bridge.verify_action import verify_after, PreState
-                    mgr = _t3mgr.default()
+                    mgr = _get_backend(session_id)
                     vr = await verify_after(
                         mgr, session_id, postcond,
                         pre_state=PreState(url=self.s.current_url or ""),
@@ -3674,8 +4771,15 @@ class BrowserClickAtTool(Tool):
                                 self.s._last_action_queue, "actions", None,
                             )
                         )
+                        # The click ladder (alternate js/keyboard strategies)
+                        # is t3-only because it dispatches via T3SessionManager
+                        # primitives the TS server doesn't expose with a
+                        # comparable strategy parameter. T1 silent clicks
+                        # surface the [click_silent] note and let the brain
+                        # pick the recovery move.
                         escalated = False
                         if is_silent_default and \
+                                session_id.startswith("t3-") and \
                                 os.environ.get("CLICK_LADDER_AUTO", "1") != "0" and \
                                 payload.get("bbox"):
                             for alt_strategy in ("js", "keyboard"):
@@ -3764,10 +4868,17 @@ class BrowserClickAtTool(Tool):
                 _expected_label = ""
         _pre_url = self.s.current_url or ""
         _pre_dom_hash = self.s._last_dom_hash or ""
+        # Per-step subgoal verification (task_plan.py). Soft-fail: if the
+        # active step's success_criteria can't be probed, the returned
+        # note describes the skip reason and the brain continues.
+        subgoal_note = await self.s.check_active_task_step(
+            session_id, pre_url=_pre_url,
+        )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
+            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
+            + verify_note + subgoal_note,
             expected_label=_expected_label or None,
             pre_url=_pre_url,
             pre_dom_hash=_pre_dom_hash,
@@ -4052,6 +5163,14 @@ class BrowserTypeAtTool(Tool):
                     )
             except Exception:
                 pass
+        # Per-step subgoal verification (task_plan.py). Type events
+        # rarely change URL but commonly satisfy `text_visible` /
+        # `focus_on_role` criteria, so checking is still useful.
+        subgoal_note = await self.s.check_active_task_step(
+            session_id, pre_url=self.s.current_url or "",
+        )
+        if subgoal_note:
+            caption += subgoal_note
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
@@ -4119,6 +5238,18 @@ class BrowserFixTextAtTool(Tool):
     ) -> Any:
         if text is None:
             text = ""
+
+        # Stale guard: raw (x, y) coords are equally volatile to DOM [N]
+        # — both reference the page state from the LAST screenshot.
+        # vision_index falls through to the V_n stale-age guard which
+        # already exists below.
+        if x is not None and y is not None and vision_index is None:
+            stale = _stale_dom_index_block(
+                self.s, tool_name="browser_fix_text_at",
+                target_disp=f"({int(float(x))},{int(float(y))})",
+            )
+            if stale:
+                return stale
 
         # Resolve target point.
         if vision_index is not None:
@@ -4263,6 +5394,7 @@ class BrowserTypeTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         print(f'\n>> browser_type([{index}], "{text}")')
         gate = await _feedback_gate("browser_type")
         if gate:
@@ -4272,6 +5404,15 @@ class BrowserTypeTool(Tool):
         if sync_block:
             return sync_block
         self.s._brain_turn_counter += 1
+        # DOM-index stale guard — same volatility as browser_click([N]).
+        # Without this, the wineaccess pattern triggers: a click_selector
+        # changes the page, then browser_type([24]) writes into a field
+        # that was index 24 on the OLD page, not the current one.
+        stale = _stale_dom_index_block(
+            self.s, tool_name="browser_type", target_disp=f"[{index}]",
+        )
+        if stale:
+            return stale
 
         # --- Dead-type guard --------------------------------------------
         # The LLM's most destructive misread: type "khulna" → autocomplete
@@ -4488,6 +5629,7 @@ class BrowserKeysTool(Tool):
         return True
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_keys({keys})")
         r = await _request_with_backoff(
             "POST",
@@ -4529,6 +5671,7 @@ class BrowserScrollTool(Tool):
         return True
 
     async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_scroll({direction or f'{percent}%'})")
         gate = await _feedback_gate("browser_scroll")
         if gate:
@@ -4579,6 +5722,12 @@ class BrowserSelectTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, value: str, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
+        stale = _stale_dom_index_block(
+            self.s, tool_name="browser_select", target_disp=f"[{index}]",
+        )
+        if stale:
+            return stale
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/select",
@@ -4967,6 +6116,53 @@ class BrowserEvalTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
+        # Eval-for-exploration rate limit: when vision is fresh AND the
+        # script is read-only DOM exploration (querySelector, getElementBy,
+        # innerText scrape), refuse — the brain should be picking V_n
+        # from the bbox list instead of poking the DOM. The wineaccess
+        # trace had 4 such evals in a row; each one was the brain trying
+        # to find a label vision had already labelled. Allows: post-action
+        # verifies that include write-ops or explicit non-querying probes
+        # (readyState, location, etc.). Kill switch
+        # EVAL_EXPLORATION_REFUSAL=0.
+        if (
+            os.environ.get("EVAL_EXPLORATION_REFUSAL", "1") != "0"
+            and _eval_looks_like_exploration(script)
+        ):
+            try:
+                resp = self.s._last_vision_response
+                bbox_count = len(getattr(resp, "bboxes", []) or []) if resp else 0
+                age_turns = max(
+                    0,
+                    self.s._brain_turn_counter - self.s._vision_epoch_turn,
+                )
+                if bbox_count > 0 and age_turns <= 2:
+                    return (
+                        f"[eval_for_exploration_refused: vision fresh "
+                        f"({bbox_count} bboxes, {age_turns} turns old)] "
+                        f"This script reads the DOM with "
+                        f"querySelector/getElementBy/etc. and has no write "
+                        f"operations — that's exploration, not action. "
+                        f"Vision already labelled the page with [V_1].."
+                        f"[V_{bbox_count}]; pick from those instead of "
+                        f"re-querying the DOM. Recovery:\n"
+                        f"  1. Read the bboxes in the most recent screenshot "
+                        f"reply — labels include checkbox names, button text, "
+                        f"link text.\n"
+                        f"  2. browser_click_at(vision_index=V_n) on the "
+                        f"target.\n"
+                        f"  3. If the target genuinely isn't visible: "
+                        f"browser_screenshot to refresh + scroll.\n"
+                        f"Eval IS allowed for: post-action verification, "
+                        f"reading numeric values (price, count), "
+                        f"non-querying probes (location.href, "
+                        f"document.readyState), and any script with write "
+                        f"ops (.click(), setAttribute, .value=). Override: "
+                        f"EVAL_EXPLORATION_REFUSAL=0."
+                    )
+            except Exception:
+                pass
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
         print(f"\n>> browser_eval({script[:60]}...)")
@@ -5031,6 +6227,17 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Refusal gate: same loop-escape protection as
+        # browser_request_help. Mutating scripts are the brain's other
+        # favourite escape hatch — when a click fails it pivots to
+        # `browser_run_script(mutates=true)` instead of taking another
+        # screenshot. Block until the brain has at least looked at the
+        # page since the last failure. Only applies when mutates=true;
+        # read-only data extraction is always allowed.
+        if bool(mutates):
+            refuse = self.s.must_screenshot_before_giving_up()
+            if refuse:
+                return refuse
         # Phase 3.1: cursor-first lockout. Read-only scripts always
         # allowed (data extraction). Mutating scripts require evidence
         # that the brain has tried — and failed — at least 2 distinct
@@ -5256,6 +6463,7 @@ class BrowserGetMarkdownTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
@@ -5279,6 +6487,7 @@ class BrowserDialogTool(Tool):
     description = "Accept or dismiss a pending JavaScript dialog."
 
     async def execute(self, session_id: str, accept: bool, text: str | None = None, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         payload: dict[str, Any] = {"accept": accept}
         if text:
             payload["text"] = text
@@ -5347,7 +6556,12 @@ class BrowserFormBeginTool(Tool):
         "Open a tracked form-fill session. After calling, fill each "
         "field with browser_type_at — the session tracks progress and "
         "warns when a field is missed. Conclude with browser_form_commit "
-        "to verify all values stuck before submitting."
+        "to verify all values stuck before submitting. "
+        "For filter modals: pass `inventory=true` after running "
+        "browser_inventory_filters first; the session will fuzzy-match "
+        "your requested labels against the manifest (resolves user "
+        "term 'WiFi' → UI label 'Wi-Fi included') and attach a stable "
+        "selector to each field for browser_click_selector application."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -5359,6 +6573,7 @@ class BrowserFormBeginTool(Tool):
         intent: str,
         fields: list[dict[str, Any]],
         submit_label: str | None = None,
+        inventory: bool = False,
         **kw: Any,
     ) -> str:
         if os.environ.get("FORM_SESSION_ENABLED", "1") in ("0", "false", "no"):
@@ -5372,23 +6587,183 @@ class BrowserFormBeginTool(Tool):
             from superbrowser_bridge.form_session import FormFillSession
         except ImportError as exc:
             return f"[form_begin_failed:import] {exc}"
+
+        # inventory=true → fuzzy-resolve user labels against the most
+        # recent browser_inventory_filters manifest. Solves the
+        # "user said 'cleaning', UI says 'Cleaning service included'"
+        # gap that wrecks form_commit verification.
+        resolution_lines: list[str] = []
+        if inventory:
+            manifest = getattr(self.s, "last_filter_manifest", None)
+            if not manifest or not manifest.get("options"):
+                return (
+                    "[form_begin_failed:no_manifest] inventory=true but no "
+                    "filter manifest cached on this session. Call "
+                    "browser_inventory_filters(session_id) FIRST to scan the "
+                    "open dialog, then re-call form_begin with inventory=true."
+                )
+            options = manifest.get("options") or []
+            resolved_fields: list[dict[str, Any]] = []
+            unresolved: list[tuple[str, list[tuple[str, float]]]] = []
+            for f in fields:
+                user_label = (f.get("label") or "").strip()
+                if not user_label:
+                    continue
+                top = _match_label_against_manifest(user_label, options, top_k=3)
+                if not top:
+                    unresolved.append((user_label, []))
+                    continue
+                best_label, best_score, best_opt = top[0]
+                if best_score >= 0.75:
+                    resolved_fields.append({
+                        **f,
+                        "_resolved_label": best_opt.get("label"),
+                        "_resolved_selector": best_opt.get("selector"),
+                        "_match_score": best_score,
+                    })
+                    resolution_lines.append(
+                        f"  ✓ {user_label!r} → {best_opt.get('label')!r} "
+                        f"(score={best_score:.2f}, selector={best_opt.get('selector')})"
+                    )
+                else:
+                    unresolved.append((user_label, [(o.get("label", ""), s) for _, s, o in top]))
+            if unresolved:
+                lines = ["[form_begin_failed:unresolved] Some requested filters did not match the manifest:"]
+                for user_label, candidates in unresolved:
+                    if candidates:
+                        cand_str = ", ".join(f"{lbl!r} ({s:.2f})" for lbl, s in candidates)
+                        lines.append(f"  ? {user_label!r} → closest: {cand_str}")
+                    else:
+                        lines.append(f"  ? {user_label!r} → no candidates (manifest empty for this region)")
+                lines.append(
+                    "ACTION: re-call browser_form_begin with the closest matching label "
+                    "from the manifest (or drop the field if the site doesn't offer it)."
+                )
+                return "\n".join(lines)
+            fields = resolved_fields  # only if all resolved confidently
+
         sess = FormFillSession.begin(
             intent=intent,
             fields=fields,
             started_at_turn=self.s._brain_turn_counter,
             submit_label=submit_label,
         )
+        # Propagate resolved metadata onto FieldState entries.
+        if inventory:
+            for f in fields:
+                key = (f.get("label") or "").strip().lower()
+                fs = sess.fields.get(key)
+                if fs is None:
+                    continue
+                if f.get("_resolved_label"):
+                    fs.resolved_label = f["_resolved_label"]
+                if f.get("_resolved_selector"):
+                    fs.resolved_selector = f["_resolved_selector"]
+                if f.get("_match_score") is not None:
+                    fs.match_score = float(f["_match_score"])
         self.s.form_session = sess
         labels = ", ".join(fs.label for fs in sess.fields.values())
-        return (
-            f"[form_begin] intent={intent!r} fields=[{labels}]\n"
-            f"Now: call browser_screenshot once to anchor every field's "
-            f"bbox, then for each field call browser_type_at(vision_index="
-            f"V_n, text=...). After typing into a field that opens "
-            f"autocomplete, click the matching suggestion (or press "
-            f"Escape) BEFORE moving on. When every field is filled, "
-            f"call browser_form_commit to verify."
+        out: list[str] = [f"[form_begin] intent={intent!r} fields=[{labels}]"]
+        if resolution_lines:
+            out.append("Resolved against manifest:")
+            out.extend(resolution_lines)
+            out.append(
+                "Apply each via browser_click_selector(<resolved selector>). "
+                "Selectors from the manifest are stable across modal scrolls. "
+                "Conclude with browser_form_commit to verify."
+            )
+        else:
+            out.append(
+                "Now: call browser_screenshot once to anchor every field's "
+                "bbox, then for each field call browser_type_at(vision_index="
+                "V_n, text=...). After typing into a field that opens "
+                "autocomplete, click the matching suggestion (or press "
+                "Escape) BEFORE moving on. When every field is filled, "
+                "call browser_form_commit to verify."
+            )
+        return "\n".join(out)
+
+
+def _match_label_against_manifest(
+    user_label: str,
+    options: list[dict],
+    top_k: int = 3,
+) -> list[tuple[str, float, dict]]:
+    """Return [(matched_label, score 0..1, option_dict)] sorted desc.
+
+    Uses difflib + token-overlap + substring bonus + a compact (no-space)
+    pass to bridge punctuation gaps like "WiFi" ↔ "Wi-Fi included". No
+    external deps. Tolerant of short user terms vs longer UI labels and
+    common UI suffixes ("included", "available", "service", "on-site").
+    """
+    import difflib
+    import re as _re
+
+    _SUFFIX_RE = _re.compile(
+        r"\b(included|available|service|services|on[- ]site|allowed|"
+        r"only|optional|free)\b",
+        _re.IGNORECASE,
+    )
+
+    def _norm(s: str) -> str:
+        s = (s or "").lower()
+        s = _re.sub(r"[^a-z0-9 ]+", " ", s)
+        return _re.sub(r"\s+", " ", s).strip()
+
+    def _strip_suffixes(s: str) -> str:
+        return _re.sub(r"\s+", " ", _SUFFIX_RE.sub(" ", s)).strip()
+
+    def _stem(tok: str) -> str:
+        # Cheap singular/-ing trim to bridge "pets"↔"pet", "parking"↔"park".
+        for suf in ("ing", "es", "s"):
+            if len(tok) > len(suf) + 2 and tok.endswith(suf):
+                return tok[: -len(suf)]
+        return tok
+
+    def _tokens(s: str) -> set[str]:
+        return {_stem(t) for t in _norm(s).split() if t}
+
+    def _compact(s: str) -> str:
+        return _norm(s).replace(" ", "")
+
+    nu = _norm(user_label)
+    nu_stripped = _strip_suffixes(nu)
+    cu = _compact(user_label)
+    tu = _tokens(user_label)
+    if not nu and not cu:
+        return []
+    scored: list[tuple[str, float, dict]] = []
+    for opt in options:
+        olabel = (opt.get("label") or "").strip()
+        if not olabel:
+            continue
+        no = _norm(olabel)
+        no_stripped = _strip_suffixes(no)
+        co = _compact(olabel)
+        to = _tokens(olabel)
+        # 1. Sequence ratio on normalized strings.
+        ratio = difflib.SequenceMatcher(None, nu, no).ratio()
+        # 2. Sequence ratio on suffix-stripped strings (handles "Wi-Fi included").
+        ratio_stripped = difflib.SequenceMatcher(None, nu_stripped, no_stripped).ratio()
+        # 3. Sequence ratio on compact (no-space) strings — bridges "wifi"↔"wi fi".
+        ratio_compact = difflib.SequenceMatcher(None, cu, co).ratio() if (cu and co) else 0.0
+        # 4. Token-overlap Jaccard with stemming.
+        jac = len(tu & to) / max(1, len(tu | to)) if (tu and to) else 0.0
+        # 5. Substring containment: a strong signal for "wifi" inside "wifiincluded".
+        contain = 0.0
+        if (nu and no) and (nu in no or no in nu):
+            contain = 0.90
+        elif (cu and co) and (cu in co or co in cu):
+            contain = 0.88
+        score = max(
+            ratio * 0.6 + jac * 0.4,
+            ratio_stripped * 0.7 + jac * 0.3,
+            ratio_compact * 0.65 + jac * 0.35,
+            contain,
         )
+        scored.append((olabel, round(score, 3), opt))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored[:top_k]
 
 
 @tool_parameters(
@@ -5412,6 +6787,7 @@ class BrowserFormStatusTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         sess = self.s.form_session
         if sess is None:
             return (
@@ -5547,11 +6923,15 @@ class BrowserPlanNextStepsTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
-        if not session_id.startswith("t3-"):
+        session_id = self.s.resolve_session_id(session_id)
+        # Planner now runs for both t1 and t3 via tier_evaluate. Single
+        # kill switch: ACTION_PLANNER_T1=0 disables on t1.
+        if not session_id.startswith("t3-") and \
+                os.environ.get("ACTION_PLANNER_T1", "1") == "0":
             return (
-                "[plan_unavailable] Planner currently runs only for t3 "
-                "(undetected Chromium) sessions. Call browser_screenshot "
-                "to get a fresh vision + suggested_actions instead."
+                "[plan_unavailable] Planner disabled on t1 "
+                "(ACTION_PLANNER_T1=0). Call browser_screenshot to get "
+                "a fresh vision + suggested_actions instead."
             )
         resp = self.s._last_vision_response
         if resp is None:
@@ -5560,11 +6940,11 @@ class BrowserPlanNextStepsTool(Tool):
                 "browser_screenshot first."
             )
         try:
-            from superbrowser_bridge.antibot import interactive_session as _t3mgr
+            from superbrowser_bridge.tier_evaluate import get_backend as _get_backend
             from superbrowser_bridge.antibot.ui_blockers import detect as _detect_blockers
             from superbrowser_bridge.action_planner import plan as _plan_actions
-            mgr = _t3mgr.default()
-            blockers = await _detect_blockers(mgr, session_id)
+            backend = _get_backend(session_id)
+            blockers = await _detect_blockers(backend, session_id)
             self.s._last_blockers = blockers
             queue = _plan_actions(
                 vresp=resp,
@@ -5579,6 +6959,269 @@ class BrowserPlanNextStepsTool(Tool):
             return f"[plan_failed] {str(exc)[:200]}"
 
 
+# ── Multi-step task plan (task_plan.py) ─────────────────────────────
+# Three small tools that let the brain commit to a top-level checklist
+# of sub-goals once at the start of a task, then advance through them
+# deterministically. Verify_action auto-checks the active step's
+# success_criteria after each click / type / navigate; worker_hook
+# renders the cursor in every tool reply. See task_plan.py for the
+# state-machine details.
+
+
+_PLAN_STEP_ITEM = ObjectSchema(
+    name=StringSchema(
+        "Short imperative description of the sub-goal — e.g. "
+        "'apply Region=Oregon filter', 'sort by critic score', "
+        "'extract top 5 wines'. One concrete verifiable action."
+    ),
+    success_criteria=ObjectSchema(
+        kind=StringSchema(
+            "Postcondition kind: url_changed, url_matches, text_visible, "
+            "text_hidden, bbox_disappeared, focus_on_role, dom_mutated, "
+            "flag_cleared. Cannot be 'none' — every step must be "
+            "observable so verify_action can advance the plan automatically."
+        ),
+        payload=ObjectSchema(
+            description=(
+                "Kind-specific payload. url_matches → {pattern: substring}; "
+                "text_visible/text_hidden → {text: needle}; "
+                "bbox_disappeared → {widget_px: [x0,y0,x1,y1]}; "
+                "focus_on_role → {selector: css}; flag_cleared → "
+                "{flag: 'captcha_present' | 'blocker_present'}; "
+                "url_changed / dom_mutated need no payload."
+            ),
+            nullable=True,
+        ),
+        timeout_ms=IntegerSchema(
+            description="How long to wait for the criterion (default 2500)",
+            nullable=True,
+        ),
+        required=["kind"],
+    ),
+    delegate=ObjectSchema(
+        description=(
+            "Optional sub-machine that executes within this step. "
+            "kind='form_session' → brain must call browser_form_begin "
+            "with payload.fields before clicking. kind='navigation' → "
+            "step is a single navigate. kind='extraction' → terminal "
+            "read step. kind='manual' → no enforced sub-machine."
+        ),
+        kind=StringSchema(
+            "form_session | navigation | extraction | manual"
+        ),
+        payload=ObjectSchema(
+            description="Sub-machine-specific payload (e.g. {fields: [...]})",
+            nullable=True,
+        ),
+        required=["kind"],
+        nullable=True,
+    ),
+    required=["name", "success_criteria"],
+)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        steps=ArraySchema(
+            description=(
+                "Ordered list of sub-goals. Each step has `name`, "
+                "`success_criteria` (Postcondition: kind + payload), and "
+                "optional `delegate` for sub-machines like form_session. "
+                "Plan must have ≥2 steps; for single-step tasks just "
+                "skip the planner entirely."
+            ),
+            items=_PLAN_STEP_ITEM,
+        ),
+        required=["session_id", "steps"],
+    )
+)
+class BrowserSetTaskPlanTool(Tool):
+    """Commit to a persistent multi-step task plan.
+
+    Call ONCE at the start of any task with ≥3 distinct sub-goals
+    (multi-filter searches, multi-step booking flows, sequential
+    extractions). The plan is rendered into every subsequent tool
+    reply with a cursor advancing through steps; verify_action
+    auto-checks the active step's success_criteria after each
+    state-change tool. See task_plan.py for lifecycle.
+    """
+
+    name = "browser_set_task_plan"
+    description = (
+        "Commit to a top-level task plan: ordered sub-goals each with "
+        "an observable success_criteria. Call ONCE after your first "
+        "screenshot if the task has ≥3 sub-goals. Validator rejects "
+        "empty / single-step plans and steps whose criterion is 'none'. "
+        "Use browser_plan_skip_step / browser_plan_replan to recover "
+        "from an unsatisfiable step rather than silently moving on."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        steps: list[dict[str, Any]],
+        **kw: Any,
+    ) -> str:
+        from superbrowser_bridge.task_plan import (
+            make_plan,
+            TaskPlanValidationError,
+        )
+
+        try:
+            plan = make_plan(steps)
+        except TaskPlanValidationError as exc:
+            return f"[set_task_plan_failed:validation] {exc}"
+        except Exception as exc:
+            return f"[set_task_plan_failed] {type(exc).__name__}: {exc}"
+
+        prior = self.s.task_plan
+        self.s.task_plan = plan
+        # Move the first step to in_progress immediately so the next
+        # state-change tool's verify_action probe knows what to check.
+        active = plan.active_step()
+        verb = "Replaced" if prior is not None else "Set"
+        active_line = (
+            f"Active: {active.name}" if active else "All steps satisfied"
+        )
+        return (
+            f"[task_plan_set] {verb} plan with {len(plan.steps)} steps. "
+            f"{active_line}\n{plan.to_brain_text()}"
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        reason=StringSchema(
+            "Why this step can't be satisfied (e.g. 'site has no Oregon "
+            "filter; only US-region', 'price slider is broken'). Recorded "
+            "for post-task analysis."
+        ),
+        required=["session_id", "reason"],
+    )
+)
+class BrowserPlanSkipStepTool(Tool):
+    """Mark the active TaskPlan step as unsatisfiable and advance.
+
+    Use when the active step genuinely can't be satisfied — the filter
+    doesn't exist on this site, a required control is missing, or a
+    flow has changed. Don't use for transient failures (network blip,
+    stale vision); the planner already auto-flips to unsatisfiable
+    after MAX_STEP_ATTEMPTS verification misses.
+    """
+
+    name = "browser_plan_skip_step"
+    description = (
+        "Skip the active task-plan step (mark it unsatisfiable) and "
+        "advance to the next. Use only when the step truly can't be "
+        "completed, not for transient failures."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(self, session_id: str, reason: str, **kw: Any) -> str:
+        if self.s.task_plan is None:
+            return (
+                "[plan_skip_failed:no_plan] No active task plan. "
+                "Call browser_set_task_plan first or just continue."
+            )
+        skipped = self.s.task_plan.skip_active(reason or "explicitly_skipped")
+        if skipped is None:
+            return (
+                "[plan_skip_noop] No active step to skip — plan is complete."
+            )
+        next_step = self.s.task_plan.active_step()
+        next_line = (
+            f"Next: {next_step.name}"
+            if next_step
+            else "All remaining steps resolved"
+        )
+        return (
+            f"[plan_step_skipped] {skipped.name!r} marked unsatisfiable "
+            f"(reason: {reason[:80]}). {next_line}\n"
+            f"{self.s.task_plan.to_brain_text()}"
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        reason=StringSchema(
+            "Why the previous plan needs to be rebuilt (e.g. 'site has "
+            "different filter taxonomy than expected'). Recorded for audit."
+        ),
+        new_steps=ArraySchema(
+            description=(
+                "Replacement step list with the same shape as "
+                "browser_set_task_plan.steps. Same validator applies."
+            ),
+            items=_PLAN_STEP_ITEM,
+        ),
+        required=["session_id", "reason", "new_steps"],
+    )
+)
+class BrowserPlanReplanTool(Tool):
+    """Replace the current TaskPlan with a new one.
+
+    Use when on-page reality diverges from your initial plan (filters
+    that don't exist, an unexpected modal flow, a redesigned page).
+    The previous plan is dropped; lifecycle counters reset.
+    """
+
+    name = "browser_plan_replan"
+    description = (
+        "Replace the current task plan entirely. Use when on-page "
+        "reality diverges from your initial plan. Validator behavior "
+        "matches browser_set_task_plan."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        reason: str,
+        new_steps: list[dict[str, Any]],
+        **kw: Any,
+    ) -> str:
+        from superbrowser_bridge.task_plan import (
+            make_plan,
+            TaskPlanValidationError,
+        )
+
+        try:
+            plan = make_plan(new_steps)
+        except TaskPlanValidationError as exc:
+            return f"[plan_replan_failed:validation] {exc}"
+        except Exception as exc:
+            return f"[plan_replan_failed] {type(exc).__name__}: {exc}"
+
+        prior_summary = ""
+        if self.s.task_plan is not None:
+            done = sum(
+                1 for s in self.s.task_plan.steps if s.status == "satisfied"
+            )
+            prior_summary = (
+                f" (replaced previous plan, {done}/"
+                f"{len(self.s.task_plan.steps)} satisfied)"
+            )
+        self.s.task_plan = plan
+        active = plan.active_step()
+        active_line = (
+            f"Active: {active.name}" if active else "All steps satisfied"
+        )
+        return (
+            f"[plan_replanned] reason={reason[:80]!r}{prior_summary}. "
+            f"{active_line}\n{plan.to_brain_text()}"
+        )
+
+
 @tool_parameters(
     tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
 )
@@ -5590,6 +7233,7 @@ class BrowserCloseTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_close({session_id})")
         self.s.log_activity(f"close({session_id})")
         self.s.print_summary()
@@ -5626,6 +7270,7 @@ class BrowserDragTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, startX: float, startY: float, endX: float, endY: float, steps: int | None = None, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
@@ -5668,6 +7313,7 @@ class BrowserDetectCaptchaTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         # Route through _request_with_backoff so t3 sessions go to the
         # in-process patchright captcha detector, not the TS server.
         r = await _request_with_backoff(
@@ -5739,6 +7385,7 @@ class BrowserCaptchaScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/captcha/screenshot",
@@ -6220,6 +7867,7 @@ class BrowserSolveCaptchaTool(Tool):
         self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def execute(self, session_id: str, method: str | None = None, provider: str | None = None, api_key: str | None = None, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         # Any solve attempt unblocks the CF nav-guard — whether or not
         # the solve succeeds, the agent has acknowledged the interstitial,
         # and re-navigating is no longer a blind loop.
@@ -7012,6 +8660,7 @@ class BrowserVerifyFactTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, claim: str, **kw: Any) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/state",
@@ -7099,6 +8748,15 @@ class BrowserRequestHelpTool(Tool):
         self.s = state
 
     async def execute(self, reason: str, failed_tactics: str, **kw: Any) -> str:
+        # Refusal gate: if a TaskPlan step is still in_progress and the
+        # brain hasn't taken a screenshot since the last failed action,
+        # refuse — force re-entry into the screenshot→click loop. The
+        # user-named pattern: instead of "tool failed → take screenshot →
+        # try different V_n" the brain reaches for request_help. This
+        # blocks that until the brain has at least looked at the page.
+        refuse = self.s.must_screenshot_before_giving_up()
+        if refuse:
+            return refuse
         # Lazy-import to avoid circular imports with the orchestrator module.
         from superbrowser_bridge.routing import _domain_from_url
         domain = _domain_from_url(self.s.current_url) if self.s.current_url else ""
@@ -7162,6 +8820,7 @@ class BrowserEscalateTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, reason: str | None = None, force: bool = False, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         if self.s.backend == "t3":
             return (
                 f"[already_t3] Session {session_id} is already on Tier 3 "
@@ -7324,6 +8983,140 @@ class BrowserEscalateTool(Tool):
             f"in-progress form before submitting. All subsequent browser_* "
             f"tools use the new session_id transparently."
         )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        max_iterations=IntegerSchema(
+            "Safety cap on scroll steps inside the dialog (default 12, max 30).",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserInventoryFiltersTool(Tool):
+    name = "browser_inventory_filters"
+    description = (
+        "Scan-and-collect tool for filter/option dialogs. When a filter "
+        "panel/dialog is open, this scrolls it top-to-bottom in one tool "
+        "call and returns EVERY checkbox/radio/option/switch with its "
+        "label, group heading, stable CSS selector, and current selected "
+        "state. Restores the original scroll position before returning. "
+        "Use this BEFORE applying multi-value filters (WiFi+cleaning, "
+        "amenities, multi-pick facets) so the brain sees the full option "
+        "inventory in one shot — no iterative click→screenshot→scroll "
+        "loop. Falls back to scanning the document if no dialog is open. "
+        "Cheap: server-side only, no vision/screenshot cost. Returned "
+        "selectors are stable across modal scrolls (vision V_n indices "
+        "are NOT) — pair with browser_click_selector for reliable apply."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        max_iterations: int | None = None,
+        **kw: Any,
+    ) -> Any:
+        gate = await _feedback_gate("browser_inventory_filters")
+        if gate:
+            return gate
+
+        if not session_id:
+            return "[inventory_filters_failed:no_session] Provide session_id."
+
+        payload: dict[str, Any] = {}
+        if max_iterations is not None:
+            payload["maxIterations"] = int(max_iterations)
+
+        print("\n>> browser_inventory_filters()")
+
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/inventory-filters",
+                json=payload,
+                timeout=20.0,
+            )
+        except Exception as exc:
+            return f"[inventory_filters_failed] request error: {exc}"
+
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[inventory_filters_failed] HTTP {r.status_code}: {err}"
+
+        data = r.json()
+        options = data.get("options") or []
+        scope = data.get("scope") or "document"
+        total = int(data.get("total") or 0)
+        travel = int(data.get("scrollTravelPx") or 0)
+        iters = int(data.get("iterations") or 0)
+
+        # Cache the manifest on session state so form_begin(inventory=true)
+        # can reuse it without a second scan.
+        try:
+            self.s.last_filter_manifest = {
+                "session_id": session_id,
+                "scope": scope,
+                "options": options,
+                "captured_at": time.time(),
+            }
+        except Exception:
+            pass
+
+        self.s.record_step(
+            "browser_inventory_filters",
+            f"scope={scope} total={total} travel={travel}px iters={iters}",
+            self.s.current_url or "",
+        )
+
+        if total == 0:
+            return (
+                "[inventory_filters:empty] No checkbox/radio/option/switch "
+                "controls found"
+                f"{' inside any open dialog' if scope == 'document' else ''}"
+                ". If you expected a filter panel here, the dialog may not "
+                "be open yet — open it (click 'All Filters', 'Show filters', "
+                "etc.) and call this tool again."
+            )
+
+        # Group options by their group heading for compact display.
+        groups: dict[str, list[dict]] = {}
+        for opt in options:
+            g = (opt.get("group") or "").strip() or "(ungrouped)"
+            groups.setdefault(g, []).append(opt)
+
+        lines: list[str] = []
+        lines.append(
+            f"[inventory_filters_ok scope={scope} total={total} "
+            f"groups={len(groups)} travel={travel}px iters={iters}]"
+        )
+        lines.append(
+            "Stable CSS selectors below — prefer browser_click_selector(<sel>) "
+            "for applying these. Selected=true means the option is already "
+            "checked; toggle only if the task requires it."
+        )
+        for gname, opts in groups.items():
+            lines.append(f"\n## {gname}")
+            for o in opts:
+                sel_marker = "✓" if o.get("selected") else "·"
+                lines.append(
+                    f"  [{sel_marker}] {o.get('kind','?'):<8} "
+                    f"label={o.get('label','')!r:<40} "
+                    f"selector={o.get('selector','')}"
+                )
+
+        return "\n".join(lines)
 
 
 @tool_parameters(
@@ -7589,6 +9382,7 @@ class BrowserRewindToCheckpointTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         target = (self.s.best_checkpoint_url or "").strip()
         print(f"\n>> browser_rewind_to_checkpoint(target={target[:80]!r})")
         if not target:
@@ -7786,6 +9580,59 @@ class BrowserClickSelectorTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_click_selector({selector!r})")
+        # Playwright-pseudo guard. Selectors like `:has-text('X')`,
+        # `:contains('X')`, `:visible`, `:hidden`, `>>` (Playwright chain)
+        # are NOT standard CSS — Puppeteer's querySelector silently
+        # returns null and the brain doesn't know whether the selector
+        # was wrong or the element doesn't exist. Surfacing a structured
+        # error stops the wild-guess pivot to compound selectors.
+        pseudo_block = _detect_playwright_pseudo(selector)
+        if pseudo_block:
+            return pseudo_block
+        # Vague-selector pre-flight. The match_count warning currently
+        # surfaces only AFTER the click — by then the brain has often
+        # pivoted to browser_eval to find a better selector. Catch
+        # selectors that look vague (no id / data-testid / nth-* /
+        # [for=] / [name=] discriminator) BEFORE the click and refuse
+        # if querySelectorAll would match >1. Cheap: one /evaluate
+        # round-trip only when the selector text-pattern is suspect.
+        if (
+            os.environ.get("SELECTOR_VAGUE_REFUSAL", "1") != "0"
+            and _looks_vague_selector(selector)
+        ):
+            try:
+                count_resp = await _request_with_backoff(
+                    "POST",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                    json={
+                        "script": (
+                            "(() => { try { return "
+                            f"document.querySelectorAll({json.dumps(selector)}).length;"
+                            " } catch(e) { return -1; } })()"
+                        ),
+                    },
+                    timeout=10.0,
+                )
+                _body = count_resp.json() if count_resp.status_code < 400 else None
+                _matched = (
+                    _body.get("result") if isinstance(_body, dict) else None
+                )
+                if isinstance(_matched, int) and _matched > 1:
+                    return (
+                        f"[selector_too_vague: would match {_matched} elements] "
+                        f"{selector!r} has no id (#…), data-testid, :nth-of-type, "
+                        f"[for=…] or [name=…] discriminator — querySelector would "
+                        f"silently click the first match, which is rarely the right "
+                        f"one. Recovery:\n"
+                        f"  1. browser_screenshot — vision labels the actual target\n"
+                        f"  2. browser_click_at(vision_index=V_n) — pixel-exact\n"
+                        f"  3. OR narrow the selector with #id, [data-testid=…], "
+                        f":nth-of-type(N), [for=…], or [name=…].\n"
+                        f"Override: SELECTOR_VAGUE_REFUSAL=0."
+                    )
+            except Exception as exc:
+                # Pre-flight is opportunistic — never block on its failure.
+                print(f"   [vague-selector pre-flight skipped — {exc}]")
         # Phase 1.1: hard sync gate.
         sync_block = await self.s.ensure_vision_synced(reason="browser_click_selector")
         if sync_block:
@@ -7823,6 +9670,7 @@ class BrowserClickSelectorTool(Tool):
             return f"[click_selector_failed] {err}"
         data = r.json()
         clicked = data.get("clicked", {})
+        _pre_url_for_subgoal = self.s.current_url or ""
         self.s.record_step(
             "browser_click_selector",
             f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
@@ -7836,8 +9684,27 @@ class BrowserClickSelectorTool(Tool):
             f"Clicked {selector} at "
             f"({clicked.get('x','?')},{clicked.get('y','?')})"
         )
+        # When a selector matches >1 elements, querySelector silently picks
+        # the first. Surfacing match_count tells the brain to narrow the
+        # selector instead of accepting whatever it got — stops the
+        # `selector: 'button'` and `a[role='button'][href='#']` family of
+        # vague-selector misclicks. Engine surfaces match_count via
+        # src/server/http.ts:/click-selector → page.ts:clickSelector.
+        match_count = data.get("match_count")
+        if isinstance(match_count, int) and match_count > 1:
+            caption += (
+                f"\n[selector_ambiguous: matched {match_count} elements, "
+                f"clicked first — narrow the selector with id, "
+                f"data-testid, :nth-of-type, or attribute filter to pick "
+                f"the intended target]"
+            )
         if data.get("elements"):
             caption += f"\n{data['elements']}"
+        subgoal_note = await self.s.check_active_task_step(
+            session_id, pre_url=_pre_url_for_subgoal,
+        )
+        if subgoal_note:
+            caption += subgoal_note
         return await _append_fresh_vision(
             _vision_task,
             _maybe_no_effect_prefix(
@@ -8508,6 +10375,7 @@ class BrowserListSliderHandlesTool(Tool):
         return True
 
     async def execute(self, session_id: str, **kw: Any) -> str:
+        session_id = self.s.resolve_session_id(session_id)
         print("\n>> browser_list_slider_handles()")
         r = await _request_with_backoff(
             "POST",
@@ -9150,6 +11018,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserOpenTool(state),
         BrowserNavigateTool(state),
         BrowserScreenshotTool(state),
+        BrowserLookAgainTool(state),  # careful coverage-mode pass
         BrowserClickTool(state),
         BrowserClickAtTool(state),
         BrowserTypeAtTool(state),
@@ -9158,6 +11027,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserKeysTool(state),
         BrowserScrollTool(state),
         BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
+        BrowserInventoryFiltersTool(state),  # filter-modal scan-and-collect
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
         BrowserFormPlanTool(state),
@@ -9185,6 +11055,9 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserRequestHelpTool(state),
         BrowserEscalateTool(state),        # t1 → t3 migration
         BrowserPlanNextStepsTool(state),   # hierarchical planner
+        BrowserSetTaskPlanTool(state),     # task_plan: persistent multi-step checklist
+        BrowserPlanSkipStepTool(state),
+        BrowserPlanReplanTool(state),
         BrowserFormBeginTool(state),       # Phase 2.1: form-fill orchestration
         BrowserFormStatusTool(state),
         BrowserFormCommitTool(state),

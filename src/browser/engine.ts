@@ -47,6 +47,13 @@ export interface BrowserConfig {
    * bot signature. Only enable for environments where GPU crashes.
    */
   disableGpu?: boolean;
+  /**
+   * Disable HTTP/2 via --disable-http2. Default true (HTTP/2 off).
+   * Anti-bot stacks (Akamai, Imperva) reject HTTP/2 frames from
+   * Chromium's JA3 fingerprint, causing ERR_HTTP2_PROTOCOL_ERROR.
+   * Opt back in via T1_DISABLE_HTTP2=0.
+   */
+  disableHttp2?: boolean;
 }
 
 const DEFAULT_CONFIG: BrowserConfig = {
@@ -57,6 +64,7 @@ const DEFAULT_CONFIG: BrowserConfig = {
   blockAds: true,
   stealth: true,
   disableGpu: false,
+  disableHttp2: true,
 };
 
 /** Chrome build identity for stealth — must stay in sync with stealth.ts. */
@@ -157,6 +165,12 @@ export class BrowserEngine extends EventEmitter {
     if (this.config.disableGpu) {
       args.push('--disable-gpu');
       args.push('--disable-accelerated-2d-canvas');
+    }
+
+    const http2Off = this.config.disableHttp2 ??
+      (process.env.T1_DISABLE_HTTP2 ?? '1') !== '0';
+    if (http2Off) {
+      args.push('--disable-http2');
     }
 
     // Resolve headless mode. `headlessMode` takes precedence when set; the

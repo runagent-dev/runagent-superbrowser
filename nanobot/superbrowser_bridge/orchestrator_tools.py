@@ -811,6 +811,35 @@ class DelegateBrowserTaskTool(Tool):
             is_research=is_research,
         )
         worker_state.task_id = task_id
+        # Stash the orchestrator-level dedup key on the state so the
+        # worker hook / close path can save handoff state under the
+        # SAME key the next delegate call will look up. Without this,
+        # each worker would save under a per-worker uuid that the next
+        # call can't find.
+        worker_state.orchestrator_task_key = _dedup_key
+
+        # --- Cross-worker handoff resume -----------------------------
+        # If a previous worker for THIS SAME (domain, instructions) task
+        # called browser_request_help and saved a handoff snapshot, hydrate
+        # the new worker from it. This preserves: the live browser
+        # session_id (so we keep the URL with filters applied), task_plan
+        # (so we don't re-plan from scratch), cursor_failure_strategies
+        # (so the script-lockout gate stays armed), and observed_anchor_urls
+        # (so the URL-hallucination guard remembers what we saw).
+        # Kill switch: WORKER_HANDOFF_RESUME=0 disables.
+        resumed_handoff = None
+        if os.environ.get("WORKER_HANDOFF_RESUME", "1") != "0":
+            try:
+                from superbrowser_bridge.handoff_store import take as _ho_take
+                resumed_handoff = _ho_take(_dedup_key)
+                if resumed_handoff is not None:
+                    worker_state.hydrate_from_handoff(resumed_handoff)
+                    print(
+                        f"   [handoff resumed] {resumed_handoff.short_summary()}"
+                    )
+            except Exception as exc:
+                print(f"   [handoff resume skipped — {exc}]")
+                resumed_handoff = None
 
         # Resolve the target domain once, up front — used by human-handoff
         # auto-enable (below), learnings injection (further down), and the
@@ -869,32 +898,123 @@ class DelegateBrowserTaskTool(Tool):
         # Target URL" text would be nonsense, so the wording below says
         # "if a Target URL is given" and the domain-pin block further
         # down enforces the rest.
-        parts.append(
-            "## HARD RULE — READ FIRST\n"
-            "You may call `browser_open` AT MOST ONCE per task. If a "
-            "`Target URL:` line appears below, the FIRST and ONLY "
-            "`browser_open` call MUST use exactly that URL — do NOT "
-            "detour to Google search, do NOT invent an article URL, do "
-            "NOT search 'site:foo.com X'. The Target URL is the "
-            "authoritative starting point; the orchestrator already "
-            "chose it.\n"
-            "The first call returns a session_id. Every later browser tool "
-            "(browser_screenshot, browser_click, browser_type, "
-            "browser_navigate, browser_get_markdown, browser_run_script, …) "
-            "MUST take that session_id and operate on the SAME session. "
-            "A second `browser_open` call is almost always a bug — it "
-            "throws away your progress and spawns a fresh throwaway "
-            "browser.\n"
-            "If a tool result looks empty, a screenshot seems missing, or "
-            "you're unsure what the page looks like, call "
-            "`browser_screenshot(session_id=<id>)` — NEVER `browser_open` — "
-            "to re-ground yourself. The tool will refuse a redundant "
-            "`browser_open` with a [SESSION_ALREADY_OPEN …] message; if "
-            "you see that tag, stop calling `browser_open` immediately and "
-            "switch to the right tool named in the refusal message."
-        )
+        if resumed_handoff is not None:
+            # Resume mode — the previous worker for this task tapped out via
+            # browser_request_help. Their browser session is still alive and
+            # the URL has progress on it. Tell the new worker NOT to call
+            # browser_open (would throw it all away) and to ground via
+            # browser_screenshot instead. Also surface the prior task_plan
+            # so the brain sees the cursor where it was.
+            _resume_sid = resumed_handoff.session_id
+            _resume_url = resumed_handoff.current_url or "(no url captured)"
+            parts.append(
+                "## HARD RULE — READ FIRST (RESUME MODE)\n"
+                "A previous worker for this exact task tapped out and you "
+                "are resuming on its live browser session. The session is "
+                "ALREADY OPEN — do NOT call `browser_open`. That would "
+                "throw away the URL state with filters/progress applied "
+                "and spawn a fresh throwaway browser.\n"
+                f"  session_id: `{_resume_sid}`\n"
+                f"  current url: `{_resume_url}`\n"
+                "First call MUST be:\n"
+                f"  `browser_screenshot(session_id='{_resume_sid}')`\n"
+                "to see what state the previous worker left the page in. "
+                "The previous worker's TaskPlan is still on this session — "
+                "you'll see the [TASK PLAN] checklist in the screenshot "
+                "reply with the cursor where it was. Continue from the "
+                "active step. If you decide the prior plan is wrong, call "
+                "`browser_plan_replan(reason=..., new_steps=[...])`.\n"
+                "Every subsequent browser tool MUST pass "
+                f"`session_id='{_resume_sid}'`."
+            )
+        else:
+            parts.append(
+                "## HARD RULE — READ FIRST\n"
+                "You may call `browser_open` AT MOST ONCE per task. If a "
+                "`Target URL:` line appears below, the FIRST and ONLY "
+                "`browser_open` call MUST use exactly that URL — do NOT "
+                "detour to Google search, do NOT invent an article URL, do "
+                "NOT search 'site:foo.com X'. The Target URL is the "
+                "authoritative starting point; the orchestrator already "
+                "chose it.\n"
+                "The first call returns a session_id. Every later browser tool "
+                "(browser_screenshot, browser_click, browser_type, "
+                "browser_navigate, browser_get_markdown, browser_run_script, …) "
+                "MUST take that session_id and operate on the SAME session. "
+                "A second `browser_open` call is almost always a bug — it "
+                "throws away your progress and spawns a fresh throwaway "
+                "browser.\n"
+                "If a tool result looks empty, a screenshot seems missing, or "
+                "you're unsure what the page looks like, call "
+                "`browser_screenshot(session_id=<id>)` — NEVER `browser_open` — "
+                "to re-ground yourself. The tool will refuse a redundant "
+                "`browser_open` with a [SESSION_ALREADY_OPEN …] message; if "
+                "you see that tag, stop calling `browser_open` immediately and "
+                "switch to the right tool named in the refusal message."
+            )
+
+        # DEFAULT LOOP section: the simple `screenshot → vision → click → repeat`
+        # pattern that handles 90%+ of tasks. Sits ABOVE the tool catalog so
+        # it's the first thing the brain reads. Without this the prompt
+        # was front-loaded with tool-preference rankings and the brain
+        # learned to pivot between TOOLS instead of looping back to
+        # screenshot. Kill switch DEFAULT_LOOP_PROMPT=0 reverts.
+        if os.environ.get("DEFAULT_LOOP_PROMPT", "1") != "0":
+            parts.append(
+                "## DEFAULT LOOP — use this >90% of the time\n"
+                "\n"
+                "  1. `browser_screenshot` — vision returns [V_1]..[V_N] "
+                "bboxes labelled with what each one IS (e.g. "
+                "`[V_3] \"Sign in\" button`, `[V_7] \"Oregon\" checkbox`).\n"
+                "  2. **READ THE LABEL of every V_n that's plausibly "
+                "your target.** Pick the V_n whose label matches your "
+                "current TaskPlan step's intent. **NEVER click V_1 by "
+                "reflex** — vision sometimes ranks V_1 as the most "
+                "visually-prominent element (header logo, hero banner), "
+                "not the one your task needs. If multiple labels could "
+                "match, prefer the one with the smaller bbox (buttons "
+                "and checkboxes are typically <100px wide; full cards "
+                "are >300px).\n"
+                "  3. `browser_click_at(vision_index=V_n)` OR "
+                "`browser_type_at(vision_index=V_n, text=...)` OR "
+                "`browser_scroll(direction='down')` to bring the next "
+                "control into view.\n"
+                "  4. Read the tool reply. If `[subgoal_advanced]` "
+                "appeared, loop with the next step. If not, "
+                "`browser_screenshot` AGAIN and pick a different V_n. "
+                "**NEVER pick a different TOOL when the right move is "
+                "to look at the page again.** If no V_n label matches "
+                "your intent at all, scroll first — don't click "
+                "whatever V_1 happens to be.\n"
+                "\n"
+                "Use a non-default tool ONLY when the page state matches "
+                "its trigger:\n"
+                "  • Slider widget visible → `browser_drag_slider_until`\n"
+                "  • 5+ checkboxes in a filter modal → "
+                "`browser_inventory_filters` + `browser_form_begin`\n"
+                "  • CAPTCHA flag in vision → `browser_solve_captcha`\n"
+                "  • Stable id / data-testid in the bbox label → "
+                "`browser_click_selector(<that selector>)`\n"
+                "\n"
+                "**Do NOT use these unless the active TaskPlan step is "
+                "already `unsatisfiable` OR you have taken 3 screenshots "
+                "in a row that produced identical state:**\n"
+                "  • `browser_request_help`\n"
+                "  • `browser_run_script(mutates=true)`\n"
+                "  • `done(success=False)`\n"
+                "\n"
+                "The bridge enforces these rules. Trying to call a "
+                "forbidden tool returns `[refused: take a screenshot "
+                "first]` — call `browser_screenshot` and try a different "
+                "V_n instead.\n"
+                "\n"
+                "The remainder of this prompt is the REFERENCE section — "
+                "scan it when the default loop above demonstrably can't "
+                "make progress, not before."
+            )
 
         parts.append(
+            "## REFERENCE — non-default tools (read on demand)\n"
             "## PICK THE RIGHT CLICK TOOL\n"
             "- **Puzzle / game / captcha?** Call `browser_solve_puzzle(session_id)` "
             "first — it auto-detects chess, slider, jigsaw, rotation, and grid-drag "
@@ -1012,22 +1132,51 @@ class DelegateBrowserTaskTool(Tool):
             "tools below all dispatch via humanized CDP mouse events "
             "(isTrusted=true), which WAF-protected sites don't flag.\n"
             "\n"
-            "Tool preference for element interaction:\n"
-            "  1. **FIRST** `browser_click_at(vision_index=V_n)` — "
-            "humanized cursor click on the bbox vision just pointed at. "
-            "`V_n` MUST come from the most recent screenshot's vision "
-            "output; do NOT invent indices or coords.\n"
-            "  2. `browser_click_selector(<css>)` — zero-Gemini click "
-            "when the target has a stable hook (id, data-test-id, "
-            "unique class). Chess squares, form fields, captcha "
-            "handles.\n"
-            "  3. `browser_click(index=N)` — DOM-index click when "
-            "the brain sees the element in the interactive elements "
-            "listing but vision didn't surface it.\n"
+            "Tool preference for element interaction (ranked by stability "
+            "AND click realism — pick from top of this list down):\n"
+            "  1. **FIRST** `browser_click_selector(<css>)` — most stable "
+            "AND humanized cursor (isTrusted=true). Use whenever you "
+            "have a stable handle: id, data-testid, unique aria-label, "
+            "OR a selector returned by `browser_inventory_filters` "
+            "(those are stable across modal scrolls). The selector "
+            "survives DOM mutations as long as the element exists; "
+            "neither V_n nor [N] gives you that.\n"
+            "  2. `browser_click_at(vision_index=V_n)` — humanized "
+            "cursor click on a bbox from the MOST RECENT screenshot. "
+            "Use when no stable selector is available (custom widgets, "
+            "canvas elements, slider handles, chess squares). `V_n` "
+            "MUST come from the latest vision pass; do NOT invent indices.\n"
+            "  3. **AVOID** `browser_click(index=N)` — DOM-tree index. "
+            "Equally volatile to V_n (resets after every mutating "
+            "action) AND uses `el.click()` which is `isTrusted=false`, "
+            "silently rejected by Cloudflare/Akamai/PerimeterX. Only "
+            "use when both the selector and V_n paths failed AND you "
+            "just took a fresh screenshot in this same turn.\n"
             "  4. **LAST RESORT** `browser_run_script(mutates=true)` — "
             "only when no bbox/selector works or the action requires "
             "multi-step orchestration. JS clicks are isTrusted=false; "
             "many sites 403 this; don't reach for it reflexively.\n"
+            "\n"
+            "**Both V_n AND [N] expire after every mutating action.** "
+            "Click, type, scroll-with-effect, navigate — any of these "
+            "rebuilds the DOM tree and shifts both index spaces. Do "
+            "NOT chain two `browser_click(...)` calls (vision OR DOM "
+            "index) without a `browser_screenshot` between them. The "
+            "second call is almost certainly hitting a different "
+            "element than you intend. The bridge enforces this with "
+            "stale-index guards on both paths — chained clicks return "
+            "`[click_failed:stale_*]` and waste your iteration budget. "
+            "After every mutating action: `browser_screenshot` first, "
+            "then click.\n"
+            "\n"
+            "**Selector reuse from inventory_filters.** When "
+            "`browser_inventory_filters` returns a manifest, each "
+            "option carries a stable CSS `selector` string. To apply "
+            "those filters, use `browser_click_selector(selector=...)` "
+            "for EACH one — do NOT switch to `browser_click(index=N)` "
+            "midway through. The selector path keeps working even as "
+            "the modal re-renders between checkbox clicks; the DOM "
+            "index path does not.\n"
             "\n"
             "For text input: `browser_type_at(vision_index=V_n, "
             "text=...)` is the React-safe cursor path.\n"
@@ -1052,17 +1201,19 @@ class DelegateBrowserTaskTool(Tool):
             "fresh bbox list. Repeat until the control appears or "
             "the page can't scroll further.\n"
             "\n"
-            "**Still missing after scrolling?** Use "
-            "`browser_get_markdown` (free) to inspect the page text "
-            "— the interactive elements listing at the bottom of "
-            "every tool reply also exposes controls vision culled. "
-            "If you see the target in the elements listing as "
-            "`[N] tag text=…`, click it via `browser_click(index=N)` "
-            "— bypasses vision entirely for stable DOM-indexed "
-            "targets. `browser_image_region(bbox_json=...)` can grab "
-            "a tight JPEG of a specific viewport region if you need "
-            "to OCR/inspect something closely (captcha tiles, price "
-            "text near a specific card).\n"
+            "**Still missing after scrolling?** Call "
+            "`browser_look_again(intent='find <X>', expected_labels="
+            "['<exact label>'])` — fresh screenshot, coverage-mode "
+            "vision pass, no cache. If even that doesn't surface the "
+            "target, use `browser_get_markdown` to verify the element "
+            "exists in the page text at all (it may be lazy-rendered, "
+            "or the site may not actually have the option). Only as a "
+            "last fallback consider `browser_click(index=N)` from the "
+            "elements listing — and ONLY if you took a fresh screenshot "
+            "in THIS turn (no mutating tool between). `browser_image_region"
+            "(bbox_json=...)` can grab a tight JPEG of a specific "
+            "viewport region if you need to OCR/inspect something "
+            "closely (captcha tiles, price text near a specific card).\n"
             "\n"
             "**Multi-field forms (filters, booking, signup):** call "
             "`browser_form_begin(intent=..., fields=[...])` to open a "
@@ -1075,6 +1226,64 @@ class DelegateBrowserTaskTool(Tool):
             "the session will require you to click a suggestion "
             "before progressing to the next field. Conclude with "
             "`browser_form_commit` to verify before submit.\n"
+            "\n"
+            "**Multi-step task plan — commit to it, don't drift.** "
+            "When the task has ≥3 distinct sub-goals (e.g. apply 3 filters + "
+            "sort + read results, navigate through booking funnel, "
+            "multi-step extraction), call "
+            "`browser_set_task_plan(steps=[...])` ONCE right after the "
+            "first screenshot. Each step needs a `name` and a "
+            "`success_criteria` (Postcondition: kind + payload — e.g. "
+            "`{kind: 'url_matches', payload: {pattern: 'red-wine'}}` for a "
+            "navigation step, `{kind: 'text_visible', payload: {text: "
+            "'Oregon'}}` for a filter step). The brain sees the plan in "
+            "every subsequent tool reply with a cursor showing which step "
+            "is active; verify_action automatically advances the cursor "
+            "when each step's criterion is satisfied. After 2 failed "
+            "verifications a step flips to unsatisfiable and you MUST call "
+            "`browser_plan_skip_step(reason)` or `browser_plan_replan(reason, "
+            "new_steps=[...])` before the next click — this is the "
+            "guardrail that stops you from drifting into URL guessing when "
+            "filters get hard. Skip the planner ONLY for single-step "
+            "tasks (just navigate + read).\n"
+            "\n"
+            "**Filter modals — scan-first, then apply by selector.** "
+            "When the task names ≥2 filter values (e.g. \"WiFi AND "
+            "cleaning service\", \"vegetarian AND under $30\", "
+            "\"in-and-out AND covered\"), follow this recipe:\n"
+            "  1. Open the filter dialog (click \"All Filters\", \"Show "
+            "filters\", \"Refine\", etc.).\n"
+            "  2. Call `browser_inventory_filters(session_id)` ONCE. It "
+            "scrolls the dialog top-to-bottom in one server-side pass and "
+            "returns EVERY checkbox/radio/option with its label, group "
+            "heading, current selected state, and a STABLE CSS selector. "
+            "No screenshot cost. This is the scroll-and-read pass a human "
+            "does mentally — don't try to do it click-by-click.\n"
+            "  3. Compare the manifest to your task's requested filters. "
+            "If a requested value has no clear match in the manifest, STOP "
+            "and reconsider — the site may not offer that filter; don't "
+            "invent one. Use the closest match (e.g. task says \"WiFi\", "
+            "manifest says \"Wi-Fi included\" → that's the match).\n"
+            "  4. Open `browser_form_begin(intent=..., fields=[...])` "
+            "listing every value you intend to apply. Pass "
+            "`inventory=true` to have the session resolve your task "
+            "labels against the manifest (fuzzy match). The session's "
+            "pending-fields reminder then keeps pressure on until all are "
+            "applied — without it, the brain reliably abandons the modal "
+            "after the first checkbox.\n"
+            "  5. Apply each filter via "
+            "`browser_click_selector(<resolved selector from manifest>)`. "
+            "Selectors from inventory are STABLE across modal scrolls; "
+            "vision V_n indices are NOT — prefer the selector path. If "
+            "an option is below the modal fold, "
+            "`browser_scroll_until(target_text='<resolved label>')` "
+            "scrolls INSIDE the dialog now (modal-aware).\n"
+            "  6. `browser_form_commit` to verify all targets are visible "
+            "as applied before submit/results-refresh.\n"
+            "Do NOT abandon the modal to open individual result/detail "
+            "pages and verify amenities by reading them — that's a "
+            "last-resort fallback when filters genuinely don't exist on "
+            "the site, not a shortcut around using the filter UI.\n"
             "\n"
             "**Cascading dropdown filter forms (trade-in valuation, "
             "vehicle/laptop selectors, multi-step search filters): "
@@ -1123,6 +1332,33 @@ class DelegateBrowserTaskTool(Tool):
             "target you intended to click, RE-SCREENSHOT before "
             "calling `browser_click_at` — the V_n indices you saw "
             "from the previous screenshot may already be stale.\n"
+            "\n"
+            "**Reading the vision header.** Each `[VISION  intent=…  "
+            "freshness=…  age=…t  cached=…  …]` line tells you whether "
+            "the bboxes below are trustworthy:\n"
+            "  • `freshness=fresh age=0t` — proceed with V_n as normal.\n"
+            "  • `freshness=uncertain` or `age` ≥ 1 — a "
+            "`[VISION_MAY_BE_STALE]` banner will appear above the header. "
+            "Re-screenshot OR call `browser_look_again` before clicking.\n"
+            "  • Per-bbox `conf=0.xx` — values < 0.45 land in a "
+            "`Low-confidence (vision is hedging)` section. Don't click "
+            "those without a verify pass.\n"
+            "  • `[DOM_DISAGREE dom=role:'text']` after a bbox line means "
+            "the DOM at that point has a different element than vision "
+            "claimed. Avoid that V_n; pick a different target or "
+            "`browser_look_again`.\n"
+            "\n"
+            "**`browser_look_again` — the careful re-look tool.** When "
+            "(a) `[VISION_MAY_BE_STALE]` is showing, (b) two consecutive "
+            "`browser_click_at` calls failed with `stale_index` or "
+            "`bad_vision_index`, (c) an element you know exists isn't in "
+            "the bbox list, or (d) the candidate target's `conf` is below "
+            "0.6 — call `browser_look_again(intent='find <X>', "
+            "expected_labels=['<exact label 1>', '<label 2>'])`. It "
+            "bypasses the cache, lifts the bbox cap to 60, suspends "
+            "page-type culling rules, and uses the larger fallback model "
+            "if configured. Costlier than `browser_screenshot`; reach for "
+            "it on recovery, not as a default.\n"
             "\n"
             "**Before `browser_run_script(mutates=true)`:** the tool "
             "is locked until at least 2 distinct cursor strategies "
@@ -1808,11 +2044,31 @@ CRITICAL RULES:
                         content[:8000],  # cap so memory stays bounded
                     )
 
+            # Save handoff snapshot — keyed by orchestrator-task dedup key
+            # so the next delegate call for the same task can resume on
+            # the same browser session (URL with filters applied), the
+            # same task_plan (cursor preserved), and the same cursor-
+            # failure ledger (script lockout stays armed). Save on BOTH
+            # success and request_help paths; the next delegate will
+            # `take` (one-shot pop) only if it decides to resume.
+            try:
+                from superbrowser_bridge.handoff_store import save as _ho_save
+                _ho_save(_dedup_key, worker_state)
+            except Exception as _ho_exc:
+                print(f"   [handoff save skipped — {_ho_exc}]")
+
             return content
 
         except Exception as e:
             if domain:
                 _record_routing_outcome(domain, "browser", success=False)
+            # Even on crash, snapshot what we have — the URL/session may
+            # still be valid and a retry should keep that context.
+            try:
+                from superbrowser_bridge.handoff_store import save as _ho_save
+                _ho_save(_dedup_key, worker_state)
+            except Exception:
+                pass
             error_msg = (
                 f"Browser worker failed: {e}\n\n"
                 f"[FABRICATION GUARD] Worker crashed — you have NO live data. "

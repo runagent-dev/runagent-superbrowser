@@ -65,6 +65,13 @@ JSON object with this exact shape:
   ],
   "changes_from_previous": "What changed since the previous screenshot (empty if first screenshot)",
   "screenshot_freshness": "fresh|uncertain|stale",
+  "unsure_regions": [
+    {
+      "box_2d": [ymin, xmin, ymax, xmax],
+      "what_i_see": "<short visual phrase, e.g. 'small unlabelled icon'>",
+      "why_unsure": "<short reason, e.g. 'glyph unrendered'>"
+    }
+  ],
   "next_action": null
 }
 
@@ -178,6 +185,25 @@ Page-type coverage rules (CRITICAL for dense filter/booking UIs):
   based on the stated intent. If blocking overlays exist (cookie banners,
   modals, captchas), suggest dismissing them first (priority=1).
   `target_bbox_index` is the 0-based index into the bboxes array.
+- `unsure_regions` is OPTIONAL but USEFUL. If you see a region that
+  looks interactive or task-relevant but you can't confidently classify
+  (the visual is ambiguous, the label is illegible, or the role is
+  unclear), emit it here INSTEAD of guessing in `bboxes` with a
+  fabricated label and a low confidence value. Each entry:
+    {
+      "box_2d": [ymin, xmin, ymax, xmax],
+      "what_i_see": "short phrase describing the visual (e.g. 'circular icon
+                    next to the price' or 'small text below the input')",
+      "why_unsure": "short reason (e.g. 'icon unrendered',
+                    'label cut off by overflow', 'glyph not in training
+                    distribution')"
+    }
+  Prefer `unsure_regions` over a low-confidence bbox when the region is
+  CLEARLY there but the IDENTITY is unclear. Don't dump ambiguous bboxes
+  into `bboxes` with confidence=0.3 — that wastes the brain's attention
+  on guessed targets. The brain has a `browser_look_again` tool that
+  re-runs vision in coverage mode against expected_labels; populating
+  `unsure_regions` lets the brain choose to ask carefully.
 - Output ONLY the JSON. No prose, no markdown fences, no commentary.
 
 Scene hierarchy (NEW — enables a "clear blockers before main goal" planner):
@@ -264,6 +290,22 @@ def intent_bucket(intent: str) -> str:
     )
     if any(n in s for n in _captcha_nouns) and any(v in s for v in _captcha_verbs):
         return "solve_captcha"
+    # filter_panel bucket: explicit "scan everything" intents on dense
+    # filter modals. Triggers a coverage-style emit so every checkbox/
+    # radio/option in viewport gets its own bbox + group label, even
+    # when the bbox cap would normally cull them. Pair with
+    # browser_inventory_filters when the brain wants both the manifest
+    # AND a visual confirmation.
+    if (
+        "inventory" in s
+        or "filter panel" in s
+        or "filter_panel" in s
+        or "amenity scan" in s
+        or "scan filters" in s
+        or "scan amenities" in s
+        or "enumerate filters" in s
+    ):
+        return "filter_panel"
     if any(k in s for k in ("click", "fill", "type", "select", "choose", "interact", "dismiss", "submit")):
         return "act"
     if any(k in s for k in ("verify", "confirm", "check if", "did it", "outcome")):
@@ -517,6 +559,27 @@ def build_user_prompt(
             "when SCROLL_STATE shows reached_bottom=true and the target "
             "is likely above. NEVER suggest more scrolling once "
             "reached_bottom=true unless retreating upward."
+        )
+    elif bucket == "filter_panel":
+        specific = (
+            "FILTER PANEL SCAN. The agent is enumerating an open filter/"
+            "amenity dialog and needs EVERY checkbox/radio/option/switch "
+            "currently in viewport surfaced as its own bbox — no grouping, "
+            "no culling, no \"chrome\" classification. Treat the filter "
+            "panel itself as the primary scene. For each control, the "
+            "label MUST combine the visible option text with the nearest "
+            "preceding heading or fieldset legend (e.g. \"Bills included → "
+            "Wi-Fi\", \"Amenities → Cleaning service\"). Mark "
+            "role_in_scene='target' for every option (none are 'chrome'). "
+            "intent_relevant=true for every option in the panel — the "
+            "agent will filter them down by name later, vision should "
+            "emit the full set. Bbox cap is lifted in this bucket; emit "
+            "as many as needed (up to ~60). If the panel is partly "
+            "off-screen, set flags.scrollable=true and add a "
+            "suggested_action with action='scroll' inside the panel so "
+            "the agent knows there are more options below the fold. "
+            "Skip top-level page chrome (header, footer, search bar) — "
+            "this pass is panel-only."
         )
     elif bucket == "verify_action":
         specific = (

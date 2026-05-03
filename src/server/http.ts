@@ -513,6 +513,7 @@ export function createHttpServer(
       sessionHandoffBudget.set(id, handoffBudget);
 
       let navStatusCode: number | null = null;
+      let navErrorPage: { kind: string; detail: string } | undefined;
       if (req.body.url) {
         // Restore any previously persisted bot-protection cookies for this
         // (task, domain) BEFORE the first navigation so the site sees a
@@ -529,6 +530,7 @@ export function createHttpServer(
         } catch { /* best-effort */ }
         const nav = await page.navigate(req.body.url);
         navStatusCode = nav.statusCode;
+        navErrorPage = nav.errorPage;
       }
 
       const wantVision = req.body.vision !== false;
@@ -556,6 +558,10 @@ export function createHttpServer(
         url: state.url,
         title: state.title,
         statusCode: navStatusCode,
+        ...(navErrorPage ? {
+          block_class: navErrorPage.kind === 'chrome-error' ? 'chrome_error' : navErrorPage.kind,
+          chrome_error_code: navErrorPage.detail,
+        } : {}),
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
@@ -616,6 +622,10 @@ export function createHttpServer(
         url: state.url,
         title: state.title,
         statusCode: nav.statusCode,
+        ...(nav.errorPage ? {
+          block_class: nav.errorPage.kind === 'chrome-error' ? 'chrome_error' : nav.errorPage.kind,
+          chrome_error_code: nav.errorPage.detail,
+        } : {}),
         ...(wantVision && state.screenshot ? { screenshot: state.screenshot } : {}),
         elements: state.elementTree.clickableElementsToString(),
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
@@ -679,12 +689,32 @@ export function createHttpServer(
         }
       }
 
+      // Modal scroll state: distinguish "same page, same window scroll,
+      // but the user scrolled inside an open filter panel". Without this
+      // the vision cache hits and serves bboxes captured before the
+      // inner-modal scroll. Best-effort — null when no dialog is open.
+      let dialogScroll: Awaited<ReturnType<typeof page.getDialogScrollInfo>> = null;
+      try {
+        dialogScroll = await page.getDialogScrollInfo();
+      } catch {
+        dialogScroll = null;
+      }
+
       res.json({
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
         elements: state.elementTree.clickableElementsToString(),
-        scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
+        scrollInfo: {
+          scrollY: state.scrollY,
+          scrollHeight: state.scrollHeight,
+          viewportHeight: state.viewportHeight,
+          ...(dialogScroll ? {
+            dialogScrollTop: dialogScroll.top,
+            dialogScrollHeight: dialogScroll.height,
+            dialogId: dialogScroll.id,
+          } : {}),
+        },
         accessibilityTree: state.accessibilityTree,
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
@@ -1063,6 +1093,55 @@ export function createHttpServer(
     }
   });
 
+  /**
+   * Cross-check vision bbox centers against DOM truth. For each (x, y)
+   * point, return the nearest interactive element. Render path uses this
+   * to flag DOM_DISAGREE on bboxes whose vision label doesn't match what
+   * actually lives at the bbox center.
+   */
+  app.post('/session/:id/elements-at-points', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { points } = req.body ?? {};
+      if (!Array.isArray(points)) {
+        res.status(400).json({ error: 'points must be an array of {x, y}' });
+        return;
+      }
+      // Defensive: clamp size so a misuse can't pin the page on a huge eval.
+      const trimmed = points.slice(0, 100).filter(
+        (p: any) => p && typeof p.x === 'number' && typeof p.y === 'number',
+      );
+      const results = await page.elementsAtPoints(trimmed);
+      res.json({ success: true, results });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Inventory all checkbox/radio/option/switch controls inside the
+   * topmost open dialog (a "filter panel" scan). Scrolls the dialog
+   * top-to-bottom collecting labels with stable selectors, then restores
+   * the original scroll position. Lets the brain see the entire option
+   * inventory in one tool call instead of iterating screenshot loops.
+   */
+  app.post('/session/:id/inventory-filters', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { maxIterations } = req.body ?? {};
+      const inv = await page.inventoryFilters({
+        maxIterations: typeof maxIterations === 'number' ? maxIterations : undefined,
+      });
+      res.json({ success: true, ...inv });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Drag from one point to another. Useful for slider CAPTCHAs and puzzle pieces. */
   app.post('/session/:id/drag', async (req, res) => {
     const page = getSession(req.params.id);
@@ -1129,6 +1208,7 @@ export function createHttpServer(
       res.json({
         success: true,
         clicked: result,
+        match_count: result.matchCount,
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),

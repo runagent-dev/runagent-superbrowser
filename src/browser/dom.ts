@@ -69,10 +69,88 @@ export class DOMElementNode {
   clickableElementsToString(includeAttributes: string[] = DEFAULT_INCLUDE_ATTRIBUTES): string {
     const lines: string[] = [];
 
-    const processNode = (node: DOMElementNode | DOMTextNode, depth: number): void => {
+    // Resolve a label for a group container (tablist / radiogroup / group /
+    // fieldset). Used so siblings inside the same group render with a
+    // disambiguating `group="..."` attribute — e.g. a tab strip with
+    // [N]<button>New ... [N+1]<button>Open-Box becomes
+    // [N]<button group="Condition">New so the brain doesn't pick adjacent
+    // indices by accident.
+    const resolveGroupLabel = (el: DOMElementNode): string | null => {
+      const ariaLabel = (el.attributes['aria-label'] || '').trim();
+      if (ariaLabel) return ariaLabel.slice(0, 40);
+      // <fieldset><legend>…</legend>: look for a direct legend child.
+      if (el.tagName.toLowerCase() === 'fieldset') {
+        for (const child of el.children) {
+          if (child instanceof DOMElementNode
+            && child.tagName.toLowerCase() === 'legend') {
+            const t = child.getAllTextTillNextClickableElement(2).trim();
+            if (t) return t.slice(0, 40);
+          }
+        }
+      }
+      // role=tablist/radiogroup/group: prefer aria-labelledby's referenced
+      // text if we can find an element with the matching id in this subtree;
+      // else use the first heading child (h1-h6).
+      const labelledBy = (el.attributes['aria-labelledby'] || '').trim();
+      if (labelledBy) {
+        const ids = new Set(labelledBy.split(/\s+/).filter(Boolean));
+        const stack: (DOMElementNode | DOMTextNode)[] = [el];
+        while (stack.length) {
+          const cur = stack.shift()!;
+          if (cur instanceof DOMElementNode) {
+            const cid = cur.attributes['id'];
+            if (cid && ids.has(cid)) {
+              const t = cur.getAllTextTillNextClickableElement(2).trim();
+              if (t) return t.slice(0, 40);
+            }
+            stack.push(...cur.children);
+          }
+        }
+      }
+      for (const child of el.children) {
+        if (child instanceof DOMElementNode
+          && /^h[1-6]$/i.test(child.tagName)) {
+          const t = child.getAllTextTillNextClickableElement(0).trim();
+          if (t) return t.slice(0, 40);
+        }
+      }
+      return null;
+    };
+
+    const isGroupContainer = (el: DOMElementNode): boolean => {
+      const role = (el.attributes['role'] || '').toLowerCase();
+      if (role === 'tablist' || role === 'radiogroup' || role === 'group') return true;
+      if (el.tagName.toLowerCase() === 'fieldset') return true;
+      return false;
+    };
+
+    const isGroupChild = (el: DOMElementNode): boolean => {
+      const role = (el.attributes['role'] || '').toLowerCase();
+      if (role === 'tab' || role === 'radio' || role === 'option' || role === 'switch') return true;
+      if (el.tagName.toLowerCase() === 'input') {
+        const t = (el.attributes['type'] || '').toLowerCase();
+        if (t === 'radio' || t === 'checkbox') return true;
+      }
+      return false;
+    };
+
+    const processNode = (
+      node: DOMElementNode | DOMTextNode,
+      depth: number,
+      groupLabel: string | null,
+    ): void => {
       if (node instanceof DOMTextNode) return;
 
       const el = node;
+      // If this element is a group container, resolve its label and pass
+      // to descendants. Don't override a tighter inner group label with
+      // an outer one — innermost wins.
+      let nextGroup = groupLabel;
+      if (isGroupContainer(el)) {
+        const lbl = resolveGroupLabel(el);
+        if (lbl) nextGroup = lbl;
+      }
+
       if (el.highlightIndex !== null) {
         const depthStr = '\t'.repeat(depth);
 
@@ -83,6 +161,12 @@ export class DOMElementNode {
           if (val && val.trim()) {
             attrs[key] = val.trim();
           }
+        }
+        // Group disambiguation: when this element is a tab/radio/option/
+        // switch sitting inside a labelled group, attach `group="…"` so
+        // adjacent indices ([32] New, [33] Open-Box) don't blur together.
+        if (groupLabel && isGroupChild(el)) {
+          attrs['group'] = groupLabel;
         }
 
         // Remove attribute if tag name matches role
@@ -135,11 +219,11 @@ export class DOMElementNode {
 
       for (const child of el.children) {
         const nextDepth = el.highlightIndex !== null ? depth + 1 : depth;
-        processNode(child, nextDepth);
+        processNode(child, nextDepth, nextGroup);
       }
     };
 
-    processNode(this, 0);
+    processNode(this, 0, null);
     return lines.join('\n');
   }
 

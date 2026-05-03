@@ -182,11 +182,10 @@ export class PageWrapper {
     const finalUrl = this.page.url();
     this.lastErrorPage = errorPage;
     if (errorPage) {
-      // Remember both the requested URL and the landed URL so either
-      // form short-circuits on retry. Cap the cache — the LLM might
-      // grind out dozens of URL variations and we don't need to hold
-      // them all.
-      if (this.badUrls.size < 128) {
+      // Cache persistent errors (404, text-error) so the LLM doesn't
+      // grind the same dead URL. Skip chrome-error — those are transient
+      // (protocol/connection) and must be retryable from the Python side.
+      if (errorPage.kind !== 'chrome-error' && this.badUrls.size < 128) {
         this.badUrls.set(url, errorPage);
         if (finalUrl && finalUrl !== url) this.badUrls.set(finalUrl, errorPage);
       }
@@ -772,11 +771,49 @@ export class PageWrapper {
     x: number; y: number; w: number; h: number;
     cx: number; cy: number;
     visible: boolean; inViewport: boolean;
+    matchCount: number;
   } | null>> {
     return await this.page.evaluate(
       (sels: string[], ensure: boolean) => {
+        // Sum the heights of position:fixed elements anchored at the top
+        // of the viewport (top within 0–80px). scrollIntoView with
+        // block:'center' otherwise plants the element directly under a
+        // sticky header — looks centered, but the cursor click lands on
+        // the header instead. Setting el.scrollMarginTop = headerH makes
+        // scrollIntoView leave that much space at the top.
+        const stickyHeaderHeight = (() => {
+          let total = 0;
+          const seen: HTMLElement[] = [];
+          // Walk every descendant once. Cap depth implicitly by skipping
+          // children of any matched element (a header's inner DOM is
+          // counted via the ancestor's height).
+          const all = document.body
+            ? Array.from(document.body.querySelectorAll<HTMLElement>('*'))
+            : [];
+          for (const n of all) {
+            const cs = getComputedStyle(n);
+            if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
+            const r = n.getBoundingClientRect();
+            if (r.top < -2 || r.top > 80) continue;
+            if (r.height < 16 || r.height > 200) continue;
+            // Skip if a parent already counted (avoid double-counting
+            // nested fixed children).
+            if (seen.some((s) => s.contains(n))) continue;
+            seen.push(n);
+            total += r.height;
+          }
+          return total;
+        })();
         return sels.map((sel) => {
-          const el = document.querySelector(sel) as HTMLElement | null;
+          let matchCount = 0;
+          let el: HTMLElement | null = null;
+          try {
+            const list = document.querySelectorAll(sel);
+            matchCount = list.length;
+            el = (list[0] as HTMLElement) ?? null;
+          } catch {
+            return null;
+          }
           if (!el) return null;
           if (ensure) {
             const pre = el.getBoundingClientRect();
@@ -784,7 +821,15 @@ export class PageWrapper {
             const inView = pre.bottom > 0 && pre.top < vh
               && pre.right > 0 && pre.left < vw;
             if (!inView) {
-              try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch { /* noop */ }
+              try {
+                if (stickyHeaderHeight > 0) {
+                  // Inline style — only affects this element's scrolling.
+                  // Persists harmlessly; future scrolls of the same element
+                  // get the same offset, which is what we want.
+                  el.style.scrollMarginTop = `${stickyHeaderHeight + 8}px`;
+                }
+                el.scrollIntoView({ block: 'center', inline: 'center' });
+              } catch { /* noop */ }
             }
           }
           const r = el.getBoundingClientRect();
@@ -795,6 +840,7 @@ export class PageWrapper {
             visible: r.width > 0 && r.height > 0,
             inViewport: r.bottom > 0 && r.top < vh
               && r.right > 0 && r.left < vw,
+            matchCount,
           };
         });
       },
@@ -811,7 +857,11 @@ export class PageWrapper {
       linear?: boolean;
       ensureVisible?: boolean;
     },
-  ): Promise<{ x: number; y: number; rect: { x: number; y: number; w: number; h: number } }> {
+  ): Promise<{
+    x: number; y: number;
+    rect: { x: number; y: number; w: number; h: number };
+    matchCount: number;
+  }> {
     const [rect] = await this.getRects([selector], { ensureVisible: opts?.ensureVisible ?? true });
     if (!rect || !rect.visible) {
       throw new Error(`clickSelector: selector not found or zero-size: ${selector}`);
@@ -829,7 +879,11 @@ export class PageWrapper {
       sessionId: this.sessionId,
     });
     await this.waitForIdle(1000).catch(() => {});
-    return { x, y, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } };
+    return {
+      x, y,
+      rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
+      matchCount: rect.matchCount,
+    };
   }
 
   async dragSelectors(
@@ -1916,8 +1970,35 @@ export class PageWrapper {
   async scrollPage(direction: 'up' | 'down'): Promise<void> {
     const viewportHeight = this.config.viewport.height;
     const distance = direction === 'down' ? viewportHeight - 100 : -(viewportHeight - 100);
+    // Modal-aware: when a dialog is open, scroll the dialog's inner overflow
+    // container instead of the window. Filter sidebars / "All Filters"
+    // panels have their own overflow-y region; window.scrollBy doesn't move
+    // them, which previously stranded the brain at the modal's first fold.
     await this.page.evaluate((d: number) => {
-      window.scrollBy(0, d);
+      const dialogs = Array.from(document.querySelectorAll(
+        '[role=dialog][aria-modal="true"], [role=alertdialog][aria-modal="true"], dialog[open]'
+      )) as HTMLElement[];
+      let container: HTMLElement | null = null;
+      // Last in DOM = most recently opened — preferred when nested.
+      for (let i = dialogs.length - 1; i >= 0 && !container; i--) {
+        const dlg = dialogs[i];
+        const r = dlg.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const candidates: HTMLElement[] = [dlg, ...Array.from(dlg.querySelectorAll<HTMLElement>('*'))];
+        for (const c of candidates) {
+          const cs = window.getComputedStyle(c);
+          const oy = cs.overflowY;
+          if ((oy === 'auto' || oy === 'scroll') && c.scrollHeight > c.clientHeight + 2) {
+            container = c;
+            break;
+          }
+        }
+      }
+      if (container) {
+        container.scrollBy(0, d);
+      } else {
+        window.scrollBy(0, d);
+      }
     }, distance);
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -1936,6 +2017,394 @@ export class PageWrapper {
       Math.round(window.innerHeight),
       Math.round(document.documentElement.scrollHeight),
     ]) as Promise<[number, number, number]>;
+  }
+
+  /**
+   * For each (x, y) point, return the nearest interactive element under
+   * that point. Used by the bridge's render path to cross-check whether
+   * vision's bbox label matches what the DOM actually has at that
+   * location — disagreements get surfaced to the brain as
+   * [DOM_DISAGREE …] markers so it can avoid the bbox or re-screenshot.
+   */
+  async elementsAtPoints(points: Array<{ x: number; y: number }>): Promise<Array<{
+    ok: boolean;
+    tag: string;
+    role: string;
+    text: string;
+  }>> {
+    if (!Array.isArray(points) || points.length === 0) return [];
+    return this.page.evaluate((pts: Array<{ x: number; y: number }>) => {
+      const isInteractive = (el: Element | null): boolean => {
+        if (!el) return false;
+        const tag = el.tagName?.toLowerCase();
+        if (!tag) return false;
+        if (['a', 'button', 'input', 'select', 'textarea', 'label', 'summary'].includes(tag)) return true;
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        if (role) return true;
+        return false;
+      };
+      const out: Array<{ ok: boolean; tag: string; role: string; text: string }> = [];
+      for (const p of pts) {
+        const x = Math.round(p.x);
+        const y = Math.round(p.y);
+        let el: Element | null = null;
+        try {
+          el = document.elementFromPoint(x, y);
+        } catch {
+          el = null;
+        }
+        if (!el) {
+          out.push({ ok: false, tag: '', role: '', text: '' });
+          continue;
+        }
+        // Bubble up to nearest interactive ancestor (vision usually
+        // targets the labelled button, not the inner text span).
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && !isInteractive(cur) && depth < 6) {
+          cur = cur.parentElement;
+          depth += 1;
+        }
+        const target = cur || el;
+        const text = (
+          (target as HTMLElement).innerText
+          || target.textContent
+          || target.getAttribute('aria-label')
+          || target.getAttribute('placeholder')
+          || ''
+        ).trim().slice(0, 80);
+        const role = (
+          target.getAttribute('role')
+          || target.tagName.toLowerCase()
+          || ''
+        ).toLowerCase();
+        out.push({
+          ok: true,
+          tag: target.tagName.toLowerCase(),
+          role,
+          text,
+        });
+      }
+      return out;
+    }, points) as Promise<Array<{ ok: boolean; tag: string; role: string; text: string }>>;
+  }
+
+  /**
+   * Enumerate every checkbox/radio/option/switch inside the topmost open
+   * dialog (a "filter panel" inventory pass). Scrolls the dialog top to
+   * bottom in viewport-sized steps, collecting labels with stable CSS
+   * selectors. Restores the original scroll position before returning so
+   * the brain can act without first putting the panel back where the user
+   * left it.
+   *
+   * Designed to replace the brain's iterative
+   *   click → screenshot → "did I see X?" → scroll → re-screenshot
+   * loop on dense filter modals. One tool call returns the entire option
+   * inventory. Falls back to scanning the document when no dialog is open.
+   */
+  async inventoryFilters(opts: { maxIterations?: number } = {}): Promise<{
+    found: boolean;
+    scope: 'modal' | 'document';
+    options: Array<{
+      label: string;
+      kind: 'checkbox' | 'radio' | 'option' | 'switch';
+      selector: string;
+      group: string;
+      selected: boolean;
+    }>;
+    total: number;
+    scrollTravelPx: number;
+    iterations: number;
+  }> {
+    const maxIter = Math.max(1, Math.min(30, opts.maxIterations ?? 12));
+    return this.page.evaluate(async (maxIterations: number) => {
+      // ── Pick the scope: topmost open dialog's scrollable child, else doc ──
+      const dialogs = Array.from(document.querySelectorAll(
+        '[role=dialog][aria-modal="true"], [role=alertdialog][aria-modal="true"], dialog[open]'
+      )) as HTMLElement[];
+      let scope: HTMLElement = document.scrollingElement as HTMLElement || document.body;
+      let scopeKind: 'modal' | 'document' = 'document';
+      let dialogRoot: HTMLElement | null = null;
+      for (let i = dialogs.length - 1; i >= 0; i--) {
+        const dlg = dialogs[i];
+        const r = dlg.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const candidates: HTMLElement[] = [dlg, ...Array.from(dlg.querySelectorAll<HTMLElement>('*'))];
+        for (const c of candidates) {
+          const cs = window.getComputedStyle(c);
+          const oy = cs.overflowY;
+          if ((oy === 'auto' || oy === 'scroll') && c.scrollHeight > c.clientHeight + 2) {
+            scope = c;
+            scopeKind = 'modal';
+            dialogRoot = dlg;
+            break;
+          }
+        }
+        if (scopeKind === 'modal') break;
+        // Dialog with no scrollable child — still scope inventory to it.
+        dialogRoot = dlg;
+        scope = dlg;
+        scopeKind = 'modal';
+        break;
+      }
+      const inventoryRoot = dialogRoot || document.body;
+
+      // ── Helpers (closure-scoped, no external refs) ──
+      const buildSelector = (el: Element): string => {
+        const tag = el.tagName.toLowerCase();
+        if (el.id && /^[A-Za-z][\w-]*$/.test(el.id)) return `#${el.id}`;
+        const name = el.getAttribute('name');
+        if (name) return `${tag}[name="${(window as any).CSS.escape(name)}"]`;
+        const testid = el.getAttribute('data-testid')
+          || el.getAttribute('data-test-id')
+          || el.getAttribute('data-cy');
+        if (testid) return `[data-testid="${(window as any).CSS.escape(testid)}"]`;
+        const value = el.getAttribute('value');
+        if (value && tag === 'input') {
+          return `${tag}[type="${el.getAttribute('type') || 'checkbox'}"][value="${(window as any).CSS.escape(value)}"]`;
+        }
+        // nth-of-type fallback anchored at dialog or body.
+        const anchor = inventoryRoot;
+        let path = '';
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && cur !== anchor && cur !== document.body && depth < 6) {
+          const parent: Element | null = cur.parentElement;
+          if (!parent) break;
+          const tagName: string = cur.tagName;
+          const sibs = (Array.from(parent.children) as Element[])
+            .filter((c: Element) => c.tagName === tagName);
+          const idx = sibs.indexOf(cur) + 1;
+          path = ` > ${cur.tagName.toLowerCase()}:nth-of-type(${idx})${path}`;
+          cur = parent;
+          depth += 1;
+        }
+        return path ? path.replace(/^ > /, '') : tag;
+      };
+
+      const getLabel = (el: HTMLElement): string => {
+        const ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+        const labelledBy = el.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          const txt = labelledBy.split(/\s+/)
+            .map(id => document.getElementById(id)?.innerText || '')
+            .join(' ').trim();
+          if (txt) return txt;
+        }
+        if (el.id) {
+          const escaped = (window as any).CSS.escape(el.id);
+          const lbl = document.querySelector(`label[for="${escaped}"]`) as HTMLElement | null;
+          if (lbl?.innerText) return lbl.innerText.trim();
+        }
+        const labelAncestor = el.closest('label') as HTMLElement | null;
+        if (labelAncestor?.innerText) return labelAncestor.innerText.trim();
+        // Sibling text (common for Material/Antd-style toggles).
+        let sib = el.nextElementSibling as HTMLElement | null;
+        for (let j = 0; j < 2 && sib; j++) {
+          const t = (sib.innerText || sib.textContent || '').trim();
+          if (t) return t.slice(0, 120);
+          sib = sib.nextElementSibling as HTMLElement | null;
+        }
+        const placeholder = el.getAttribute('placeholder');
+        if (placeholder) return placeholder.trim();
+        return ((el.innerText || el.textContent || '').trim()).slice(0, 120);
+      };
+
+      const getGroup = (el: HTMLElement): string => {
+        const fieldset = el.closest('fieldset') as HTMLElement | null;
+        if (fieldset) {
+          const legend = fieldset.querySelector('legend') as HTMLElement | null;
+          if (legend?.innerText) return legend.innerText.trim();
+        }
+        // Walk up looking for a preceding heading inside the same dialog/document.
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && cur !== inventoryRoot && depth < 8) {
+          let prev: Element | null = cur.previousElementSibling;
+          while (prev) {
+            if (/^H[1-6]$/.test(prev.tagName)) {
+              return (prev as HTMLElement).innerText.trim();
+            }
+            const heading = prev.querySelector('h1, h2, h3, h4, h5, h6') as HTMLElement | null;
+            if (heading?.innerText) return heading.innerText.trim();
+            prev = prev.previousElementSibling;
+          }
+          cur = cur.parentElement;
+          depth += 1;
+        }
+        return '';
+      };
+
+      const isSelected = (el: HTMLElement): boolean => {
+        if (el instanceof HTMLInputElement) return !!el.checked;
+        const checked = el.getAttribute('aria-checked');
+        if (checked) return checked.toLowerCase() === 'true';
+        const selected = el.getAttribute('aria-selected');
+        if (selected) return selected.toLowerCase() === 'true';
+        return false;
+      };
+
+      const kindOf = (el: HTMLElement): 'checkbox' | 'radio' | 'option' | 'switch' | null => {
+        if (el instanceof HTMLInputElement) {
+          const t = (el.type || '').toLowerCase();
+          if (t === 'checkbox') return 'checkbox';
+          if (t === 'radio') return 'radio';
+        }
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        if (role === 'checkbox') return 'checkbox';
+        if (role === 'radio') return 'radio';
+        if (role === 'option') return 'option';
+        if (role === 'switch') return 'switch';
+        return null;
+      };
+
+      // ── Scroll-and-collect loop ──
+      const collected = new Map<string, {
+        label: string;
+        kind: 'checkbox' | 'radio' | 'option' | 'switch';
+        selector: string;
+        group: string;
+        selected: boolean;
+      }>();
+
+      const collectVisible = (): void => {
+        const candidates = Array.from(inventoryRoot.querySelectorAll<HTMLElement>(
+          'input[type="checkbox"], input[type="radio"], '
+          + '[role="checkbox"], [role="radio"], [role="option"], [role="switch"]'
+        ));
+        for (const el of candidates) {
+          const kind = kindOf(el);
+          if (!kind) continue;
+          const selector = buildSelector(el);
+          if (!selector || collected.has(selector)) continue;
+          const label = getLabel(el);
+          if (!label) continue;
+          collected.set(selector, {
+            label: label.slice(0, 200),
+            kind,
+            selector,
+            group: getGroup(el).slice(0, 80),
+            selected: isSelected(el),
+          });
+        }
+      };
+
+      const scrollableEl = scope as HTMLElement;
+      const startTop = scopeKind === 'modal' ? scrollableEl.scrollTop : (window.scrollY || 0);
+      const stepPx = Math.max(200, Math.round((scrollableEl.clientHeight || window.innerHeight) * 0.85));
+
+      // Collect at the starting position first.
+      collectVisible();
+
+      // Scroll to top of scope, then walk down.
+      if (scopeKind === 'modal') {
+        scrollableEl.scrollTop = 0;
+      } else {
+        window.scrollTo(0, 0);
+      }
+      await new Promise<void>(r => setTimeout(r, 150));
+      collectVisible();
+
+      let lastTop = -1;
+      let iter = 0;
+      let scrollTravel = 0;
+      while (iter < maxIterations) {
+        const before = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
+        if (scopeKind === 'modal') {
+          scrollableEl.scrollBy(0, stepPx);
+        } else {
+          window.scrollBy(0, stepPx);
+        }
+        await new Promise<void>(r => setTimeout(r, 200));
+        const after = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
+        scrollTravel += Math.abs(after - before);
+        collectVisible();
+        if (Math.abs(after - lastTop) < 2) break; // plateau
+        lastTop = after;
+        iter += 1;
+      }
+
+      // Restore scroll position so the brain's screenshot reflects where
+      // the user left off, not where the inventory ended.
+      if (scopeKind === 'modal') {
+        scrollableEl.scrollTop = startTop;
+      } else {
+        window.scrollTo(0, startTop);
+      }
+      await new Promise<void>(r => setTimeout(r, 100));
+
+      const options = Array.from(collected.values());
+      return {
+        found: options.length > 0,
+        scope: scopeKind,
+        options,
+        total: options.length,
+        scrollTravelPx: scrollTravel,
+        iterations: iter,
+      };
+    }, maxIter) as Promise<{
+      found: boolean;
+      scope: 'modal' | 'document';
+      options: Array<{
+        label: string;
+        kind: 'checkbox' | 'radio' | 'option' | 'switch';
+        selector: string;
+        group: string;
+        selected: boolean;
+      }>;
+      total: number;
+      scrollTravelPx: number;
+      iterations: number;
+    }>;
+  }
+
+  /**
+   * When a modal/dialog is open, return its inner scrollable container's
+   * scroll state so the vision cache key can vary as the brain scrolls
+   * inside the modal (the window scrollY does not change in this case,
+   * which previously caused the cache to serve stale bboxes from before
+   * the inner scroll). Null when no aria-modal dialog is open or none
+   * has a scrollable child.
+   */
+  async getDialogScrollInfo(): Promise<{
+    top: number;
+    height: number;
+    client: number;
+    id: string;
+  } | null> {
+    return this.page.evaluate(() => {
+      const dialogs = Array.from(document.querySelectorAll(
+        '[role=dialog][aria-modal="true"], [role=alertdialog][aria-modal="true"], dialog[open]'
+      )) as HTMLElement[];
+      for (let i = dialogs.length - 1; i >= 0; i--) {
+        const dlg = dialogs[i];
+        const r = dlg.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const candidates: HTMLElement[] = [dlg, ...Array.from(dlg.querySelectorAll<HTMLElement>('*'))];
+        for (const c of candidates) {
+          const cs = window.getComputedStyle(c);
+          const oy = cs.overflowY;
+          if ((oy === 'auto' || oy === 'scroll') && c.scrollHeight > c.clientHeight + 2) {
+            // Stable-ish identity: aria-labelledby > id > class — survives
+            // re-renders within the same dialog instance.
+            const idHint = (
+              dlg.getAttribute('aria-labelledby')
+              || dlg.id
+              || (dlg.className || '').toString().slice(0, 40)
+              || dlg.tagName.toLowerCase()
+            );
+            return {
+              top: Math.round(c.scrollTop),
+              height: Math.round(c.scrollHeight),
+              client: Math.round(c.clientHeight),
+              id: idHint,
+            };
+          }
+        }
+      }
+      return null;
+    }) as Promise<{ top: number; height: number; client: number; id: string } | null>;
   }
 
   // Closed-loop scroll: walks the page in `direction` one viewport-fraction
@@ -1999,9 +2468,15 @@ export class PageWrapper {
     const viewportH = startInfo[1];
     const stepDelta = Math.round(viewportH * stepRatio);
 
-    let lastY = startY;
+    // Plateau detection now reads from whichever surface we actually
+    // scrolled (modal container or window) — see step block below.
+    // NaN sentinel avoids a false-plateau on iteration 1 when the
+    // first step scrolls a different surface than the initial window
+    // scrollY captured here.
+    let lastY = Number.NaN;
     let plateauHits = 0;
     let iterations = 0;
+    let cumulativePx = 0;
     let matchedSelector: string | undefined;
     let matchedText: string | undefined;
 
@@ -2087,12 +2562,39 @@ export class PageWrapper {
 
     while (iterations < maxIter) {
       iterations += 1;
-      // Step. We re-use scrollPage's behavior (window.scrollBy with a
-      // ~viewport-100px chunk) but parametric on stepRatio so callers
-      // can take smaller steps on dense pages.
+      // Modal-aware step: scroll the topmost open dialog's inner overflow
+      // container if one exists; otherwise the window. Returns the
+      // container's scrollTop after the step so plateau detection reads
+      // the right surface — without this, modal-internal lists triggered
+      // a false page_end while options below the modal fold sat unseen.
       const delta = direction === 'down' ? stepDelta : -stepDelta;
-      await this.page.evaluate((d: number) => {
+      const stepInfo = await this.page.evaluate((d: number) => {
+        const dialogs = Array.from(document.querySelectorAll(
+          '[role=dialog][aria-modal="true"], [role=alertdialog][aria-modal="true"], dialog[open]'
+        )) as HTMLElement[];
+        let container: HTMLElement | null = null;
+        for (let i = dialogs.length - 1; i >= 0 && !container; i--) {
+          const dlg = dialogs[i];
+          const r = dlg.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          const candidates: HTMLElement[] = [dlg, ...Array.from(dlg.querySelectorAll<HTMLElement>('*'))];
+          for (const c of candidates) {
+            const cs = window.getComputedStyle(c);
+            const oy = cs.overflowY;
+            if ((oy === 'auto' || oy === 'scroll') && c.scrollHeight > c.clientHeight + 2) {
+              container = c;
+              break;
+            }
+          }
+        }
+        if (container) {
+          const before = container.scrollTop;
+          container.scrollBy(0, d);
+          return { kind: 'modal' as const, before, top: container.scrollTop };
+        }
+        const before = window.scrollY;
         window.scrollBy(0, d);
+        return { kind: 'window' as const, before, top: window.scrollY };
       }, delta);
       // Brief settle for lazy-loaded content. 300ms balances against the
       // need to make ~10 iterations finish under 5 seconds.
@@ -2100,24 +2602,27 @@ export class PageWrapper {
 
       const info = await this.getScrollInfo();
       const y = info[0];
+      const surfaceY = stepInfo.top;
+      cumulativePx += surfaceY - stepInfo.before;
 
-      // Plateau detection — same scrollY twice in a row means the page
-      // can't scroll further this direction.
-      if (Math.abs(y - lastY) < 2) {
+      // Plateau detection — same scrollTop twice in a row on the surface
+      // we're actually scrolling means it can't scroll further this
+      // direction.
+      if (!Number.isNaN(lastY) && Math.abs(surfaceY - lastY) < 2) {
         plateauHits += 1;
         if (plateauHits >= 2) {
           return {
             found: false,
             iterations,
             finalScrollY: y,
-            scrolledPx: y - startY,
+            scrolledPx: cumulativePx !== 0 ? cumulativePx : y - startY,
             reason: direction === 'down' ? 'page_end' : 'page_start',
           };
         }
       } else {
         plateauHits = 0;
       }
-      lastY = y;
+      lastY = surfaceY;
 
       const m = await findMatch();
       if (m) {
@@ -2127,7 +2632,7 @@ export class PageWrapper {
           found: true,
           iterations,
           finalScrollY: y,
-          scrolledPx: y - startY,
+          scrolledPx: cumulativePx !== 0 ? cumulativePx : y - startY,
           reason: 'matched',
           matchedSelector,
           matchedText,
@@ -2140,7 +2645,7 @@ export class PageWrapper {
       found: false,
       iterations,
       finalScrollY: finalInfo[0],
-      scrolledPx: finalInfo[0] - startY,
+      scrolledPx: cumulativePx !== 0 ? cumulativePx : finalInfo[0] - startY,
       reason: 'max_iterations',
     };
   }

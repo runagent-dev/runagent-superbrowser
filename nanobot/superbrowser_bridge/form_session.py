@@ -87,6 +87,14 @@ class FieldState:
     kind: FieldKind = FieldKind.TEXT
     depends_on: Optional[str] = None
     resolved_value: Optional[str] = None  # what the picker actually selected
+    # Set when form_begin(inventory=true) fuzzy-matches the user-supplied
+    # label against an inventory manifest. resolved_label is the actual
+    # UI text (e.g. "Wi-Fi included" for user "WiFi"); resolved_selector
+    # is the stable CSS selector returned by browser_inventory_filters
+    # so click_selector can apply it without re-anchoring through vision.
+    resolved_label: Optional[str] = None
+    resolved_selector: Optional[str] = None
+    match_score: Optional[float] = None  # 0..1 fuzzy similarity
 
 
 @dataclass

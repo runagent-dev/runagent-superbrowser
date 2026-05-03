@@ -28,12 +28,61 @@ class BrowserWorkerHook(AgentHook):
         self._captcha_solve_attempts: int = 0
         self._captcha_escalation_pending: bool = False
         self._captcha_escalation_turns: int = 0
-        # Generic loop + stagnation detector (replaces consecutive_click_calls +
-        # ad-hoc _stagnation_url/_stagnation_count logic).
-        self._loop = LoopDetector()
+        # Generic loop + stagnation detector. Owned by state so the
+        # screenshot tool can record stale-screenshot streaks and the
+        # impasse-tool refusal can read the count. `_loop` stays as an
+        # alias so existing hook code (record_action / record_page_state
+        # below) doesn't change.
+        self._loop = state.loop_detector
         # Tier-auto-escalation: fires at most once per session to avoid
         # loop-cascading the LLM into repeated escalations.
         self._auto_escalated: bool = False
+
+    # Tools that, by definition, observe the page rather than change it.
+    # When one of these runs we clear the failure flag — the brain has
+    # looked at the page (or rebuilt its state) since the last failure.
+    _OBSERVATION_TOOLS = frozenset({
+        "browser_screenshot",
+        "browser_look_again",
+        "browser_get_markdown",
+        "browser_image_region",
+    })
+
+    # Tools that produce an action result the brain needs to act on.
+    # If their result string contains a failure marker we set the
+    # failure flag.
+    _STATE_CHANGE_TOOLS = frozenset({
+        "browser_click", "browser_click_at", "browser_click_selector",
+        "browser_type", "browser_type_at", "browser_fix_text_at",
+        "browser_navigate", "browser_drag", "browser_drag_selectors",
+        "browser_drag_path", "browser_keys", "browser_select",
+        "browser_select_option", "browser_set_slider",
+        "browser_set_slider_at", "browser_drag_slider_until",
+        "browser_eval", "browser_run_script", "browser_wait_for",
+    })
+
+    # Substrings in tool result text that mark a failure / no-effect
+    # outcome — the brain should re-screenshot before pivoting tools.
+    _FAILURE_MARKERS = (
+        "_failed", "_timeout", "click_silent", "navigate_unverified",
+        "VERIFY_MISS", "selector_ambiguous", "BLOCKED:", "NETWORK_BLOCKED",
+        "subgoal_unsatisfiable", "click_loop_detected",
+    )
+
+    def _update_failure_flag(self, last_step: dict) -> None:
+        """Set or clear `state.last_failure_without_screenshot` based on
+        the last tool's outcome. See class-level marker sets."""
+        tool = last_step.get("tool") or ""
+        if tool in self._OBSERVATION_TOOLS:
+            self.state.clear_action_failed()
+            return
+        if tool not in self._STATE_CHANGE_TOOLS:
+            return
+        result = str(last_step.get("result") or "")
+        for marker in self._FAILURE_MARKERS:
+            if marker in result:
+                self.state.mark_action_failed(f"{tool}: {result[:120]}")
+                return
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -63,6 +112,17 @@ class BrowserWorkerHook(AgentHook):
             )
             if stag_nudge:
                 guidance_parts.append(stag_nudge)
+
+            # --- Refusal-tool gate: failure flag bookkeeping --------
+            # Set last_failure_without_screenshot when the previous tool
+            # surfaced a failure marker; clear it when a fresh screenshot
+            # was taken. The flag gates browser_request_help and
+            # browser_run_script(mutates=true) — see
+            # BrowserSessionState.must_screenshot_before_giving_up.
+            try:
+                self._update_failure_flag(last_step)
+            except Exception:
+                pass
 
         # --- Iteration budget warnings ---
         iteration = context.iteration
@@ -240,13 +300,32 @@ class BrowserWorkerHook(AgentHook):
                     "fingerprint."
                 )
 
+        # --- TaskPlan rendering -----------------------------------------
+        # If the brain committed to a multi-step plan via
+        # browser_set_task_plan, render it on every iteration so the
+        # cursor never falls out of working memory. Composition rule
+        # (see task_plan.py): when a form_session is ALSO active, the
+        # form checklist is the primary view and the TaskPlan renders
+        # as a single-line cursor; otherwise the full plan checklist
+        # is shown. Verify_action handles per-step advancement; this
+        # hook is the persistent visual reminder.
+        plan = getattr(self.state, "task_plan", None)
+        form_sess = getattr(self.state, "form_session", None)
+        if plan is not None:
+            try:
+                compact = form_sess is not None
+                plan_text = plan.to_brain_text(compact=compact)
+                if plan_text:
+                    guidance_parts.append(plan_text)
+            except Exception:
+                pass
+
         # --- Phase 2: form-fill checklist reminder ----------------------
         # While a form_session is active, remind the brain at every
         # iteration which fields still need filling. The session itself
         # tracks state via browser_type_at + form_commit; this hook is
         # the persistent visual nudge so the brain can't forget the
         # field hidden behind an autocomplete dropdown.
-        form_sess = getattr(self.state, "form_session", None)
         if form_sess is not None:
             try:
                 checklist = form_sess.remaining_checklist(max_lines=10)
@@ -258,6 +337,78 @@ class BrowserWorkerHook(AgentHook):
                     if needs:
                         pieces.append(needs)
                     guidance_parts.append("\n".join(pieces))
+            except Exception:
+                pass
+
+        # --- Phase 2.5: filter-dialog-without-form-session nudge --------
+        # When the brain has likely opened a multi-option filter dialog
+        # (≥3 checkbox/radio/option controls in the latest tool result's
+        # interactive elements listing) AND the original task names
+        # multiple filter values (joined by "and"/"with both"), but no
+        # form_session is active, inject a one-line reminder. Filter-modal
+        # tasks reliably failed when the worker applied the first visible
+        # filter then panic-navigated instead of opening form_begin —
+        # which would have kept the pending-fields pressure on. Fires at
+        # most once per task; never refuses a tool.
+        if form_sess is None and not getattr(self, "_filter_nudge_fired", False):
+            try:
+                import re as _re
+                task_lower = (self.state.task_instruction or "").lower()
+                # Tight intent match: require a real filter-intent verb
+                # NEAR an "and" conjunction. Loose `" and " + "match"`
+                # would over-fire on any task that happens to contain the
+                # word "match" and a clause join (e.g. "click Fall 2023
+                # and find courses that match"), and previously caused
+                # the brain to treat term-picker options as multi-value
+                # filter fields — clicking Fall 2023 *and later* an
+                # unrelated option as if filling form_session fields.
+                multi_filter_pattern = _re.compile(
+                    r"\bwith\s+both\b"
+                    r"|\b(?:include|including|includes|featuring|"
+                    r"with|amenities|amenity|filter(?:s|ed|ing)?\s+(?:by|for))"
+                    r"\b[^.,;\n]{0,60}\band\b",
+                    _re.IGNORECASE,
+                )
+                if multi_filter_pattern.search(task_lower):
+                    last_tool_text = ""
+                    for m in reversed(context.messages):
+                        if m.get("role") == "tool":
+                            c = m.get("content")
+                            if isinstance(c, str):
+                                last_tool_text = c
+                            elif isinstance(c, list):
+                                last_tool_text = "\n".join(
+                                    (b.get("text") or "")
+                                    for b in c
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                )
+                            break
+                    n_options = len(_re.findall(
+                        r'type="(?:checkbox|radio)"|role="(?:checkbox|radio|option)"',
+                        last_tool_text,
+                    ))
+                    # Higher threshold: 5+ controls is a real filter
+                    # panel; 3-4 covers cookie-banner consent rows and
+                    # one-off radio groups (single-pick term selector,
+                    # gender selector, etc.) that are NOT multi-value
+                    # filter dialogs.
+                    if n_options >= 5:
+                        snippet = (self.state.task_instruction or "")[:160]
+                        guidance_parts.append(
+                            "[FILTER_DIALOG_OPEN_NO_SESSION] "
+                            f"{n_options} checkbox/radio/option controls are "
+                            "visible in the current page elements but no "
+                            "form_session is active. The task names multiple "
+                            f"filter values: \"{snippet}\"\n"
+                            "Call browser_form_begin(intent='...', fields=[...]) "
+                            "with EVERY filter value from the task BEFORE the "
+                            "next click in this dialog. The pending-fields "
+                            "reminder is what stops you from navigating away "
+                            "after only the first checkbox. For options below "
+                            "the modal fold, browser_scroll_until(target_text="
+                            "'<exact label>') now scrolls inside open dialogs."
+                        )
+                        self._filter_nudge_fired = True
             except Exception:
                 pass
 

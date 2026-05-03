@@ -29,7 +29,7 @@ from typing import Optional
 from pydantic import ValidationError
 
 from .cache import CacheKey, VisionCache
-from .prompts import SYSTEM_PROMPT, build_user_prompt, intent_bucket
+from .prompts import SYSTEM_PROMPT, build_coverage_prompt, build_user_prompt, intent_bucket
 from .providers import VisionProvider, select_fallback_provider, select_provider
 from .schemas import BBox, DiffInfo, PageFlags, SceneGraph, SceneLayer, VisionResponse
 
@@ -80,10 +80,19 @@ def dom_text_hash_of(
         return ""
     try:
         if isinstance(scroll_info, dict):
+            # Include open-dialog scroll state when present. Scrolling
+            # inside a fixed-position filter modal does NOT change
+            # window.scrollY, so without these fields the cache HITS and
+            # the brain reads bboxes from before the inner-modal scroll.
+            # Empty-string defaults keep the hash identical for non-modal
+            # pages (backwards compatible).
             sig = (
                 f"{scroll_info.get('scrollY', 0)}|"
                 f"{scroll_info.get('scrollHeight', 0)}|"
-                f"{scroll_info.get('viewportHeight', 0)}"
+                f"{scroll_info.get('viewportHeight', 0)}|"
+                f"{scroll_info.get('dialogScrollTop', '')}|"
+                f"{scroll_info.get('dialogScrollHeight', '')}|"
+                f"{scroll_info.get('dialogId', '')}"
             )
         else:
             sig = str(scroll_info)
@@ -158,6 +167,9 @@ class VisionAgent:
         task_instruction: str | None = None,
         cursor_trail: list[tuple[int, int]] | None = None,
         current_subgoal: Any | None = None,
+        coverage_mode: bool = False,
+        expected_labels: list[str] | None = None,
+        force_fresh: bool = False,
     ) -> VisionResponse:
         start = time.monotonic()
         # Subgoal id participates in the cache key — same screenshot
@@ -191,7 +203,10 @@ class VisionAgent:
         if not image_width or not image_height:
             image_width, image_height = _decode_dims(screenshot_b64)
 
-        cached = await self._cache.get(key)
+        # force_fresh skips the cache lookup so browser_look_again can
+        # guarantee a Gemini round-trip even when the dom_hash hasn't
+        # changed (the brain explicitly asked for a careful re-look).
+        cached = None if force_fresh else await self._cache.get(key)
         if cached is not None:
             # Re-attach dims — cache is process-local so they're typically
             # the same as last time, but a viewport resize between calls
@@ -283,14 +298,27 @@ class VisionAgent:
             call — we use a longer one on the compact retry after the
             first attempt timed out.
             """
-            prompt = build_user_prompt(
-                intent=intent,
-                url=url,
-                previous_summary=previous_summary,
-                task_instruction=task_instruction,
-                compact=compact,
-                current_subgoal=current_subgoal,
-            )
+            if coverage_mode:
+                # Coverage prompt lifts the bbox cap and disables
+                # page-type culling rules — the brain reaches for this
+                # via browser_look_again when it suspects the previous
+                # pass missed required targets.
+                prompt = build_coverage_prompt(
+                    intent=intent,
+                    url=url,
+                    expected_labels=list(expected_labels or []),
+                    task_instruction=task_instruction,
+                    current_subgoal=current_subgoal,
+                )
+            else:
+                prompt = build_user_prompt(
+                    intent=intent,
+                    url=url,
+                    previous_summary=previous_summary,
+                    task_instruction=task_instruction,
+                    compact=compact,
+                    current_subgoal=current_subgoal,
+                )
             try:
                 raw_ = await provider.chat_with_image(
                     screenshot_b64=screenshot_b64,
@@ -314,7 +342,7 @@ class VisionAgent:
         last_type = self._last_page_type.get(tier_key, "")
         use_fallback_first = bool(
             self._fallback_provider is not None
-            and last_type in self._COMPLEX_PAGE_TYPES
+            and (last_type in self._COMPLEX_PAGE_TYPES or coverage_mode)
             and os.environ.get("VISION_TIER_UP", "1") != "0"
         )
         first_provider = (
@@ -394,6 +422,8 @@ class VisionAgent:
         parsed.tokens_used = raw.tokens_used
         parsed.model = raw.model
         parsed.provider = raw.provider
+        if coverage_mode:
+            parsed.coverage_mode = True
         parsed.with_image_dims(image_width, image_height)
         # Server-side bbox cap. Trim to top-N so the brain's
         # selectorMap and overlay UI don't drown in noise. Ranking
@@ -429,6 +459,23 @@ class VisionAgent:
                 max_bboxes_form = 80
             if max_bboxes_form > max_bboxes:
                 max_bboxes = max_bboxes_form
+        # filter_panel intent: explicit "scan everything" pass on a filter
+        # modal. Lift the cap further (default 100) since dense panels
+        # routinely exceed the 80-bbox form cap when every checkbox/radio/
+        # option needs its own bbox.
+        try:
+            from .prompts import intent_bucket as _ib
+            if _ib(intent or "") == "filter_panel":
+                try:
+                    max_bboxes_filter = int(
+                        os.environ.get("VISION_FILTER_PANEL_MAX_BBOXES") or "100"
+                    )
+                except ValueError:
+                    max_bboxes_filter = 100
+                if max_bboxes_filter > max_bboxes:
+                    max_bboxes = max_bboxes_filter
+        except Exception:
+            pass
         if max_bboxes > 0 and len(parsed.bboxes) > max_bboxes:
             # Build a token set from the task instruction (alphanum,
             # ≥3 chars) so we can protect bboxes whose labels touch it.
@@ -682,9 +729,21 @@ def _parse_response_with_error(text: str) -> tuple[VisionResponse | None, str]:
     start = candidate.find("{")
     if start < 0:
         return None, "no '{' found in response"
+    # Use JSONDecoder.raw_decode so a valid JSON object followed by trailing
+    # prose ("Extra data: line 82 column 3") parses cleanly into a full
+    # VisionResponse instead of failing and forcing the upstream caller
+    # into compact-mode retry (12-bbox cap, half the page invisible).
+    # rfind('}') had been the previous fallback; it broke whenever the
+    # trailing prose itself contained a '}' (e.g. an example JSON in
+    # explanatory text), grabbing the wrong end and producing invalid
+    # input on the second try.
     try:
-        obj = json.loads(candidate[start:])
+        decoder = json.JSONDecoder()
+        obj, _consumed = decoder.raw_decode(candidate[start:])
     except json.JSONDecodeError:
+        # raw_decode failed on the literal slice — fall back to the
+        # last-'}' truncation as a safety net for malformed JSON that
+        # actually IS truncated mid-object.
         end = candidate.rfind("}")
         if end <= start:
             return None, "no closing '}' for JSON object"

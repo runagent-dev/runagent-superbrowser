@@ -106,6 +106,16 @@ class BBox(BaseModel):
         default=None,
         description="ID of the SceneLayer this bbox belongs to. None when scene is absent.",
     )
+    dom_check: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Filled in post-parse by the bridge when VISION_DOM_CROSSCHECK is "
+            "on. Shape: {tag, role, text, disagree: bool}. The render path "
+            "appends [DOM_DISAGREE …] when disagree=True so the brain can "
+            "spot vision↔DOM mismatches before clicking. Vision model itself "
+            "never populates this field."
+        ),
+    )
 
     @field_validator("box_2d", mode="before")
     @classmethod
@@ -490,6 +500,65 @@ class SuggestedAction(BaseModel):
         return max(1, min(3, p))
 
 
+class UnsureRegion(BaseModel):
+    """A region vision noticed but couldn't confidently classify.
+
+    Gives Gemini a dignified channel to declare doubt instead of forcing
+    it to emit a low-confidence bbox the brain might mistake for a real
+    target. Render path surfaces these under a `Vision uncertain about:`
+    section so the brain can choose to call browser_look_again with these
+    descriptions as expected_labels for a careful pass.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    box_2d: list[int] = Field(
+        default_factory=lambda: [0, 0, 0, 0],
+        description="[ymin, xmin, ymax, xmax] normalized to [0, 1000].",
+    )
+    what_i_see: str = Field(
+        default="",
+        description="One short phrase describing what's visually present.",
+    )
+    why_unsure: str = Field(
+        default="",
+        description="One short phrase explaining why classification failed.",
+    )
+
+    @field_validator("box_2d", mode="before")
+    @classmethod
+    def _coerce_box(cls, v: object) -> list[int]:
+        # Reuse BBox's coercion semantics but inline to avoid the cycle.
+        if isinstance(v, dict):
+            for keys in (
+                ("ymin", "xmin", "ymax", "xmax"),
+                ("y0", "x0", "y1", "x1"),
+            ):
+                if all(k in v for k in keys):
+                    v = [v[k] for k in keys]
+                    break
+            else:
+                if "box_2d" in v and isinstance(v["box_2d"], (list, tuple)):
+                    v = v["box_2d"]
+                else:
+                    return [0, 0, 0, 0]
+        if not isinstance(v, (list, tuple)) or len(v) != 4:
+            return [0, 0, 0, 0]
+        out: list[int] = []
+        for x in v:
+            try:
+                i = int(round(float(x)))
+            except (TypeError, ValueError):
+                i = 0
+            out.append(max(0, min(1000, i)))
+        ymin, xmin, ymax, xmax = out
+        if ymax < ymin:
+            ymin, ymax = ymax, ymin
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        return [ymin, xmin, ymax, xmax]
+
+
 class NextAction(BaseModel):
     """The single next action the vision agent commits to, during captcha
     step-mode.
@@ -654,6 +723,16 @@ class VisionResponse(BaseModel):
     bboxes: list[BBox] = Field(default_factory=list)
     flags: PageFlags = Field(default_factory=PageFlags)
     suggested_actions: list[SuggestedAction] = Field(default_factory=list)
+    unsure_regions: list[UnsureRegion] = Field(
+        default_factory=list,
+        description=(
+            "Regions vision noticed but couldn't confidently classify. "
+            "Surfaced to the brain as a `Vision uncertain about:` section "
+            "so it can call browser_look_again with these descriptions if "
+            "any look like the target it needs. Empty for confident "
+            "passes; render path omits the section when empty."
+        ),
+    )
     next_action: Optional[NextAction] = Field(
         default=None,
         description=(
@@ -820,7 +899,15 @@ class VisionResponse(BaseModel):
         }
         return aliases.get(s, "uncertain")
 
-    def as_brain_text(self, max_bboxes: int = 50) -> str:
+    def as_brain_text(
+        self,
+        max_bboxes: int = 50,
+        *,
+        current_turn: int | None = None,
+        epoch_turn: int | None = None,
+        max_age_turns: int = 1,
+        low_conf_threshold: float = 0.45,
+    ) -> str:
         """Render into a compact text block the nanobot brain consumes.
 
         Bboxes are ranked intent-relevant first, then clickable, then by
@@ -829,12 +916,58 @@ class VisionResponse(BaseModel):
         from `box_2d` using the attached image dimensions; if dims are
         zero (test fixture without an image), normalized 0-1000 coords
         are shown instead so the brain can still ground.
+
+        Kwargs (added to surface signals the system already computed but
+        previously hid from the brain — without these, the brain couldn't
+        distinguish a confident bbox from a hedge, or fresh vision from
+        stale):
+          current_turn, epoch_turn — when both provided, render `age=Nt`
+            in the header and trigger a stale-warning banner if the gap
+            exceeds max_age_turns.
+          max_age_turns — turns since vision epoch beyond which V_n
+            references will be rejected by the click guard. Default 1
+            mirrors the VISION_MAX_AGE_TURNS default in session_tools.
+          low_conf_threshold — bboxes with confidence below this go in a
+            separate "Low-confidence" section so the brain can still
+            reference them by V_n but knows to verify before clicking.
         """
-        header = (
-            f"[VISION  intent={self.intent}  page_type={self.page_type}  "
-            f"cached={str(self.cached).lower()}  "
-            f"model={self.model or '?'}  dur={self.duration_ms}ms]"
-        )
+        # Compute staleness signals up front — used in both the banner
+        # decision and the header.
+        age_turns: int | None = None
+        if current_turn is not None and epoch_turn is not None:
+            age_turns = max(0, int(current_turn) - int(epoch_turn))
+        freshness = (self.screenshot_freshness or "fresh").lower()
+        is_stale_freshness = freshness != "fresh"
+        is_stale_age = age_turns is not None and age_turns >= max_age_turns
+
+        # Header is intentionally lean on the common (fresh, age=0) path —
+        # the brain doesn't need cached/model/dur, and freshness=fresh is
+        # implied by absence of the stale banner. Only surface what's
+        # actionable; debug fields stay in logs, not in the LLM prompt.
+        header_bits = [
+            f"intent={self.intent}",
+            f"page_type={self.page_type}",
+        ]
+        if is_stale_freshness:
+            header_bits.append(f"freshness={freshness}")
+        if age_turns is not None and age_turns > 0:
+            header_bits.append(f"age={age_turns}t")
+        if self.cached:
+            header_bits.append("cached=true")
+        header = "[VISION  " + "  ".join(header_bits) + "]"
+
+        stale_banner: str | None = None
+        if is_stale_freshness or is_stale_age:
+            reasons: list[str] = []
+            if is_stale_freshness:
+                reasons.append(f"freshness={freshness}")
+            if is_stale_age:
+                reasons.append(f"age={age_turns}t")
+            stale_banner = (
+                "[VISION_MAY_BE_STALE  " + "  ".join(reasons) + "]  "
+                "Re-screenshot before using V_n indices below — the click "
+                "guard will reject them anyway."
+            )
         flags = self.flags
         flag_bits = [
             f"captcha={flags.captcha_type or 'none'}",
@@ -860,6 +993,7 @@ class VisionResponse(BaseModel):
 
         ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
         elements_lines: list[str] = []
+        low_conf_lines: list[str] = []
         iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
             if b.role_in_scene == "blocker":
@@ -876,23 +1010,50 @@ class VisionResponse(BaseModel):
             else:
                 ymin, xmin, ymax, xmax = b.box_2d
                 coord_text = f"(box_2d=[{ymin},{xmin},{ymax},{xmax}])"
-            elements_lines.append(
+            # DOM cross-check decoration (#2): when the render path attached
+            # a `dom_check` payload onto this bbox, render disagreements as
+            # a [DOM_DISAGREE: ...] suffix. Match path produces no marker
+            # to keep the line short.
+            dom_marker = ""
+            dom_check = getattr(b, "dom_check", None)
+            if isinstance(dom_check, dict) and dom_check.get("disagree"):
+                dom_role = str(dom_check.get("role") or dom_check.get("tag") or "")
+                dom_text = str(dom_check.get("text") or "")[:40]
+                dom_marker = f"  [DOM_DISAGREE dom={dom_role}:{dom_text!r}]"
+            # Only emit conf= when the brain might actually want to know —
+            # high-confidence bboxes are the common case and a numeric
+            # decoration on every line is mostly token noise.
+            conf_val = float(b.confidence)
+            conf_marker = (
+                f"conf={conf_val:.2f}  "
+                if conf_val < 0.75 else ""
+            )
+            line = (
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "
+                f"{conf_marker}"
                 f"{coord_text}"
                 f"{role_tag}"
+                f"{dom_marker}"
             )
+            if float(b.confidence) < low_conf_threshold:
+                low_conf_lines.append(line)
+            else:
+                elements_lines.append(line)
         truncated = (
             f"  … {len(self.bboxes) - max_bboxes} more bboxes truncated"
             if len(self.bboxes) > max_bboxes
             else ""
         )
 
-        parts = [
+        parts: list[str] = []
+        if stale_banner:
+            parts.append(stale_banner)
+        parts.extend([
             header,
             f"Summary: {self.summary}",
             flags_line,
-        ]
+        ])
         if self.scene and self.scene.layers:
             # Walk layers top-most first so the brain sees what's on top
             # before what's underneath. Index each layer to [V...] labels
@@ -927,11 +1088,32 @@ class VisionResponse(BaseModel):
             parts.extend(elements_lines)
             if truncated:
                 parts.append(truncated)
+        if low_conf_lines:
+            parts.append(
+                "Low-confidence (vision is hedging — verify before clicking):"
+            )
+            parts.extend(low_conf_lines)
         if self.suggested_actions:
             parts.append("Suggested actions:")
             for sa in sorted(self.suggested_actions, key=lambda a: a.priority):
                 target = f" -> bbox V{sa.target_bbox_index + 1}" if sa.target_bbox_index is not None else ""
                 parts.append(f"  [P{sa.priority}] {sa.action}{target}: {sa.description}")
+        # Unsure regions — vision saw something but couldn't classify
+        # confidently. The brain can `browser_look_again` with these as
+        # expected_labels to force a careful pass on the region.
+        if self.unsure_regions:
+            parts.append(
+                "Vision uncertain about (consider browser_look_again with "
+                "these as expected_labels):"
+            )
+            for u in self.unsure_regions[:8]:
+                what = (u.what_i_see or "").strip()[:80]
+                why = (u.why_unsure or "").strip()[:60]
+                ymin, xmin, ymax, xmax = u.box_2d
+                parts.append(
+                    f"  - {what!r}  why={why!r}  "
+                    f"region=[{ymin},{xmin},{ymax},{xmax}]"
+                )
         # Captcha auto-escalation: if vision flagged a captcha, surface an
         # imperative block so the worker LLM doesn't try to click through it.
         if getattr(flags, "captcha_present", False):
