@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -191,6 +192,32 @@ def _is_proxy_error(nav_error: str) -> bool:
         return False
     msg = nav_error.upper()
     return any(sig in msg for sig in _PROXY_ERROR_SUBSTRINGS)
+
+
+_CHROME_ERR_RE = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+
+
+def _extract_chrome_error_code(page_url: str, nav_error: str) -> str:
+    """Return a `net::ERR_*` code if this navigation landed in a
+    Chromium error page, else "".
+
+    Detects two signatures:
+      1. The page URL is `chrome-error://chromewebdata/` (Chromium
+         redirected to the built-in error placeholder after the request
+         was canceled / RST'd / produced no body).
+      2. The captured exception message contains a `net::ERR_*` token
+         (Playwright propagates these from the underlying CDP).
+
+    Returns the ERR_* code (e.g. "ERR_HTTP2_PROTOCOL_ERROR") so the
+    caller can surface it for diagnostics + targeted retry policy.
+    """
+    if nav_error:
+        m = _CHROME_ERR_RE.search(nav_error)
+        if m:
+            return m.group(1)
+    if page_url and page_url.startswith("chrome-error://"):
+        return "ERR_FAILED"
+    return ""
 
 # Match the TS server's session lifetime (src/server/http.ts:40-41).
 SESSION_IDLE_TIMEOUT_S = 30 * 60
@@ -1441,7 +1468,10 @@ class T3SessionManager:
         }
 
     async def _goto_with_warmup(
-        self, sid: str, url: str, timeout_s: float
+        self, sid: str, url: str, timeout_s: float,
+        *,
+        force_warmup: bool = False,
+        extra_humanize: bool = False,
     ) -> dict[str, Any]:
         s = self._get(sid)
         _light = bool(s.light_mode or _env_light_mode())
@@ -1458,12 +1488,16 @@ class T3SessionManager:
         # identical page.goto calls within 2 seconds is a textbook bot
         # signature that DataDome/Akamai flag instantly.
         target_is_root = url.rstrip("/") == root.rstrip("/")
+        # `force_warmup=True` is set by the chrome-error retry path: it
+        # had a same-origin failure that landed on chrome-error://, so
+        # the in-context _abck/sensor cookies are stale or bad-scored.
+        # Re-visiting the homepage refreshes them before the second
+        # attempt at the deep link. We still skip when target IS root
+        # (no point pre-fetching the same URL).
         needs_warmup = (
-            not _light
-            and warmup.should_warmup(url)
-            and (cross_origin or prev_host == "")
-            and not target_is_root
-        )
+            (not _light and warmup.should_warmup(url) and (cross_origin or prev_host == ""))
+            or force_warmup
+        ) and not target_is_root
         if needs_warmup:
             try:
                 await s.page.goto(
@@ -1483,7 +1517,22 @@ class T3SessionManager:
         # navigate. Tune via T3_NAV_JITTER=0 to disable. Auto-skipped in
         # light mode.
         import random as _random
-        if not _light and os.environ.get("T3_NAV_JITTER") != "0":
+        if extra_humanize:
+            # Stronger pre-nav humanization for the chrome-error retry —
+            # several mouse moves + a longer pause to nudge Akamai's
+            # behavioral score before re-attempting the deep link.
+            try:
+                for _ in range(_random.randint(3, 5)):
+                    await s.page.mouse.move(
+                        _random.randint(150, 1100),
+                        _random.randint(120, 650),
+                        steps=_random.randint(8, 18),
+                    )
+                    await asyncio.sleep(_random.uniform(0.15, 0.35))
+                await asyncio.sleep(_random.uniform(0.8, 1.5))
+            except Exception:
+                pass
+        elif not _light and os.environ.get("T3_NAV_JITTER") != "0":
             try:
                 await s.page.mouse.move(
                     _random.randint(200, 800),
@@ -1617,6 +1666,21 @@ class T3SessionManager:
             if status in (0, 200):
                 result["status"] = 403
                 result["statusCode"] = 403
+        # Chromium-level navigation failure (RST / no body / protocol
+        # error). Lands the page on `chrome-error://chromewebdata/`, no
+        # title, no status. Akamai bot-manager refusals on Best Buy
+        # product pages surface this way (sensor scoring fails and the
+        # CDN closes the connection rather than serving a challenge).
+        # Tag the result so the caller can decide between retry,
+        # fallback, or escalation — and keep this distinct from
+        # "cloudflare" so the existing CF/captcha path doesn't fire.
+        elif not result.get("block_class"):
+            err_code = _extract_chrome_error_code(s.page.url, nav_error)
+            if err_code:
+                result["block_class"] = "chrome_error"
+                result["chrome_error_code"] = err_code
+                result["status"] = 0
+                result["statusCode"] = 0
         if turnstile_info:
             # Surface the Turnstile context to the caller so the LLM can
             # decide to call browser_solve_captcha when no API key is set
@@ -1727,6 +1791,52 @@ class T3SessionManager:
                     "proxy-fallback retry failed for %s: %s", url, exc,
                 )
                 nav.setdefault("proxy_fallback_error", str(exc)[:200])
+        # Chrome-error auto-recovery: nav landed on chrome-error:// (RST,
+        # protocol error, blank body — Akamai-style refusal on Best Buy
+        # /product/.../openbox URLs is the canonical case). Force a
+        # same-origin homepage warmup + extra humanization to refresh
+        # the _abck score, then retry once. Disable via
+        # T3_CHROME_ERROR_RETRY=0. Skipped if the proxy-fallback path
+        # already retried on this call.
+        if (
+            s is not None
+            and not nav.get("proxy_fallback")
+            and not nav.get("chrome_error_retry")
+            and os.environ.get("T3_CHROME_ERROR_RETRY", "1") != "0"
+            and nav.get("block_class") == "chrome_error"
+        ):
+            err_code = nav.get("chrome_error_code") or ""
+            logger.warning(
+                "navigate %s hit chrome-error (%s) — forcing same-origin "
+                "warmup + humanization burst and retrying once",
+                url, err_code,
+            )
+            try:
+                nav = await self._goto_with_warmup(
+                    sid, url, timeout_s,
+                    force_warmup=True,
+                    extra_humanize=True,
+                )
+                nav["chrome_error_retry"] = True
+            except Exception as exc:
+                logger.warning(
+                    "chrome-error retry raised for %s: %s", url, exc,
+                )
+                nav.setdefault("chrome_error_retry_error", str(exc)[:200])
+            # Surface a fallback hint when the retry didn't fix it. The
+            # orchestrator's existing T2/handoff escalation path can
+            # then consume this without us silently dropping JS-required
+            # pages into a static-HTML fetch.
+            if nav.get("block_class") == "chrome_error":
+                nav.setdefault("fallback_hint", "tier2_static_html")
+                # ERR_HTTP2_PROTOCOL_ERROR specifically suggests the
+                # operator should consider the inverse HTTP/2 toggle
+                # (default is --disable-http2; some Akamai endpoints
+                # need it ON). Surface as a hint — toggling at runtime
+                # would require relaunching the shared browser, which
+                # would disrupt every other concurrent session.
+                if "HTTP2" in (nav.get("chrome_error_code") or ""):
+                    nav["fallback_hint"] = "toggle_http2_then_relaunch"
         state = await self.state(sid)
         # Live viewer telemetry — banner shows the current URL + title
         # so the operator always knows where the worker landed.
