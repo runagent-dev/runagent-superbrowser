@@ -24,6 +24,12 @@ import asyncio
 import os
 import sys
 
+# Arch v4.2: PREPLAN_GATE defaults to OFF in v4.2 (BrowserPreplanTool
+# is no longer registered in the default tool surface — see
+# session_tools.py::register_session_tools). These tests exercise the
+# gate's enforcement and refusal behavior, so they need it ON.
+os.environ.setdefault("PREPLAN_GATE", "1")
+
 
 def _state_with_brief():
     from superbrowser_bridge.session_tools import BrowserSessionState
@@ -246,7 +252,10 @@ def test_preplan_gate_kill_switch_disables_layer() -> None:
         # No preplan, but gate yields.
         assert s.must_screenshot_before_state_change("browser_click_at") is None
     finally:
-        del os.environ["PREPLAN_GATE"]
+        # Restore to "1" (test-suite default) so downstream tests in
+        # the same run still exercise the gate. v4.2 production default
+        # is "0"; we override to "1" at module top.
+        os.environ["PREPLAN_GATE"] = "1"
 
 
 # ── Deadlock backoff ────────────────────────────────────────────────

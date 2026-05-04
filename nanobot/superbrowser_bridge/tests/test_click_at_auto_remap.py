@@ -50,6 +50,17 @@ def _state_with_bboxes(labels: list[str]):
 
 
 def test_remap_when_vN_label_mismatches_but_vM_matches() -> None:
+    """Arch v4 (Step 3 follow-up): auto-remap is now off by default.
+    Real-run traces showed it silently rewriting the brain's V_n to a
+    fuzzy-label-matched V_M that turned out to be the wrong target
+    (e.g. a product card heading instead of a filter chip), producing
+    "lands on a single bottle instead of filtering" failures. With
+    auto-remap off the function returns the original V_n unchanged;
+    the click tool's existing label-mismatch refusal forces the brain
+    to re-evaluate. Test verifies the new default behavior; flipping
+    CLICK_AT_AUTO_REMAP=1 still re-enables the legacy remap (covered
+    by `test_remap_kill_switch_via_env` below)."""
+    import os
     from superbrowser_bridge.session_tools import (
         _resolve_vision_index_by_label,
     )
@@ -58,12 +69,22 @@ def test_remap_when_vN_label_mismatches_but_vM_matches() -> None:
         s, vision_index=1, target_label="White",
         bboxes=s._last_vision_response.bboxes,
     )
-    assert new_idx == 5
-    assert note is not None
-    assert "click_at_remap V_1→V_5" in note
-    assert "White" in note
-    # Counter ticked.
-    assert s._click_at_remap_count == 1
+    # Default-off: brain's vision_index is preserved.
+    assert new_idx == 1
+    assert note is None
+    assert s._click_at_remap_count == 0
+    # Opt-in path still works.
+    os.environ["CLICK_AT_AUTO_REMAP"] = "1"
+    try:
+        new_idx2, note2 = _resolve_vision_index_by_label(
+            s, vision_index=1, target_label="White",
+            bboxes=s._last_vision_response.bboxes,
+        )
+    finally:
+        del os.environ["CLICK_AT_AUTO_REMAP"]
+    assert new_idx2 == 5
+    assert note2 is not None
+    assert "click_at_remap V_1→V_5" in note2
 
 
 def test_no_remap_when_vN_already_matches() -> None:
@@ -157,11 +178,14 @@ def test_remap_cap_honored() -> None:
 
 
 def test_remap_cap_via_env() -> None:
+    """The CLICK_AT_REMAP_MAX cap still works once remap is opted into
+    via CLICK_AT_AUTO_REMAP=1 (Arch v4: now opt-in not opt-out)."""
     from superbrowser_bridge.session_tools import (
         _resolve_vision_index_by_label,
     )
     s = _state_with_bboxes(["Cart", "White"])
     os.environ["CLICK_AT_REMAP_MAX"] = "1"
+    os.environ["CLICK_AT_AUTO_REMAP"] = "1"
     try:
         # First remap: allowed.
         new_idx, note = _resolve_vision_index_by_label(
@@ -178,6 +202,7 @@ def test_remap_cap_via_env() -> None:
         assert new_idx == 1 and note is None
     finally:
         del os.environ["CLICK_AT_REMAP_MAX"]
+        del os.environ["CLICK_AT_AUTO_REMAP"]
 
 
 # ── Worker hook nudge ───────────────────────────────────────────────

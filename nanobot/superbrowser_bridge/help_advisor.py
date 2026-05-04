@@ -1,4 +1,19 @@
-"""In-session help advisor for `browser_request_help`.
+"""DEPRECATED in Arch v4 — pending removal.
+
+The mid-task replanning need is now served by
+``task_brief.redecompose()``, which regenerates the still-open
+checklist tail using the original query + completed_log + current url
+path. ``redecompose()`` fires automatically from the screenshot
+caption pipeline once ``stuck_counter`` crosses 8 (capped at
+``MAX_REDECOMPOSE``). Keep this module loaded so legacy callers
+(``browser_request_help`` tool) still receive an advice string, but do
+NOT extend it. Scheduled for deletion once that tool retires.
+
+────────────────────────────────────────────────────────────────────
+Original docstring follows.
+────────────────────────────────────────────────────────────────────
+
+In-session help advisor for `browser_request_help`.
 
 Background
 ----------

@@ -310,7 +310,12 @@ def test_to_brain_text_full_includes_focus_line() -> None:
 # ── worker_hook surfaces [FOCUS] line ───────────────────────────────
 
 
-def test_worker_hook_emits_focus_line_after_original_query() -> None:
+def test_worker_hook_no_longer_duplicates_query_or_focus() -> None:
+    """Arch v4 (Step 4 slim): the worker_hook no longer re-emits
+    [ORIGINAL_QUERY] or [FOCUS] per iteration. Both are rendered into
+    the screenshot caption by TaskBrief.to_brain_text(compact=False).
+    Re-emitting them was a primary 'noise source' that confused the
+    brain on dense scenes."""
     from superbrowser_bridge.session_tools import BrowserSessionState
     from superbrowser_bridge.task_brief import compute_focus
     from superbrowser_bridge.worker_hook import BrowserWorkerHook
@@ -326,13 +331,14 @@ def test_worker_hook_emits_focus_line_after_original_query() -> None:
     )()
     asyncio.run(hook.after_iteration(ctx))
     msg = ctx.messages[-1]["content"]
-    assert "[ORIGINAL_QUERY]" in msg
-    assert "[FOCUS]" in msg
-    # [FOCUS] should appear AFTER [ORIGINAL_QUERY] in the guidance text.
-    assert msg.index("[ORIGINAL_QUERY]") < msg.index("[FOCUS]")
+    assert "[ORIGINAL_QUERY]" not in msg
+    assert "[FOCUS]" not in msg
 
 
-def test_focus_line_kill_switch_disables() -> None:
+def test_focus_line_kill_switch_inert_after_slim() -> None:
+    """The FOCUS_LINE env var is now inert — the hook no longer reads
+    it. Kept the test as a guardrail in case anyone re-introduces
+    duplicate [FOCUS] emission from the hook."""
     from superbrowser_bridge.session_tools import BrowserSessionState
     from superbrowser_bridge.task_brief import compute_focus
     from superbrowser_bridge.worker_hook import BrowserWorkerHook
@@ -414,8 +420,8 @@ def main() -> int:
         test_focus_line_empty_when_unset,
         test_to_brain_text_full_includes_focus_line,
         # worker hook integration
-        test_worker_hook_emits_focus_line_after_original_query,
-        test_focus_line_kill_switch_disables,
+        test_worker_hook_no_longer_duplicates_query_or_focus,
+        test_focus_line_kill_switch_inert_after_slim,
         test_progress_block_uses_current_focus_idx,
     ]
     failed = 0

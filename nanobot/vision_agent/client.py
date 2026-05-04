@@ -237,49 +237,15 @@ class VisionAgent:
             f"url={(url or '')[:60]}"
         )
 
-        # Set-of-Marks feedback: overlay the bboxes we emitted on the
-        # previous pass so Gemini can re-anchor visually instead of
-        # re-guessing every element from scratch. Opt-out via
-        # VISION_SOM_OVERLAY=0 for A/B testing. Any failure here falls
-        # through to the raw screenshot — overlay must never block a
-        # vision call.
-        #
-        # Suppressed when:
-        #   - intent is solve_captcha_step (tiles re-render between steps)
-        #   - previous pass is older than _SOM_STALE_AFTER_S (anchor too
-        #     cold to trust; layout probably shifted)
-        #   - URL changed since the previous pass (different page → old
-        #     bboxes would point at dead coordinates)
+        # Arch v4 (Step 3): Set-of-Marks overlay removed.
+        # Carrying prior bboxes onto the next screenshot anchored vision
+        # on stale elements when the DOM mutated subtly — a primary
+        # source of "after-step-5" hallucinations in v3. Vision now
+        # re-extracts fresh bboxes per screenshot; epoch-stamped V_n
+        # indices (Step 2 freshness gate) are the only ground.
+        # Cursor-trail overlay for captcha step-mode is preserved below.
         _bucket = intent_bucket(intent)
         sid_key = session_id or "_"
-        prev_ts = self._last_response_ts.get(sid_key, 0.0)
-        prev_url = self._last_response_url.get(sid_key, "")
-        _som_prev_stale = (
-            prev_ts > 0.0
-            and (time.monotonic() - prev_ts) > self._SOM_STALE_AFTER_S
-        )
-        _som_url_changed = bool(prev_url) and (prev_url != (url or ""))
-        if (
-            os.environ.get("VISION_SOM_OVERLAY", "1") != "0"
-            and _bucket != "solve_captcha_step"
-            and not _som_prev_stale
-            and not _som_url_changed
-        ):
-            prev = self._last_response_bboxes.get(sid_key) or []
-            if prev and image_width > 0 and image_height > 0:
-                try:
-                    from superbrowser_bridge.highlights import build_som_screenshot
-                    screenshot_b64 = build_som_screenshot(
-                        screenshot_b64, prev, image_width, image_height,
-                    )
-                except Exception as exc:
-                    _log(f"SoM overlay failed (non-fatal): {exc!r}")
-        elif _som_prev_stale or _som_url_changed:
-            # Clear the stale anchor so future passes don't keep
-            # re-evaluating the same ageing bboxes.
-            self._last_response_bboxes.pop(sid_key, None)
-            self._last_response_ts.pop(sid_key, None)
-            self._last_response_url.pop(sid_key, None)
 
         # Cursor trail overlay — only for captcha step-mode. Draws numbered
         # dots where earlier step-mode clicks landed so Gemini can reason

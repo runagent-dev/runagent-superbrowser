@@ -78,6 +78,24 @@ class Constraint:
     # extractor populates this when the query has dependencies; the focus
     # picker skips a constraint whose prerequisite is unverified.
     prerequisite_idx: int = -1
+    # Arch v4: stable id (slug). Survives reorderings; used by focus_id
+    # and the [CHECKLIST] render. Lazily populated by ensure_id().
+    id: str = ""
+    # Arch v4: written ONCE on terminal flip (satisfied|failed|na).
+    # ≤120 chars. Replaces accumulating per-turn evidence as the
+    # canonical post-completion summary line in [CHECKLIST].
+    outcome: str = ""
+
+    def ensure_id(self, fallback_idx: int = 0) -> str:
+        """Lazily compute a stable slug id from canonical_value/text."""
+        if self.id:
+            return self.id
+        seed = (self.canonical_value or self.text or "").strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", seed).strip("_")
+        if not slug:
+            slug = f"item{fallback_idx + 1}"
+        self.id = slug[:24]
+        return self.id
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -95,6 +113,8 @@ class Constraint:
             evidence=str(d.get("evidence") or "")[:160],
             last_checked_url=str(d.get("last_checked_url") or "")[:240],
             prerequisite_idx=int(d.get("prerequisite_idx") if d.get("prerequisite_idx") is not None else -1),
+            id=str(d.get("id") or "")[:24],
+            outcome=str(d.get("outcome") or "")[:120],
         )
 
 
@@ -143,6 +163,9 @@ class TaskBrief:
     target_url: str = ""
     domain: str = ""
     constraints: list[Constraint] = field(default_factory=list)
+    # Legacy (Arch v3) fields. Kept as dataclass fields so existing
+    # serialized briefs still deserialize, but Arch v4 no longer
+    # renders them. Will be removed after callers migrate.
     plan_of_attack: str = ""
     cot_trail: list[ChainOfThoughtNote] = field(default_factory=list)
     extracted_at: float = 0.0
@@ -155,12 +178,51 @@ class TaskBrief:
     # auto-recompute fires (e.g. another constraint flips). -1 means
     # "no constraints / all done / no recommendation".
     current_focus_idx: int = -1
+    # Arch v4 (sub-goal compression): id-based mirror of
+    # current_focus_idx. Updated together with current_focus_idx via
+    # _sync_focus_id(); reorder-safe.
+    focus_id: str = ""
+    # Arch v4: one-line summaries of items closed via mark_constraint
+    # (terminal status). Capped at MAX_COMPLETED_LOG. Replaces the
+    # accumulating cot_trail with a bounded set of "<text> → <outcome>"
+    # entries the brain reads at a glance.
+    completed_log: list[str] = field(default_factory=list)
+    # Arch v4: turns since last progress signal. Reset on terminal
+    # constraint flip; bumped by callers when an attempt yields no
+    # status change. Drives the redecompose-on-stuck trigger.
+    stuck_counter: int = 0
+    # Arch v4: how many times redecompose() has been called for this
+    # brief. Capped at MAX_REDECOMPOSE.
+    redecompose_count: int = 0
 
-    # Maximum CoT notes retained — prevents unbounded growth on long
-    # tasks. The most recent N are kept; older ones drop off.
+    # Maximum CoT notes retained — legacy. Kept so old code paths
+    # writing to cot_trail don't OOM, but cot_trail is no longer
+    # rendered into the brain prompt.
     MAX_COT_NOTES: int = 20
+    # Arch v4: maximum entries kept in completed_log before old
+    # entries roll off. Mirrors the max checklist size.
+    MAX_COMPLETED_LOG: int = 12
+    # Arch v4: redecompose() refuses to fire more than this many
+    # times per task — protects against pathological replanning loops.
+    MAX_REDECOMPOSE: int = 2
+
+    def _sync_focus_id(self) -> None:
+        """Mirror current_focus_idx onto focus_id (id-based slug)."""
+        idx = self.current_focus_idx
+        if 0 <= idx < len(self.constraints):
+            self.focus_id = self.constraints[idx].ensure_id(idx)
+        else:
+            self.focus_id = ""
+
+    def bump_stuck(self) -> int:
+        """Increment stuck_counter; return the new value."""
+        self.stuck_counter += 1
+        return self.stuck_counter
 
     def add_cot_note(self, turn: int, summary: str, decision: str = "") -> None:
+        """Legacy: append a CoT note. Arch v4 no longer renders these
+        but the field is preserved so older callsites don't crash.
+        """
         note = ChainOfThoughtNote(
             turn=int(turn),
             summary=(summary or "").strip()[:200],
@@ -178,11 +240,17 @@ class TaskBrief:
         status: ConstraintStatus,
         evidence: str = "",
         url: str = "",
+        outcome: str = "",
     ) -> bool:
         """Update a constraint's status. Returns True if status changed.
 
         Arch v4 Move 2: also recomputes `current_focus_idx` after a flip
         so the brain's next-iteration FOCUS pointer reflects the change.
+
+        Arch v4 (sub-goal compression): on a TERMINAL flip
+        (satisfied|failed|not_applicable), also writes
+        constraint.outcome (≤120 chars), appends a one-line entry to
+        completed_log (bounded), and resets stuck_counter.
         """
         if not (0 <= index < len(self.constraints)):
             return False
@@ -194,10 +262,26 @@ class TaskBrief:
             c.evidence = evidence[:160]
         if url:
             c.last_checked_url = url[:240]
+
+        if status in {"satisfied", "failed", "not_applicable"}:
+            # Pick the most informative source for the outcome line:
+            # explicit outcome arg > evidence arg > prior c.evidence.
+            out_clean = (outcome or evidence or c.evidence or "").strip()
+            if out_clean:
+                c.outcome = out_clean[:120]
+            label = c.text or c.canonical_value or c.ensure_id(index)
+            log_line = f"{label} → {c.outcome}" if c.outcome else label
+            self.completed_log.append(log_line[:200])
+            if len(self.completed_log) > self.MAX_COMPLETED_LOG:
+                self.completed_log = self.completed_log[-self.MAX_COMPLETED_LOG :]
+            # A terminal flip is progress — clear stuck counter.
+            self.stuck_counter = 0
+
         self.version += 1
         # Recompute focus on every status change. Cheap (linear in
         # constraint count, typically <10).
         self.current_focus_idx = compute_focus(self)
+        self._sync_focus_id()
         return True
 
     def find_constraint_by_canonical(self, canonical: str) -> int:
@@ -248,20 +332,24 @@ class TaskBrief:
     def to_brain_text(self, *, compact: bool = False) -> str:
         """Render the brief for inclusion in tool result captions.
 
-        compact=True: header + one-line constraint summary + latest CoT.
-        compact=False: full multi-line view including original query.
+        Arch v4 — fixed-shape render:
+          - compact=True: one-line `[BRIEF v=N] checklist=sat/total ...`
+          - compact=False: `[TASK_BRIEF v=N]`, original query, [CHECKLIST]
+            block, optional [FOCUS] line, optional last 3 completed_log.
+
+        cot_trail and plan_of_attack are still stored for back-compat
+        (deserialization of old saved briefs) but are no longer rendered.
         """
         total, sat, fail = self.counts()
         if compact:
             bits = [
                 f"[BRIEF v={self.version}]",
-                f"constraints={sat}/{total}",
+                f"checklist={sat}/{total}",
             ]
             if fail:
                 bits.append(f"failed={fail}")
-            if self.cot_trail:
-                last = self.cot_trail[-1]
-                bits.append(f'cot="{last.summary[:80]}"')
+            if self.focus_id:
+                bits.append(f"focus={self.focus_id}")
             return " ".join(bits)
 
         lines: list[str] = [f"[TASK_BRIEF v={self.version}]"]
@@ -269,55 +357,70 @@ class TaskBrief:
         # exact phrasing here.
         if self.original_query:
             lines.append(f"Original: {self.original_query}")
-        if self.plan_of_attack:
-            lines.append(f"Approach: {self.plan_of_attack}")
-        # Arch v4 Move 2: surface the system-recommended focus inside
-        # the full brief render too. The hook also emits a standalone
-        # [FOCUS] line every iteration; this is the version that lands
-        # in screenshot captions where to_brain_text(compact=False) is
-        # used.
+        if self.constraints:
+            lines.append(self.render_checklist_block())
         focus_line = self.focus_line()
         if focus_line:
             lines.append(focus_line)
-        if self.constraints:
-            lines.append(
-                f"Constraints ({total} total, {sat} satisfied"
-                + (f", {fail} failed" if fail else "")
-                + "):"
-            )
-            for c in self.constraints:
-                marker = {
-                    "satisfied": "[done]",
-                    "failed": "[fail]",
-                    "not_applicable": "[n/a] ",
-                    "unverified": "[?]   ",
-                }.get(c.status, "[?]   ")
-                kind_bit = f"({c.kind})"
-                # Numeric / negative / ordering get a richer line.
-                cmp_bit = ""
-                if c.operator:
-                    cmp_bit = f" {c.operator}"
-                    if c.threshold:
-                        cmp_bit += f" {c.threshold}"
-                        if c.unit:
-                            cmp_bit += c.unit
-                ev_bit = ""
-                if c.evidence and c.status == "satisfied":
-                    ev_bit = f'  evidence="{c.evidence[:60]}"'
-                    if c.last_checked_url:
-                        # Keep URL short — brain just needs the path.
-                        ev_bit += f' @ {_short_url(c.last_checked_url)}'
-                elif c.last_checked_url and c.status == "failed":
-                    ev_bit = f"  reason={c.evidence[:60]!r}"
-                lines.append(
-                    f"  {marker} {c.text or c.canonical_value}{cmp_bit} {kind_bit}{ev_bit}"
-                )
-        if self.cot_trail:
-            last = self.cot_trail[-1]
-            lines.append(
-                f'Latest CoT (turn {last.turn}): "{last.summary[:160]}"'
-            )
+        if self.completed_log:
+            tail = self.completed_log[-3:]
+            lines.append("Recently closed:")
+            for entry in tail:
+                lines.append(f"  · {entry}")
         return "\n".join(lines)
+
+    def render_checklist_block(self) -> str:
+        """Render the `[CHECKLIST]` block per Arch v4 §B template.
+
+        Format:
+            [CHECKLIST] N items, S done, F failed
+              - [done]    1) <text>   → <outcome>
+              - [active]  2) <text>   ← focus
+              - [open]    3) <text>
+              - [blocked] 4) <text>   → <reason>
+
+        Each line ≤120 chars; max 12 items rendered (the checklist is
+        already capped at extraction time so this is a guard, not a cut).
+        """
+        total, sat, fail = self.counts()
+        header = f"[CHECKLIST] {total} items, {sat} done"
+        if fail:
+            header += f", {fail} failed"
+        lines: list[str] = [header]
+        focus_idx = self.current_focus_idx
+        for i, c in enumerate(self.constraints[:12]):
+            label_text = (c.text or c.canonical_value or c.ensure_id(i))[:60]
+            if c.status == "satisfied":
+                marker = "[done]   "
+                tail = f" → {c.outcome}" if c.outcome else ""
+            elif c.status == "failed":
+                marker = "[blocked]"
+                tail = f" → {c.outcome or 'failed'}"
+            elif c.status == "not_applicable":
+                marker = "[na]     "
+                tail = f" → {c.outcome or 'not applicable'}"
+            elif i == focus_idx:
+                marker = "[active] "
+                tail = "  ← focus"
+            else:
+                marker = "[open]   "
+                tail = ""
+            line = f"  - {marker} {i + 1}) {label_text}{tail}"
+            lines.append(line[:120])
+        return "\n".join(lines)
+
+    def render_query_block(self) -> str:
+        """Render the `[QUERY]` block per Arch v4 §B template (≤800 chars).
+
+        Brain pulls the original wording from here on every step — this
+        is the persistent task memory humans rely on.
+        """
+        q = (self.original_query or "").strip()
+        if not q:
+            return "[QUERY] (no original query recorded)"
+        if len(q) > 800:
+            q = q[:797] + "..."
+        return f"[QUERY] {q}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -331,6 +434,10 @@ class TaskBrief:
             "extraction_model": self.extraction_model,
             "version": self.version,
             "current_focus_idx": self.current_focus_idx,
+            "focus_id": self.focus_id,
+            "completed_log": list(self.completed_log),
+            "stuck_counter": self.stuck_counter,
+            "redecompose_count": self.redecompose_count,
         }
 
     @classmethod
@@ -356,6 +463,13 @@ class TaskBrief:
             extraction_model=str(d.get("extraction_model") or ""),
             version=int(d.get("version") or 1),
             current_focus_idx=focus,
+            focus_id=str(d.get("focus_id") or "")[:24],
+            completed_log=[
+                str(s)[:200] for s in (d.get("completed_log") or [])
+                if isinstance(s, str)
+            ],
+            stuck_counter=int(d.get("stuck_counter") or 0),
+            redecompose_count=int(d.get("redecompose_count") or 0),
         )
 
 
@@ -859,6 +973,16 @@ async def build_task_brief(
             constraints.append(c)
             seen.add(key)
 
+    # Arch v4: cap at MAX_COMPLETED_LOG to align with the per-step
+    # checklist render. Extractor already requests 1..12; this is a
+    # belt-and-braces guard.
+    if len(constraints) > TaskBrief.MAX_COMPLETED_LOG:
+        constraints = constraints[: TaskBrief.MAX_COMPLETED_LOG]
+    # Arch v4: ensure each constraint has a stable id slug before the
+    # brief is exposed to renderers / focus_id mirroring.
+    for i, c in enumerate(constraints):
+        c.ensure_id(i)
+
     brief = TaskBrief(
         original_query=query,
         target_url=target_url,
@@ -873,6 +997,7 @@ async def build_task_brief(
     # Arch v4 Move 2: seed focus on construction so the first iteration
     # already has a system recommendation in [FOCUS].
     brief.current_focus_idx = compute_focus(brief)
+    brief._sync_focus_id()
     return brief
 
 
@@ -1193,14 +1318,178 @@ def merge_brief_progress(
                 nc.evidence = match.evidence
             if match.last_checked_url:
                 nc.last_checked_url = match.last_checked_url
+            # Arch v4: also carry over outcome (one-line summary) so the
+            # successor brief renders the closed item identically.
+            if getattr(match, "outcome", ""):
+                nc.outcome = match.outcome
             transferred += 1
     if transferred > 0:
         new.version += 1
+    # Arch v4: carry over completed_log + redecompose_count so the
+    # successor brief preserves history of what's already been closed
+    # and respects the redecompose budget across handoffs.
+    if old.completed_log and not new.completed_log:
+        new.completed_log = list(old.completed_log[-TaskBrief.MAX_COMPLETED_LOG :])
+    new.redecompose_count = max(new.redecompose_count, old.redecompose_count)
     # Arch v4 Move 2: re-seed focus on the new brief whether or not any
     # progress transferred — the new constraints may have shuffled
     # ordering or added prerequisites that change the recommendation.
     new.current_focus_idx = compute_focus(new)
+    new._sync_focus_id()
     return transferred
+
+
+# ── Redecompose (Arch v4) ────────────────────────────────────────────
+
+
+_REDECOMPOSE_SYSTEM_PROMPT = """\
+You re-extract structured constraints for a browser task that has gotten
+stuck mid-execution. Some constraints have already been closed. Your job
+is to produce the REMAINING checklist tail using:
+  - the original user query (unchanged source of truth),
+  - the recently_closed items (do NOT re-emit any of these),
+  - the current_url_path (to bias toward the current funnel step).
+
+OUTPUT — return ONLY this JSON object, no commentary:
+{
+  "constraints": [
+    {
+      "text":"<short verbatim quote>",
+      "kind":"filter|attribute|negative|numeric|ordering",
+      "canonical_value":"<lowercase normalized value>",
+      "operator":"eq|lte|gte|contains|not|ascending|descending",
+      "threshold":"<numeric threshold or empty>",
+      "unit":"<USD|stars|miles|empty>"
+    }
+  ]
+}
+
+Rules:
+- Emit ONLY constraints still open. Skip anything in recently_closed.
+- 0..8 constraints. Empty array is valid (task is essentially done).
+- Keep canonical_value short and lowercase.
+"""
+
+
+async def redecompose(
+    brief: Optional[TaskBrief],
+    *,
+    current_url_path: str = "",
+) -> int:
+    """Replace the still-open/active tail of ``brief.constraints`` with a
+    freshly-extracted set, using ``original_query`` + ``completed_log`` +
+    ``current_url_path`` as context.
+
+    Refuses if ``brief.redecompose_count >= TaskBrief.MAX_REDECOMPOSE``.
+    Closed (satisfied/failed/not_applicable) constraints are preserved
+    in place; only ``unverified`` constraints are pruned and replaced.
+
+    Returns the number of new tail constraints added (or 0 if refused
+    / no change). Increments ``brief.redecompose_count`` on success.
+
+    LLM call uses the same Gemini-Flash plumbing as
+    ``extract_constraints_llm``. On any failure, returns 0 without
+    mutating the brief — callers can keep the existing tail.
+    """
+    if brief is None:
+        return 0
+    if brief.redecompose_count >= TaskBrief.MAX_REDECOMPOSE:
+        return 0
+    if not brief.original_query:
+        return 0
+
+    api_key = (
+        os.environ.get("VISION_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    )
+    if not api_key:
+        return 0
+    try:
+        from openai import AsyncOpenAI  # type: ignore
+    except Exception:
+        return 0
+
+    model = os.environ.get("TASK_BRIEF_MODEL") or "gemini-2.5-flash"
+    base_url = os.environ.get(
+        "TASK_BRIEF_BASE_URL"
+    ) or "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    closed_lines = "\n".join(f"- {s}" for s in brief.completed_log[-12:])
+    user_payload = (
+        f"original_query:\n  {brief.original_query[:2000]}\n\n"
+        f"current_url_path:\n  {current_url_path or '(unknown)'}\n\n"
+        f"recently_closed:\n{closed_lines or '  (none)'}"
+    )
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=10.0)
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _REDECOMPOSE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_payload[:6000]},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1000,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        print(f"[task_brief] redecompose LLM call failed: {exc}")
+        return 0
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    try:
+        content = (resp.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError):
+        return 0
+    data: Any = None
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = _repair_truncated_json(content)
+    if not isinstance(data, dict):
+        return 0
+    raw_list = data.get("constraints") or []
+    if not isinstance(raw_list, list):
+        return 0
+    new_tail: list[Constraint] = []
+    for raw in raw_list[: TaskBrief.MAX_COMPLETED_LOG]:
+        if isinstance(raw, dict):
+            new_tail.append(Constraint.from_dict(raw))
+    # Drop any constraint whose canonical_value already appears in the
+    # closed set — the LLM is asked to skip these, but be defensive.
+    closed_canonicals = {
+        (c.canonical_value or c.text).strip().lower()
+        for c in brief.constraints
+        if c.status in {"satisfied", "failed", "not_applicable"}
+    }
+    new_tail = [
+        c for c in new_tail
+        if (c.canonical_value or c.text).strip().lower() not in closed_canonicals
+    ]
+    if not new_tail:
+        return 0
+
+    # Replace open/active constraints with the new tail. Closed ones
+    # stay in place (front of the list).
+    closed = [
+        c for c in brief.constraints
+        if c.status in {"satisfied", "failed", "not_applicable"}
+    ]
+    brief.constraints = closed + new_tail
+    for i, c in enumerate(brief.constraints):
+        c.ensure_id(i)
+    brief.redecompose_count += 1
+    brief.stuck_counter = 0
+    brief.version += 1
+    brief.current_focus_idx = compute_focus(brief)
+    brief._sync_focus_id()
+    return len(new_tail)
 
 
 __all__ = [
@@ -1218,4 +1507,5 @@ __all__ = [
     "reconcile_from_page_state",
     "reconcile_from_url",
     "reconcile_negative_constraints",
+    "redecompose",
 ]

@@ -13,6 +13,8 @@ bridge denormalizes to CSS pixels before any click is dispatched.
 
 from __future__ import annotations
 
+import os
+
 SYSTEM_PROMPT = """You are a machine-vision agent embedded between a web browser \
 and a reasoning agent. You are the "eyes" — you see the page, and the browser \
 tools are the "hands". You receive one screenshot at a time and return a single \
@@ -578,20 +580,36 @@ def build_user_prompt(
                 "but not this immediate step.\n"
             )
 
-    # Arch v3 fix #3: explicit FOCUS block from the active TaskBrief
-    # constraint. Vision uses this to rank V_1 — the bbox most likely to
-    # advance THIS constraint, not the overall task.
-    if active_constraint and isinstance(active_constraint, dict):
+    # Arch v4.2: explicit FOCUS biasing toggled OFF by default.
+    # The previous "find the FILTER chip whose label contains {cv} and
+    # set role_in_scene='target' / intent_relevant=true" biasing forced
+    # Gemini to pick the FIRST element matching the canonical_value as
+    # V_1. On real pages this routinely picked the wrong element when
+    # the term appeared in multiple places (e.g. "White" on a mega-menu
+    # navigation tile, on a category card heading, AND on the actual
+    # filter chip — the chip is what the brain wants but the tile won
+    # the bias). OLD lightweight architecture had no per-constraint
+    # bias and ranked bboxes on the overall task only — that worked
+    # better in practice. Re-enable with VISION_FOCUS_BIAS=1 for A/B.
+    if (
+        active_constraint
+        and isinstance(active_constraint, dict)
+        and os.environ.get("VISION_FOCUS_BIAS", "0") == "1"
+    ):
         kind = str(active_constraint.get("kind", "filter") or "filter")
         cv = str(active_constraint.get("canonical_value", "") or "").strip()
         text = str(active_constraint.get("text", "") or "").strip()
         op = str(active_constraint.get("operator", "") or "").strip()
         threshold = str(active_constraint.get("threshold", "") or "").strip()
         unit = str(active_constraint.get("unit", "") or "").strip()
-        focus_lines = ["FOCUS — the brain's next click should advance THIS constraint:"]
+        # Soft hint only — no role_in_scene mandate, no "set V_1 to X"
+        # directive. Just tell Gemini what kind of UI element matters
+        # so it doesn't cull it; let the existing intent_relevant +
+        # confidence ranking decide V_1.
+        focus_lines = ["Brain's current focus (informational only — rank by your normal rules):"]
         if cv or text:
             label = cv or text
-            focus_lines.append(f"  - target: {label!r} (kind={kind})")
+            focus_lines.append(f"  - working on: {label!r} (kind={kind})")
         if op:
             cmp_bit = op
             if threshold:
@@ -599,42 +617,6 @@ def build_user_prompt(
                 if unit:
                     cmp_bit += f" {unit}"
             focus_lines.append(f"  - condition: {cmp_bit}")
-        # Per-kind hint about what to look for
-        if kind == "filter":
-            focus_lines.append(
-                f"  - find the FILTER chip / checkbox / toggle whose "
-                f"label contains {cv!r}. Set its bbox role_in_scene='target' "
-                f"and intent_relevant=true. If a filter group is collapsed "
-                f"and the target is inside it, emit the EXPAND chevron / "
-                f"caret as a separate target bbox so the brain can open "
-                f"the group first."
-            )
-        elif kind == "numeric":
-            focus_lines.append(
-                f"  - find the slider / range input / numeric filter that "
-                f"controls {cv!r}. Both thumbs (low + high), the track, "
-                f"and the rendered value label should each be separate "
-                f"bboxes (see slider rules in the system prompt)."
-            )
-        elif kind == "ordering":
-            focus_lines.append(
-                f"  - find the SORT / ORDER dropdown or chip. The relevant "
-                f"option for direction={op!r} on {cv!r} (e.g. 'Price: low "
-                f"to high', 'Highest rating') should be the target."
-            )
-        elif kind == "negative":
-            focus_lines.append(
-                f"  - find the EXCLUDE / 'no {cv}' filter, OR the positive "
-                f"chip for {cv!r} that you may need to UNCHECK if it's "
-                f"currently active. role_in_scene='target' for whichever "
-                f"applies."
-            )
-        else:  # attribute
-            focus_lines.append(
-                f"  - find the input / link / facet that lets the brain "
-                f"select {cv!r}. If multiple candidates exist, prefer the "
-                f"one closest to the page's primary results area."
-            )
         context += "\n".join(focus_lines) + "\n"
 
     if previous_summary:

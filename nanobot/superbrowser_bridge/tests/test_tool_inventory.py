@@ -20,9 +20,12 @@ import sys
 # Tools the brain MUST be able to call in arch v4.
 _REQUIRED_TOOLS = {
     # Lifecycle
-    "browser_open", "browser_navigate", "browser_close",
+    # Arch v4.4: browser_navigate is NOT registered by default.
+    # browser_open handles cold-start; in-task navigation goes via
+    # browser_click_at(V_n). Re-enable with REGISTER_BROWSER_NAVIGATE=1.
+    "browser_open", "browser_close",
     # Vision
-    "browser_screenshot", "browser_look_again", "browser_state_check",
+    "browser_screenshot",
     "browser_image_region",
     # The single click family
     "browser_click_at",
@@ -41,11 +44,16 @@ _REQUIRED_TOOLS = {
     "browser_get_rect",
     # Last-resort tier-3 / tier-4
     "browser_eval", "browser_run_script",
-    # Verification + planning
-    "browser_verify_action", "browser_update_task_brief",
-    "browser_preplan",
-    "browser_set_task_plan", "browser_plan_next_steps",
-    "browser_plan_skip_step", "browser_plan_replan",
+    # Hierarchical planning (still in default surface).
+    # Arch v4.1 (Fix 2a): browser_set_task_plan, browser_plan_skip_step,
+    # and browser_plan_replan removed — TaskBrief.checklist is the
+    # single source of truth.
+    # Arch v4.2: browser_look_again, browser_state_check,
+    # browser_verify_action, browser_update_task_brief, browser_preplan
+    # also removed from default surface — they were meta-vision bloat
+    # making the brain take 5 tool calls per click. OLD lightweight
+    # architecture used only screenshot + get_markdown for observation.
+    "browser_plan_next_steps",
     "browser_wait_for",
     # Captcha + escalate
     "browser_detect_captcha", "browser_solve_captcha",

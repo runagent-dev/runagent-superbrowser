@@ -446,11 +446,15 @@ def _scene_fingerprint(
 
 # ── main entry point ────────────────────────────────────────────────────
 
-# Process-local 3s cache keyed by plan_hash. Re-planning on an identical
-# scene wastes turns; 3s is long enough to deduplicate rapid retries,
-# short enough that a real scene change breaks it.
-_CACHE_TTL_S = 3.0
-_cache: dict[str, tuple[float, ActionQueue]] = {}
+# Process-local cache keyed by plan_hash (which already encodes the
+# scene fingerprint, url, and task instruction).
+#
+# Arch v4 (Step 5): the previous 3-second wall-clock TTL replanned the
+# same identical scene every few seconds, churning without memory of
+# prior decisions. The cache now persists indefinitely; eviction is by
+# scene change (different plan_hash → fresh entry) and by capacity
+# trim (lines below). Same scene → same plan, single source of truth.
+_cache: dict[str, ActionQueue] = {}
 
 
 def plan(
@@ -470,8 +474,8 @@ def plan(
 
     now = time.monotonic()
     cached = _cache.get(phash)
-    if cached and (now - cached[0]) < _CACHE_TTL_S:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     actions: list[PlannedAction] = []
 
@@ -623,7 +627,7 @@ def plan(
         plan_hash=phash,
         generated_at=now,
     )
-    _cache[phash] = (now, queue)
+    _cache[phash] = queue
     # Trim cache opportunistically.
     if len(_cache) > 64:
         for k in list(_cache.keys())[: len(_cache) - 32]:

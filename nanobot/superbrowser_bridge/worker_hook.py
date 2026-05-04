@@ -253,21 +253,14 @@ class BrowserWorkerHook(AgentHook):
         # screenshot-budget limiter automatically re-engage after solving.
         self.state.tick_captcha_mode()
 
-        # --- Arch v4 Move 5: pin [ORIGINAL_QUERY] full-verbatim ---------
-        # First guidance line on every iteration when a brief exists.
-        # Long sessions otherwise let the user's verbatim query scroll out
-        # of recent context. Re-pinning costs ~50–300 tokens but keeps the
-        # brain's primary objective unambiguous on multi-constraint tasks.
-        # Kill switch: PIN_ORIGINAL_QUERY=0.
-        if __import__("os").environ.get("PIN_ORIGINAL_QUERY", "1") != "0":
-            brief_oq = getattr(self.state, "task_brief", None)
-            if brief_oq is not None:
-                try:
-                    oq = (brief_oq.original_query or "").strip()
-                    if oq:
-                        guidance_parts.append(f"[ORIGINAL_QUERY] {oq}")
-                except Exception:
-                    pass
+        # Arch v4 (Step 4 slim): the per-iteration [ORIGINAL_QUERY] and
+        # [FOCUS] re-pins are removed. Both are now rendered into the
+        # screenshot caption by TaskBrief.to_brain_text(compact=False)
+        # which fires on every browser_screenshot, and the post-Step-2
+        # freshness gate forces a fresh screenshot before each click.
+        # Re-emitting them from the hook duplicated 50–800 chars per
+        # turn and was a primary "noise source" that made the brain
+        # confuse V_n indices on dense scenes.
 
         # --- Arch v4 Move 1: [GATE_BACKOFF] notice ---------------------
         # When the preplan gate auto-disengages after 3 consecutive
@@ -290,21 +283,11 @@ class BrowserWorkerHook(AgentHook):
         except Exception:
             pass
 
-        # --- Arch v4 Move 2: [FOCUS] line on every iteration ------------
-        # Renders the system-recommended next constraint right under
-        # [ORIGINAL_QUERY] so the brain sees the prioritization signal
-        # before reading [BUDGET] / brief checklist. The brain may
-        # override via browser_update_task_brief; until then this is the
-        # system's recommendation. Kill switch: FOCUS_LINE=0.
-        if __import__("os").environ.get("FOCUS_LINE", "1") != "0":
-            brief_focus = getattr(self.state, "task_brief", None)
-            if brief_focus is not None:
-                try:
-                    focus_text = brief_focus.focus_line()
-                    if focus_text:
-                        guidance_parts.append(focus_text)
-                except Exception:
-                    pass
+        # Arch v4 (Step 4 slim): per-iteration [FOCUS] re-emit removed.
+        # The focus line is now rendered into the screenshot caption by
+        # TaskBrief.to_brain_text(compact=False) and surfaced via the
+        # render_checklist_block "← focus" marker. Single source of
+        # truth.
 
         # --- Generic action-repetition detection ---
         # Inspect the last recorded step (added by the tool that just ran)
@@ -578,12 +561,11 @@ class BrowserWorkerHook(AgentHook):
                     + f"  remaining_iter={remaining}]"
                 )
                 guidance_parts.append(budget_line)
-                # Render compact form to keep token cost low — the full
-                # form is in build_tool_result_blocks for screenshot
-                # turns where the brain is making strategic decisions.
-                brief_compact = brief.to_brain_text(compact=True)
-                if brief_compact:
-                    guidance_parts.append(brief_compact)
+                # Arch v4 (Step 4 slim): the brief compact one-liner is
+                # no longer re-emitted from the hook. The full
+                # to_brain_text(compact=False) lands in the screenshot
+                # caption (post-Step-2 freshness gate forces a fresh
+                # screenshot per turn anyway).
             except Exception:
                 pass
 
@@ -604,25 +586,12 @@ class BrowserWorkerHook(AgentHook):
             except Exception:
                 pass
 
-        # --- TaskPlan rendering -----------------------------------------
-        # If the brain committed to a multi-step plan via
-        # browser_set_task_plan, render it on every iteration so the
-        # cursor never falls out of working memory. Composition rule
-        # (see task_plan.py): when a form_session is ALSO active, the
-        # form checklist is the primary view and the TaskPlan renders
-        # as a single-line cursor; otherwise the full plan checklist
-        # is shown. Verify_action handles per-step advancement; this
-        # hook is the persistent visual reminder.
-        plan = getattr(self.state, "task_plan", None)
+        # Arch v4 (Step 4 slim): TaskPlan rendering removed. task_plan.py
+        # is deprecated (see deprecation banner at the top of that file).
+        # Multi-step decomposition now lives in TaskBrief.checklist
+        # (Step 1 schema). The form_session render below remains since
+        # form-fill state is orthogonal to checklist state.
         form_sess = getattr(self.state, "form_session", None)
-        if plan is not None:
-            try:
-                compact = form_sess is not None
-                plan_text = plan.to_brain_text(compact=compact)
-                if plan_text:
-                    guidance_parts.append(plan_text)
-            except Exception:
-                pass
 
         # --- Arch v3: dense-scene verify nudge --------------------------
         # When the most recent click landed on a scene with ≥5 candidate

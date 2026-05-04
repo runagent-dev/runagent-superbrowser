@@ -17,6 +17,10 @@ import asyncio
 import os
 import sys
 
+# Arch v4.2: gate is OFF in v4.2 default (BrowserPreplanTool unregistered).
+# This file's test of the lock interaction needs the gate ON.
+os.environ.setdefault("PREPLAN_GATE", "1")
+
 
 # ── _find_best_label_match: fuzzy matcher ──────────────────────────
 

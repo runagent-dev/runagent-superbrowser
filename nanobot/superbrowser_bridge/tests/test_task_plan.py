@@ -958,69 +958,73 @@ def test_navigate_filter_hack_kill_switch() -> None:
 # ── v7: intent auto-injection + close guard ──
 
 
+def _brief_with_focus(canonical: str, kind: str = "filter"):
+    """Helper: build a TaskBrief with a single unverified constraint
+    set as the focus. Arch v4.1 tests use this since intent enrichment
+    is now TaskBrief-driven, not TaskPlan-driven."""
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint, compute_focus
+    b = TaskBrief(
+        original_query="x",
+        constraints=[
+            Constraint(
+                text=canonical, kind=kind,
+                canonical_value=canonical.lower(),
+            ),
+        ],
+    )
+    b.current_focus_idx = compute_focus(b)
+    b._sync_focus_id()
+    return b
+
+
 def test_intent_auto_inject_replaces_generic() -> None:
-    """When the brain's intent is generic ('ground before plan'), the
-    screenshot tool replaces it with the active TaskPlan step name."""
+    """Arch v4.1 (Fix 2b): when the brain's intent is generic, the
+    screenshot tool replaces it with the active TaskBrief constraint
+    (canonical_value + kind). Source switched from task_plan."""
     from superbrowser_bridge.session_tools import (
         BrowserSessionState, BrowserScreenshotTool,
     )
-    from superbrowser_bridge.task_plan import make_plan
-
     s = BrowserSessionState()
-    s.task_plan = make_plan([
-        {"name": "Apply Region=Oregon", "success_criteria": {"kind": "url_changed"}},
-        {"name": "next", "success_criteria": {"kind": "url_changed"}},
-    ])
-    s.task_plan.active_step()
+    s.task_brief = _brief_with_focus("Oregon", kind="filter")
     tool = BrowserScreenshotTool(s)
     enriched = tool._enrich_intent_with_plan("ground before setting task plan")
-    assert "Apply Region=Oregon" in enriched, f"got {enriched!r}"
+    assert "oregon" in enriched.lower(), f"got {enriched!r}"
+    assert "filter" in enriched.lower()
 
 
 def test_intent_auto_inject_appends_when_specific() -> None:
-    """A specific brain intent isn't replaced — the step name is just
-    appended as context."""
+    """A specific brain intent isn't replaced — the focus phrase is
+    just appended as context."""
     from superbrowser_bridge.session_tools import (
         BrowserSessionState, BrowserScreenshotTool,
     )
-    from superbrowser_bridge.task_plan import make_plan
-
     s = BrowserSessionState()
-    s.task_plan = make_plan([
-        {"name": "Apply Region=Oregon", "success_criteria": {"kind": "url_changed"}},
-        {"name": "next", "success_criteria": {"kind": "url_changed"}},
-    ])
-    s.task_plan.active_step()
+    s.task_brief = _brief_with_focus("Oregon", kind="filter")
     tool = BrowserScreenshotTool(s)
     enriched = tool._enrich_intent_with_plan("find the Region accordion sidebar")
     assert "find the Region accordion" in enriched
-    assert "active step: Apply Region=Oregon" in enriched
+    assert "oregon" in enriched.lower()
 
 
-def test_intent_auto_inject_missing_intent_uses_step() -> None:
+def test_intent_auto_inject_missing_intent_uses_focus() -> None:
     from superbrowser_bridge.session_tools import (
         BrowserSessionState, BrowserScreenshotTool,
     )
-    from superbrowser_bridge.task_plan import make_plan
-
     s = BrowserSessionState()
-    s.task_plan = make_plan([
-        {"name": "Apply Region=Oregon", "success_criteria": {"kind": "url_changed"}},
-        {"name": "next", "success_criteria": {"kind": "url_changed"}},
-    ])
-    s.task_plan.active_step()
+    s.task_brief = _brief_with_focus("Oregon", kind="filter")
     tool = BrowserScreenshotTool(s)
     enriched = tool._enrich_intent_with_plan(None)
-    assert "Apply Region=Oregon" in enriched
+    assert enriched is not None
+    assert "oregon" in enriched.lower()
 
 
-def test_intent_auto_inject_silent_without_plan() -> None:
-    """No plan → enrich_intent passes through unchanged."""
+def test_intent_auto_inject_silent_without_brief() -> None:
+    """No brief → enrich_intent passes through unchanged."""
     from superbrowser_bridge.session_tools import (
         BrowserSessionState, BrowserScreenshotTool,
     )
     s = BrowserSessionState()
-    s.task_plan = None
+    s.task_brief = None
     tool = BrowserScreenshotTool(s)
     assert tool._enrich_intent_with_plan("anything") == "anything"
     assert tool._enrich_intent_with_plan(None) is None
@@ -1444,10 +1448,11 @@ def test_build_retry_instructions_carries_context() -> None:
     # Unsatisfied step names listed
     assert "'Apply Oregon and red wine filters'" in enriched
     assert "'Apply dessert and fish food pairings'" in enriched
-    # Recovery section present and references the right tools
+    # Recovery section present and references the right tools.
+    # Phase L (v4): the recovery flow is screenshot + click_at(V_n)
+    # — browser_inventory_filters was removed from the inventory.
     assert "browser_screenshot" in enriched
-    assert "browser_inventory_filters" in enriched
-    assert "browser_form_begin" in enriched
+    assert "browser_click_at" in enriched
     # Tells worker not to call browser_open (handoff resume mode)
     assert "do NOT call browser_open" in enriched
     # Caps further request_help to prevent ping-pong
@@ -1743,8 +1748,8 @@ def main() -> int:
         # v7
         test_intent_auto_inject_replaces_generic,
         test_intent_auto_inject_appends_when_specific,
-        test_intent_auto_inject_missing_intent_uses_step,
-        test_intent_auto_inject_silent_without_plan,
+        test_intent_auto_inject_missing_intent_uses_focus,
+        test_intent_auto_inject_silent_without_brief,
         test_close_guard_refuses_with_unsatisfied_plan,
         test_close_guard_allows_when_no_plan,
         test_close_guard_allows_when_budget_exhausted,

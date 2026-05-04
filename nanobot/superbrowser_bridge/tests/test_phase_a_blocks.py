@@ -63,32 +63,26 @@ def test_tool_ladder_block_present_in_worker_soul() -> None:
 # ── Move 5 ──────────────────────────────────────────────────────────
 
 
-def test_original_query_pinned_when_brief_exists() -> None:
-    """[ORIGINAL_QUERY] line appears in the guidance text when a brief
-    is set on the session state."""
-    from superbrowser_bridge.session_tools import BrowserSessionState
+def test_original_query_rendered_in_caption_via_to_brain_text() -> None:
+    """Arch v4 (Step 4 slim): [ORIGINAL_QUERY] is no longer re-emitted
+    by worker_hook on every iteration. The full verbatim query is now
+    rendered into the screenshot caption by
+    TaskBrief.to_brain_text(compact=False) — single source of truth.
+    This test verifies the brief still carries the verbatim query."""
     from superbrowser_bridge.task_brief import TaskBrief
-    from superbrowser_bridge.worker_hook import BrowserWorkerHook
 
-    s = BrowserSessionState()
-    s.session_id = "sid"
-    s.task_brief = TaskBrief(
+    brief = TaskBrief(
         original_query="find a hotel in Portland with WiFi and parking under $100",
     )
-    hook = BrowserWorkerHook(s)
-    ctx = _make_ctx()
-    asyncio.run(hook.after_iteration(ctx))
-    msg = _last_msg(ctx)
-    assert "[ORIGINAL_QUERY]" in msg
-    assert "Portland" in msg
-    assert "WiFi" in msg
+    rendered = brief.to_brain_text(compact=False)
+    assert "Portland" in rendered
+    assert "WiFi" in rendered
 
 
-def test_original_query_full_verbatim_no_truncation() -> None:
-    """The pin emits the full verbatim query, not a truncated form."""
-    from superbrowser_bridge.session_tools import BrowserSessionState
+def test_original_query_full_verbatim_in_to_brain_text() -> None:
+    """The verbatim query is rendered without truncation in the
+    full to_brain_text view (which lands in screenshot captions)."""
     from superbrowser_bridge.task_brief import TaskBrief
-    from superbrowser_bridge.worker_hook import BrowserWorkerHook
 
     long_q = (
         "I want a hotel in Portland Oregon for 2 nights starting March 14, "
@@ -96,14 +90,9 @@ def test_original_query_full_verbatim_no_truncation() -> None:
         "night, at least 4 stars, no smoking rooms, walking distance to "
         "downtown, with a fitness center if possible."
     )
-    s = BrowserSessionState()
-    s.session_id = "sid"
-    s.task_brief = TaskBrief(original_query=long_q)
-    hook = BrowserWorkerHook(s)
-    ctx = _make_ctx()
-    asyncio.run(hook.after_iteration(ctx))
-    msg = _last_msg(ctx)
-    assert long_q in msg
+    brief = TaskBrief(original_query=long_q)
+    rendered = brief.to_brain_text(compact=False)
+    assert long_q in rendered
 
 
 def test_original_query_kill_switch_disables() -> None:
@@ -431,8 +420,8 @@ def test_click_miss_retry_nudge_kill_switch() -> None:
 def main() -> int:
     tests = [
         test_tool_ladder_block_present_in_worker_soul,
-        test_original_query_pinned_when_brief_exists,
-        test_original_query_full_verbatim_no_truncation,
+        test_original_query_rendered_in_caption_via_to_brain_text,
+        test_original_query_full_verbatim_in_to_brain_text,
         test_original_query_kill_switch_disables,
         test_original_query_skipped_when_no_brief,
         test_progress_emits_plus_satisfied_on_flip,

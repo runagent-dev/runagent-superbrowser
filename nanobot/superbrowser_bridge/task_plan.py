@@ -1,4 +1,19 @@
-"""Persistent multi-step task plan for the browser worker.
+"""DEPRECATED in Arch v4 — pending removal.
+
+Superseded by ``TaskBrief.checklist`` (constraints + completed_log +
+focus_id) in ``task_brief.py``. The whole-task decomposition is now
+done at ``build_task_brief()`` time via the constraint extractor; the
+checklist is rendered each step via ``render_checklist_block()`` and
+mid-task replanning fires through ``redecompose()`` rather than via a
+``browser_set_task_plan`` tool call. Keep this module loaded so legacy
+callers don't break, but do NOT extend it. Scheduled for deletion once
+all callsites have migrated.
+
+────────────────────────────────────────────────────────────────────
+Original docstring follows.
+────────────────────────────────────────────────────────────────────
+
+Persistent multi-step task plan for the browser worker.
 
 The existing per-screenshot `[PLAN]` block (action_planner.py) ranks
 *one* dismiss-blocker action and *one* main-goal action against the

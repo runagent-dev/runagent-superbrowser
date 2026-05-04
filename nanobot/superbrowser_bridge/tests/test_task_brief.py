@@ -365,6 +365,123 @@ def test_to_brain_text_full_includes_original_query() -> None:
     # Full text — the verbatim query is rendered without truncation.
     assert long_query in full
     assert "[TASK_BRIEF" in full
+    # Arch v4: checklist block replaces the legacy "Constraints (..)" line.
+    assert "[CHECKLIST]" in full
+
+
+def test_render_checklist_block_shape() -> None:
+    """Arch v4: [CHECKLIST] block is fixed-shape and reflects status
+    via [done]/[active]/[open]/[blocked]/[na] markers."""
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint
+
+    b = TaskBrief(
+        original_query="multi",
+        constraints=[
+            Constraint(
+                text="WiFi", kind="filter",
+                canonical_value="wifi", status="satisfied",
+                outcome="seen on /results",
+            ),
+            Constraint(text="parking", kind="filter", canonical_value="parking"),
+            Constraint(text="under $200", kind="numeric", canonical_value="price",
+                       operator="lte", threshold="200"),
+        ],
+    )
+    # Pin focus to the first unverified constraint.
+    b.current_focus_idx = 1
+    b._sync_focus_id()
+    block = b.render_checklist_block()
+    assert "[CHECKLIST]" in block
+    assert "[done]" in block
+    assert "[active]" in block
+    assert "← focus" in block
+    assert "→ seen on /results" in block
+
+
+def test_render_query_block_truncates_to_800() -> None:
+    from superbrowser_bridge.task_brief import TaskBrief
+
+    long = "x" * 1200
+    b = TaskBrief(original_query=long)
+    blk = b.render_query_block()
+    assert blk.startswith("[QUERY]")
+    # Excludes leading "[QUERY] " prefix; payload capped at 800.
+    payload = blk.split(" ", 1)[1]
+    assert len(payload) <= 800
+
+
+def test_constraint_ensure_id_is_stable_slug() -> None:
+    from superbrowser_bridge.task_brief import Constraint
+
+    c = Constraint(text="under $200/night", kind="numeric",
+                   canonical_value="price", operator="lte", threshold="200")
+    s = c.ensure_id(0)
+    assert s == "price"
+    # Calling again returns the cached id.
+    assert c.ensure_id(0) == "price"
+    # Slug-only chars allowed.
+    assert all(ch.isalnum() or ch == "_" for ch in s)
+
+
+def test_mark_constraint_writes_outcome_and_completed_log() -> None:
+    """Arch v4 sub-goal compression: a terminal flip writes the
+    constraint's outcome (≤120) AND appends a one-line entry to
+    completed_log AND resets stuck_counter."""
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint
+
+    b = TaskBrief(
+        original_query="x",
+        constraints=[
+            Constraint(text="WiFi", kind="filter", canonical_value="wifi"),
+        ],
+    )
+    b.stuck_counter = 5
+    flipped = b.mark_constraint(
+        0, "satisfied",
+        evidence="Free WiFi seen on /results",
+        url="/results",
+    )
+    assert flipped is True
+    assert b.constraints[0].outcome.startswith("Free WiFi")
+    assert any("WiFi" in line for line in b.completed_log)
+    assert b.stuck_counter == 0
+
+
+def test_completed_log_is_capped() -> None:
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint
+
+    cs = [
+        Constraint(text=f"item{i}", kind="filter",
+                   canonical_value=f"v{i}")
+        for i in range(20)
+    ]
+    b = TaskBrief(original_query="x", constraints=cs)
+    for i in range(20):
+        b.mark_constraint(i, "satisfied", evidence=f"got {i}")
+    assert len(b.completed_log) == TaskBrief.MAX_COMPLETED_LOG
+    # Newest entry is at the end.
+    assert "item19" in b.completed_log[-1]
+
+
+def test_focus_id_mirrors_current_focus_idx() -> None:
+    from superbrowser_bridge.task_brief import (
+        TaskBrief, Constraint, compute_focus,
+    )
+
+    b = TaskBrief(
+        original_query="x",
+        constraints=[
+            Constraint(text="A", kind="filter", canonical_value="alpha"),
+            Constraint(text="B", kind="filter", canonical_value="beta"),
+        ],
+    )
+    b.current_focus_idx = compute_focus(b)
+    b._sync_focus_id()
+    # focus_id mirrors the slug of constraint at current_focus_idx.
+    assert b.focus_id == b.constraints[b.current_focus_idx].id
+    # Closing the active item advances focus_id to the next.
+    b.mark_constraint(b.current_focus_idx, "satisfied", evidence="x")
+    assert b.focus_id == b.constraints[b.current_focus_idx].id
 
 
 def test_to_dict_from_dict_roundtrip() -> None:
@@ -481,6 +598,12 @@ def main() -> int:
         test_reconcile_negative_constraint_fails_when_active,
         test_to_brain_text_compact_is_one_line,
         test_to_brain_text_full_includes_original_query,
+        test_render_checklist_block_shape,
+        test_render_query_block_truncates_to_800,
+        test_constraint_ensure_id_is_stable_slug,
+        test_mark_constraint_writes_outcome_and_completed_log,
+        test_completed_log_is_capped,
+        test_focus_id_mirrors_current_focus_idx,
         test_to_dict_from_dict_roundtrip,
         test_cot_trail_is_bounded,
         test_repair_truncated_json_recovers_complete_objects,
