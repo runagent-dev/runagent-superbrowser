@@ -2031,6 +2031,7 @@ export class PageWrapper {
     tag: string;
     role: string;
     text: string;
+    rect?: { x0: number; y0: number; x1: number; y1: number };
   }>> {
     if (!Array.isArray(points) || points.length === 0) return [];
     return this.page.evaluate((pts: Array<{ x: number; y: number }>) => {
@@ -2043,7 +2044,10 @@ export class PageWrapper {
         if (role) return true;
         return false;
       };
-      const out: Array<{ ok: boolean; tag: string; role: string; text: string }> = [];
+      const out: Array<{
+        ok: boolean; tag: string; role: string; text: string;
+        rect?: { x0: number; y0: number; x1: number; y1: number };
+      }> = [];
       for (const p of pts) {
         const x = Math.round(p.x);
         const y = Math.round(p.y);
@@ -2078,15 +2082,36 @@ export class PageWrapper {
           || target.tagName.toLowerCase()
           || ''
         ).toLowerCase();
+        // Arch v4 Phase J — return the resolved DOM element's bounding
+        // rect so the bridge can tighten loose vision bboxes to the
+        // pixel-exact text/control area before clicking.
+        let rect: { x0: number; y0: number; x1: number; y1: number } | undefined;
+        try {
+          const r = (target as HTMLElement).getBoundingClientRect();
+          if (r && (r.width > 0) && (r.height > 0)) {
+            rect = {
+              x0: Math.round(r.left),
+              y0: Math.round(r.top),
+              x1: Math.round(r.right),
+              y1: Math.round(r.bottom),
+            };
+          }
+        } catch {
+          // fall through — rect stays undefined.
+        }
         out.push({
           ok: true,
           tag: target.tagName.toLowerCase(),
           role,
           text,
+          ...(rect ? { rect } : {}),
         });
       }
       return out;
-    }, points) as Promise<Array<{ ok: boolean; tag: string; role: string; text: string }>>;
+    }, points) as Promise<Array<{
+      ok: boolean; tag: string; role: string; text: string;
+      rect?: { x0: number; y0: number; x1: number; y1: number };
+    }>>;
   }
 
   /**
@@ -2102,7 +2127,7 @@ export class PageWrapper {
    * loop on dense filter modals. One tool call returns the entire option
    * inventory. Falls back to scanning the document when no dialog is open.
    */
-  async inventoryFilters(opts: { maxIterations?: number } = {}): Promise<{
+  async inventoryFilters(opts: { maxIterations?: number; noScrollWalk?: boolean } = {}): Promise<{
     found: boolean;
     scope: 'modal' | 'document';
     options: Array<{
@@ -2111,13 +2136,22 @@ export class PageWrapper {
       selector: string;
       group: string;
       selected: boolean;
+      parent_label: string | null;
+    }>;
+    expanders: Array<{
+      label: string;
+      selector: string;
+      expanded: boolean;
+      controls_selector: string | null;
+      child_count: number;
     }>;
     total: number;
     scrollTravelPx: number;
     iterations: number;
   }> {
     const maxIter = Math.max(1, Math.min(30, opts.maxIterations ?? 12));
-    return this.page.evaluate(async (maxIterations: number) => {
+    const noScrollWalk = !!opts.noScrollWalk;
+    return this.page.evaluate(async (maxIterations: number, skipScrollWalk: boolean) => {
       // ── Pick the scope: topmost open dialog's scrollable child, else doc ──
       const dialogs = Array.from(document.querySelectorAll(
         '[role=dialog][aria-modal="true"], [role=alertdialog][aria-modal="true"], dialog[open]'
@@ -2259,6 +2293,119 @@ export class PageWrapper {
         return null;
       };
 
+      // ── Expander sweep (hierarchical filters) ──
+      // Standards-only patterns: [aria-expanded][aria-controls], <details>,
+      // [role=treeitem][aria-expanded]. Bootstrap .collapse / custom-JS
+      // expanders are deliberately NOT detected — false-positive whack-a-mole.
+      // Returns parallel `expanders` list + records `parent_label` on each
+      // option whose ancestor chain crosses an expander root.
+      type ExpanderInfo = {
+        el: HTMLElement;
+        rootEl: HTMLElement | null;  // controls target or <details> body
+        label: string;
+        selector: string;
+        expanded: boolean;
+        controls_selector: string | null;
+      };
+      const collectExpanders = (): ExpanderInfo[] => {
+        const out: ExpanderInfo[] = [];
+        const seen = new Set<HTMLElement>();
+        // Pattern A: aria-expanded with aria-controls.
+        const ariaSet = Array.from(inventoryRoot.querySelectorAll<HTMLElement>(
+          '[aria-expanded][aria-controls]'
+        ));
+        for (const el of ariaSet) {
+          if (seen.has(el)) continue;
+          const role = (el.getAttribute('role') || '').toLowerCase();
+          // Skip pure listbox/combobox owners — those are dropdowns, not
+          // hierarchical filters.
+          if (role === 'combobox' || role === 'listbox') continue;
+          const controlsId = el.getAttribute('aria-controls') || '';
+          // aria-controls can be space-separated IDs; take the first.
+          const firstId = controlsId.split(/\s+/)[0];
+          let rootEl: HTMLElement | null = null;
+          if (firstId) {
+            try {
+              rootEl = document.getElementById(firstId);
+            } catch { rootEl = null; }
+          }
+          const expanded = (el.getAttribute('aria-expanded') || '').toLowerCase() === 'true';
+          out.push({
+            el, rootEl,
+            label: getLabel(el).slice(0, 120),
+            selector: buildSelector(el),
+            expanded,
+            controls_selector: firstId
+              ? `#${(window as any).CSS.escape(firstId)}`
+              : null,
+          });
+          seen.add(el);
+        }
+        // Pattern B: <details> / <summary>. The summary is the toggle;
+        // the <details> body is the controlled root.
+        const detailsList = Array.from(inventoryRoot.querySelectorAll<HTMLDetailsElement>(
+          'details'
+        ));
+        for (const det of detailsList) {
+          const summary = det.querySelector('summary') as HTMLElement | null;
+          if (!summary || seen.has(summary)) continue;
+          out.push({
+            el: summary,
+            rootEl: det,
+            label: getLabel(summary).slice(0, 120),
+            selector: buildSelector(summary),
+            expanded: !!det.open,
+            controls_selector: det.id
+              ? `#${(window as any).CSS.escape(det.id)}`
+              : null,
+          });
+          seen.add(summary);
+        }
+        // Pattern C: role=treeitem with aria-expanded (faceted-search trees).
+        const treeItems = Array.from(inventoryRoot.querySelectorAll<HTMLElement>(
+          '[role="treeitem"][aria-expanded]'
+        ));
+        for (const el of treeItems) {
+          if (seen.has(el)) continue;
+          const expanded = (el.getAttribute('aria-expanded') || '').toLowerCase() === 'true';
+          // For treeitems, the children typically live inside the same
+          // element (nested role=group). Use the el itself as the root
+          // for ancestor walks.
+          out.push({
+            el, rootEl: el,
+            label: getLabel(el).slice(0, 120),
+            selector: buildSelector(el),
+            expanded,
+            controls_selector: null,
+          });
+          seen.add(el);
+        }
+        return out.filter(e => e.label && e.selector);
+      };
+
+      const findExpanderForOption = (
+        opt: HTMLElement, expanders: ExpanderInfo[],
+      ): ExpanderInfo | null => {
+        // Walk up from the option; the first expander whose rootEl
+        // contains the option (or whose toggle is an ancestor) wins.
+        for (const ex of expanders) {
+          if (ex.rootEl && ex.rootEl.contains(opt)) return ex;
+        }
+        // Fallback: walk ancestors and match any expander-toggle on the way.
+        let cur: HTMLElement | null = opt.parentElement;
+        let depth = 0;
+        while (cur && depth < 12) {
+          for (const ex of expanders) {
+            if (cur === ex.el) return ex;
+          }
+          cur = cur.parentElement;
+          depth += 1;
+        }
+        return null;
+      };
+
+      const expanderInfos = collectExpanders();
+
       // ── Scroll-and-collect loop ──
       const collected = new Map<string, {
         label: string;
@@ -2266,6 +2413,7 @@ export class PageWrapper {
         selector: string;
         group: string;
         selected: boolean;
+        parent_label: string | null;
       }>();
 
       const collectVisible = (): void => {
@@ -2280,12 +2428,14 @@ export class PageWrapper {
           if (!selector || collected.has(selector)) continue;
           const label = getLabel(el);
           if (!label) continue;
+          const ex = findExpanderForOption(el, expanderInfos);
           collected.set(selector, {
             label: label.slice(0, 200),
             kind,
             selector,
             group: getGroup(el).slice(0, 80),
             selected: isSelected(el),
+            parent_label: ex ? ex.label : null,
           });
         }
       };
@@ -2294,56 +2444,79 @@ export class PageWrapper {
       const startTop = scopeKind === 'modal' ? scrollableEl.scrollTop : (window.scrollY || 0);
       const stepPx = Math.max(200, Math.round((scrollableEl.clientHeight || window.innerHeight) * 0.85));
 
-      // Collect at the starting position first.
-      collectVisible();
-
-      // Scroll to top of scope, then walk down.
-      if (scopeKind === 'modal') {
-        scrollableEl.scrollTop = 0;
-      } else {
-        window.scrollTo(0, 0);
-      }
-      await new Promise<void>(r => setTimeout(r, 150));
+      // Always collect what's currently visible — no scroll needed for this.
       collectVisible();
 
       let lastTop = -1;
       let iter = 0;
       let scrollTravel = 0;
-      while (iter < maxIterations) {
-        const before = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
-        if (scopeKind === 'modal') {
-          scrollableEl.scrollBy(0, stepPx);
-        } else {
-          window.scrollBy(0, stepPx);
-        }
-        await new Promise<void>(r => setTimeout(r, 200));
-        const after = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
-        scrollTravel += Math.abs(after - before);
-        collectVisible();
-        if (Math.abs(after - lastTop) < 2) break; // plateau
-        lastTop = after;
-        iter += 1;
-      }
 
-      // Restore scroll position so the brain's screenshot reflects where
-      // the user left off, not where the inventory ended.
-      if (scopeKind === 'modal') {
-        scrollableEl.scrollTop = startTop;
-      } else {
-        window.scrollTo(0, startTop);
+      // skipScrollWalk: collect only what's currently visible. Used by
+      // the post-click expander rescan (BrowserClickSelectorTool's
+      // _maybe_rescan_after_expander_click) so re-running inventory
+      // after each accordion click doesn't re-scroll the page top to
+      // bottom — the newly-revealed children are always local to the
+      // expander we just clicked. Saves visible scroll motion users
+      // were observing across 3 parallel expander clicks.
+      if (!skipScrollWalk) {
+        // Scroll to top of scope, then walk down.
+        if (scopeKind === 'modal') {
+          scrollableEl.scrollTop = 0;
+        } else {
+          window.scrollTo(0, 0);
+        }
+        await new Promise<void>(r => setTimeout(r, 150));
+        collectVisible();
+
+        while (iter < maxIterations) {
+          const before = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
+          if (scopeKind === 'modal') {
+            scrollableEl.scrollBy(0, stepPx);
+          } else {
+            window.scrollBy(0, stepPx);
+          }
+          await new Promise<void>(r => setTimeout(r, 200));
+          const after = scopeKind === 'modal' ? scrollableEl.scrollTop : window.scrollY;
+          scrollTravel += Math.abs(after - before);
+          collectVisible();
+          if (Math.abs(after - lastTop) < 2) break; // plateau
+          lastTop = after;
+          iter += 1;
+        }
+
+        // Restore scroll position so the brain's screenshot reflects where
+        // the user left off, not where the inventory ended.
+        if (scopeKind === 'modal') {
+          scrollableEl.scrollTop = startTop;
+        } else {
+          window.scrollTo(0, startTop);
+        }
+        await new Promise<void>(r => setTimeout(r, 100));
       }
-      await new Promise<void>(r => setTimeout(r, 100));
 
       const options = Array.from(collected.values());
+      // Annotate each expander with how many of the collected options
+      // it parents — useful for the brain to gauge "is this worth expanding?"
+      const expanders = expanderInfos.map(ex => {
+        const childCount = options.filter(o => o.parent_label === ex.label).length;
+        return {
+          label: ex.label,
+          selector: ex.selector,
+          expanded: ex.expanded,
+          controls_selector: ex.controls_selector,
+          child_count: childCount,
+        };
+      });
       return {
-        found: options.length > 0,
+        found: options.length > 0 || expanders.length > 0,
         scope: scopeKind,
         options,
+        expanders,
         total: options.length,
         scrollTravelPx: scrollTravel,
         iterations: iter,
       };
-    }, maxIter) as Promise<{
+    }, maxIter, noScrollWalk) as Promise<{
       found: boolean;
       scope: 'modal' | 'document';
       options: Array<{
@@ -2352,6 +2525,14 @@ export class PageWrapper {
         selector: string;
         group: string;
         selected: boolean;
+        parent_label: string | null;
+      }>;
+      expanders: Array<{
+        label: string;
+        selector: string;
+        expanded: boolean;
+        controls_selector: string | null;
+        child_count: number;
       }>;
       total: number;
       scrollTravelPx: number;

@@ -37,10 +37,23 @@ interface ManagedSession {
   page: PageWrapper;
   createdAt: number;
   lastAccessed: number;
+  /**
+   * Arch v3: each `/session/:id/keepalive` ping bumps lastAccessed AND
+   * extends the lifetime envelope by `SESSION_LIFETIME_EXTENSION` (up
+   * to `MAX_LIFETIME_EXTENSIONS`). Long-running tasks where the brain
+   * spends minutes in vision/help-advisor calls between browser tool
+   * calls used to silently die at the 2-hour cap.
+   */
+  lifetimeExtensions: number;
 }
 
-const SESSION_IDLE_TIMEOUT = 30 * 60 * 1000;   // 30 minutes idle
-const SESSION_MAX_LIFETIME = 2 * 60 * 60 * 1000; // 2 hours max
+// Arch v3: lifted from 30min/2hr. The brain genuinely takes minutes on
+// vision-heavy tasks; the old idle window punished long-running flows.
+const SESSION_IDLE_TIMEOUT = 60 * 60 * 1000;     // 60 minutes idle
+const SESSION_MAX_LIFETIME = 4 * 60 * 60 * 1000; // 4 hours max
+// Each keepalive ping extends max lifetime by 1 hour, capped at 4 → effective 8 hr ceiling.
+const SESSION_LIFETIME_EXTENSION = 60 * 60 * 1000;
+const MAX_LIFETIME_EXTENSIONS = 4;
 
 export function createHttpServer(
   engine: BrowserEngine,
@@ -465,7 +478,14 @@ export function createHttpServer(
     const now = Date.now();
     for (const [id, session] of sessions) {
       const idle = now - session.lastAccessed > SESSION_IDLE_TIMEOUT;
-      const expired = now - session.createdAt > SESSION_MAX_LIFETIME;
+      // Arch v3: max lifetime grows by 1 hour per keepalive extension,
+      // capped at MAX_LIFETIME_EXTENSIONS. Long-running tasks survive.
+      const effectiveMaxLifetime = (
+        SESSION_MAX_LIFETIME
+        + Math.min(session.lifetimeExtensions, MAX_LIFETIME_EXTENSIONS)
+          * SESSION_LIFETIME_EXTENSION
+      );
+      const expired = now - session.createdAt > effectiveMaxLifetime;
       if (idle || expired) {
         session.page.close().catch(() => {});
         sessions.delete(id);
@@ -473,6 +493,32 @@ export function createHttpServer(
       }
     }
   }, 60000);
+
+  /**
+   * Keepalive endpoint — Python worker pings this before any LLM call
+   * expected to take >30s (vision passes, help advisor, brief
+   * extraction). Bumps lastAccessed and grants up to N lifetime
+   * extensions so long-running flows don't get killed at the 4-hour cap.
+   * Idempotent.
+   */
+  app.post('/session/:id/keepalive', (req, res) => {
+    const id = req.params.id;
+    const session = sessions.get(id);
+    if (!session) {
+      res.status(404).json({ error: 'session not found' });
+      return;
+    }
+    session.lastAccessed = Date.now();
+    if (session.lifetimeExtensions < MAX_LIFETIME_EXTENSIONS) {
+      session.lifetimeExtensions += 1;
+    }
+    res.json({
+      ok: true,
+      sessionId: id,
+      lifetimeExtensions: session.lifetimeExtensions,
+      maxLifetimeExtensions: MAX_LIFETIME_EXTENSIONS,
+    });
+  });
 
   /** Get session with access tracking. */
   function getSession(id: string): PageWrapper | null {
@@ -501,7 +547,12 @@ export function createHttpServer(
 
       const id = `session-${crypto.randomUUID().split('-')[0]}`;
       page.sessionId = id;
-      sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
+      sessions.set(id, {
+        page,
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+        lifetimeExtensions: 0,
+      });
 
       // Per-session human-input manager + handoff budget.
       sessionHumanInput.set(id, new HumanInputManager());
@@ -1132,9 +1183,10 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { maxIterations } = req.body ?? {};
+      const { maxIterations, noScrollWalk } = req.body ?? {};
       const inv = await page.inventoryFilters({
         maxIterations: typeof maxIterations === 'number' ? maxIterations : undefined,
+        noScrollWalk: !!noScrollWalk,
       });
       res.json({ success: true, ...inv });
     } catch (err) {

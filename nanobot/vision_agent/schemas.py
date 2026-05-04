@@ -704,6 +704,239 @@ class DomAnchor(BaseModel):
     box_2d: list[int] = Field(default_factory=lambda: [0, 0, 0, 0])
 
 
+# ── PageState (arch v3) ──────────────────────────────────────────────
+#
+# A structured "where am I and what just happened" snapshot. Vision
+# already encodes a lot (ranked bboxes, scene graph, page_type, flags),
+# but the brain has historically inferred funnel position / filter
+# state / last-action verdict from prose summaries. PageState makes
+# those signals first-class so the brain doesn't have to re-parse text.
+
+
+class FunnelPosition(BaseModel):
+    """Where the user is in a multi-step flow."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(
+        default="",
+        description="Human-readable label, e.g. 'checkout step 2 of 4'.",
+    )
+    step_index: Optional[int] = Field(default=None)
+    total_steps: Optional[int] = Field(default=None)
+    funnel_kind: Literal[
+        "checkout", "search_funnel", "signup", "booking",
+        "filter_panel", "form_wizard", "none",
+    ] = Field(default="none")
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _coerce_name(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:120]
+
+    @field_validator("step_index", "total_steps", mode="before")
+    @classmethod
+    def _coerce_int(cls, v: object) -> Optional[int]:
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("funnel_kind", mode="before")
+    @classmethod
+    def _coerce_kind(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "none"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "checkout", "search_funnel", "signup", "booking",
+            "filter_panel", "form_wizard", "none",
+        }
+        return s if s in allowed else "none"
+
+
+class ActiveFilter(BaseModel):
+    """A filter / facet visible on the current page and its applied state."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    label: str = Field(default="")
+    state: Literal["on", "off", "partial", "unknown"] = Field(default="unknown")
+    value: str = Field(
+        default="",
+        description="For range/slider filters: applied value, e.g. '$50–$100'.",
+    )
+
+    @field_validator("label", "value", mode="before")
+    @classmethod
+    def _coerce_str(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:120]
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _coerce_state(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "unknown"
+        s = v.strip().lower()
+        if s in {"on", "off", "partial", "unknown"}:
+            return s
+        aliases = {
+            "active": "on", "applied": "on", "selected": "on",
+            "checked": "on", "true": "on", "yes": "on", "enabled": "on",
+            "inactive": "off", "unselected": "off", "unchecked": "off",
+            "false": "off", "no": "off", "disabled": "off",
+            "indeterminate": "partial", "mixed": "partial",
+        }
+        return aliases.get(s, "unknown")
+
+
+class LastActionVerdict(BaseModel):
+    """Did the previous action succeed?
+
+    Populated when the vision call's intent is `verify_action` or when
+    `previous_summary` is supplied. For pure observation passes, the
+    verdict defaults to `no_action`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    verdict: Literal["succeeded", "failed", "uncertain", "no_action"] = Field(
+        default="no_action"
+    )
+    evidence: str = Field(
+        default="",
+        description="Short observation, e.g. 'modal closed and toast says Saved'.",
+    )
+    delta_summary: str = Field(
+        default="",
+        description="One-sentence 'what changed since last screenshot'.",
+    )
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _coerce_verdict(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "no_action"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"succeeded", "failed", "uncertain", "no_action"}
+        if s in allowed:
+            return s
+        aliases = {
+            "success": "succeeded", "ok": "succeeded", "passed": "succeeded",
+            "fail": "failed", "broken": "failed",
+            "unsure": "uncertain", "unknown": "uncertain",
+            "none": "no_action", "n/a": "no_action",
+        }
+        return aliases.get(s, "no_action")
+
+    @field_validator("evidence", "delta_summary", mode="before")
+    @classmethod
+    def _coerce_text(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:240]
+
+
+class StuckIndicator(BaseModel):
+    """A signal that the page is blocked / not progressing."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal[
+        "loading_spinner", "error_banner", "captcha", "empty_results",
+        "rate_limit", "timeout", "none",
+    ] = Field(default="none")
+    detail: str = Field(default="")
+    duration_hint: str = Field(
+        default="",
+        description="Estimated duration, e.g. '≥3s loading'.",
+    )
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _coerce_kind(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return "none"
+        s = v.strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "loading_spinner", "error_banner", "captcha", "empty_results",
+            "rate_limit", "timeout", "none",
+        }
+        return s if s in allowed else "none"
+
+    @field_validator("detail", "duration_hint", mode="before")
+    @classmethod
+    def _coerce_text(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:160]
+
+
+class PageState(BaseModel):
+    """Structured page-state snapshot — the brain's "where am I" view.
+
+    Sits alongside `bboxes` on `VisionResponse`. Renders as a `[STATE]`
+    block at the top of `as_brain_text` so the brain can answer
+    "where am I and what just happened" without re-reading prose.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    funnel: FunnelPosition = Field(default_factory=FunnelPosition)
+    active_filters: list[ActiveFilter] = Field(default_factory=list)
+    result_count: Optional[int] = Field(
+        default=None,
+        description="Visible result-count number, e.g. 47 for '47 hotels'.",
+    )
+    list_length_visible: Optional[int] = Field(
+        default=None,
+        description="Number of items currently rendered in the primary list.",
+    )
+    last_action_verdict: LastActionVerdict = Field(
+        default_factory=LastActionVerdict
+    )
+    stuck_indicators: list[StuckIndicator] = Field(default_factory=list)
+    primary_intent_match: str = Field(
+        default="",
+        description="One-sentence 'this page does what'.",
+    )
+
+    @field_validator("result_count", "list_length_visible", mode="before")
+    @classmethod
+    def _coerce_int(cls, v: object) -> Optional[int]:
+        if v is None or v == "":
+            return None
+        try:
+            n = int(v)
+            return n if n >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("primary_intent_match", mode="before")
+    @classmethod
+    def _coerce_intent(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)[:240]
+
+    @field_validator("active_filters", "stuck_indicators", mode="before")
+    @classmethod
+    def _coerce_list(cls, v: object) -> list:
+        if v is None:
+            return []
+        if isinstance(v, (dict, BaseModel)):
+            return [v]
+        if isinstance(v, list):
+            return [item for item in v if isinstance(item, (dict, BaseModel))]
+        return []
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -788,6 +1021,18 @@ class VisionResponse(BaseModel):
             "bbox cap was lifted and page-type culling rules were disabled. "
             "Consumers should not cache these responses and should trust "
             "their completeness more than a standard pass."
+        ),
+    )
+    page_state: PageState = Field(
+        default_factory=PageState,
+        description=(
+            "Structured 'where am I and what just happened' snapshot — "
+            "funnel position, active filters, result counts, last-action "
+            "verdict, stuck indicators. Renders as a [STATE] block at the "
+            "top of as_brain_text so the brain can verify state without "
+            "re-parsing prose. Empty defaults are safe — older provider "
+            "responses simply emit no fields and the brief reconciliation "
+            "treats it as 'unknown state'."
         ),
     )
 
@@ -899,6 +1144,78 @@ class VisionResponse(BaseModel):
         }
         return aliases.get(s, "uncertain")
 
+    def _render_page_state(self) -> list[str]:
+        """Build the `[STATE]` block lines. Empty list when PageState is
+        at default (no fields populated)."""
+        ps = self.page_state
+        # Determine if anything substantive was set. An empty PageState
+        # has every nested object/list empty, both ints None, and verdict
+        # `no_action`.
+        has_funnel = bool(
+            ps.funnel.name
+            or ps.funnel.funnel_kind != "none"
+            or ps.funnel.step_index is not None
+        )
+        has_filters = bool(ps.active_filters)
+        has_counts = (
+            ps.result_count is not None or ps.list_length_visible is not None
+        )
+        has_verdict = ps.last_action_verdict.verdict != "no_action"
+        has_stuck = any(s.kind != "none" for s in ps.stuck_indicators)
+        has_intent = bool(ps.primary_intent_match)
+        if not (
+            has_funnel or has_filters or has_counts
+            or has_verdict or has_stuck or has_intent
+        ):
+            return []
+
+        lines: list[str] = ["[STATE]"]
+        if has_funnel:
+            funnel_bits: list[str] = []
+            if ps.funnel.funnel_kind != "none":
+                funnel_bits.append(ps.funnel.funnel_kind)
+            if ps.funnel.name:
+                funnel_bits.append(ps.funnel.name)
+            elif ps.funnel.step_index is not None:
+                tot = ps.funnel.total_steps
+                step_bit = (
+                    f"step {ps.funnel.step_index}"
+                    + (f"/{tot}" if tot else "")
+                )
+                funnel_bits.append(step_bit)
+            lines.append("  Funnel: " + " — ".join(funnel_bits))
+        if has_filters:
+            chips = []
+            for af in ps.active_filters[:12]:
+                val_bit = f"={af.state}"
+                if af.value and af.state != "off":
+                    val_bit = f"={af.state}({af.value})"
+                chips.append(f"[{af.label}{val_bit}]")
+            lines.append("  Active filters: " + " ".join(chips))
+        if has_counts:
+            count_bits = []
+            if ps.result_count is not None:
+                count_bits.append(f"results={ps.result_count}")
+            if ps.list_length_visible is not None:
+                count_bits.append(f"visible={ps.list_length_visible}")
+            lines.append("  Counts: " + "  ".join(count_bits))
+        if has_verdict:
+            v = ps.last_action_verdict
+            ev = f' — "{v.evidence}"' if v.evidence else ""
+            lines.append(f"  Last action: {v.verdict}{ev}")
+            if v.delta_summary:
+                lines.append(f"    Delta: {v.delta_summary}")
+        if has_stuck:
+            for s in ps.stuck_indicators:
+                if s.kind == "none":
+                    continue
+                detail = f" — {s.detail}" if s.detail else ""
+                dur = f" ({s.duration_hint})" if s.duration_hint else ""
+                lines.append(f"  Stuck: {s.kind}{dur}{detail}")
+        if has_intent:
+            lines.append(f"  Intent: {ps.primary_intent_match}")
+        return lines
+
     def as_brain_text(
         self,
         max_bboxes: int = 50,
@@ -994,6 +1311,13 @@ class VisionResponse(BaseModel):
         ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
         elements_lines: list[str] = []
         low_conf_lines: list[str] = []
+        # Arch v3 fix F — track loose chevron bboxes (label says
+        # "expand sub-options" / "chevron" but width > 60px). On filter
+        # UIs Gemini often emits the WHOLE accordion row as the
+        # "chevron" bbox; clicking the center hits the parent label
+        # instead of the icon. We surface a [LOOSE_CHEVRON] block so
+        # the brain can call browser_look_again for a tighter pass.
+        loose_chevrons: list[tuple[int, str, int]] = []  # (V_n, label, width_px)
         iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
             if b.role_in_scene == "blocker":
@@ -1040,6 +1364,23 @@ class VisionResponse(BaseModel):
                 low_conf_lines.append(line)
             else:
                 elements_lines.append(line)
+            # Arch v3 fix F — flag chevron-labeled bboxes wider than
+            # 60 px (loose row instead of tight icon). Click_at runs
+            # an automatic right-edge shift on these (fix E), but the
+            # brain should still know vision was sloppy so it can
+            # browser_look_again with expected_labels=[<chevron>] for
+            # a tighter coverage pass when needed.
+            if iw > 0 and ih > 0:
+                width_px = (x1 - x0)
+                lbl = (b.label or "").lower()
+                if width_px > 60 and any(
+                    kw in lbl for kw in (
+                        "expand sub", "expand-sub", "sub-options",
+                        "sub options", "chevron", "caret", "(expand",
+                        "(toggle", "expand sub-options",
+                    )
+                ):
+                    loose_chevrons.append((i, b.label or "", int(width_px)))
         truncated = (
             f"  … {len(self.bboxes) - max_bboxes} more bboxes truncated"
             if len(self.bboxes) > max_bboxes
@@ -1054,6 +1395,14 @@ class VisionResponse(BaseModel):
             f"Summary: {self.summary}",
             flags_line,
         ])
+        # [STATE] block — renders structured PageState near the top so
+        # the brain can answer "where am I / did my last action work"
+        # without parsing prose. Suppressed entirely when PageState is
+        # at its default (no fields populated) to keep token noise low
+        # on legacy provider responses.
+        state_lines = self._render_page_state()
+        if state_lines:
+            parts.extend(state_lines)
         if self.scene and self.scene.layers:
             # Walk layers top-most first so the brain sees what's on top
             # before what's underneath. Index each layer to [V...] labels
@@ -1093,6 +1442,23 @@ class VisionResponse(BaseModel):
                 "Low-confidence (vision is hedging — verify before clicking):"
             )
             parts.extend(low_conf_lines)
+        # Arch v3 fix F — loose chevron warning. Tells the brain that
+        # specific V_n bboxes are too wide for their label (vision
+        # emitted the whole row as "the chevron"). The click_at right-
+        # edge shift (fix E) handles the dispatch automatically; this
+        # block tells the brain to ask for a tighter pass when it
+        # really needs the fine geometry.
+        if loose_chevrons:
+            parts.append(
+                "[LOOSE_CHEVRON] Vision emitted these chevron/expand bboxes "
+                "wider than expected (likely the whole row, not the icon). "
+                "click_at auto-shifts to the right-edge, which usually "
+                "works. If a chevron click doesn't expand on first try, "
+                "browser_look_again(expected_labels=[<chevron>]) for a "
+                "tight bbox:"
+            )
+            for v_n, lbl, w in loose_chevrons[:5]:
+                parts.append(f"  V{v_n} '{lbl[:60]}' width={w}px")
         if self.suggested_actions:
             parts.append("Suggested actions:")
             for sa in sorted(self.suggested_actions, key=lambda a: a.priority):

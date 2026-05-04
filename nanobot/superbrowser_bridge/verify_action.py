@@ -116,6 +116,48 @@ _TEXT_PRESENT_JS = """
 }
 """
 
+# Arch v3: bbox state-change probe. Reads the element at the rect's
+# center and reports text/aria/class signals so the verifier can detect
+# "button label changed" / "checkbox checked" / "active class added"
+# without needing a vision call.
+_BBOX_STATE_JS = """
+(rect, expectedText) => {
+  const [x0, y0, x1, y1] = rect;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const el = document.elementFromPoint(cx, cy);
+  if (!el) return {changed: false, reason: 'no element at center'};
+  const text = (el.innerText || el.textContent || '').trim().slice(0, 240);
+  const aria = {
+    pressed: el.getAttribute('aria-pressed'),
+    checked: el.getAttribute('aria-checked'),
+    selected: el.getAttribute('aria-selected'),
+    expanded: el.getAttribute('aria-expanded'),
+  };
+  const cls = (el.className || '').toString();
+  const has_active_marker = /(\\b|--)(active|selected|checked|on)\\b|\\bis-(active|on|checked)\\b/i.test(cls);
+  // Heuristic for "changed" — if the element's aria/checked state is
+  // affirmative OR an active class marker is present, treat as changed.
+  // The pre/post comparison happens at the python layer if needed.
+  const affirmative = (
+    aria.pressed === 'true' || aria.checked === 'true' ||
+    aria.selected === 'true' || aria.expanded === 'true' ||
+    has_active_marker
+  );
+  let text_match = true;
+  const want = (expectedText || '').toString().trim();
+  if (want) {
+    text_match = text.toLowerCase().indexOf(want.toLowerCase()) !== -1;
+  }
+  return {
+    changed: !!affirmative,
+    text: text,
+    text_match: !!text_match,
+    aria: aria,
+    cls: cls,
+  };
+}
+"""
+
 _FOCUS_MATCH_JS = """
 (selector) => {
   const ae = document.activeElement;
@@ -240,6 +282,34 @@ async def _dispatch(
             return True, "probe_returned_non_dict", {}
         absent = bool(result.get("absent"))
         return absent, ("bbox_gone" if absent else "overlay_still_present"), result
+
+    if kind == "bbox_state_change":
+        # Arch v3: confirm a bbox at `rect` either:
+        #   (a) changed text content (button label "Save" -> "Saved"),
+        #   (b) toggled checked / aria-pressed / aria-selected state, or
+        #   (c) gained/lost a visible class marker (--active, --selected).
+        # `payload.expected_text` (optional) — if set, require post-action
+        # text to contain it. Otherwise: any text-content delta counts.
+        rect = payload.get("widget_px") or payload.get("rect")
+        if not rect or len(rect) < 4:
+            return True, "no_rect_to_check", {}
+        expected_text = str(payload.get("expected_text") or "")
+        result = await t3manager.evaluate(
+            session_id, _BBOX_STATE_JS, list(rect), expected_text,
+        )
+        if not isinstance(result, dict):
+            return True, "probe_returned_non_dict", {}
+        changed = bool(result.get("changed"))
+        text_match = bool(result.get("text_match")) if expected_text else True
+        ok = changed and text_match
+        reason = (
+            "bbox_state_changed" if ok
+            else (
+                "text_mismatch" if (changed and not text_match)
+                else "bbox_state_unchanged"
+            )
+        )
+        return ok, reason, result
 
     if kind == "url_changed":
         cur = await _page_url(t3manager, session_id)

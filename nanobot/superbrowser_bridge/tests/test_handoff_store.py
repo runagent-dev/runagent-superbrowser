@@ -189,6 +189,79 @@ def test_hydrate_with_none_is_safe() -> None:
     assert s.session_id == ""  # default unchanged
 
 
+# ── Arch v3 fields ───────────────────────────────────────────────────
+
+
+def test_brief_survives_save_take_roundtrip() -> None:
+    """Arch v3: full TaskBrief carries through save/take with fidelity."""
+    from superbrowser_bridge.handoff_store import save, take, clear
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint
+
+    clear()
+    s = _fresh_state(session_id="brief-x", url="https://b.example")
+    s.task_brief = TaskBrief(
+        original_query="find a hotel with WiFi AND parking under $100",
+        constraints=[
+            Constraint(
+                text="WiFi",
+                kind="filter",
+                canonical_value="wifi",
+                operator="contains",
+                status="satisfied",
+                evidence="Free WiFi badge visible",
+            ),
+            Constraint(
+                text="under $100",
+                kind="numeric",
+                canonical_value="price",
+                operator="lte",
+                threshold="100",
+                unit="USD",
+            ),
+        ],
+        plan_of_attack="search the city, apply WiFi filter, sort by price",
+    )
+    s.task_brief.add_cot_note(turn=3, summary="applied wifi filter")
+    s.failed_tactics = ["selector_lookup_for_login_button"]
+
+    save("brief-key", s)
+    h = take("brief-key")
+    assert h is not None
+    assert h.task_brief is s.task_brief  # same object
+    assert h.task_brief.original_query.endswith("under $100")
+    assert len(h.task_brief.constraints) == 2
+    assert h.task_brief.constraints[0].status == "satisfied"
+    assert "selector_lookup_for_login_button" in h.failed_tactics
+    summary = h.short_summary()
+    assert "1/2 constraints satisfied" in summary
+
+
+def test_brief_hydrate_restores() -> None:
+    """Hydrating a fresh state from handoff restores the brief intact."""
+    from superbrowser_bridge.session_tools import BrowserSessionState
+    from superbrowser_bridge.handoff_store import save, take, clear
+    from superbrowser_bridge.task_brief import TaskBrief, Constraint
+
+    clear()
+    s1 = _fresh_state(session_id="hydrate-x")
+    long_query = (
+        "long verbose multi-paragraph instruction with many constraints "
+        "and details that the brain must keep in working memory at all times "
+    ) * 10  # ~1300 chars — well past the legacy 500-char truncation point
+    s1.task_brief = TaskBrief(
+        original_query=long_query,
+        constraints=[Constraint(text="x", kind="filter", canonical_value="x")],
+    )
+    save("hydrate-key", s1)
+    s2 = BrowserSessionState()
+    h = take("hydrate-key")
+    s2.hydrate_from_handoff(h)
+    assert s2.task_brief is not None
+    # Original query was preserved verbatim — no 500-char truncation.
+    assert len(s2.task_brief.original_query) > 500
+    assert s2.task_brief.constraints[0].canonical_value == "x"
+
+
 def main() -> int:
     tests = [
         test_save_take_roundtrip,
@@ -201,6 +274,8 @@ def main() -> int:
         test_short_summary_includes_plan_progress,
         test_hydrate_from_handoff_restores_state,
         test_hydrate_with_none_is_safe,
+        test_brief_survives_save_take_roundtrip,
+        test_brief_hydrate_restores,
     ]
     failed = 0
     for t in tests:

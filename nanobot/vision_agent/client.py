@@ -170,6 +170,7 @@ class VisionAgent:
         coverage_mode: bool = False,
         expected_labels: list[str] | None = None,
         force_fresh: bool = False,
+        active_constraint: dict | None = None,
     ) -> VisionResponse:
         start = time.monotonic()
         # Subgoal id participates in the cache key — same screenshot
@@ -182,6 +183,17 @@ class VisionAgent:
                 subgoal_key = str(getattr(current_subgoal, "id", "") or "")
             except Exception:
                 subgoal_key = ""
+        # Arch v3 fix #3: active_constraint also discriminates the cache.
+        # Same screenshot under different active constraints must produce
+        # different bbox emphasis (the FOCUS block changes V_n ranking).
+        if active_constraint and isinstance(active_constraint, dict):
+            try:
+                _cv = str(active_constraint.get("canonical_value") or "")[:40]
+                _op = str(active_constraint.get("operator") or "")[:8]
+                _tag = f"|c={_cv}:{_op}"
+                subgoal_key = (subgoal_key + _tag) if subgoal_key else _tag.lstrip("|")
+            except Exception:
+                pass
         # Phase 1.2: dom_text_hash extends the cache key with viewport
         # state so two snapshots of the same page at different scroll
         # positions get separate cache entries (different bboxes are
@@ -309,6 +321,7 @@ class VisionAgent:
                     expected_labels=list(expected_labels or []),
                     task_instruction=task_instruction,
                     current_subgoal=current_subgoal,
+                    active_constraint=active_constraint,
                 )
             else:
                 prompt = build_user_prompt(
@@ -318,6 +331,7 @@ class VisionAgent:
                     task_instruction=task_instruction,
                     compact=compact,
                     current_subgoal=current_subgoal,
+                    active_constraint=active_constraint,
                 )
             try:
                 raw_ = await provider.chat_with_image(

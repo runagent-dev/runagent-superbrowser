@@ -44,6 +44,7 @@ from superbrowser_bridge.antibot.ui_blockers import BlockerInfo
 
 PostcondKind = Literal[
     "bbox_disappeared",
+    "bbox_state_change",  # arch v3: bbox-presence/text DOM probe before/after
     "url_changed",
     "url_matches",
     "text_visible",
@@ -61,18 +62,28 @@ StepKind = Literal[
 
 @dataclass
 class Postcondition:
-    """What should be true after the action for it to count as successful."""
+    """What should be true after the action for it to count as successful.
+
+    Arch v3 adds optional `constraint_id` linking a verification to a
+    TaskBrief constraint — when the postcondition succeeds, the named
+    constraint auto-flips to `satisfied` (free path; no LLM needed).
+    Empty string means "no constraint linkage" (the legacy case).
+    """
 
     kind: PostcondKind = "none"
     payload: dict[str, Any] = field(default_factory=dict)
     timeout_ms: int = 2500
+    constraint_id: str = ""  # arch v3 — TaskBrief.constraints[*].canonical_value
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "kind": self.kind,
             "payload": dict(self.payload),
             "timeout_ms": self.timeout_ms,
         }
+        if self.constraint_id:
+            d["constraint_id"] = self.constraint_id
+        return d
 
 
 @dataclass
@@ -292,6 +303,54 @@ def _collect_blockers(
         return (sev_rank, type_rank, -b.confidence)
     merged.sort(key=_brank)
     return merged
+
+
+# Arch v4 Move 6 — keywords that hint a stateful control in the visible
+# label. Combined with vision metadata via a TWO-SIGNAL AND before
+# promoting the postcondition from dom_mutated → bbox_state_change.
+_STATEFUL_LABEL_HINTS = (
+    "toggle", "switch", "checkbox", "radio", "filter chip",
+    "filter:", "chip", " on ", " off ",
+)
+_STATEFUL_DOM_ROLES = frozenset({
+    "checkbox", "radio", "switch", "tab", "option", "treeitem",
+    "menuitemcheckbox", "menuitemradio",
+})
+
+
+def _is_stateful_target(bbox: BBox, label: str) -> bool:
+    """Two-signal AND: label hints stateful AND vision/DOM metadata
+    confirms. Returns True when we're confident enough to ask
+    verify_action to probe the bbox's aria-pressed/aria-checked state
+    delta instead of just "did anything in the DOM change".
+
+    Signal A (label): label includes a stateful keyword, with a small
+    bias to avoid false matches on unrelated buttons named "Switch
+    accounts" — we look for the keyword as a contiguous substring with
+    word boundaries where it matters (" on " / " off " specifically).
+
+    Signal B (vision/DOM): bbox.role is a stateful BBoxRole (currently
+    only `checkbox` is in the canonical role set), OR dom_check.role
+    matches a stateful ARIA role from the DOM crosscheck pass.
+
+    Both must fire. Single-signal matches stay on dom_mutated.
+    """
+    if not label:
+        return False
+    lab = f" {label.lower()} "
+    signal_a = any(h in lab for h in _STATEFUL_LABEL_HINTS)
+    if not signal_a:
+        return False
+    # Signal B candidates.
+    role_b = (getattr(bbox, "role", "") or "").strip().lower()
+    if role_b in _STATEFUL_DOM_ROLES:
+        return True
+    dom_check = getattr(bbox, "dom_check", None)
+    if isinstance(dom_check, dict):
+        dom_role = str(dom_check.get("role") or "").strip().lower()
+        if dom_role in _STATEFUL_DOM_ROLES:
+            return True
+    return False
 
 
 def _dismiss_stagnant(recent_steps: list[dict], blocker: _Blocker) -> bool:
@@ -518,14 +577,36 @@ def plan(
         else:
             step_kind = "click"
 
+        # Arch v4 Move 6 — promote postcondition to bbox_state_change
+        # ONLY when BOTH signals agree:
+        #   (A) label pattern matches a stateful keyword
+        #   (B) vision/DOM metadata signals a stateful role
+        # Single-signal matches stay on dom_mutated. False-positive cost
+        # (verify reports unchanged → click looks failed → wasted retry)
+        # is high; false-negative cost is zero (same as v3 baseline).
+        # So we err strongly toward dom_mutated.
+        target_label_str = target_bbox.label if target_bbox else ""
+        if step_kind == "click" and target_bbox is not None and \
+                _is_stateful_target(target_bbox, target_label_str):
+            payload: dict[str, Any] = {}
+            if target_px:
+                payload["widget_px"] = list(target_px)
+            postcond = Postcondition(
+                kind="bbox_state_change",
+                payload=payload,
+                timeout_ms=2500,
+            )
+        else:
+            postcond = Postcondition(kind="dom_mutated", timeout_ms=2500)
+
         actions.append(PlannedAction(
             step=step_kind,
             reason=main_action.description or f"execute {main_action.action} for task",
             source="vision_suggestion",
             target_vision_index=vidx_1,
             target_bbox_pixels=target_px,
-            target_label=(target_bbox.label if target_bbox else ""),
-            postcondition=Postcondition(kind="dom_mutated", timeout_ms=2500),
+            target_label=target_label_str,
+            postcondition=postcond,
         ))
     elif not merged:
         # No blockers, no vision suggestion — synthesize a `wait` so the

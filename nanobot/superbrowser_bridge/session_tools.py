@@ -9,6 +9,7 @@ to have isolated state in the same process.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 import os
@@ -512,6 +513,520 @@ def _looks_vague_selector(selector: str) -> bool:
     return not has_strong
 
 
+# ── v8: vision-grounded clicks (target_label protocol) ──
+#
+# Forces the brain to NAME the V_n it's clicking before the click happens.
+# Tools that take `vision_index` now require `target_label` — a string
+# fuzzy-matched against the actual V_n label vision emitted. Mismatch
+# refuses with the actual ranked V_n labels surfaced inline so the brain
+# can pivot in the same turn. This is a protocol change, not a refusal
+# layer: a click no longer means "execute action" — it means "execute
+# action WITH my reading of the page attached, so the system can verify
+# I actually read." Kill switch VISION_TARGET_LABEL_REQUIRED=0 reverts
+# to v7 behavior (no validation).
+
+
+def _format_bbox_label_list(vresp: Any, max_count: int = 8) -> str:
+    """Compact `[V_n] 'label'` rendering for refusal recovery messages.
+
+    Mirrors the ranked-order sort in vision_agent/schemas.py:as_brain_text
+    (line 998) so V_n in the refusal matches V_n the brain saw in its
+    most recent screenshot reply.
+    """
+    if vresp is None or not getattr(vresp, "bboxes", None):
+        return "  (no vision response cached — call browser_screenshot first)"
+    bboxes = vresp.bboxes
+
+    def _rank_key(b: Any) -> tuple:
+        # Match the rank function in vision_agent/schemas.py:981.
+        role = getattr(b, "role_in_scene", None)
+        role_rank = 0 if role == "blocker" else (1 if role == "target" else 2)
+        return (
+            role_rank,
+            0 if getattr(b, "intent_relevant", False) else 1,
+            0 if getattr(b, "clickable", True) else 1,
+            -float(getattr(b, "confidence", 0.0) or 0.0),
+        )
+
+    try:
+        ordered = sorted(bboxes, key=_rank_key)[:max_count]
+    except Exception:
+        ordered = list(bboxes)[:max_count]
+    lines: list[str] = []
+    for i, b in enumerate(ordered, start=1):
+        label = (getattr(b, "label", "") or "").strip() or "(no label)"
+        marker = ""
+        if getattr(b, "intent_relevant", False):
+            marker = "  ← matches intent"
+        lines.append(f"  [V{i}] {label!r}{marker}")
+    return "\n".join(lines) if lines else "  (vision returned 0 bboxes)"
+
+
+def _validate_target_label(
+    state: "BrowserSessionState",
+    vision_index: int | None,
+    target_label: str | None,
+) -> str | None:
+    """Verify the brain's `target_label` matches the actual V_n label.
+
+    Returns a refusal string when the protocol is violated (vision_index
+    is set, validation enabled, and either target_label is missing or
+    mismatches). Returns None to allow the click.
+
+    Behavior:
+      • vision_index is None → no validation (raw (x, y) path).
+      • VISION_TARGET_LABEL_REQUIRED=0 → no validation.
+      • No vision response cached → no validation (brain hasn't taken a
+        screenshot yet; nothing to verify against).
+      • V_n out of range → no refusal here (handled by existing freshness
+        / range gates in click_at).
+      • bbox.label is empty → allow (vision didn't emit a label; can't
+        verify mismatch).
+      • target_label missing/empty → refuse with
+        [click_at_target_label_required].
+      • target_label matches via bidirectional substring (case-insensitive,
+        whitespace-stripped) → allow.
+      • target_label mismatches → refuse with [click_at_label_mismatch]
+        and inline V_n label list.
+    """
+    if vision_index is None:
+        return None
+    if os.environ.get("VISION_TARGET_LABEL_REQUIRED", "1") == "0":
+        return None
+    vresp = getattr(state, "_last_vision_response", None)
+    if vresp is None or not getattr(vresp, "bboxes", None):
+        # Brain hasn't taken a screenshot in this session — let downstream
+        # gates (no_vision, bad_vision_index) produce the canonical error.
+        return None
+    try:
+        bbox = vresp.get_bbox(int(vision_index))
+    except Exception:
+        return None
+    if bbox is None:
+        # Out-of-range vision_index — let the existing
+        # [click_at_failed:bad_vision_index] gate handle it.
+        return None
+    actual_label = (getattr(bbox, "label", "") or "").strip()
+    target = (target_label or "").strip()
+    if not target:
+        # Brain didn't pass target_label — protocol violation.
+        labels_block = _format_bbox_label_list(vresp)
+        return (
+            f"[click_at_target_label_required] You called the V_n path "
+            f"(vision_index={vision_index}) without passing `target_label`. "
+            f"The bridge requires you to NAME what V_{vision_index} is "
+            f"before clicking, so the system can verify you actually read "
+            f"the bbox label. This catches the V_1-reflex pattern where "
+            f"the brain clicks whatever V_n it thinks should be right "
+            f"without decoding what V_n actually represents.\n"
+            f"  Recovery: re-call with `target_label='<the label vision "
+            f"assigned>'`. Ranked V_n labels from the most recent "
+            f"screenshot:\n{labels_block}\n"
+            f"Override: VISION_TARGET_LABEL_REQUIRED=0."
+        )
+    if not actual_label:
+        # Vision didn't emit a label — can't verify mismatch, allow.
+        return None
+    a = actual_label.lower()
+    t = target.lower()
+    if a in t or t in a:
+        return None  # match
+    # Mismatch — refuse with actual labels inline.
+    labels_block = _format_bbox_label_list(vresp)
+    return (
+        f"[click_at_label_mismatch] V{vision_index} actual label is "
+        f"{actual_label!r} — your target_label {target!r} does not "
+        f"match. The bridge requires your reading of the page to align "
+        f"with what vision saw. This catches the V_1-reflex where the "
+        f"brain picks an index without decoding what's there.\n"
+        f"  Ranked V_n labels (top 8) from the most recent screenshot:\n"
+        f"{labels_block}\n"
+        f"Pick the V_n whose label actually matches your intent and "
+        f"re-call with the matching `target_label`. "
+        f"Override: VISION_TARGET_LABEL_REQUIRED=0."
+    )
+
+
+# Arch v3 fix E — labels that designate a chevron/expand affordance
+# rather than a primary toggle. Click position is shifted to the right
+# edge when a bbox carries one of these labels.
+_CHEVRON_LABEL_RE = __import__("re").compile(
+    r"\b(?:expand[ \-]?sub[ \-]?options?"
+    r"|expand sub[- ]?options?"
+    r"|sub[- ]?regions?"
+    r"|expand regions?"
+    r"|toggle\s+(?:all|sub|expand)"
+    r"|(?:^|\s)(?:expand|chevron|caret|disclosure)\b"
+    r"|\(expand[^)]*\)"
+    r"|\(chevron\)"
+    r"|\(toggle[^)]*\))",
+    __import__("re").IGNORECASE,
+)
+
+
+def _bbox_is_chevron_label(label: str) -> bool:
+    """Return True when a bbox label designates an "expand / chevron /
+    toggle-sub-options" affordance — used by click_at to shift the
+    click target to the bbox's right edge."""
+    if not label:
+        return False
+    return bool(_CHEVRON_LABEL_RE.search(label))
+
+
+_SELECTOR_VAGUE_BARE = frozenset({
+    "button", "a", "label", "summary", "input", "div", "span",
+    "li", "tr", "td", "p", "h1", "h2", "h3", "h4", "section",
+    "article", "header", "footer", "nav", "form",
+    "[role='button']", '[role="button"]',
+    "[role='link']", '[role="link"]',
+    "[role='checkbox']", '[role="checkbox"]',
+    "[type='button']", '[type="button"]',
+})
+
+
+def _selector_is_vague(selector: str) -> bool:
+    """Heuristic: is the selector a "kitchen-sink" probe that needs a
+    target_label to be safe to dispatch?
+
+    Vague forms include:
+      - bare tag selectors ("button", "summary", "a")
+      - multi-fallback comma lists ("summary, button, [role='button']")
+      - bare role/type attribute selectors ("[role='button']")
+      - generic universal selectors
+
+    Specific (NOT vague) forms include:
+      - id selectors (#email, #accordion-region)
+      - data-testid / data-test-id
+      - explicit value attribute matches ([name='oregon'])
+      - selectors with text content matchers (handled separately)
+    """
+    s = (selector or "").strip().lower()
+    if not s:
+        return True
+    # Multi-fallback comma list with ≥2 alternatives → kitchen-sink probe.
+    if s.count(",") >= 1:
+        return True
+    # Bare tag or role/type without further qualifiers.
+    if s in _SELECTOR_VAGUE_BARE:
+        return True
+    # Universal selector, attribute-only.
+    if s in {"*", "[role]", "[type]"}:
+        return True
+    return False
+
+
+def _selector_is_specific(selector: str) -> bool:
+    """Inverse: highly-specific selectors that name the target so well
+    they don't need a `target_label`.
+
+    Recognized:
+      - id selectors (#x)
+      - data-testid / data-test-id / data-cy / data-qa attributes
+      - id= attribute matches
+      - longer, multi-segment selectors with attribute matchers
+    """
+    s = (selector or "").strip().lower()
+    if not s:
+        return False
+    if s.startswith("#") and " " not in s and "," not in s:
+        return True
+    for marker in (
+        "[data-testid", "[data-test-id", "[data-cy", "[data-qa",
+        "[id=", "[name=",
+    ):
+        if marker in s:
+            return True
+    # Long, single-target selectors with explicit attribute matchers
+    # (e.g. "label[for*='oregon' i]") — likely intentional, not probes.
+    if "," not in s and "[" in s and "=" in s and len(s) > 12:
+        return True
+    return False
+
+
+def _vision_label_overlaps(target_label: str, bbox_label: str) -> bool:
+    """Return True when target_label and bbox_label share a content token.
+
+    Used by the vision-alignment check: tokenize both, drop stopwords,
+    require ≥1 token of length ≥4 to overlap (case-insensitive).
+    Stopwords like "button", "click", "filter" don't count alone — they
+    appear on too many bboxes and would over-match.
+    """
+    if not target_label or not bbox_label:
+        return False
+    import re as _re
+    stop = _SELECTOR_TARGET_STOPWORDS
+
+    def _tokens(s: str) -> set[str]:
+        toks = _re.split(r"[\s,.;:!?()\[\]{}\"'/\-_]+", s.lower())
+        return {t for t in toks if len(t) >= 4 and t not in stop}
+
+    target_toks = _tokens(target_label)
+    bbox_toks = _tokens(bbox_label)
+    return bool(target_toks & bbox_toks)
+
+
+_SELECTOR_TARGET_STOPWORDS = frozenset({
+    "button", "click", "link", "label", "filter", "filters", "input",
+    "field", "checkbox", "radio", "option", "options", "menu", "open",
+    "close", "expand", "collapse", "show", "hide", "select", "selected",
+    "active", "with", "from", "into", "this", "that", "page",
+    "view", "more", "load", "loading",
+})
+
+
+def _validate_selector_target_label(
+    selector: str,
+    target_label: str | None,
+    state: "BrowserSessionState | None" = None,
+) -> str | None:
+    """Arch v3 fixes A + D — selector validation, structural + vision-aligned.
+
+    Mirrors `_validate_target_label` for vision-grounded clicks. Two layers:
+
+    Layer 1 (fix A — structural):
+      - SELECTOR_TARGET_LABEL_REQUIRED=0 → no validation.
+      - Specific selector (#id, [data-testid], etc.) → no requirement.
+      - Vague selector + missing target_label → refuse.
+
+    Layer 2 (fix D — vision alignment, post-trace):
+      When `target_label` IS provided AND `state` has a fresh vision
+      response with bboxes, verify at least one V_n label overlaps with
+      `target_label`. Refuse otherwise — brain is asserting it sees
+      an element vision didn't emit. This is the dominant hallucination
+      mode on dynamic filter pages where the DOM-anchored selector
+      `#region-united-states` doesn't actually match anything visible.
+      Kill switch: SELECTOR_VISION_ALIGNMENT=0.
+    """
+    if os.environ.get("SELECTOR_TARGET_LABEL_REQUIRED", "1") == "0":
+        return None
+    sel = (selector or "").strip()
+    target = (target_label or "").strip()
+    # Layer 1 — structural shape check.
+    if _selector_is_vague(sel):
+        if not (target and len(target) >= 3):
+            return (
+                f"[click_selector_target_label_required] You called "
+                f"browser_click_selector with a vague selector "
+                f"({sel!r}) and no `target_label`. The bridge requires you to "
+                f"NAME what visible text/aria you expect that selector to "
+                f"match before clicking. This catches kitchen-sink selectors "
+                f"like \"summary, button, [role='button']\" that match anything "
+                f"on the page.\n"
+                f"  Recovery options:\n"
+                f"  1. Re-call with `target_label='<short label of the element "
+                f"you expect to click — e.g. \"Oregon checkbox\", \"Apply "
+                f"filters button\">'`.\n"
+                f"  2. Replace the selector with a specific one: an #id, "
+                f"[data-testid='...'], [name='...'], or a label/text-content "
+                f"match (e.g. `label[for='region-oregon']`).\n"
+                f"  3. If you don't know the exact element, browser_screenshot "
+                f"first — vision will emit V_n bboxes and you can use "
+                f"browser_click_at(vision_index=...) instead.\n"
+                f"Override: SELECTOR_TARGET_LABEL_REQUIRED=0."
+            )
+        # vague + named target → fall through to layer 2
+    elif _selector_is_specific(sel):
+        # id/data-testid: selector self-names; layer 2 is still useful but
+        # specific selectors are usually intentional. Allow without further
+        # checks unless target_label was supplied (then layer 2 runs).
+        if not target:
+            return None
+    # Layer 2 — vision alignment. Only runs when target_label is provided.
+    if (
+        os.environ.get("SELECTOR_VISION_ALIGNMENT", "1") == "0"
+        or state is None
+        or not target
+    ):
+        return None
+    vresp = getattr(state, "_last_vision_response", None)
+    if vresp is None:
+        return None  # no vision yet — can't verify
+    bboxes = list(getattr(vresp, "bboxes", None) or [])
+    if not bboxes:
+        return None  # empty vision pass; allow
+    # Layer E (arch v3 fix L) — when target_label HAS a high-confidence
+    # clickable V_n match, redirect to browser_click_at instead. On
+    # dynamic filter pages a working V_n bbox is more reliable than the
+    # selector hook (which rearranges between clicks). Vision saw it →
+    # use the V_n path.
+    prefer_vision = (
+        os.environ.get("SELECTOR_PREFER_VISION", "1") != "0"
+    )
+    if prefer_vision:
+        # Mirror VisionResponse.get_bbox ranking so the V_n index here
+        # matches what the brain sees in as_brain_text.
+        def _rank(b: Any) -> tuple[int, int, int, float]:
+            role_rank = (
+                0 if getattr(b, "role_in_scene", "") == "blocker"
+                else (1 if getattr(b, "role_in_scene", "") == "target" else 2)
+            )
+            return (
+                role_rank,
+                0 if getattr(b, "intent_relevant", False) else 1,
+                0 if getattr(b, "clickable", False) else 1,
+                -float(getattr(b, "confidence", 0.0) or 0.0),
+            )
+        ordered = sorted(bboxes, key=_rank)
+        for idx, b in enumerate(ordered, start=1):
+            bbox_label = (getattr(b, "label", "") or "")
+            if not _vision_label_overlaps(target, bbox_label):
+                continue
+            conf = float(getattr(b, "confidence", 0.0) or 0.0)
+            clickable = bool(getattr(b, "clickable", False))
+            if conf < 0.7 or not clickable:
+                # Low-confidence or non-clickable V_n exists — selector
+                # might still be the better path. Don't redirect; fall
+                # through to "allow".
+                continue
+            sid = (
+                getattr(state, "session_id", "") or "<session_id>"
+            )
+            return (
+                f"[click_selector_redundant_with_v_n] You called "
+                f"browser_click_selector(selector={sel!r}, "
+                f"target_label={target!r}) but vision already emitted "
+                f"V_{idx} with label '{bbox_label[:80]}' "
+                f"(confidence={conf:.2f}, clickable=true). On dynamic "
+                f"filter pages the DOM hook rearranges between clicks "
+                f"— the V_n bbox path is more reliable.\n"
+                f"REQUIRED: re-call as\n"
+                f"  browser_click_at(session_id='{sid}', "
+                f"vision_index={idx}, "
+                f"target_label='{bbox_label[:80]}')\n"
+                f"Override: SELECTOR_PREFER_VISION=0."
+            )
+    # Layer D (existing) — find ANY V_n whose label overlaps with target_label.
+    for b in bboxes:
+        bbox_label = (getattr(b, "label", "") or "")
+        if _vision_label_overlaps(target, bbox_label):
+            return None  # match found (low-conf / non-clickable; allow)
+    # No V_n matches the brain's stated label — likely a hallucinated
+    # selector pointing at a stale DOM hook. Refuse with the V_n list.
+    labels_block = _format_bbox_label_list(vresp)
+    return (
+        f"[click_selector_label_unseen] You called "
+        f"browser_click_selector(selector={sel!r}, target_label={target!r}) "
+        f"but vision did NOT emit any V_n with that label in the most "
+        f"recent screenshot. On dynamic filter pages the DOM rearranges "
+        f"after each click; selectors that worked on the previous page "
+        f"often hallucinate against the current DOM. If the element "
+        f"genuinely exists, vision should see it.\n"
+        f"  Recovery options:\n"
+        f"  1. Take a fresh browser_screenshot — vision may now see the "
+        f"target. Then click via browser_click_at(vision_index=V_n).\n"
+        f"  2. If the element really isn't visible, scroll into view "
+        f"first (browser_scroll_until or browser_scroll), then re-screenshot.\n"
+        f"  3. browser_look_again with expected_labels=[<your target>] "
+        f"forces a careful coverage pass over the current view.\n"
+        f"  Ranked V_n labels (top 8) from the most recent screenshot:\n"
+        f"{labels_block}\n"
+        f"Override: SELECTOR_VISION_ALIGNMENT=0."
+    )
+
+
+_FILTER_LABEL_RE = __import__("re").compile(
+    r"\b(filter|facet|amenity|amenities|pairing|pairings|region|regions|"
+    r"price\s*range|price|sort|option|sub[- ]options?|chevron|caret|"
+    r"category|categories|brand|color|size|rating|stars?)\b",
+    __import__("re").IGNORECASE,
+)
+
+
+def _inventory_filters_redundant(
+    state: "BrowserSessionState | None",
+) -> str | None:
+    """Arch v3 fix M — refuse browser_inventory_filters when vision has
+    already surfaced enough filter-shaped bboxes.
+
+    The inventory tool scrolls the filter panel server-side to inventory
+    every checkbox/radio. On dynamic accordion sites that rearranges the
+    DOM and invalidates the V_n indices vision just emitted. If vision
+    already shows the filters as bboxes, the brain should click them
+    directly via browser_click_at(V_n) — no scroll, no DOM thrash.
+
+    Heuristic (cheap, no LLM):
+      - count V_n bboxes whose role is checkbox/radio/input;
+      - PLUS V_n's whose label matches `_FILTER_LABEL_RE`;
+      - PLUS V_n's whose role_in_scene='target' AND label overlaps a
+        TaskBrief constraint canonical_value (so brain-targeted filter
+        chips count even if their role is "button").
+      - threshold ≥ 4 → refuse with redirect.
+
+    Kill switch: INVENTORY_FILTERS_VISION_GUARD=0.
+    """
+    if state is None:
+        return None
+    if os.environ.get("INVENTORY_FILTERS_VISION_GUARD", "1") == "0":
+        return None
+    vresp = getattr(state, "_last_vision_response", None)
+    if vresp is None:
+        return None
+    bboxes = list(getattr(vresp, "bboxes", None) or [])
+    if len(bboxes) < 4:
+        return None  # tiny vision pass; allow inventory
+    # Constraint-keyword set from the brief (if present).
+    brief = getattr(state, "task_brief", None)
+    constraint_kws: set[str] = set()
+    if brief is not None:
+        try:
+            for c in brief.constraints:
+                cv = (c.canonical_value or c.text or "").strip().lower()
+                for tok in cv.replace("-", " ").replace("_", " ").split():
+                    if len(tok) >= 4:
+                        constraint_kws.add(tok)
+        except Exception:
+            pass
+    filter_indices: list[int] = []
+    seen_labels: list[str] = []
+    # Mirror the V_n ranking from VisionResponse.as_brain_text so V_n
+    # in the refusal text matches what the brain sees.
+    def _rank(b: Any) -> tuple[int, int, int, float]:
+        role_rank = (
+            0 if getattr(b, "role_in_scene", "") == "blocker"
+            else (1 if getattr(b, "role_in_scene", "") == "target" else 2)
+        )
+        return (
+            role_rank,
+            0 if getattr(b, "intent_relevant", False) else 1,
+            0 if getattr(b, "clickable", False) else 1,
+            -float(getattr(b, "confidence", 0.0) or 0.0),
+        )
+    ordered = sorted(bboxes, key=_rank)
+    for idx, b in enumerate(ordered, start=1):
+        role = (getattr(b, "role", "") or "").lower()
+        label = (getattr(b, "label", "") or "")
+        label_low = label.lower()
+        is_filter_role = role in {"checkbox", "radio", "input"}
+        is_filter_label = bool(_FILTER_LABEL_RE.search(label_low))
+        is_constraint_target = (
+            getattr(b, "role_in_scene", "") == "target"
+            and any(kw in label_low for kw in constraint_kws)
+        )
+        if is_filter_role or is_filter_label or is_constraint_target:
+            filter_indices.append(idx)
+            seen_labels.append(label[:60])
+    if len(filter_indices) < 4:
+        return None
+    # Build refusal with the matching V_n indices listed.
+    sid = getattr(state, "session_id", "") or "<session_id>"
+    sample = ", ".join(
+        f"V_{i} '{lbl}'" for i, lbl in zip(filter_indices[:6], seen_labels[:6])
+    )
+    return (
+        f"[inventory_filters_redundant] Vision already emitted "
+        f"{len(filter_indices)} filter-shaped bboxes in the most recent "
+        f"screenshot ({sample}). Calling browser_inventory_filters would "
+        f"scroll the panel server-side, which on this site can rearrange "
+        f"the DOM and invalidate the V_n indices vision just gave you "
+        f"— the brain ends up clicking selectors that no longer match.\n"
+        f"REQUIRED: click the matching V_n directly via "
+        f"browser_click_at(session_id='{sid}', vision_index=...). If a "
+        f"specific filter is BELOW the fold and not in the V_n list, "
+        f"browser_scroll first, then browser_screenshot, then click_at.\n"
+        f"Override: INVENTORY_FILTERS_VISION_GUARD=0."
+    )
+
+
 def _stale_dom_index_block(
     state: "BrowserSessionState",
     *,
@@ -555,14 +1070,247 @@ def _stale_dom_index_block(
         f"{state.actions_since_screenshot} mutating action(s) since the "
         f"last screenshot. DOM `{target_disp}` no longer reliably refers "
         f"to the element you saw — the tree has shifted. Call "
-        f"browser_screenshot first, then either:\n"
-        f"  • browser_click_selector(<stable selector>) — survives DOM "
-        f"mutations.\n"
-        f"  • browser_click_at(vision_index=V_n) — fresh vision indices "
-        f"from the new screenshot.\n"
-        f"Do not chain index/coords-based actions without a screenshot "
-        f"between."
+        f"browser_screenshot first, then "
+        f"browser_click_at(vision_index=V_n) using the fresh V_n indices "
+        f"from the new screenshot. Do not chain index/coords-based "
+        f"actions without a screenshot between."
     )
+
+
+def _maybe_tighten_to_dom_rect(
+    bbox: "Any",
+    vis_x0: int,
+    vis_y0: int,
+    vis_x1: int,
+    vis_y1: int,
+    image_w: int,
+    image_h: int,
+    dpr: float,
+) -> tuple[int, int, int, int] | None:
+    """Arch v4 Phase J — return (x0,y0,x1,y1) tightened to the DOM
+    element's bounding rect when bbox.dom_check carries a `rect`.
+
+    Click center always stays within the original vision rect — the
+    DOM rect is only used IF its center falls inside the vision rect
+    (otherwise the bubble-up resolved a non-target ancestor, e.g. the
+    whole row instead of the chevron icon, and tightening would land
+    on the wrong element). In that case we return None and the
+    original vision rect is used. CSS-pixel rect; no DPR division
+    needed (DOM rects are CSS-pixel native).
+
+    Returns None when:
+      • dom_check is missing or has no rect
+      • the DOM rect's center is outside the vision rect (mismatch)
+      • the DOM rect is degenerate (zero or negative area)
+    """
+    dom_check = getattr(bbox, "dom_check", None)
+    if not isinstance(dom_check, dict):
+        return None
+    rect = dom_check.get("rect")
+    if not isinstance(rect, dict):
+        return None
+    try:
+        dx0 = int(rect.get("x0"))
+        dy0 = int(rect.get("y0"))
+        dx1 = int(rect.get("x1"))
+        dy1 = int(rect.get("y1"))
+    except (TypeError, ValueError):
+        return None
+    if dx1 <= dx0 or dy1 <= dy0:
+        return None
+    # Sanity: DOM rect's center should fall inside the original vision
+    # rect (with a small tolerance). Otherwise the bubble-up resolved
+    # to a non-target ancestor and tightening would mis-click.
+    cx = (dx0 + dx1) // 2
+    cy = (dy0 + dy1) // 2
+    pad = 4
+    if not (
+        (vis_x0 - pad) <= cx <= (vis_x1 + pad)
+        and (vis_y0 - pad) <= cy <= (vis_y1 + pad)
+    ):
+        return None
+    # Sanity: the DOM rect shouldn't be enormous compared to the vision
+    # rect. If it is, the bubble-up grabbed a wrapping container — fall
+    # back to the vision rect.
+    vis_area = max(1, (vis_x1 - vis_x0) * (vis_y1 - vis_y0))
+    dom_area = (dx1 - dx0) * (dy1 - dy0)
+    if dom_area > vis_area * 4:
+        return None
+    return (dx0, dy0, dx1, dy1)
+
+
+def _resolve_vision_index_by_label(
+    state: "Any",
+    vision_index: int,
+    target_label: str,
+    bboxes: list,
+) -> tuple[int, str | None]:
+    """Arch v4 Phase K — when the brain's `vision_index` doesn't point
+    at a bbox whose label matches `target_label` but a different V_M
+    does, return the remap. Makes `target_label` the source of truth
+    and `vision_index` a tiebreaker hint, eliminating the
+    `[click_at_label_mismatch]` wall-of-labels refusal that pushes
+    the brain off `click_at` and into `eval` / `run_script`.
+
+    Returns:
+      (vision_index_to_use, optional_remap_note). Note is None when
+      no remap was needed; populated when a remap fired so the caller
+      can prepend it to the click result caption.
+
+    Behavior:
+      - Empty target_label / empty bboxes → no-op, returns
+        (vision_index, None).
+      - V_N's label substring-matches target_label → original is fine,
+        no remap.
+      - Otherwise call `_find_best_label_match` (Phase F fuzzy matcher:
+        substring / Levenshtein ≤ 2 / token-overlap ≥ 0.6).
+        - If best == vision_index or best <= 0: no remap. The caller
+          will hit the existing label-mismatch refusal naturally.
+        - If best != vision_index and within remap budget: remap.
+      - Tiebreaker: when multiple V_n match equally, `_find_best_label_
+        match` already returns the first one in iteration order. We
+        don't override that ordering here — fuzzy matcher's "first
+        substring match wins" preserves the bbox-list ranking which
+        already encodes intent_relevant + clickable + confidence.
+      - Honors CLICK_AT_AUTO_REMAP=0 (kill switch) and the per-session
+        CLICK_AT_REMAP_MAX cap to prevent spirals on hallucinated
+        labels.
+    """
+    if (
+        not target_label
+        or not bboxes
+        or not isinstance(vision_index, int)
+        or vision_index <= 0
+    ):
+        return vision_index, None
+    if os.environ.get("CLICK_AT_AUTO_REMAP", "1") == "0":
+        return vision_index, None
+    try:
+        max_remaps = int(os.environ.get("CLICK_AT_REMAP_MAX", "3"))
+    except ValueError:
+        max_remaps = 3
+    if max_remaps <= 0:
+        return vision_index, None
+    used = int(getattr(state, "_click_at_remap_count", 0) or 0)
+    if used >= max_remaps:
+        return vision_index, None
+
+    # V_N's current label — check if it already substring-matches.
+    needle = target_label.strip().lower()
+    if 0 < vision_index <= len(bboxes):
+        cur_label = (getattr(bboxes[vision_index - 1], "label", "") or "").strip().lower()
+        if needle and cur_label and (needle in cur_label or cur_label in needle):
+            return vision_index, None  # original V_N is fine
+
+    # Find the best-matching V_M via Phase F fuzzy matcher.
+    best = _find_best_label_match(bboxes, target_label)
+    if best <= 0 or best == vision_index:
+        return vision_index, None  # caller falls through to existing refusal
+
+    new_label = (getattr(bboxes[best - 1], "label", "") or "").strip()
+    state._click_at_remap_count = used + 1
+    note = (
+        f"[click_at_remap V_{vision_index}→V_{best} "
+        f"reason=\"target_label='{target_label[:60]}' matched V_{best} "
+        f"label '{new_label[:60]}', not V_{vision_index}\"]"
+    )
+    return best, note
+
+
+def _find_best_label_match(bboxes: list, target_label: str) -> int:
+    """Arch v4 Move 3 — fuzzy-match `target_label` against the labels
+    in a freshly-emitted bbox list. Returns the 1-based index of the
+    best match, or -1 when no bbox is similar enough.
+
+    Match rules (any one is enough):
+      • exact lowercase substring match (target ⊆ label or label ⊆ target)
+      • Levenshtein distance ≤ 2 on the lowercased labels
+      • token overlap ≥ 0.6 of the smaller token set, after stripping
+        separators and dropping tokens of len < 3 (mirrors
+        merge_brief_progress._tokenize)
+
+    The function does not break ties beyond "first match wins" — caller
+    can iterate with a different filter if needed.
+    """
+    if not bboxes or not target_label:
+        return -1
+    needle = target_label.strip().lower()
+    # "Wi-Fi" etc. — also try a separator-stripped form so the
+    # substring path handles common label variants.
+    needle_compact = needle
+    for ch in "-_ /.;:,":
+        needle_compact = needle_compact.replace(ch, "")
+    needle_toks = _label_tokens(needle)
+    best_idx = -1
+    best_score = 0.0
+    for i, b in enumerate(bboxes, start=1):
+        label = (getattr(b, "label", "") or "").strip().lower()
+        if not label:
+            continue
+        label_compact = label
+        for ch in "-_ /.;:,":
+            label_compact = label_compact.replace(ch, "")
+        # Substring exact (raw OR compact). Either path is enough —
+        # "Wi-Fi" → "wifi" matches "WiFi filter chip" → "wififilterchip".
+        if needle and label and (needle in label or label in needle):
+            return i
+        if (
+            needle_compact and label_compact
+            and (needle_compact in label_compact or label_compact in needle_compact)
+        ):
+            return i
+        # Levenshtein distance ≤ 2.
+        try:
+            if _levenshtein(needle, label) <= 2:
+                return i
+        except Exception:
+            pass
+        # Token overlap.
+        toks = _label_tokens(label)
+        if needle_toks and toks:
+            overlap = len(needle_toks & toks)
+            denom = max(1, min(len(needle_toks), len(toks)))
+            score = overlap / denom
+            if score >= 0.6 and score > best_score:
+                best_score = score
+                best_idx = i
+    return best_idx
+
+
+def _label_tokens(label: str) -> set[str]:
+    """Tokenize a bbox label the same way TaskBrief tokenizes canonical
+    values. Lowercase, strip separators, drop tokens of length < 3.
+    """
+    s = (label or "").lower()
+    for ch in "-_,/.;:":
+        s = s.replace(ch, " ")
+    return {t for t in s.split() if len(t) >= 3}
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Tiny Levenshtein implementation for short strings (label
+    matching). O(len(a) * len(b)) memory and time; fine for labels
+    capped at ~80 chars."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    # DP row-by-row.
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(
+                cur[j - 1] + 1,        # insert
+                prev[j] + 1,           # delete
+                prev[j - 1] + cost,    # substitute
+            )
+        prev = cur
+    return prev[lb]
 
 
 def _vision_alternatives_hint(
@@ -803,6 +1551,11 @@ async def _decorate_bboxes_with_dom_check(
         dom_tag = (dr.get("tag") or "").lower()
         dom_role = (dr.get("role") or "").lower()
         dom_text = (dr.get("text") or "")
+        # Arch v4 Phase J — DOM rect from the resolved element. When
+        # populated, click_at uses this pixel-exact rect instead of
+        # the looser vision bbox so the click lands inside the actual
+        # text/control area, not on padding.
+        dom_rect = dr.get("rect") if isinstance(dr.get("rect"), dict) else None
         v_role = (getattr(b, "role", "") or "").lower()
         v_label = (getattr(b, "label", "") or "")
 
@@ -817,16 +1570,30 @@ async def _decorate_bboxes_with_dom_check(
             or (v_role in interactive_roles and dom_role in interactive_roles)
             or (v_role in interactive_roles and dom_tag in {"a", "button", "input", "select", "textarea"})
         )
-        # Disagree only when neither the label tokens nor the role
-        # match — keeps the false-positive rate down on reactive UIs.
+        # Phase J — populate dom_check with rect on AGREEMENT too, so
+        # the click can tighten even when vision and DOM agree on
+        # role/text. Set disagree=False in that case so as_brain_text
+        # doesn't flag it. The render path's disagree-only filter
+        # already handles the legacy case.
         if text_overlap or role_agree:
+            if dom_rect is not None:
+                b.dom_check = {
+                    "tag": dom_tag,
+                    "role": dom_role,
+                    "text": dom_text[:60],
+                    "disagree": False,
+                    "rect": dom_rect,
+                }
             continue
-        b.dom_check = {
+        payload = {
             "tag": dom_tag,
             "role": dom_role,
             "text": dom_text[:60],
             "disagree": True,
         }
+        if dom_rect is not None:
+            payload["rect"] = dom_rect
+        b.dom_check = payload
 
 
 def _read_image_dims(b64: str) -> tuple[int, int]:
@@ -1558,6 +2325,31 @@ class WorkerMustExitError(RuntimeError):
     """
 
 
+@dataclasses.dataclass
+class PreplanLock:
+    """Arch v4 Move 1 — declarative pre-action plan.
+
+    The brain calls `browser_preplan(...)` to set this lock. The next
+    state-change tool consumes it (sets `preplan_lock_consumed=True`).
+    The freshness gate then refuses any further state-change until a
+    fresh `browser_preplan` re-sets the lock with new declarations.
+
+    Fields capture what the brain claims it's about to do so the
+    refusal text can quote the prior intent ("Last preplan: focus=#2
+    'WiFi', tool=click_at, target='Wi-Fi filter chip', expected='filter
+    chip becomes checked'"). Verification (browser_verify_action +
+    reconcile) then checks declared-vs-observed, closing the loop.
+    """
+
+    focus_constraint_idx: int = -1
+    planned_tool: str = ""
+    planned_target_label: str = ""
+    planned_target_vision_index: int = -1
+    expected_outcome: str = ""
+    expected_postcondition: str = "dom_mutated"
+    set_at_iter: int = -1
+
+
 _CAPTCHA_KEYWORDS = (
     "captcha", "recaptcha", "hcaptcha", "turnstile", "cloudflare",
     "verify you are human", "prove you are not a robot", "slider puzzle",
@@ -1578,10 +2370,15 @@ def _compute_screenshot_budget(
 ) -> int:
     """Task-complexity-aware screenshot budget.
 
-    Base=6. +4 for research tasks, +10 for captcha-suspect tasks, +8 for
-    known-hard domains. Capped at 30 to prevent runaway cost.
+    Arch v3: base lifted 6 -> 12. The original cap was sized when vision
+    was expensive; on Gemini Flash a screenshot costs cents. Multi-
+    constraint queries reliably need ≥10 vision passes (filter panel
+    open, filter applied, results refreshed, repeat per constraint),
+    and the brain spent too much energy in v2 working around budget
+    gating. +4 research, +10 captcha-suspect, +8 hard domains. Capped
+    at 30 to prevent runaway cost.
     """
-    budget = 6
+    budget = 12
     lower_task = (task_instruction or "").lower()
     lower_url = (target_url or "").lower()
     if is_research:
@@ -1602,9 +2399,17 @@ class BrowserSessionState:
 
     # Default budget when no task context is supplied. Use
     # configure_budget() to switch to complexity-aware allocation.
-    DEFAULT_SCREENSHOT_BUDGET = 6
+    # Arch v3: lifted 6 -> 12 (see _compute_screenshot_budget).
+    DEFAULT_SCREENSHOT_BUDGET = 12
     CAPTCHA_MODE_ITERATIONS = 15
-    MAX_CLICK_AT = 3
+    # Arch v4 — session-wide click_at cap raised. The original v3 cap
+    # of 3 fired at the 4th legitimate click in a multi-step flow
+    # (e.g. Shop → White → Region → United States) and pushed the
+    # brain to click_selector / run_script. Real loop detection now
+    # lives in check_dead_click (same target + no DOM change refuses)
+    # and the Phase D tool ladder ratchet. This cap is a last-resort
+    # session-runaway guard, not a per-flow limiter.
+    MAX_CLICK_AT = 60
 
     def __init__(self):
         self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
@@ -1807,6 +2612,56 @@ class BrowserSessionState:
         # type / navigate). None for single-step or no-plan tasks.
         self.task_plan: Any = None  # Optional[task_plan.TaskPlan]
 
+        # Arch v3 working memory — TaskBrief carries the full original
+        # query, structured constraints with status, plan_of_attack, and
+        # CoT trail. Survives session restart with full fidelity via
+        # handoff_store. Built once at delegation time by
+        # orchestrator_tools.delegate_browser_task; readers are
+        # build_tool_result_blocks (renders), worker_hook (constraint
+        # checklist), verify_action (auto-flips constraints), and the
+        # browser_update_task_brief tool (brain-driven revisions).
+        self.task_brief: Any = None  # Optional[task_brief.TaskBrief]
+
+        # PageState history — last 5 PageState dicts captured from
+        # vision passes. Used by handoff_store to preserve "what the
+        # page looked like recently" across worker restart.
+        self.vision_state_history: list[dict] = []
+        self._VISION_STATE_HISTORY_CAP = 5
+
+        # Failed-tactics ledger — short labels of approaches the brain
+        # already tried and abandoned. Surfaced to the help_advisor and
+        # to the next worker after restart so we don't re-suggest dead
+        # paths.
+        self.failed_tactics: list[str] = []
+        self._FAILED_TACTICS_CAP = 20
+
+        # Interaction ledger — last N (V_n, outcome) tuples from
+        # click_at / type_at / verify_action. Helps the successor
+        # worker avoid re-trying dead bboxes after restart.
+        self.interaction_ledger: list[dict] = []
+        self._INTERACTION_LEDGER_CAP = 20
+
+        # Pre-action context for browser_verify_action. Captured by the
+        # action dispatch path before each state-change tool runs;
+        # cleared after verify completes.
+        self.last_action_context: Any = None  # Optional[ActionContext]
+
+        # Help-advisor budget — the first 3 browser_request_help calls
+        # become non-terminal advisor calls; subsequent calls fall
+        # through to the legacy "spawn successor worker" path.
+        self.help_advisor_calls: int = 0
+        self.HELP_ADVISOR_BUDGET = 3
+
+        # Arch v3 fix G — track the most recent chevron click so the
+        # next vision pass can detect "click landed but accordion did
+        # not expand" and append a failed_tactic for the successor.
+        # `_last_chevron_click_label` is set in click_at when the
+        # right-edge shift fires; `_last_chevron_click_url` records the
+        # URL at click time so the next vision pass can confirm we're
+        # still on the same page.
+        self._last_chevron_click_label: str = ""
+        self._last_chevron_click_url: str = ""
+
         # URL-hallucination guard: a ring of href values observed in
         # recent state.elements / tool result snapshots. browser_navigate
         # uses it to reject same-domain URLs the brain dreamt up
@@ -1833,6 +2688,73 @@ class BrowserSessionState:
         # trying to escape without first looking at the page.
         self.last_failure_without_screenshot: bool = False
         self.last_failure_summary: str = ""
+
+        # Arch v3 fix #5 — state-freshness gate. Set True by every
+        # state-change tool (click/type/drag/navigate/run_script/eval).
+        # Cleared by browser_screenshot / browser_state_check /
+        # browser_look_again. Read by `must_screenshot_before_state_change`
+        # at the top of each gated tool's execute(): when dirty, the
+        # tool refuses with a redirect to browser_screenshot. Eliminates
+        # the "click → script → script → URL guess" loop where the
+        # brain reaches for JS instead of re-screenshotting after a click
+        # rearranged the DOM.
+        # Kill switch: STATE_FRESHNESS_GATE=0 disables the refusal.
+        # Tracks the last mutating tool's name + a one-line outcome so
+        # the refusal message can be specific.
+        self.dom_dirty_since_screenshot: bool = False
+        self.last_mutating_tool: str = ""
+        self.last_mutating_summary: str = ""
+
+        # Arch v4 Move 1 — preplan lock state. Forces a *vision → preplan
+        # → action → verify* ritual: the brain physically cannot mutate
+        # the page without first declaring (a) which constraint it's
+        # attacking, (b) which tool, (c) what it expects to happen. The
+        # preplan_lock holds that declaration; it's consumed by the next
+        # state-change tool. Backoff prevents deadlocks: ≥3 consecutive
+        # refusals auto-yield one free pass with [GATE_BACKOFF] guidance.
+        # Kill switches: PREPLAN_GATE=0 disables; PREPLAN_BACKOFF=0 keeps
+        # refusing instead of yielding.
+        self.preplan_lock: PreplanLock | None = None
+        self.preplan_lock_consumed: bool = False
+        self.preplan_consecutive_refusals: int = 0
+        self.preplan_backoff_just_fired: bool = False
+
+        # Arch v4 Move 4 — per-target tool attempts ledger. Keyed by the
+        # focus constraint's canonical_value when a preplan declares
+        # focus_constraint_idx; falls back to a token-frozenset of the
+        # target_label for unfocused calls (rare, e.g. dismissing a
+        # blocker mid-task). Inner dict maps tool tier label →
+        # attempt count. Cleared per-target when verify_action returns
+        # verdict='succeeded' on that target. The preplan tool consults
+        # this ledger to enforce the TOOL LADDER (click_at → selector
+        # → run_script → navigate).
+        self.tool_attempts: dict[str, dict[str, int]] = {}
+        # Tracks the cold-start session signal for Tier-4 navigate
+        # enforcement: True only before the first non-navigate state-
+        # change fires. After any cursor/script/etc. tool runs we drop
+        # the cold-start flag and same-domain navigates start ratcheting.
+        self.is_cold_start: bool = True
+
+        # Arch v4 Move 3 — set True while an internal click_at auto-
+        # retry is in flight. The freshness + preplan gates skip their
+        # double-consume checks under this flag because the retry is
+        # logically covered by the brain's original preplan declaration.
+        # The retry path resets this to False before returning.
+        self._bbox_auto_retry_in_flight: bool = False
+
+        # Arch v4 Phase K — counts how many times click_at auto-remapped
+        # the brain's vision_index to a different V_n that matched the
+        # target_label better. Capped at CLICK_AT_REMAP_MAX (env, default
+        # 3 per session) so a hallucinated label can't spiral. Reset on
+        # session restart (via __init__).
+        self._click_at_remap_count: int = 0
+
+        # v5: chain-of-thought trail. Optional `narration` param on
+        # click_at / click_selector / type_at sets this; worker_hook
+        # renders it on the NEXT turn as [last_intended: "..."] and
+        # then clears it. Lets the brain compare its prior intent
+        # against the actual outcome without code-side substring match.
+        self._last_narration: str = ""
 
         # Phase 3.1: cursor-failure ledger. Each cursor-based interaction
         # tool that returns a failure caption records its strategy here
@@ -1908,7 +2830,10 @@ class BrowserSessionState:
         # regions to bbox. "Book a flight on trip.com" → the vision agent
         # should prioritize departure / destination / date / search
         # button bboxes, not navbar noise.
-        self.task_instruction = (task_instruction or "")[:500]
+        # Arch v3: full instruction is preserved (not truncated). The
+        # brief carries this verbatim too; this field stays for the
+        # legacy code paths that read state.task_instruction directly.
+        self.task_instruction = task_instruction or ""
         self.task_target_url = target_url or ""
         return self.max_screenshots
 
@@ -2104,6 +3029,16 @@ class BrowserSessionState:
         norm = self._normalize_url(url)
         self.current_url = url
         self.url_visit_counts[norm] = self.url_visit_counts.get(norm, 0) + 1
+        # Arch v3 fix #2: every URL change is a chance for the brief to
+        # auto-flip filter/attribute/ordering constraints encoded in the
+        # path or query string. Cheap (regex+token match), no LLM.
+        try:
+            brief = getattr(self, "task_brief", None)
+            if brief is not None:
+                from superbrowser_bridge.task_brief import reconcile_from_url
+                reconcile_from_url(brief, url)
+        except Exception:
+            pass
 
     def record_checkpoint(self, url: str, title: str, action: str) -> None:
         """Record a progress checkpoint (successful meaningful step)."""
@@ -2129,6 +3064,7 @@ class BrowserSessionState:
         self,
         url: str,
         content_hash: str = "",
+        intent: str = "",
     ) -> tuple[bool, str]:
         """Check if a screenshot should be allowed. Returns (allowed, reason).
 
@@ -2139,6 +3075,11 @@ class BrowserSessionState:
             attempt gets its own allowance
           - a hard cap (captcha_mode_screenshot_cap) prevents runaway burn
             even if vision keeps failing
+
+        Arch v3: explicit verify_action / state_check intent bypasses the
+        actions_since_screenshot==0 rejection. Those tools are themselves
+        observation hops — gating them on "did you click since last
+        screenshot" forces the brain to act blindly.
         """
         if self.screenshot_budget <= 0:
             return False, "[Screenshot budget exhausted] Use browser_get_markdown or browser_eval instead."
@@ -2157,7 +3098,18 @@ class BrowserSessionState:
                     "Call browser_solve_captcha or browser_click a tile — don't re-screenshot the same state.]"
                 )
             return True, ""
-        if self.actions_since_screenshot == 0:
+        # Arch v3: verify-action / state-check intents are explicit
+        # observation hops — exempt from the actions_since_screenshot==0
+        # rejection so the brain can verify state without first making a
+        # dummy mutation.
+        intent_lower = (intent or "").lower()
+        is_verify_intent = (
+            "verify_action" in intent_lower
+            or "state_check" in intent_lower
+            or "verify action" in intent_lower
+            or "state check" in intent_lower
+        )
+        if self.actions_since_screenshot == 0 and not is_verify_intent:
             return False, "[No actions since last screenshot — reuse previous. Use browser_get_markdown to re-read content.]"
         norm = self._normalize_url(url)
         # Dedupe on (url, content_hash) — if content changed since last shot
@@ -2254,6 +3206,25 @@ class BrowserSessionState:
         canonical = f"n={count}|h={hist}|a={attrs}|{scroll_bucket}"
         return hashlib.sha1(canonical.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
+    # Tools whose execution mutates the page DOM. Set the freshness
+    # dirty flag in `record_step` so the next state-change tool gets
+    # gated by `must_screenshot_before_state_change`.
+    #
+    # browser_navigate / browser_open are NOT included — they're
+    # navigation-class tools that already return vision results in their
+    # success path (clearing the flag implicitly), and they're often the
+    # legitimate recovery move when the brain wants to start fresh.
+    _MUTATING_TOOLS: frozenset = frozenset({
+        "browser_click", "browser_click_at", "browser_click_selector",
+        "browser_type", "browser_type_at", "browser_fix_text_at",
+        "browser_keys", "browser_drag", "browser_drag_selectors",
+        "browser_drag_path", "browser_drag_slider_until",
+        "browser_set_slider", "browser_set_slider_at",
+        "browser_select", "browser_select_option",
+        "browser_run_script", "browser_eval",
+        "browser_solve_captcha",
+    })
+
     def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:
         """Record a step in the structured step history."""
         self.step_history.append({
@@ -2263,6 +3234,127 @@ class BrowserSessionState:
             "url": self.current_url,
             "time": datetime.now().strftime("%H:%M:%S"),
         })
+        # Arch v3 fix #5: tools in _MUTATING_TOOLS dirty the freshness
+        # flag automatically — single chokepoint, no per-tool wiring.
+        if tool_name in self._MUTATING_TOOLS:
+            self.dom_dirty_since_screenshot = True
+            self.last_mutating_tool = tool_name
+            self.last_mutating_summary = (result_summary or "")[:160]
+            # Arch v4 Move 4: drop cold-start once any non-navigate
+            # mutating tool fires. Tier-4 navigate ratcheting kicks in
+            # from this point. Cold-start navigates (browser_open,
+            # the very first browser_navigate of a session) bypass the
+            # ladder.
+            if tool_name not in {"browser_open", "browser_navigate"}:
+                self.is_cold_start = False
+            # Arch v4 Move 4: bookkeep the attempt against the current
+            # preplan_lock's target so ladder ratchet logic has data.
+            try:
+                self._record_tool_attempt(tool_name, result_summary)
+            except Exception:
+                pass
+
+    # ── Arch v4 Move 4 — tool ladder ratchet helpers ─────────────
+    # Tier label maps. We intentionally keep a small fixed set so the
+    # ledger stays interpretable. Sub-tools (e.g. type_at, drag_at) are
+    # rolled up into Tier 1 / Tier 2 by family.
+    _TIER1_TOOLS = frozenset({
+        "browser_click_at", "browser_type_at", "browser_fix_text_at",
+        "browser_set_slider_at", "browser_drag", "browser_drag_path",
+        "browser_keys", "browser_scroll", "browser_scroll_until",
+    })
+    _TIER2_TOOLS = frozenset({
+        "browser_click_selector", "browser_type",
+        "browser_select", "browser_select_option",
+        "browser_set_slider", "browser_drag_selectors",
+        "browser_drag_slider_until",
+    })
+    _TIER3_TOOLS = frozenset({"browser_run_script", "browser_eval"})
+    _TIER4_TOOLS = frozenset({"browser_navigate"})
+
+    def _tier_for_tool(self, tool_name: str) -> int:
+        if tool_name in self._TIER1_TOOLS:
+            return 1
+        if tool_name in self._TIER2_TOOLS:
+            return 2
+        if tool_name in self._TIER3_TOOLS:
+            return 3
+        if tool_name in self._TIER4_TOOLS:
+            return 4
+        return 0  # uncategorized — observation tools, etc.
+
+    def _ledger_key_for_lock(
+        self, lock: "PreplanLock | None", fallback_label: str = "",
+    ) -> str:
+        """Derive the per-target ledger key. Prefer the focus
+        constraint's canonical_value (stable identity), fall back to a
+        canonical-token fingerprint of the target label so vision
+        label drift ('Wi-Fi' vs 'WiFi') doesn't fragment the ledger.
+        """
+        brief = getattr(self, "task_brief", None)
+        if lock is not None and brief is not None:
+            idx = lock.focus_constraint_idx
+            if 0 <= idx < len(brief.constraints):
+                cv = (brief.constraints[idx].canonical_value or "").strip().lower()
+                if cv:
+                    return f"constraint:{cv}"
+        label_src = (
+            (lock.planned_target_label if lock is not None else "")
+            or fallback_label
+            or ""
+        ).lower()
+        if not label_src:
+            return "label:<unscoped>"
+        # Lowercase + strip separators + drop tokens <3 chars. Mirrors
+        # task_brief.merge_brief_progress._tokenize, so vision label
+        # drift collapses to one ledger key.
+        for ch in "-_,/.;:":
+            label_src = label_src.replace(ch, " ")
+        toks = sorted(t for t in label_src.split() if len(t) >= 3)
+        if not toks:
+            return "label:<unscoped>"
+        return "label:" + "+".join(toks)
+
+    def _record_tool_attempt(
+        self, tool_name: str, result_summary: str,
+    ) -> None:
+        """Bookkeep an attempt on the per-target ledger. Called from
+        record_step for every mutating tool. Tier 0 (observation,
+        navigate to a different domain) is skipped — only ladder tiers
+        contribute.
+        """
+        tier = self._tier_for_tool(tool_name)
+        if tier == 0:
+            return
+        lock = self.preplan_lock
+        key = self._ledger_key_for_lock(lock)
+        rec = self.tool_attempts.setdefault(key, {})
+        rec[f"tier{tier}"] = rec.get(f"tier{tier}", 0) + 1
+        # Track failures separately so the ratchet only escalates after
+        # genuine failure (not after a successful click that we count
+        # as Tier 1 attempted). A failing result_summary contains one
+        # of the canonical failure markers; otherwise treat as success.
+        result_str = str(result_summary or "")
+        is_fail = any(
+            m in result_str for m in (
+                "_failed", "_timeout", "click_silent",
+                "VERIFY_MISS", "selector_ambiguous", "BLOCKED:",
+                "NETWORK_BLOCKED", "navigate_unverified",
+            )
+        )
+        if is_fail:
+            rec[f"tier{tier}_failed"] = rec.get(f"tier{tier}_failed", 0) + 1
+
+    def clear_tool_attempts_for_lock(
+        self, lock: "PreplanLock | None" = None,
+    ) -> None:
+        """Reset the ledger for a specific target — called when
+        verify_action returns verdict='succeeded' so subsequent attacks
+        on a *different* target start fresh on Tier 1.
+        """
+        key = self._ledger_key_for_lock(lock or self.preplan_lock)
+        if key in self.tool_attempts:
+            del self.tool_attempts[key]
 
     def mark_action_failed(self, summary: str) -> None:
         """Set the failure flag consumed by the impasse-tool refusal.
@@ -2281,6 +3373,169 @@ class BrowserSessionState:
         """Clear the failure flag — called by browser_screenshot."""
         self.last_failure_without_screenshot = False
         self.last_failure_summary = ""
+
+    def mark_dom_dirty(self, tool_name: str, summary: str = "") -> None:
+        """Record that a mutating tool just ran. Sets the freshness flag
+        consumed by `must_screenshot_before_state_change`. Cleared by
+        browser_screenshot / browser_state_check / browser_look_again.
+        """
+        self.dom_dirty_since_screenshot = True
+        self.last_mutating_tool = (tool_name or "")[:48]
+        self.last_mutating_summary = (summary or "")[:160]
+
+    def clear_dom_dirty(self) -> None:
+        """Clear the freshness flag — called by observation tools."""
+        self.dom_dirty_since_screenshot = False
+        self.last_mutating_tool = ""
+        self.last_mutating_summary = ""
+
+    def must_screenshot_before_state_change(self, tool_name: str) -> str | None:
+        """Arch v3 fix #5 — refuses a state-change tool when the prior
+        action was also state-changing and no screenshot ran in between.
+        Returns the refusal text on block, None on allow.
+
+        The brain's dominant failure mode is: click → DOM rearranges →
+        brain reaches for `browser_run_script` / `browser_eval` /
+        `browser_click_selector` to "guess" the new DOM, instead of
+        re-screenshotting. Forcing a screenshot first is what makes V_n
+        indices fresh and keeps the click ladder usable.
+
+        Exempt tools (always allowed):
+          - browser_screenshot, browser_state_check, browser_look_again,
+            browser_get_markdown, browser_image_region — observations
+          - browser_navigate — sometimes the recovery move
+          - browser_close, browser_request_help, browser_ask_user — exits
+          - browser_set_task_plan / browser_plan_* / browser_update_task_brief
+            — pure state updates on the worker, no DOM impact
+
+        Kill switch: STATE_FRESHNESS_GATE=0 (default 1).
+        """
+        if os.environ.get("STATE_FRESHNESS_GATE", "1") == "0":
+            return None
+        # Arch v4 Move 3 — internal auto-retry is covered by the
+        # outer call's gate clearance. Skip both gates here.
+        if getattr(self, "_bbox_auto_retry_in_flight", False):
+            return None
+        # The list of GATED tools. Anything mutating the page goes here.
+        gated = {
+            "browser_click", "browser_click_at", "browser_click_selector",
+            "browser_type", "browser_type_at", "browser_fix_text_at",
+            "browser_keys", "browser_drag", "browser_drag_selectors",
+            "browser_drag_path", "browser_drag_slider_until",
+            "browser_set_slider", "browser_set_slider_at",
+            "browser_select", "browser_select_option",
+            "browser_run_script", "browser_eval",
+            "browser_solve_captcha",
+        }
+        if tool_name not in gated:
+            return None
+        # Arch v3 fix C — gate-pass marks dirty IMMEDIATELY. Same-turn
+        # parallel mutating batches (Anthropic API can return multiple
+        # tool_use blocks per turn) used to slip past the gate because
+        # `record_step` (which sets dirty) ran at the END of execute().
+        # By dirtying on gate-pass we guarantee the second parallel call's
+        # gate check sees dirty=True even if the first call hasn't
+        # finished record_step yet. Idempotent with record_step's set.
+        if not self.dom_dirty_since_screenshot:
+            self.dom_dirty_since_screenshot = True
+            self.last_mutating_tool = tool_name
+            self.last_mutating_summary = "in_flight"
+            # Arch v4 Move 1: screenshot-freshness clear; now enforce
+            # preplan-lock. Returns None to allow, refusal text to block.
+            return self._check_preplan_lock(tool_name)
+        prev_tool = self.last_mutating_tool or "(prior action)"
+        prev_outcome = self.last_mutating_summary or ""
+        outcome_bit = f" Outcome: {prev_outcome[:120]}" if prev_outcome else ""
+        sid = self.session_id or "<session_id>"
+        return (
+            f"[refused: state is dirty — screenshot before next action]\n"
+            f"You just ran {prev_tool} which mutated the page; the V_n "
+            f"indices and DOM you have are STALE. Calling {tool_name} now "
+            f"would either click a moved/missing element or guess via JS "
+            f"against a DOM you can't see.{outcome_bit}\n"
+            f"REQUIRED next call — one of:\n"
+            f"  - browser_screenshot(session_id='{sid}') — full vision pass, "
+            f"new V_n indices, fresh bbox geometry.\n"
+            f"  - browser_state_check(session_id='{sid}', expected='...') — "
+            f"cheap state-only pass; use when you only need to confirm "
+            f"the prior action took effect.\n"
+            f"After a fresh vision pass the gate clears and you can call "
+            f"{tool_name} again with fresh references. DO NOT call "
+            f"browser_run_script or browser_eval to work around this — "
+            f"that's the failure mode this gate exists to prevent. "
+            f"browser_get_markdown is fine for reading text but does NOT "
+            f"clear this gate (no vision = no fresh V_n)."
+        )
+
+    def _check_preplan_lock(self, tool_name: str) -> str | None:
+        """Arch v4 Move 1 — refuses a state-change tool when no fresh
+        preplan has been declared since the last consumption. Layered
+        on top of must_screenshot_before_state_change: the screenshot-
+        freshness gate runs first, then this one.
+
+        Side effects:
+          - On allow: marks `preplan_lock_consumed = True` so the next
+            state-change requires a fresh preplan.
+          - On consecutive refusals: increments `preplan_consecutive_
+            refusals`. At ≥3, sets `preplan_backoff_just_fired=True`,
+            resets the counter, and ALLOWS the call (so the brain can
+            unstick). worker_hook surfaces [GATE_BACKOFF n=1] to the
+            brain. Disabled by PREPLAN_BACKOFF=0.
+          - On allow: resets `preplan_consecutive_refusals` to 0.
+        Kill switch: PREPLAN_GATE=0 disables this layer (returns None).
+        """
+        if os.environ.get("PREPLAN_GATE", "1") == "0":
+            return None
+        # No lock OR lock already consumed: refuse (or backoff).
+        lock = self.preplan_lock
+        if lock is None or self.preplan_lock_consumed:
+            backoff_active = (
+                os.environ.get("PREPLAN_BACKOFF", "1") != "0"
+                and self.preplan_consecutive_refusals >= 3
+            )
+            if backoff_active:
+                # Yield: allow this call, reset counter, signal hook.
+                self.preplan_consecutive_refusals = 0
+                self.preplan_backoff_just_fired = True
+                # The lock stays None / consumed, but consume-mark is
+                # idempotent — let it through. Marking consumed here
+                # would be a no-op since it's already consumed/missing.
+                return None
+            self.preplan_consecutive_refusals += 1
+            sid = self.session_id or "<session_id>"
+            if lock is None:
+                last_quote = (
+                    "(no prior preplan on this session)"
+                )
+            else:
+                last_quote = (
+                    f"focus=#{lock.focus_constraint_idx + 1}, "
+                    f"tool={lock.planned_tool!r}, "
+                    f"target={lock.planned_target_label!r}, "
+                    f"expected={lock.expected_outcome!r}"
+                )
+            return (
+                f"[refused: preplan_lock consumed]\n"
+                f"Calling {tool_name} requires a fresh browser_preplan. "
+                f"Last preplan: {last_quote}.\n"
+                f"Before the next action, declare which TaskBrief "
+                f"constraint you're attacking, which tool, and what "
+                f"should happen. Call:\n"
+                f"  browser_preplan(session_id='{sid}', "
+                f"focus_constraint_idx=<int>, planned_tool='click_at', "
+                f"planned_target_label='<V_n label>', "
+                f"planned_target_vision_index=<V_n>, "
+                f"expected_outcome='<one-sentence>', "
+                f"expected_postcondition='bbox_state_change'|'dom_mutated'|"
+                f"'url_changed')\n"
+                f"This forces vision→preplan→action→verify discipline "
+                f"so multi-constraint queries don't drift. Override "
+                f"with PREPLAN_GATE=0 if you genuinely need to bypass."
+            )
+        # Lock is fresh: allow + consume.
+        self.preplan_consecutive_refusals = 0
+        self.preplan_lock_consumed = True
+        return None
 
     def must_screenshot_before_giving_up(self) -> str | None:
         """Refusal message for browser_request_help /
@@ -2353,6 +3608,19 @@ class BrowserSessionState:
         )
         if getattr(h, "task_plan", None) is not None:
             self.task_plan = h.task_plan
+        # Arch v3 — restore TaskBrief, vision history, failed tactics,
+        # interaction ledger so the successor worker isn't blind.
+        if getattr(h, "task_brief", None) is not None:
+            self.task_brief = h.task_brief
+        vsh = getattr(h, "vision_state_history", None)
+        if isinstance(vsh, list):
+            self.vision_state_history = list(vsh)[-self._VISION_STATE_HISTORY_CAP:]
+        ft = getattr(h, "failed_tactics", None)
+        if isinstance(ft, list):
+            self.failed_tactics = list(ft)[-self._FAILED_TACTICS_CAP:]
+        il = getattr(h, "interaction_ledger", None)
+        if isinstance(il, list):
+            self.interaction_ledger = list(il)[-self._INTERACTION_LEDGER_CAP:]
         self.cursor_failure_strategies = set(
             getattr(h, "cursor_failure_strategies", set()) or set()
         )
@@ -2370,6 +3638,36 @@ class BrowserSessionState:
         # brain to browser_screenshot instead.
         if self.session_id:
             self.sessions_opened = max(self.sessions_opened, 1)
+
+    def _task_plan_step_prefix(self) -> str:
+        """Return a one-line `[step i/N → "name"]` prefix for the active
+        TaskPlan step, or empty string when no plan is set.
+
+        Used by build_text_only and build_tool_result_blocks to prepend
+        the canonical plan-cursor reminder at the TOP of every tool
+        reply. The full plan checklist is still rendered post-iteration
+        by worker_hook; this prefix is the single-line cursor at the
+        moment of decision. Kill switch STEP_PREFIX_IN_CAPTION=0.
+        """
+        if os.environ.get("STEP_PREFIX_IN_CAPTION", "1") == "0":
+            return ""
+        plan = getattr(self, "task_plan", None)
+        if plan is None:
+            return ""
+        try:
+            active_idx = plan.active_index()
+            if active_idx is None:
+                return f"[step done {len(plan.steps)} of {len(plan.steps)}]"
+            active = plan.steps[active_idx]
+            # Use " of " instead of "/" so the prefix can't pollute
+            # filesystem path generation when the caption is hashed
+            # into a screenshot filename label downstream.
+            return (
+                f"[step {active_idx + 1} of {len(plan.steps)} → "
+                f"{active.name!r}]"
+            )
+        except Exception:
+            return ""
 
     def harvest_anchor_urls(self, blob: str) -> int:
         """Extract `href="..."` URLs from a tool result blob and add them
@@ -2487,6 +3785,27 @@ class BrowserSessionState:
             reason_str.startswith(p) for p in _probe_failed_reasons
         ):
             return f"\n[subgoal_check_skipped: {reason_str[:80]}]"
+        # Arch v3: when the postcondition links to a TaskBrief constraint
+        # via constraint_id, flip that constraint to satisfied on success.
+        # Free path — runs after the verify_after probe already succeeded.
+        try:
+            cid = step.success_criteria.payload.get("constraint_id") or ""
+            cid = cid or getattr(step.success_criteria, "constraint_id", "") or ""
+            if (
+                vr.verified
+                and cid
+                and getattr(self, "task_brief", None) is not None
+            ):
+                idx = self.task_brief.find_constraint_by_canonical(cid)
+                if idx >= 0:
+                    self.task_brief.mark_constraint(
+                        idx,
+                        "satisfied",
+                        f"verify_after({reason_str[:60]})",
+                        self.current_url or "",
+                    )
+        except Exception:
+            pass
         from superbrowser_bridge.task_plan import MAX_STEP_ATTEMPTS
         return _format_subgoal_note(self, step, vr.verified, reason_str, MAX_STEP_ATTEMPTS)
 
@@ -2526,10 +3845,9 @@ class BrowserSessionState:
                 f"{self.MAX_CONSECUTIVE_SAME_TARGET} times in a row with "
                 "no DOM change. The previous clicks did not move the "
                 "page. Switch tactic: call browser_screenshot to "
-                "re-observe, then pick a different [V_n]/[index], try a "
-                "different role (e.g., the form's submit button instead "
-                "of the input), try browser_click_selector with a stable "
-                "CSS hook, or browser_wait_for content you expect to "
+                "re-observe, pick a different V_n (try a sibling "
+                "control or a different role — submit button vs. the "
+                "input), or browser_wait_for content you expect to "
                 "appear. Do NOT retry this exact target, and do NOT "
                 "synthesize clicks via browser_run_script — JS clicks "
                 "are isTrusted=false and bot-detected."
@@ -2715,6 +4033,27 @@ class BrowserSessionState:
         key so a re-screenshot on the same URL with identical DOM hits
         the cache.
         """
+        # v5: prepend the active TaskPlan step cursor as the first line
+        # of the caption so the brain sees the holistic state BEFORE
+        # the screenshot/vision content. Skipped on un-planned tasks.
+        _step_prefix = self._task_plan_step_prefix()
+        if _step_prefix:
+            caption = f"{_step_prefix}\n{caption}" if caption else _step_prefix
+        # Arch v3: prepend the TaskBrief in COMPACT form on regular tool
+        # results. Full-form rendering happens after the vision pass
+        # below where it sits next to the [STATE] block. Compact mode
+        # adds ~80 tokens per tool reply — cheap insurance against the
+        # brain forgetting filters/constraints mid-task.
+        _brief = getattr(self, "task_brief", None)
+        if _brief is not None and os.environ.get("BRIEF_IN_CAPTION", "1") != "0":
+            try:
+                _brief_line = _brief.to_brain_text(compact=True)
+            except Exception:
+                _brief_line = ""
+            if _brief_line:
+                caption = (
+                    f"{_brief_line}\n{caption}" if caption else _brief_line
+                )
         # Lazy import: keeps the vision package optional at import time
         # so a broken VISION_API_KEY doesn't blow up sessions that never
         # enable the feature.
@@ -2756,6 +4095,20 @@ class BrowserSessionState:
                 # needs the source pixel dims to convert back to viewport
                 # coordinates accurately.
                 img_w, img_h = _read_image_dims(b64)
+                # Arch v3 fix #3: derive the highest-priority unverified
+                # TaskBrief constraint and pass it as active_constraint so
+                # vision biases V_n ranking toward elements that advance
+                # this specific constraint right now.
+                _active_constraint: dict | None = None
+                _brief = getattr(self, "task_brief", None)
+                if _brief is not None:
+                    try:
+                        for _c in _brief.constraints:
+                            if _c.status == "unverified":
+                                _active_constraint = _c.to_dict()
+                                break
+                    except Exception:
+                        _active_constraint = None
                 resp = await agent.analyze(
                     screenshot_b64=b64,
                     intent=effective_intent,
@@ -2770,6 +4123,7 @@ class BrowserSessionState:
                     coverage_mode=coverage_mode,
                     expected_labels=expected_labels,
                     force_fresh=force_fresh,
+                    active_constraint=_active_constraint,
                 )
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
@@ -2777,13 +4131,22 @@ class BrowserSessionState:
                 self._last_vision_url = effective_url or self.current_url or ""
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
+                # Arch v3 fix #5: a fresh vision pass clears the
+                # freshness dirty flag — brain has seen the post-mutation
+                # state, so the next state-change tool is allowed.
+                self.clear_dom_dirty()
                 # Freeze this response as the current epoch. The brain
                 # is about to see `as_brain_text()` output — subsequent
                 # V_n references MUST resolve to this snapshot, not to
                 # whatever background prefetch writes into
                 # `_last_vision_response` before the brain's next turn.
                 self.freeze_vision_epoch()
-                label = (caption or "").split("\n")[0][:30].replace(" ", "-")
+                label = (
+                    (caption or "").split("\n")[0][:30]
+                    .replace(" ", "-")
+                    .replace("/", "_")
+                    .replace("\\", "_")
+                )
                 # Still save the raw screenshot locally for debugging —
                 # doesn't leave the box, doesn't reach the brain.
                 self.save_screenshot(b64, label)
@@ -2866,6 +4229,86 @@ class BrowserSessionState:
                 )
                 if plan_text:
                     brain_text = f"{brain_text}\n\n{plan_text}"
+                # Arch v3: reconcile brief constraints from page_state
+                # and append the FULL brief to the brain text. Empty
+                # PageState (legacy provider response) → no-op.
+                # Arch v3 fix G — chevron-click verdict check. When the
+                # previous click_at was a chevron-labeled bbox AND we're
+                # on the same URL AND the page_state.last_action_verdict
+                # indicates failure, the chevron click silently missed.
+                # Append a failed_tactic so the successor worker (and the
+                # advisor) know to try a different chevron strategy.
+                try:
+                    chevron_lbl = self._last_chevron_click_label
+                    chevron_url = self._last_chevron_click_url
+                    if chevron_lbl and chevron_url == (self.current_url or ""):
+                        ps = getattr(resp, "page_state", None)
+                        verdict_obj = (
+                            getattr(ps, "last_action_verdict", None) if ps else None
+                        )
+                        verdict = (
+                            getattr(verdict_obj, "verdict", "") if verdict_obj else ""
+                        )
+                        if verdict in ("failed", "uncertain"):
+                            tactic = (
+                                f"chevron_click_no_expansion: V_n labeled "
+                                f"'{chevron_lbl[:80]}' was clicked at right-edge "
+                                f"but accordion did not expand. Try "
+                                f"browser_look_again with expected_labels=["
+                                f"'{chevron_lbl[:60]}'] for a tighter chevron "
+                                f"bbox, then browser_click_at on the new V_n. "
+                                f"If the chevron is genuinely a non-button div, "
+                                f"try clicking the parent row label instead."
+                            )
+                            if tactic not in self.failed_tactics:
+                                self.failed_tactics.append(tactic)
+                                if len(self.failed_tactics) > self._FAILED_TACTICS_CAP:
+                                    self.failed_tactics = self.failed_tactics[
+                                        -self._FAILED_TACTICS_CAP :
+                                    ]
+                    # One-shot: clear after this vision pass either way.
+                    self._last_chevron_click_label = ""
+                    self._last_chevron_click_url = ""
+                except Exception:
+                    pass
+                _brief = getattr(self, "task_brief", None)
+                if _brief is not None:
+                    try:
+                        from superbrowser_bridge.task_brief import (
+                            reconcile_from_page_state,
+                            reconcile_from_url,
+                            reconcile_negative_constraints,
+                        )
+                        # Arch v3 fix #2: URL-based reconciliation runs
+                        # FIRST. Many filter-state changes are encoded in
+                        # the URL (e.g. /regions/oregon/, ?make=ford) and
+                        # vision often can't see them until results render.
+                        reconcile_from_url(_brief, self.current_url)
+                        ps = getattr(resp, "page_state", None)
+                        if ps is not None:
+                            reconcile_from_page_state(
+                                _brief, ps, current_url=self.current_url,
+                            )
+                            reconcile_negative_constraints(
+                                _brief, ps, current_url=self.current_url,
+                            )
+                            # Track recent PageState snapshots for restart
+                            # fidelity. model_dump() is best-effort.
+                            try:
+                                ps_dict = ps.model_dump()
+                            except Exception:
+                                ps_dict = None
+                            if ps_dict:
+                                self.vision_state_history.append(ps_dict)
+                                if len(self.vision_state_history) > self._VISION_STATE_HISTORY_CAP:
+                                    self.vision_state_history = (
+                                        self.vision_state_history[-self._VISION_STATE_HISTORY_CAP:]
+                                    )
+                        brief_text = _brief.to_brain_text(compact=False)
+                        if brief_text:
+                            brain_text = f"{brain_text}\n\n{brief_text}"
+                    except Exception as exc:
+                        print(f"  [task_brief render: skipped — {exc}]")
                 text = f"{caption}\n\n{brain_text}" if caption else brain_text
                 return [{"type": "text", "text": text}]
             except Exception as exc:
@@ -2896,6 +4339,10 @@ class BrowserSessionState:
         """
         self.vision_calls += 1
         self.actions_since_screenshot = 0
+        # Arch v3 fix #5: a fresh image-blocks pass also clears the
+        # freshness dirty flag (the brain has now seen the page after
+        # whatever mutation happened).
+        self.clear_dom_dirty()
         label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
 
         final_b64 = b64
@@ -2935,7 +4382,14 @@ class BrowserSessionState:
         actual_url = data.get("url") or ""
         if actual_url and actual_url != self.current_url:
             self.record_url(actual_url)
-        parts = [prefix]
+        # v5: prepend the active TaskPlan step as the FIRST line of every
+        # state-change tool reply so the brain sees the cursor BEFORE
+        # the action result, not after (worker_hook still renders the
+        # full plan as guidance for the NEXT turn). This is the "always
+        # visible holistic state" the user asked for. Skipped on
+        # un-planned tasks. Kill switch STEP_PREFIX_IN_CAPTION=0.
+        step_prefix = self._task_plan_step_prefix()
+        parts = [step_prefix, prefix] if step_prefix else [prefix]
         if data.get("url"):
             parts.append(f"Page: {data['url']}")
         if data.get("title"):
@@ -3089,7 +4543,6 @@ def _build_network_block_message(
     reason_hint = {
         401: "Authentication required — this page needs a logged-in session.",
         403: "Forbidden — site's bot detection refused at the network layer. No page interaction will help.",
-        404: "Page not found at this URL.",
         429: "Rate-limited — the site throttled our requests. Different IP may help.",
         451: "Blocked for legal reasons (geographic restriction likely).",
         503: "Service unavailable — could be bot detection (Cloudflare/Akamai) or real outage.",
@@ -3100,6 +4553,30 @@ def _build_network_block_message(
         f"ACTION: do NOT attempt further interactions. Call "
         f"done(success=False, final_answer='NETWORK_BLOCKED: HTTP {status_code} at {url}') "
         f"so the orchestrator can escalate (try a different approach, search worker, or request proxy)."
+    )
+
+
+def _build_not_found_message(url: str) -> str:
+    """Recoverable message for HTTP 404 — distinct from NETWORK_BLOCKED.
+
+    Arch v3 fix: a 404 on a single navigation usually means the brain
+    guessed a URL that doesn't exist. The right action is to navigate
+    elsewhere on the SAME session, not to bail. The earlier template
+    used the NETWORK_BLOCKED wording, which the brain echoed into its
+    final_answer; the orchestrator then detected the substring and
+    spawned a fresh worker — burning the live session for nothing.
+    """
+    return (
+        f"\n\n[PAGE_NOT_FOUND status=404 url={url}]\n"
+        f"The URL doesn't exist on this site. This is a navigation "
+        f"error, NOT a site-level block — DO NOT call done(success=False) "
+        f"and DO NOT classify this as a network block in your final_answer.\n"
+        f"ACTION: stay on this session. Either:\n"
+        f"  - browser_navigate back to a known-good URL (e.g. the "
+        f"site root or the listing page you came from), or\n"
+        f"  - browser_screenshot to see what's currently rendered, then "
+        f"pick a different link from the visible UI rather than "
+        f"guessing another deep URL."
     )
 
 
@@ -3314,15 +4791,11 @@ class BrowserOpenTool(Tool):
         # Return a plain-string message (no image blocks, so truncation
         # can't mangle it) pointing the LLM at the right next tool.
         if self.s.session_id:
+            # Arch v3: never raise WorkerMustExitError here. Killing the
+            # worker over a tool-name confusion was the single biggest
+            # cause of mid-task session restarts in arch v2. Counter is
+            # kept for telemetry only; behavior below is idempotent.
             self.s.blocked_browser_open_count += 1
-            if self.s.blocked_browser_open_count >= BLOCKED_BROWSER_OPEN_HARD_STOP:
-                raise WorkerMustExitError(
-                    f"browser_open called {self.s.blocked_browser_open_count} "
-                    f"times after the idempotency guard refused it. The LLM "
-                    f"is in a tight loop ignoring the guard message. "
-                    f"Aborting worker to prevent iteration drain. "
-                    f"session_id={self.s.session_id}"
-                )
             same_url = (
                 not url
                 or self.s._normalize_url(url) == self.s._normalize_url(self.s.current_url)
@@ -3347,14 +4820,44 @@ class BrowserOpenTool(Tool):
                     f"  - browser_navigate(session_id=\"{self.s.session_id}\", "
                     f"url=\"...\") to switch URLs on the same session"
                 )
-            return (
-                f"[WRONG_TOOL session_id={self.s.session_id} current_url={self.s.current_url}]\n"
-                f"You asked to open a different URL ({url}) but a session is "
-                f"already active. Use browser_navigate on the existing session — "
-                f"do NOT call browser_open, which would create a throwaway "
-                f"second session and discard your current page.\n"
-                f"  browser_navigate(session_id=\"{self.s.session_id}\", url=\"{url}\")"
+            # Arch v3: when a url is supplied AND it's different from the
+            # active session's URL, transparently route to browser_navigate
+            # on the existing session. This fixes the most common form of
+            # the confusion ("LLM picked browser_open when it meant
+            # browser_navigate") without losing progress. The brain still
+            # sees a one-line note explaining what happened so it learns
+            # the correct tool for next time.
+            try:
+                navigate_tool = BrowserNavigateTool(self.s)
+                nav_result = await navigate_tool.execute(
+                    session_id=self.s.session_id,
+                    url=url,
+                    intent=intent,
+                )
+            except Exception as exc:
+                return (
+                    f"[BROWSER_OPEN_AUTOROUTE_FAILED session_id={self.s.session_id}]\n"
+                    f"You called browser_open with url={url!r} while a session "
+                    f"was already active. I tried to auto-route to "
+                    f"browser_navigate but it failed: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}\n"
+                    f"Call browser_navigate(session_id=\"{self.s.session_id}\", "
+                    f"url=\"{url}\") explicitly."
+                )
+            note = (
+                f"[BROWSER_OPEN_AUTOROUTED session_id={self.s.session_id}]\n"
+                f"You called browser_open with url={url!r} while session "
+                f"{self.s.session_id} was already active; I auto-routed to "
+                f"browser_navigate on the existing session. Use "
+                f"browser_navigate directly next time.\n"
             )
+            # If the navigate result is a list of content blocks (e.g.
+            # screenshot variant), prepend the note as a text block.
+            if isinstance(nav_result, list):
+                return [{"type": "text", "text": note}] + nav_result
+            if isinstance(nav_result, str):
+                return note + nav_result
+            return note + str(nav_result)
 
         self.s.reset_per_session()
         self.s.sessions_opened += 1
@@ -3554,7 +5057,12 @@ class BrowserOpenTool(Tool):
                     self.s.record_step("browser_open", url or "blank", f"NETWORK_BLOCKED status={status_code}")
                 return caption
             elif status_code == 404:
-                caption += _build_network_block_message(404, actual_url)
+                # Arch v3: 404 is recoverable — do NOT route through the
+                # NETWORK_BLOCKED template (which tells the brain to bail).
+                caption += _build_not_found_message(actual_url)
+                self.s.record_step(
+                    "browser_open", url or "blank", f"HTTP 404 at {actual_url}",
+                )
                 return caption
 
         # Surface captcha detection from the server
@@ -3615,6 +5123,52 @@ class BrowserNavigateTool(Tool):
     async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
         session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_navigate({url})")
+        # Arch v3 fix (post-trace): refuse anchor-only navigations
+        # ("/path#fragment" or just "#fragment"). Anchor URLs scroll the
+        # page to the named element WITHOUT triggering a real page load,
+        # so they bypass the freshness gate's clear path while still
+        # rearranging visible state. Brain often uses them as a
+        # roundabout "scroll to filter" — the right tool is browser_scroll
+        # or browser_scroll_until.
+        if os.environ.get("REFUSE_ANCHOR_NAVIGATE", "1") != "0":
+            from urllib.parse import urlsplit as _urlsplit
+            try:
+                target_parts = _urlsplit(url)
+                current_parts = _urlsplit(self.s.current_url or "")
+                same_origin_path = (
+                    bool(target_parts.fragment)
+                    and (
+                        # Pure fragment: "#region"
+                        (not target_parts.scheme and not target_parts.netloc and not target_parts.path)
+                        # OR same-origin same-path with only fragment differing
+                        or (
+                            target_parts.scheme == current_parts.scheme
+                            and target_parts.netloc == current_parts.netloc
+                            and (target_parts.path or "/") == (current_parts.path or "/")
+                            and target_parts.query == current_parts.query
+                        )
+                    )
+                )
+                if same_origin_path:
+                    sid = self.s.session_id or "<session_id>"
+                    return (
+                        f"[browser_navigate_anchor_refused url={url!r}]\n"
+                        f"This is an anchor-only navigation (URL fragment "
+                        f"{target_parts.fragment!r}) on the current page. "
+                        f"Anchor URLs scroll the browser to the named "
+                        f"element WITHOUT a real page load — they don't "
+                        f"trigger the freshness gate's clear path and "
+                        f"often confuse downstream V_n geometry.\n"
+                        f"  Recovery options:\n"
+                        f"  1. browser_scroll_until(session_id='{sid}', "
+                        f"target_text='<text>') — scrolls until the named "
+                        f"text is visible.\n"
+                        f"  2. browser_click_at(V_n) — if the target is "
+                        f"already in the viewport, just click it.\n"
+                        f"Override: REFUSE_ANCHOR_NAVIGATE=0."
+                    )
+            except Exception:
+                pass
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
@@ -3728,12 +5282,87 @@ class BrowserNavigateTool(Tool):
                                 f"the brain may be hallucinating a product slug.\n"
                                 f"  Recovery: call browser_screenshot to see the "
                                 f"current page, then browser_click_at(vision_index=V_n) "
-                                f"or browser_click_selector on a real link, OR set "
+                                f"on a real link from the bboxes. Set "
                                 f"NAVIGATE_HALLUCINATION_GUARD=0 to bypass."
                             )
             except Exception as exc:
                 # Guard must never break a legitimate navigate.
                 print(f"   [navigate_hallucination_guard skipped: {exc}]")
+
+        # --- v6: URL filter-hack guard ---------------------------------
+        # When a TaskPlan is active AND the target URL has filter-shaped
+        # query params (food_pairings=, region_slug=, max_price=, type=,
+        # ordering=, category__in=, etc.), refuse — the brain should be
+        # applying these via the filter UI (browser_inventory_filters +
+        # browser_click_selector), not URL-hacking around it. The
+        # observed wineaccess pattern was: brain inventories filters,
+        # learns the URL params, then constructs
+        # `?food_pairings=fish,sweets&max_price=40&...` directly,
+        # bypassing the visual loop. Also bypasses subgoal verification
+        # and locks the brain into URL-construction guesses on sites
+        # whose filter params don't match. Kill switch
+        # URL_FILTER_HACK_REFUSAL=0.
+        if (
+            self.s.task_plan is not None
+            and os.environ.get("URL_FILTER_HACK_REFUSAL", "1") != "0"
+        ):
+            try:
+                from urllib.parse import urlparse as _urlparse3, parse_qs as _parse_qs
+                _p3 = _urlparse3(url)
+                _qs = _parse_qs(_p3.query) if _p3.query else {}
+                # Filter-shaped param names. Conservative list — common
+                # patterns across e-commerce / catalog sites. Doesn't
+                # include generic q=, page=, sort= (legitimate without
+                # filter intent).
+                _FILTER_PARAM_HINTS = (
+                    "food_pairings", "food_pairing", "region", "region_slug",
+                    "regions", "category", "category__in", "categories",
+                    "type", "types", "max_price", "min_price", "price",
+                    "price_range", "ordering", "facet", "facets",
+                    "filter", "filters", "amenities", "amenity",
+                    "brand", "brands", "tag", "tags", "varietal",
+                )
+                _matched_params = [
+                    k for k in _qs.keys()
+                    if any(
+                        hint == k or k.startswith(hint + "[") or k.endswith("[]")
+                        for hint in _FILTER_PARAM_HINTS
+                    )
+                    or any(hint in k.lower() for hint in _FILTER_PARAM_HINTS)
+                ]
+                # Refuse only when ≥2 filter-shaped params present —
+                # single-param navigation (e.g. just ?ordering=) is
+                # a legitimate sort and not the URL-hack pattern.
+                if len(_matched_params) >= 2:
+                    self.s.record_step(
+                        "browser_navigate", url,
+                        f"BLOCKED: url_filter_hack ({len(_matched_params)} "
+                        f"filter params) while TaskPlan active",
+                    )
+                    return (
+                        f"[navigate_filter_hack_refused: {len(_matched_params)} "
+                        f"filter-shaped query params: "
+                        f"{', '.join(_matched_params[:6])}] You have an "
+                        f"active TaskPlan and you're trying to URL-hack "
+                        f"the filters instead of applying them via the UI. "
+                        f"This bypasses the per-step subgoal verification, "
+                        f"breaks on sites whose param names you guessed "
+                        f"wrong, and skips the visual loop the brain is "
+                        f"supposed to use.\n"
+                        f"  Recovery:\n"
+                        f"  1. browser_screenshot — see the current filter "
+                        f"panel.\n"
+                        f"  2. browser_click_at(vision_index=V_n) on each "
+                        f"filter chip the screenshot emits — vision will "
+                        f"surface the filters as bboxes.\n"
+                        f"  Subgoal verification will mark each step "
+                        f"satisfied as the URL gains the filter param.\n"
+                        f"  Single-param navigation (e.g. just ?ordering=) "
+                        f"still works — this guard fires only on ≥2 "
+                        f"filter params. Override: URL_FILTER_HACK_REFUSAL=0."
+                    )
+            except Exception as exc:
+                print(f"   [url_filter_hack_guard skipped: {exc}]")
 
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
@@ -3916,7 +5545,9 @@ class BrowserNavigateTool(Tool):
                     )
                 return caption
             elif status_code == 404:
-                caption += _build_network_block_message(404, actual_url)
+                # Arch v3: 404 is recoverable. Brain stays on the session
+                # and navigates elsewhere instead of being told to bail.
+                caption += _build_not_found_message(actual_url)
                 self.s.record_step("browser_navigate", url, f"HTTP 404 at {actual_url}")
                 return caption
 
@@ -3977,6 +5608,15 @@ class BrowserScreenshotTool(Tool):
     name = "browser_screenshot"
     description = "Take a screenshot. COSTS MONEY. Use browser_get_markdown or browser_eval to verify instead."
 
+    # Generic intent phrases that don't tell vision anything actionable.
+    # When the brain's intent matches one of these, we replace it with
+    # the active TaskPlan step's name (which is by definition specific).
+    _GENERIC_INTENT_PATTERNS = (
+        "ground", "see what", "look at", "observe", "inspect page",
+        "verify", "check page", "current state", "what's on the page",
+        "page content", "general observation",
+    )
+
     def __init__(self, state: BrowserSessionState):
         self.s = state
 
@@ -3984,8 +5624,53 @@ class BrowserScreenshotTool(Tool):
     def read_only(self) -> bool:
         return True
 
+    def _enrich_intent_with_plan(self, intent: str | None) -> str | None:
+        """Auto-inject the active TaskPlan step name into the screenshot
+        intent when the brain's intent is missing or generic.
+
+        Returns the enriched intent (or the original if no plan / no
+        active step / brain's intent is already specific).
+        """
+        plan = getattr(self.s, "task_plan", None)
+        if plan is None:
+            return intent
+        try:
+            active = plan.peek_active()
+        except Exception:
+            return intent
+        if active is None:
+            return intent
+        step_name = (active.name or "").strip()
+        if not step_name:
+            return intent
+        # Empty intent → use step name directly.
+        clean_intent = (intent or "").strip()
+        if not clean_intent:
+            return f"advance task step: {step_name}"
+        # Generic intent → replace.
+        intent_lower = clean_intent.lower()
+        is_generic = any(p in intent_lower for p in self._GENERIC_INTENT_PATTERNS)
+        if is_generic:
+            return f"advance task step: {step_name} ({clean_intent})"
+        # Specific intent → keep, but append step name as context for
+        # vision. Don't overwrite — the brain may want vision to focus
+        # on something specific within the step.
+        return f"{clean_intent} (active step: {step_name})"
+
     async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
         session_id = self.s.resolve_session_id(session_id)
+        # v7: auto-inject the active TaskPlan step's name into intent
+        # when the brain's intent is missing or generic. Vision uses
+        # `intent` to decide which bboxes are `intent_relevant=true`,
+        # which in turn drives V_n ordering. A generic intent ("ground
+        # before plan") leaves Gemini guessing — V_1 ends up being
+        # whatever's visually prominent (often a header button) instead
+        # of the actual task target. With the plan step injected
+        # ("Apply Region=Oregon"), Gemini ranks the Region accordion /
+        # Oregon checkbox as intent_relevant and V_1 becomes the right
+        # click. Kill switch AUTO_INJECT_PLAN_INTENT=0.
+        if os.environ.get("AUTO_INJECT_PLAN_INTENT", "1") != "0":
+            intent = self._enrich_intent_with_plan(intent)
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""
@@ -3995,7 +5680,9 @@ class BrowserScreenshotTool(Tool):
         except Exception:
             pass
 
-        allowed, reason = self.s.should_allow_screenshot(self.s.current_url, peek_hash)
+        allowed, reason = self.s.should_allow_screenshot(
+            self.s.current_url, peek_hash, intent=intent or "",
+        )
         if not allowed:
             self.s.log_activity("screenshot(BLOCKED)", reason[:60])
             return reason
@@ -4189,6 +5876,9 @@ class BrowserClickTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
+        gate = self.s.must_screenshot_before_state_change("browser_click")
+        if gate:
+            return gate
         session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_click([{index}])")
         # DOM-index click refusal: refuse whenever ANY vision response
@@ -4408,6 +6098,30 @@ class BrowserClickTool(Tool):
         ),
         x=NumberSchema(description="X coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
         y=NumberSchema(description="Y coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
+        target_label=StringSchema(
+            description=(
+                "REQUIRED when vision_index is set. The label you read "
+                "for V_n in the most recent screenshot reply (e.g. "
+                "'Wine Facts', 'Oregon checkbox', 'Sign in button'). "
+                "The bridge fuzzy-substring-matches this against the "
+                "actual V_n label vision emitted; refuses with the real "
+                "labels listed inline if they don't match. This catches "
+                "the V_1-reflex pattern where the brain picks an index "
+                "without decoding what V_n actually is. Ignored when "
+                "using raw (x, y)."
+            ),
+            nullable=True,
+        ),
+        narration=StringSchema(
+            description=(
+                "Optional one-sentence narration of WHY you're clicking "
+                "this V_n and what you expect to happen. Stored on state; "
+                "rendered back in the next turn's guidance as "
+                "`[last_intended: ...]` so you can compare your prior "
+                "intent against the actual outcome. Never required."
+            ),
+            nullable=True,
+        ),
         required=["session_id"],
     )
 )
@@ -4429,8 +6143,72 @@ class BrowserClickAtTool(Tool):
         vision_index: int | None = None,
         x: float | None = None,
         y: float | None = None,
+        target_label: str | None = None,
+        narration: str | None = None,
+        internal_retry: bool = False,
         **kw: Any,
     ) -> Any:
+        # Arch v4 Move 3 — internal retries inherit the original call's
+        # preplan_lock + freshness clearance. Set the flag here; the
+        # gate skips its consume checks under it. Cleared at the end.
+        if internal_retry:
+            self.s._bbox_auto_retry_in_flight = True
+        # Arch v3 fix #5: state-freshness gate. Refuse if the brain is
+        # chaining a click without a screenshot since the last mutation.
+        gate = self.s.must_screenshot_before_state_change("browser_click_at")
+        if gate:
+            return gate
+        # v5: stash optional narration so worker_hook renders it back as
+        # [last_intended: ...] on the next turn. Never required, never
+        # refused. Pure scaffolding for chain-of-thought trail.
+        if narration:
+            self.s._last_narration = str(narration)[:240]
+        # Arch v4 Phase K — auto-resolve vision_index by target_label.
+        # When V_N's label doesn't substring-match target_label but
+        # another V_M does (per Phase F's fuzzy matcher), silently
+        # remap so the click executes against the right element. This
+        # eliminates the [click_at_label_mismatch] wall-of-labels
+        # refusal that pushes the brain off click_at and into eval /
+        # run_script / navigate when vision shifts a few V_n positions
+        # between actions. The remap note is prepended to the result
+        # caption so the brain sees what happened.
+        remap_note: str | None = None
+        if vision_index is not None and target_label:
+            try:
+                _vresp_for_remap = getattr(
+                    self.s, "_last_vision_response", None,
+                )
+                _bboxes_for_remap = list(
+                    getattr(_vresp_for_remap, "bboxes", None) or []
+                )
+                if _bboxes_for_remap:
+                    new_idx, _note = _resolve_vision_index_by_label(
+                        self.s, int(vision_index), target_label,
+                        _bboxes_for_remap,
+                    )
+                    if _note is not None:
+                        vision_index = new_idx
+                        remap_note = _note
+            except Exception:
+                # Helper must never break the click — fall through.
+                pass
+        # v8: vision-grounded click protocol. When vision_index is set,
+        # the brain MUST pass target_label naming what V_n is. Bridge
+        # validates against the actual label vision emitted; refuses on
+        # mismatch with real labels listed inline. This catches the
+        # V_1-reflex pattern where the brain picks an index without
+        # decoding what V_n actually represents. Runs BEFORE the sync
+        # gate / brain_turn increment so a refusal doesn't waste the
+        # turn budget. Kill switch VISION_TARGET_LABEL_REQUIRED=0.
+        # Phase K — skip when a remap fired: Phase F's matcher is more
+        # permissive (Levenshtein / token overlap) than the substring
+        # check here, and the remap already verified intent alignment.
+        if remap_note is None:
+            label_refuse = _validate_target_label(
+                self.s, vision_index, target_label,
+            )
+            if label_refuse:
+                return label_refuse
         # Phase 1.1: hard sync gate. Block until the in-flight vision
         # prefetch from the previous action lands — without this the
         # brain's V_n resolves against a frozen epoch but the freshness
@@ -4444,11 +6222,11 @@ class BrowserClickAtTool(Tool):
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return (
                 f"[BLOCKED] browser_click_at used "
-                f"{self.s.click_at_count} times in this session. The "
-                f"task is looping on clicks — call browser_screenshot "
-                f"to re-observe, then try browser_click_selector with "
-                f"a stable CSS hook, or browser_rewind_to_checkpoint "
-                f"if the page is stuck. Do NOT attempt "
+                f"{self.s.click_at_count} times in this session — "
+                f"runaway click loop. Call browser_screenshot to re-"
+                f"observe; if the page is stuck call "
+                f"browser_rewind_to_checkpoint, browser_navigate, or "
+                f"browser_request_help. Do NOT attempt "
                 f"browser_run_script to click — JS clicks are "
                 f"isTrusted=false and bot-detected."
             )
@@ -4655,17 +6433,49 @@ class BrowserClickAtTool(Tool):
             # screenshot is physical-pixel-sized so we divide by DPR.
             dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
             x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+            bbox_label = (getattr(bbox, "label", "") or "").strip()
+            # Arch v4 Phase J — DOM-rect override. When vision crosscheck
+            # populated bbox.dom_check with the resolved DOM element's
+            # rect, prefer that rect over the vision-emitted one. DOM
+            # rects are pixel-exact and tight-fit to the visible text;
+            # vision rects can drift by 0.5–1% (box_2d quantization) and
+            # often span a whole row when the actual control is just an
+            # icon in one corner. When no dom_check rect is available,
+            # fall back to the vision rect. Override:
+            # BBOX_DOM_TIGHTEN=0 keeps the vision rect always.
+            if os.environ.get("BBOX_DOM_TIGHTEN", "1") != "0":
+                tightened = _maybe_tighten_to_dom_rect(
+                    bbox, x0, y0, x1, y1, iw, ih, dpr_val,
+                )
+                if tightened is not None:
+                    x0, y0, x1, y1 = tightened
+            # Arch v4 Phase J — chevron-shift removed. Always click the
+            # geometric center of the four bbox points. Per-site
+            # observation showed the right-edge shift hit empty space
+            # on accordions whose chevron sat at the row's left, OR
+            # fired on labels like "Region (expand sub-options)" where
+            # the vision row bbox was already tight enough that the
+            # center click DID expand the accordion. The new auto-retry
+            # + [CLICK_MISS_RETRY] nudge handles misses without needing
+            # the shift heuristic. We still RECORD that this was a
+            # chevron-labeled click so the next vision pass can detect
+            # no-expansion and emit guidance.
+            if _bbox_is_chevron_label(bbox_label):
+                self.s._last_chevron_click_label = bbox_label[:120]
+                self.s._last_chevron_click_url = self.s.current_url or ""
             payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
             # Carry the vision label into the click payload so the T3
             # backend can run a post-snap semantic match check. Empty
             # label → the check is skipped on the backend, which is
             # fine for raw-coord clicks further below.
-            bbox_label = (getattr(bbox, "label", "") or "").strip()
             if bbox_label:
                 payload["expected_label"] = bbox_label[:120]
                 payload["label"] = bbox_label[:120]
             log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
-            print(f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1})")
+            print(
+                f"\n>> browser_click_at(V{vision_index}) → "
+                f"bbox=({x0},{y0},{x1},{y1})"
+            )
         else:
             if x is None or y is None:
                 return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
@@ -4673,6 +6483,15 @@ class BrowserClickAtTool(Tool):
             log_target = f"({x},{y})"
             print(f"\n>> browser_click_at({x}, {y})")
 
+        # Arch v4 Phase I — capture the DOM hash BEFORE the HTTP click
+        # so we can detect "click landed but page didn't actually
+        # change" cases (e.g. chevron-shifted clicks on accordions
+        # that don't expand). The verify_action probe is sometimes
+        # fooled by trivial DOM mutations (animation frames, timestamps);
+        # comparing pre/post _last_dom_hash directly is a more robust
+        # "click missed" signal that we use to widen the auto-retry
+        # trigger below.
+        _pre_click_dom_hash = self.s._last_dom_hash or ""
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/click",
@@ -4848,6 +6667,59 @@ class BrowserClickAtTool(Tool):
                 except Exception as exc:
                     print(f"  [verify_action: skipped — {exc}]")
 
+        # Arch v4 Move 3 — bbox auto-retry. When verification reports
+        # a silent miss or postcondition mismatch, AND the brain
+        # supplied a target_label, AND we haven't already retried, the
+        # system takes one fresh screenshot and re-clicks against the
+        # new V_n bearing the same label. Recovers transient misses
+        # (the common case on dense filter modals where the DOM
+        # rearranges mid-render) without burning an iteration. One
+        # retry only — second miss returns control to the brain.
+        #
+        # Phase I — widened trigger: also fire when the post-click
+        # DOM hash equals the pre-click hash (a robust "click missed"
+        # signal that catches false-positive verify_action verdicts on
+        # chevron clicks that don't expand the accordion). We compare
+        # _last_dom_hash AFTER the click finished — record_url and the
+        # synchronous parts of the click handler may have updated it.
+        # If it's still equal to _pre_click_dom_hash, the page didn't
+        # change.
+        retry_outcome_note = ""
+        verify_signaled_miss = (
+            "[click_silent]" in verify_note or "[VERIFY_MISS]" in verify_note
+        )
+        post_click_dom_hash = self.s._last_dom_hash or ""
+        dom_unchanged = bool(
+            _pre_click_dom_hash
+            and post_click_dom_hash == _pre_click_dom_hash
+        )
+        if (
+            not internal_retry
+            and target_label
+            and (verify_signaled_miss or dom_unchanged)
+            and os.environ.get("BBOX_AUTO_RETRY", "1") != "0"
+        ):
+            try:
+                retry_text = await self._attempt_bbox_auto_retry(
+                    session_id=session_id,
+                    original_vision_index=vision_index,
+                    target_label=str(target_label),
+                    narration=narration,
+                )
+                if retry_text is not None:
+                    # _attempt_bbox_auto_retry returns the retry's full
+                    # tool result text on success or [BBOX_AUTO_RETRY_NO_MATCH]
+                    # on label-gone. Either way, return that as the
+                    # primary result so the brain sees the recovery.
+                    self.s._bbox_auto_retry_in_flight = False
+                    return retry_text
+            except Exception as exc:
+                self.s._bbox_auto_retry_in_flight = False
+                retry_outcome_note = (
+                    f"\n[BBOX_AUTO_RETRY_ERROR {type(exc).__name__}: "
+                    f"{str(exc)[:120]}]"
+                )
+
         self.s.record_step(
             "browser_click_at",
             log_target,
@@ -4875,15 +6747,154 @@ class BrowserClickAtTool(Tool):
             session_id, pre_url=_pre_url,
         )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
-        return await _append_fresh_vision(
+        # Arch v4 Phase K — prepend the remap note so the brain sees
+        # the V_N→V_M correction at the top of the result. Empty
+        # string when no remap fired.
+        remap_prefix = (remap_note + "\n") if remap_note else ""
+        result = await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
-            + verify_note + subgoal_note,
+            remap_prefix
+            + self.s.build_text_only(data, f"Clicked {log_target}{snap_note}")
+            + verify_note + subgoal_note + retry_outcome_note,
             expected_label=_expected_label or None,
             pre_url=_pre_url,
             pre_dom_hash=_pre_dom_hash,
             state=self.s,
         )
+        # Arch v4 Move 3 — clear retry-in-flight flag (idempotent;
+        # already cleared on the success path above).
+        self.s._bbox_auto_retry_in_flight = False
+        return result
+
+    async def _attempt_bbox_auto_retry(
+        self,
+        session_id: str,
+        original_vision_index: int | None,
+        target_label: str,
+        narration: str | None = None,
+    ) -> str | None:
+        """Arch v4 Move 3 — take a fresh screenshot, fuzzy-match
+        target_label against the new bboxes, re-issue browser_click_at
+        on the new V_n with internal_retry=True. Returns:
+
+          • The retry's full tool result text when a matching V_n was
+            found AND clicked (whether or not that retry succeeded).
+            The text is annotated with [BBOX_AUTO_RETRY n=1 V_a→V_b
+            outcome=succeeded|failed].
+          • A short "[BBOX_AUTO_RETRY_NO_MATCH ...]" caption when the
+            target_label is no longer visible after the fresh
+            screenshot (different remediation than "clicked but no
+            change" — the brain should switch tactics, not retry).
+          • None if BBOX_AUTO_RETRY_MAX is exhausted or the retry
+            machinery itself can't run (fall through to the original
+            failure return).
+
+        Caller is responsible for resetting state._bbox_auto_retry_in_
+        flight on return.
+        """
+        s = self.s
+        # Cap retries: default 1.
+        max_retries = int(os.environ.get("BBOX_AUTO_RETRY_MAX", "1"))
+        if max_retries <= 0:
+            return None
+        attempt_n = getattr(s, "_bbox_auto_retry_attempts", 0)
+        if attempt_n >= max_retries:
+            return None
+        s._bbox_auto_retry_attempts = attempt_n + 1
+
+        # Take a fresh screenshot via direct API. We don't go through
+        # BrowserScreenshotTool here because we want a deterministic
+        # vision pass without the screenshot-budget throttling and
+        # without firing the screenshot-record-step machinery (which
+        # would muddy the brain's tool history with a tool the brain
+        # didn't call).
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true", "bounds": "true"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        b64 = data.get("screenshot") or ""
+        if not b64:
+            return None
+        # Run vision against the new screenshot to get fresh bboxes.
+        # Mirrors the screenshot-tool path: get the process-wide
+        # VisionAgent and call analyze(). When vision is disabled or
+        # unavailable, fall through to None so the caller takes the
+        # original failure path.
+        try:
+            from vision_agent import (  # type: ignore[import-not-found]
+                get_vision_agent, vision_agent_enabled,
+            )
+            if not vision_agent_enabled():
+                return None
+            agent = get_vision_agent()
+            if agent is None:
+                return None
+            vresp = await agent.analyze(
+                screenshot_b64=b64,
+                intent=f"locate {target_label!r} after click miss",
+                session_id=session_id,
+                url=data.get("url", "") or s.current_url,
+                dom_hash="",
+                dom_text_hash="",
+                previous_summary=getattr(s, "_last_vision_summary", None),
+                image_width=int(data.get("imageWidth") or 0) or None,
+                image_height=int(data.get("imageHeight") or 0) or None,
+                task_instruction=getattr(s, "task_instruction", None) or None,
+            )
+        except Exception:
+            return None
+        bboxes = list(getattr(vresp, "bboxes", None) or [])
+        if not bboxes:
+            return (
+                f"[BBOX_AUTO_RETRY_NO_MATCH target={target_label!r}] "
+                f"Took a fresh screenshot but vision returned no "
+                f"bboxes. The page may be loading or empty — "
+                f"try browser_screenshot manually before re-attempting."
+            )
+        new_idx_1based = _find_best_label_match(bboxes, target_label)
+        if new_idx_1based < 0:
+            labels_preview = ", ".join(
+                f"V_{i+1}={(b.label or '?')!r}" for i, b in enumerate(bboxes[:8])
+            )
+            return (
+                f"[BBOX_AUTO_RETRY_NO_MATCH target={target_label!r}] "
+                f"Took a fresh screenshot but no bbox label fuzzy-"
+                f"matches the original target. Vision sees: "
+                f"{labels_preview}. The label may have changed text "
+                f"or the element is gone — switch tactics rather than "
+                f"retry on a stale label."
+            )
+        # Replace the cached vision response with the fresh one so
+        # downstream V_n indices resolve correctly during retry.
+        s._last_vision_response = vresp
+        # Recursive call with internal_retry=True. Gates skip their
+        # consume checks; postcondition + verify still run normally.
+        retry_result = await self.execute(
+            session_id=session_id,
+            vision_index=new_idx_1based,
+            target_label=target_label,
+            narration=narration,
+            internal_retry=True,
+        )
+        retry_text = str(retry_result)
+        retry_succeeded = (
+            "[click_silent]" not in retry_text
+            and "[VERIFY_MISS]" not in retry_text
+        )
+        outcome = "succeeded" if retry_succeeded else "failed"
+        v_orig = original_vision_index if original_vision_index is not None else "?"
+        annotation = (
+            f"\n[BBOX_AUTO_RETRY n={attempt_n + 1} "
+            f"V_{v_orig}→V_{new_idx_1based} outcome={outcome}]"
+        )
+        return retry_text + annotation
 
     def _lookup_postcondition(
         self,
@@ -4953,6 +6964,26 @@ class BrowserClickAtTool(Tool):
             ),
             default=True,
         ),
+        target_label=StringSchema(
+            description=(
+                "REQUIRED when vision_index is set. The label you read for "
+                "V_n in the most recent screenshot reply (e.g. 'Search box', "
+                "'Email input'). The bridge fuzzy-substring-matches this "
+                "against the actual V_n label vision emitted; refuses with "
+                "the real labels listed inline if they don't match. Catches "
+                "the V_1-reflex pattern. Ignored when using raw (x, y)."
+            ),
+            nullable=True,
+        ),
+        narration=StringSchema(
+            description=(
+                "Optional one-sentence narration of WHY you're typing here "
+                "and what you expect to happen. Stored on state; rendered "
+                "back in the next turn's guidance as `[last_intended: ...]` "
+                "for chain-of-thought trail. Never required."
+            ),
+            nullable=True,
+        ),
         required=["session_id", "text"],
     )
 )
@@ -4994,8 +7025,24 @@ class BrowserTypeAtTool(Tool):
         x: float | None = None,
         y: float | None = None,
         clear: bool = True,
+        target_label: str | None = None,
+        narration: str | None = None,
         **kw: Any,
     ) -> Any:
+        # Arch v3 fix #5: state-freshness gate.
+        gate = self.s.must_screenshot_before_state_change("browser_type_at")
+        if gate:
+            return gate
+        # v5: stash optional narration for the next-turn `[last_intended]`
+        # render in worker_hook. Never required, never refused.
+        if narration:
+            self.s._last_narration = str(narration)[:240]
+        # v8: vision-grounded type protocol. Same gate as click_at —
+        # when vision_index is set, brain MUST name the V_n label.
+        # Catches reflexive type-into-V_1 without reading.
+        label_refuse = _validate_target_label(self.s, vision_index, target_label)
+        if label_refuse:
+            return label_refuse
         # Phase 1.1: hard sync gate before mutation.
         sync_block = await self.s.ensure_vision_synced(reason="browser_type_at")
         if sync_block:
@@ -5236,6 +7283,10 @@ class BrowserFixTextAtTool(Tool):
         y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Arch v3 fix #5: state-freshness gate.
+        gate = self.s.must_screenshot_before_state_change("browser_fix_text_at")
+        if gate:
+            return gate
         if text is None:
             text = ""
 
@@ -5394,6 +7445,10 @@ class BrowserTypeTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, text: str, clear: bool = True, **kw: Any) -> Any:
+        # Arch v3 fix #5: state-freshness gate.
+        fgate = self.s.must_screenshot_before_state_change("browser_type")
+        if fgate:
+            return fgate
         session_id = self.s.resolve_session_id(session_id)
         print(f'\n>> browser_type([{index}], "{text}")')
         gate = await _feedback_gate("browser_type")
@@ -5629,6 +7684,9 @@ class BrowserKeysTool(Tool):
         return True
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
+        gate = self.s.must_screenshot_before_state_change("browser_keys")
+        if gate:
+            return gate
         session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_keys({keys})")
         r = await _request_with_backoff(
@@ -5695,10 +7753,73 @@ class BrowserScrollTool(Tool):
             if elements:
                 data["elements"] = elements
         action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
+        # v5: soft hint to use closed-loop browser_scroll_until when the
+        # active TaskPlan step names a recognizable noun-phrase target.
+        # No refusal — blind scroll is sometimes the right move (long
+        # results page, no specific target text yet). Hint only.
+        # Kill switch SCROLL_HINT=0.
+        scroll_hint = ""
+        if os.environ.get("SCROLL_HINT", "1") != "0":
+            scroll_hint = self._scroll_target_hint()
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, action),
+            self.s.build_text_only(data, action) + scroll_hint,
+        )
+
+    def _scroll_target_hint(self) -> str:
+        """Inspect the active TaskPlan step's name for a recognizable
+        noun-phrase target. If found, return a `[scroll_hint]` suffix
+        suggesting `browser_scroll_until(target_text=...)` instead of
+        blind scrolling. Returns empty string when no plan, no active
+        step, or no proper-noun target visible in the step name.
+        """
+        plan = getattr(self.s, "task_plan", None)
+        if plan is None:
+            return ""
+        try:
+            active = plan.peek_active()
+        except Exception:
+            return ""
+        if active is None:
+            return ""
+        name = (active.name or "").strip()
+        if not name:
+            return ""
+        # Skip the leading verb pattern ("Apply ", "Open ", "Select ",
+        # "Click ", "Find ", "Set ") so the regex sees the target.
+        import re as _re_n
+        body = _re_n.sub(
+            r"^(?:apply|open|select|click|find|set|enable|expand|"
+            r"check|tick|toggle|configure)\s+",
+            "", name, flags=_re_n.IGNORECASE,
+        )
+        # For `field=value` / `field: value` patterns the VALUE is the
+        # scroll target, not the field name. Step names like
+        # "Apply Region=Oregon" should hint "Oregon", not "Region".
+        # If the body matches `<word>=<word>` or `<word>: <word>`, use
+        # only the value side for target extraction.
+        eq_match = _re_n.search(
+            r"[A-Za-z][\w-]*\s*[=:]\s*([A-Za-z][\w +&-]*)",
+            body,
+        )
+        if eq_match:
+            body = eq_match.group(1)
+        # Pull the first proper-noun-ish token: a Capitalized word ≥3
+        # chars, optionally joined by "+" / "&" / "and" with another.
+        m = _re_n.search(
+            r"\b[A-Z][A-Za-z][A-Za-z]+(?:\s*(?:\+|&|and)\s*[A-Z][A-Za-z][A-Za-z]+)?",
+            body,
+        )
+        if not m:
+            return ""
+        target = m.group(0)
+        # Strip joiners for a clean target_text suggestion.
+        target_first = _re_n.split(r"\s*(?:\+|&|and)\s*", target)[0]
+        return (
+            f"\n[scroll_hint] Active step targets {target_first!r} — "
+            f"prefer browser_scroll_until(target_text={target_first!r}) "
+            f"for closed-loop scrolling that stops at the match."
         )
 
 
@@ -5722,6 +7843,10 @@ class BrowserSelectTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, value: str, **kw: Any) -> Any:
+        # Arch v3 fix #5: state-freshness gate.
+        gate = self.s.must_screenshot_before_state_change("browser_select")
+        if gate:
+            return gate
         session_id = self.s.resolve_session_id(session_id)
         stale = _stale_dom_index_block(
             self.s, tool_name="browser_select", target_disp=f"[{index}]",
@@ -5812,6 +7937,10 @@ class BrowserSelectOptionTool(Tool):
         extra_option_selectors: list[str] | None = None,
         **kw: Any,
     ) -> str:
+        # Arch v3 fix #5: state-freshness gate.
+        gate = self.s.must_screenshot_before_state_change("browser_select_option")
+        if gate:
+            return gate
         print(f"\n>> browser_select_option(label={label!r}, value={value!r})")
         payload: dict[str, Any] = {"label": label, "value": value, "fuzzy": bool(fuzzy)}
         if timeout is not None:
@@ -6116,6 +8245,11 @@ class BrowserEvalTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
+        # Arch v3 fix #5: state-freshness gate. Eval after a click
+        # without a screenshot in between is the dominant detour pattern.
+        gate = self.s.must_screenshot_before_state_change("browser_eval")
+        if gate:
+            return gate
         session_id = self.s.resolve_session_id(session_id)
         # Eval-for-exploration rate limit: when vision is fresh AND the
         # script is read-only DOM exploration (querySelector, getElementBy,
@@ -6226,6 +8360,12 @@ class BrowserRunScriptTool(Tool):
         mutates: bool = False,
         **kw: Any,
     ) -> str:
+        # Arch v3 fix #5: state-freshness gate. Run-script is the brain's
+        # ultimate detour from the bbox path; refuse if the page mutated
+        # without a screenshot since.
+        gate = self.s.must_screenshot_before_state_change("browser_run_script")
+        if gate:
+            return gate
         print(f"\n>> browser_run_script({script[:80]}...)")
         # Refusal gate: same loop-escape protection as
         # browser_request_help. Mutating scripts are the brain's other
@@ -6238,6 +8378,45 @@ class BrowserRunScriptTool(Tool):
             refuse = self.s.must_screenshot_before_giving_up()
             if refuse:
                 return refuse
+        # v6: read-only browser_run_script for DOM exploration is the
+        # last unguarded escape hatch from the visual loop. The wineaccess
+        # trace had 8 such scripts in a row — the brain's pattern was:
+        # eval refused → switch to run_script (read_only) → same
+        # exploration. Mirrors v3 EVAL_EXPLORATION_REFUSAL on browser_eval
+        # but for run_script. Allows: write-op scripts, short browser-
+        # state probes, and any script when no vision exists yet.
+        # Kill switch SCRIPT_EXPLORATION_REFUSAL=0.
+        if (
+            not bool(mutates)
+            and os.environ.get("SCRIPT_EXPLORATION_REFUSAL", "1") != "0"
+            and _eval_looks_like_exploration(script)
+        ):
+            try:
+                resp = self.s._last_vision_response
+                bbox_count = len(getattr(resp, "bboxes", []) or []) if resp else 0
+                if bbox_count > 0:
+                    return (
+                        f"[run_script_for_exploration_refused: vision has "
+                        f"{bbox_count} bboxes available] This script reads "
+                        f"the DOM with querySelector/getElementBy/etc. "
+                        f"and has no write operations — that's exploration, "
+                        f"not action. browser_run_script(read-only) and "
+                        f"browser_eval are both gated for this pattern; "
+                        f"the visual loop is the right tool. Recovery:\n"
+                        f"  1. Read the V_n LABELS in the most recent "
+                        f"screenshot reply.\n"
+                        f"  2. browser_click_at(vision_index=V_n) or "
+                        f"browser_click_selector(<#id-or-data-testid>) on "
+                        f"the target.\n"
+                        f"  3. browser_inventory_filters for filter modals "
+                        f"— returns stable selectors WITHOUT script.\n"
+                        f"Read-only run_script IS allowed for: bulk data "
+                        f"extraction once you've reached the result page, "
+                        f"non-querying probes, and write-op flows. "
+                        f"Override: SCRIPT_EXPLORATION_REFUSAL=0."
+                    )
+            except Exception:
+                pass
         # Phase 3.1: cursor-first lockout. Read-only scripts always
         # allowed (data extraction). Mutating scripts require evidence
         # that the brain has tried — and failed — at least 2 distinct
@@ -7234,6 +9413,19 @@ class BrowserCloseTool(Tool):
 
     async def execute(self, session_id: str, **kw: Any) -> str:
         session_id = self.s.resolve_session_id(session_id)
+        # v7: refuse close when an active TaskPlan still has work AND
+        # there's screenshot budget left to do it. The brain otherwise
+        # closes after partial progress and reports "I could not
+        # truthfully return any qualifying wine" — observed wineaccess
+        # trace where it reached the Oregon catalog, sorted by score,
+        # then closed before applying remaining filters or extracting
+        # results. If the brain genuinely needs to bail, it should call
+        # done(success=False) — that's the explicit failure path.
+        # Kill switch CLOSE_GUARD=0.
+        if os.environ.get("CLOSE_GUARD", "1") != "0":
+            refuse = self._maybe_refuse_premature_close()
+            if refuse:
+                return refuse
         print(f"\n>> browser_close({session_id})")
         self.s.log_activity(f"close({session_id})")
         self.s.print_summary()
@@ -7249,6 +9441,55 @@ class BrowserCloseTool(Tool):
         r.raise_for_status()
         used = self.s.max_screenshots - self.s.screenshot_budget
         return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {used}/{self.s.max_screenshots}, Regressions: {self.s.regression_count}"
+
+    def _maybe_refuse_premature_close(self) -> str | None:
+        """Refuse browser_close when:
+          • A TaskPlan exists AND has unsatisfied steps (pending or in_progress), AND
+          • Screenshot budget > 2 (room to keep working), AND
+          • The brain hasn't called done(success=False) — that's the
+            explicit failure path. We can't observe done() from here;
+            the orchestrator handles it. So this guard fires only on
+            "close without explicit failure-report".
+
+        Returns refusal message or None to allow.
+        """
+        plan = getattr(self.s, "task_plan", None)
+        if plan is None:
+            return None
+        try:
+            unsatisfied = [
+                s for s in plan.steps
+                if s.status in ("pending", "in_progress")
+            ]
+        except Exception:
+            return None
+        if not unsatisfied:
+            return None
+        # Need budget to keep working. Below 3 screenshots, give up
+        # gracefully (brain has earned the close).
+        budget = max(0, self.s.screenshot_budget)
+        if budget <= 2:
+            return None
+        return (
+            f"[close_guard_refused: {len(unsatisfied)} of "
+            f"{len(plan.steps)} TaskPlan steps still unsatisfied; "
+            f"{budget} screenshots remaining] You're closing the session "
+            f"with real budget left and pending work. Don't give up here.\n"
+            f"  Unsatisfied steps: "
+            f"{', '.join(repr(s.name) for s in unsatisfied[:5])}"
+            f"{'…' if len(unsatisfied) > 5 else ''}\n"
+            f"  Recovery — pick one:\n"
+            f"  1. browser_screenshot — take a fresh look at the page; "
+            f"the active step may be one click away.\n"
+            f"  2. browser_plan_skip_step(reason='...') — explicitly "
+            f"skip a step you've concluded is unsatisfiable on this site.\n"
+            f"  3. browser_plan_replan(reason='...', new_steps=[...]) — "
+            f"if the page reality diverges from your initial plan.\n"
+            f"  4. done(success=False, final_answer='honest reason') — "
+            f"the explicit failure path. After done() the orchestrator "
+            f"closes the session for you.\n"
+            f"Override: CLOSE_GUARD=0."
+        )
 
 
 @tool_parameters(
@@ -7270,6 +9511,9 @@ class BrowserDragTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, startX: float, startY: float, endX: float, endY: float, steps: int | None = None, **kw: Any) -> str:
+        gate = self.s.must_screenshot_before_state_change("browser_drag")
+        if gate:
+            return gate
         session_id = self.s.resolve_session_id(session_id)
         print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
         self.s.actions_since_screenshot += 1
@@ -8757,7 +11001,90 @@ class BrowserRequestHelpTool(Tool):
         refuse = self.s.must_screenshot_before_giving_up()
         if refuse:
             return refuse
-        # Lazy-import to avoid circular imports with the orchestrator module.
+
+        # Track failed tactics on the session — they survive into
+        # handoff and into the help-advisor's "do not suggest" list.
+        try:
+            for line in (failed_tactics or "").split("\n"):
+                tactic = line.strip().lstrip("-• ").strip()
+                if tactic and tactic not in self.s.failed_tactics:
+                    self.s.failed_tactics.append(tactic)
+            if len(self.s.failed_tactics) > self.s._FAILED_TACTICS_CAP:
+                self.s.failed_tactics = self.s.failed_tactics[
+                    -self.s._FAILED_TACTICS_CAP :
+                ]
+        except Exception:
+            pass
+
+        # Arch v3: first 3 calls become non-terminal advisor calls.
+        # The advisor returns tactical advice as the tool result and the
+        # worker keeps running in the same conversation. After 3 calls,
+        # fall through to the legacy "save resumption artifact + spawn
+        # successor" path.
+        if (
+            os.environ.get("HELP_ADVISOR_ENABLED", "1") != "0"
+            and self.s.help_advisor_calls < self.s.HELP_ADVISOR_BUDGET
+        ):
+            self.s.help_advisor_calls += 1
+            try:
+                from superbrowser_bridge.help_advisor import advise_sync
+            except Exception as exc:
+                advise_sync = None  # type: ignore[assignment]
+                print(f"[help_advisor import failed: {exc}]")
+            if advise_sync is not None:
+                # Build advisor payload from the live session.
+                brief_dict = None
+                brief = getattr(self.s, "task_brief", None)
+                if brief is not None and hasattr(brief, "to_dict"):
+                    try:
+                        brief_dict = brief.to_dict()
+                    except Exception:
+                        brief_dict = None
+                page_state_dict = None
+                last_resp = getattr(self.s, "_last_vision_response", None)
+                if last_resp is not None:
+                    try:
+                        ps = getattr(last_resp, "page_state", None)
+                        if ps is not None and hasattr(ps, "model_dump"):
+                            page_state_dict = ps.model_dump()
+                    except Exception:
+                        page_state_dict = None
+                last_steps_raw = (
+                    getattr(self.s, "step_history", None) or []
+                )[-6:]
+                last_steps = [
+                    s for s in last_steps_raw if isinstance(s, dict)
+                ]
+                advice = advise_sync({
+                    "brief": brief_dict,
+                    "current_url": self.s.current_url,
+                    "page_state": page_state_dict,
+                    "last_steps": last_steps,
+                    "failed_tactics": list(self.s.failed_tactics)[-12:],
+                    "failed_bboxes": list(
+                        getattr(self.s, "_failed_bboxes", []) or []
+                    )[-8:],
+                    "reason": reason,
+                })
+                self.s.record_step(
+                    "browser_request_help",
+                    reason[:80],
+                    f"advised={self.s.help_advisor_calls}/"
+                    f"{self.s.HELP_ADVISOR_BUDGET}",
+                )
+                budget_left = (
+                    self.s.HELP_ADVISOR_BUDGET - self.s.help_advisor_calls
+                )
+                return (
+                    f"[ADVISOR call {self.s.help_advisor_calls}/"
+                    f"{self.s.HELP_ADVISOR_BUDGET}, {budget_left} left]\n"
+                    f"{advice}\n\n"
+                    f"This is in-session advice — keep working. After "
+                    f"{self.s.HELP_ADVISOR_BUDGET} advisor calls, the next "
+                    f"request_help will trigger a successor worker spawn."
+                )
+
+        # Legacy path: save resumption artifact + signal "successor needed".
         from superbrowser_bridge.routing import _domain_from_url
         domain = _domain_from_url(self.s.current_url) if self.s.current_url else ""
         saved = save_resumption_artifact(
@@ -9028,6 +11355,12 @@ class BrowserInventoryFiltersTool(Tool):
         gate = await _feedback_gate("browser_inventory_filters")
         if gate:
             return gate
+        # Arch v3 fix M — refuse when vision already surfaced enough
+        # filter-shaped bboxes. Inventory's server-side scroll
+        # invalidates V_n indices and confuses downstream clicks.
+        redundant = _inventory_filters_redundant(self.s)
+        if redundant:
+            return redundant
 
         if not session_id:
             return "[inventory_filters_failed:no_session] Provide session_id."
@@ -9057,18 +11390,31 @@ class BrowserInventoryFiltersTool(Tool):
 
         data = r.json()
         options = data.get("options") or []
+        # Hierarchy fields from the v5 expander sweep (page.ts:2105+).
+        # When INVENTORY_HIERARCHY=0 we drop them to revert to flat rendering.
+        if os.environ.get("INVENTORY_HIERARCHY", "1") == "0":
+            expanders: list[dict] = []
+            # Strip parent_label from each option so downstream form_session
+            # fuzzy match doesn't see it either.
+            for o in options:
+                o.pop("parent_label", None)
+        else:
+            expanders = data.get("expanders") or []
         scope = data.get("scope") or "document"
         total = int(data.get("total") or 0)
         travel = int(data.get("scrollTravelPx") or 0)
         iters = int(data.get("iterations") or 0)
 
         # Cache the manifest on session state so form_begin(inventory=true)
-        # can reuse it without a second scan.
+        # can reuse it without a second scan, AND so the post-click expander
+        # rescan in BrowserClickSelectorTool can detect when the brain
+        # clicked an expander.
         try:
             self.s.last_filter_manifest = {
                 "session_id": session_id,
                 "scope": scope,
                 "options": options,
+                "expanders": expanders,
                 "captured_at": time.time(),
             }
         except Exception:
@@ -9076,11 +11422,12 @@ class BrowserInventoryFiltersTool(Tool):
 
         self.s.record_step(
             "browser_inventory_filters",
-            f"scope={scope} total={total} travel={travel}px iters={iters}",
+            f"scope={scope} total={total} expanders={len(expanders)} "
+            f"travel={travel}px iters={iters}",
             self.s.current_url or "",
         )
 
-        if total == 0:
+        if total == 0 and not expanders:
             return (
                 "[inventory_filters:empty] No checkbox/radio/option/switch "
                 "controls found"
@@ -9099,21 +11446,48 @@ class BrowserInventoryFiltersTool(Tool):
         lines: list[str] = []
         lines.append(
             f"[inventory_filters_ok scope={scope} total={total} "
-            f"groups={len(groups)} travel={travel}px iters={iters}]"
+            f"groups={len(groups)} expanders={len(expanders)} "
+            f"travel={travel}px iters={iters}]"
         )
         lines.append(
             "Stable CSS selectors below — prefer browser_click_selector(<sel>) "
             "for applying these. Selected=true means the option is already "
             "checked; toggle only if the task requires it."
         )
+
+        # Hierarchical expanders (v5): show BEFORE the flat option groups
+        # so the brain sees parent expanders are first-class citizens, not
+        # just leaf checkboxes. The wineaccess "click US, get all 50
+        # states" failure mode comes from treating "United States" as a
+        # leaf when it's actually a parent that needs expanding.
+        if expanders:
+            lines.append(
+                "\n## Collapsed groups (click expander to reveal children, "
+                "then click the child option)"
+            )
+            for ex in expanders:
+                state_marker = "▼" if ex.get("expanded") else "▶"
+                ctrl = ex.get("controls_selector") or "?"
+                cc = ex.get("child_count")
+                cc_note = f" children≈{cc}" if isinstance(cc, int) and cc > 0 else ""
+                lines.append(
+                    f"  [{state_marker}] expander label={ex.get('label','')!r} "
+                    f"selector={ex.get('selector','')} controls={ctrl}{cc_note}"
+                )
+
         for gname, opts in groups.items():
             lines.append(f"\n## {gname}")
             for o in opts:
                 sel_marker = "✓" if o.get("selected") else "·"
+                parent = o.get("parent_label")
+                parent_suffix = (
+                    f"  (under {parent!r} — expand parent first if collapsed)"
+                    if parent else ""
+                )
                 lines.append(
                     f"  [{sel_marker}] {o.get('kind','?'):<8} "
                     f"label={o.get('label','')!r:<40} "
-                    f"selector={o.get('selector','')}"
+                    f"selector={o.get('selector','')}{parent_suffix}"
                 )
 
         return "\n".join(lines)
@@ -9528,6 +11902,16 @@ class BrowserGetRectTool(Tool):
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
         selector=StringSchema("CSS selector of the element to click"),
+        target_label=StringSchema(
+            description=(
+                "Short label of the element you expect this selector to "
+                "match (e.g. 'Oregon checkbox', 'Apply filters button'). "
+                "REQUIRED when the selector is vague (bare tag, comma "
+                "fallback list, [role='button']). Optional when the "
+                "selector is highly specific (#id, [data-testid='...'])."
+            ),
+            nullable=True,
+        ),
         button=StringSchema("Mouse button: left|right|middle", nullable=True),
         click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
         linear=BooleanSchema(
@@ -9537,20 +11921,13 @@ class BrowserGetRectTool(Tool):
             ),
             nullable=True,
         ),
-        required=["session_id", "selector"],
-    )
-)
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selector=StringSchema("CSS selector of the element to click"),
-        button=StringSchema("Mouse button: left|right|middle", nullable=True),
-        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
-        linear=BooleanSchema(
+        narration=StringSchema(
             description=(
-                "If true (default), use deterministic teleport click (pixel-exact). "
-                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
+                "Optional one-sentence narration of WHY you're clicking "
+                "this selector and what you expect to happen. Stored on "
+                "state; rendered back in the next turn's guidance as "
+                "`[last_intended: ...]` for chain-of-thought trail. "
+                "Never required."
             ),
             nullable=True,
         ),
@@ -9577,8 +11954,28 @@ class BrowserClickSelectorTool(Tool):
         button: str | None = None,
         click_count: int | None = None,
         linear: bool | None = None,
+        narration: str | None = None,
+        target_label: str | None = None,
         **kw: Any,
     ) -> str:
+        # Arch v3 fix #5: state-freshness gate.
+        gate = self.s.must_screenshot_before_state_change("browser_click_selector")
+        if gate:
+            return gate
+        # Arch v3 fix A + D: structural + vision-alignment selector check.
+        # Layer A catches kitchen-sink probes ("summary, button,
+        # [role='button']"). Layer D catches DOM-stale selectors on
+        # dynamic filter pages where the brain claims a target vision
+        # didn't actually emit (#region-united-states, #accordion-region,
+        # etc., that worked on a prior page state but no longer match).
+        sel_refuse = _validate_selector_target_label(
+            selector, target_label, state=self.s,
+        )
+        if sel_refuse:
+            return sel_refuse
+        # v5: stash optional narration for next-turn `[last_intended]`.
+        if narration:
+            self.s._last_narration = str(narration)[:240]
         print(f"\n>> browser_click_selector({selector!r})")
         # Playwright-pseudo guard. Selectors like `:has-text('X')`,
         # `:contains('X')`, `:visible`, `:hidden`, `>>` (Playwright chain)
@@ -9700,6 +12097,16 @@ class BrowserClickSelectorTool(Tool):
             )
         if data.get("elements"):
             caption += f"\n{data['elements']}"
+        # Post-click expander rescan (v5): when the brain just clicked an
+        # expander it learned about from the most recent inventory, the
+        # page now reveals child filters. Re-scan and surface them so the
+        # next action picks the right CHILD instead of guessing or
+        # re-running inventory_filters manually.
+        expander_note = await self._maybe_rescan_after_expander_click(
+            session_id, selector,
+        )
+        if expander_note:
+            caption += expander_note
         subgoal_note = await self.s.check_active_task_step(
             session_id, pre_url=_pre_url_for_subgoal,
         )
@@ -9712,6 +12119,96 @@ class BrowserClickSelectorTool(Tool):
                 session_state=self.s,
             ),
             state=self.s,
+        )
+
+    async def _maybe_rescan_after_expander_click(
+        self, session_id: str, clicked_selector: str,
+    ) -> str:
+        """If `clicked_selector` matches an expander from the most
+        recent inventory_filters manifest AND that expander was
+        collapsed, re-scan filters and surface the newly-visible
+        children. Cheap (~100ms server-side, no vision cost). Returns
+        empty string when not applicable (no manifest, selector not an
+        expander, expander already open, hierarchy disabled).
+        """
+        if os.environ.get("INVENTORY_HIERARCHY", "1") == "0":
+            return ""
+        manifest = getattr(self.s, "last_filter_manifest", None)
+        if not isinstance(manifest, dict):
+            return ""
+        expanders = manifest.get("expanders") or []
+        if not expanders:
+            return ""
+        matched_expander = None
+        for ex in expanders:
+            if ex.get("selector") == clicked_selector:
+                matched_expander = ex
+                break
+        if matched_expander is None:
+            return ""
+        if matched_expander.get("expanded"):
+            # Was already open; clicking it likely collapsed it. Don't
+            # re-scan in that case — the brain just hid children.
+            return ""
+        try:
+            # noScrollWalk=true: the post-click rescan is looking ONLY
+            # for newly-revealed children of the expander we just
+            # clicked, which are local to that expander (no need to
+            # walk the whole page top-to-bottom). Skipping the scroll
+            # walk eliminates the visible page-scroll motion users
+            # were observing across multiple parallel expander clicks.
+            # Kill switch INVENTORY_QUICK_RESCAN=0 reverts to
+            # full-scroll rescan.
+            _quick = os.environ.get("INVENTORY_QUICK_RESCAN", "1") != "0"
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/inventory-filters",
+                json={"noScrollWalk": _quick},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            new_data = r.json()
+        except Exception as exc:
+            return f"\n[expander_rescan_skipped: {exc!s:.60s}]"
+        new_options = new_data.get("options") or []
+        new_expanders = new_data.get("expanders") or []
+        # Refresh the cached manifest so the NEXT click can again
+        # detect expander interactions.
+        try:
+            self.s.last_filter_manifest = {
+                "session_id": session_id,
+                "scope": new_data.get("scope") or "document",
+                "options": new_options,
+                "expanders": new_expanders,
+                "captured_at": time.time(),
+            }
+        except Exception:
+            pass
+        # Children are options whose parent_label matches the expander
+        # we just clicked. Cap the surfaced list to keep the caption tight.
+        parent_label = matched_expander.get("label") or ""
+        children = [
+            o for o in new_options
+            if (o.get("parent_label") or "") == parent_label
+        ]
+        if not children:
+            return (
+                f"\n[expander_clicked label={parent_label!r}] "
+                f"Re-scanned manifest but found no child options under "
+                f"this label yet — the expand may still be animating, or "
+                f"this expander reveals non-checkbox content. Take a "
+                f"screenshot to verify."
+            )
+        sample = children[:8]
+        sample_str = ", ".join(
+            f"{o.get('label','?')!r}→{o.get('selector','?')}" for o in sample
+        )
+        more = f" (+{len(children) - len(sample)} more)" if len(children) > len(sample) else ""
+        return (
+            f"\n[expander_opened label={parent_label!r}] "
+            f"{len(children)} children now visible: {sample_str}{more}. "
+            f"Click the specific child you want with "
+            f"browser_click_selector(<selector from list above>)."
         )
 
 
@@ -10997,9 +13494,678 @@ class BrowserSolvePuzzleTool(Tool):
         return "\n".join(lines)
 
 
+# ─── Arch v3: TaskBrief + state-check + verify-action tools ──────────
+
+
 @tool_parameters(
-    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        expected=StringSchema(
+            "Optional: short description of what state you expect "
+            "(e.g. 'WiFi filter applied; results <100'). Helps the "
+            "vision agent target its observation.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
 )
+class BrowserStateCheckTool(Tool):
+    """Cheap state-only vision call — returns PageState + flags, no bboxes.
+
+    Use when you want to verify "where am I / did my filter take effect"
+    without committing to a click. ~30% the token cost of a full
+    browser_screenshot. Bypasses the actions_since_screenshot==0 gate
+    because it's an explicit observation hop, not amnesia.
+    """
+
+    name = "browser_state_check"
+    description = (
+        "Quick state-only observation — returns funnel position, active "
+        "filters, result counts, last-action verdict, stuck indicators. "
+        "No bboxes (use browser_screenshot when you need click targets). "
+        "Lower cost than browser_screenshot; use it freely to verify "
+        "constraint progress."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        expected: str | None = None,
+        **kw: Any,
+    ) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
+        intent = "state_check"
+        if expected:
+            intent = f"state_check: {expected[:200]}"
+        peek_hash = ""
+        try:
+            peek_elements = await _fetch_elements(session_id, self.s)
+            peek_hash = BrowserSessionState.hash_page_content(peek_elements)
+        except Exception:
+            pass
+        allowed, reason = self.s.should_allow_screenshot(
+            self.s.current_url, peek_hash, intent=intent,
+        )
+        if not allowed:
+            return reason
+        self.s.screenshot_budget -= 1
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true", "bounds": "true"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            return (
+                f"[state_check_failed] {type(exc).__name__}: {str(exc)[:200]}"
+            )
+        b64 = data.get("screenshot") or ""
+        if not b64:
+            return "[state_check_failed] no screenshot in /state response"
+        elements = data.get("elements", "") or ""
+        url = data.get("url") or self.s.current_url
+        return await self.s.build_tool_result_blocks(
+            b64,
+            f"state_check: {expected[:120]}" if expected else "state_check",
+            intent=intent,
+            url=url,
+            elements=elements,
+            elements_with_bounds=data.get("selectorEntries"),
+            device_pixel_ratio=float(data.get("devicePixelRatio") or 1.0),
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        expected=StringSchema(
+            "What you expected the previous action to do (e.g. "
+            "'modal closes and toast says Saved', 'WiFi chip becomes "
+            "active and result count drops')."
+        ),
+        bbox_ref=IntegerSchema(
+            "Optional 1-based V_n you clicked. Helps vision focus on the "
+            "right area for the verdict.",
+            nullable=True,
+        ),
+        required=["session_id", "expected"],
+    )
+)
+class BrowserVerifyActionTool(Tool):
+    """Post-action verifier — did the previous click/type produce the
+    expected outcome?
+
+    Returns a verdict (succeeded | failed | uncertain) and a
+    recommendation (continue | undo | retry) plus a PageState snapshot.
+    The brain decides what to do with the recommendation — this tool
+    never auto-undoes anything.
+    """
+
+    name = "browser_verify_action"
+    description = (
+        "Verify the previous action produced the expected outcome. "
+        "Returns action_outcome + recommendation + page_state. Use "
+        "after risky clicks on dense scenes; cheap form is "
+        "browser_state_check."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        expected: str,
+        bbox_ref: int | None = None,
+        **kw: Any,
+    ) -> Any:
+        session_id = self.s.resolve_session_id(session_id)
+        intent = f"verify_action: {expected[:200]}"
+        peek_hash = ""
+        try:
+            peek_elements = await _fetch_elements(session_id, self.s)
+            peek_hash = BrowserSessionState.hash_page_content(peek_elements)
+        except Exception:
+            pass
+        allowed, reason = self.s.should_allow_screenshot(
+            self.s.current_url, peek_hash, intent=intent,
+        )
+        if not allowed:
+            return reason
+        self.s.screenshot_budget -= 1
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                params={"vision": "true", "bounds": "true"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            return (
+                f"[verify_action_failed] {type(exc).__name__}: {str(exc)[:200]}"
+            )
+        b64 = data.get("screenshot") or ""
+        if not b64:
+            return "[verify_action_failed] no screenshot in /state response"
+        elements = data.get("elements", "") or ""
+        url = data.get("url") or self.s.current_url
+        result_blocks = await self.s.build_tool_result_blocks(
+            b64,
+            f"verify_action: expected={expected[:160]}",
+            intent=intent,
+            url=url,
+            elements=elements,
+            elements_with_bounds=data.get("selectorEntries"),
+            device_pixel_ratio=float(data.get("devicePixelRatio") or 1.0),
+        )
+        verifier_outcome = ""
+        try:
+            from superbrowser_bridge.action_verifier import (
+                build_verifier_result,
+                render_verifier_text,
+            )
+            resp = self.s._last_vision_response
+            verifier = build_verifier_result(
+                resp,
+                expected=expected,
+                pre_summary=getattr(self.s, "_last_vision_summary", "") or "",
+            )
+            verifier_outcome = verifier.get("action_outcome") or ""
+            verify_text = render_verifier_text(verifier)
+            if isinstance(result_blocks, list) and verify_text:
+                if result_blocks and result_blocks[0].get("type") == "text":
+                    result_blocks[0]["text"] = (
+                        result_blocks[0]["text"] + "\n\n" + verify_text
+                    )
+                else:
+                    result_blocks.insert(0, {"type": "text", "text": verify_text})
+        except Exception as exc:
+            print(f"  [verify_action_render: skipped — {exc}]")
+        try:
+            self.s.interaction_ledger.append({
+                "tool": "browser_verify_action",
+                "bbox": bbox_ref,
+                "expected": expected[:120],
+                "outcome": verifier_outcome,
+            })
+            if len(self.s.interaction_ledger) > self.s._INTERACTION_LEDGER_CAP:
+                self.s.interaction_ledger = self.s.interaction_ledger[
+                    -self.s._INTERACTION_LEDGER_CAP :
+                ]
+        except Exception:
+            pass
+        return result_blocks
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        constraint_updates=ArraySchema(
+            description="Constraint updates to apply.",
+            items=ObjectSchema(
+                canonical_value=StringSchema(
+                    "Canonical name of the constraint to update "
+                    "(matches existing TaskBrief constraints by canonical_value)."
+                ),
+                status=StringSchema(
+                    "New status: unverified | satisfied | failed | not_applicable"
+                ),
+                evidence=StringSchema(
+                    "Short justification for the new status",
+                    nullable=True,
+                ),
+                required=["canonical_value", "status"],
+            ),
+            nullable=True,
+        ),
+        cot_note=StringSchema(
+            "Short chain-of-thought note (≤200 chars) about the "
+            "current strategy / next intent. Appears in the brief.",
+            nullable=True,
+        ),
+        new_constraint=ObjectSchema(
+            text=StringSchema("Verbatim phrase from the user's query."),
+            kind=StringSchema(
+                "filter | attribute | negative | numeric | ordering"
+            ),
+            canonical_value=StringSchema(
+                "Lowercase canonical name (e.g. 'wifi', 'price')."
+            ),
+            operator=StringSchema(
+                "eq|lte|gte|contains|not|ascending|descending",
+                nullable=True,
+            ),
+            threshold=StringSchema("Numeric threshold", nullable=True),
+            unit=StringSchema("USD|stars|miles", nullable=True),
+            description=(
+                "Optional: a constraint the brief missed at extraction "
+                "time. Use sparingly — extraction usually catches them."
+            ),
+            nullable=True,
+            required=["text", "kind", "canonical_value"],
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserUpdateTaskBriefTool(Tool):
+    """Update the TaskBrief mid-task.
+
+    Use when:
+      - The brain learned a constraint cannot be satisfied on this site
+        (mark not_applicable with evidence).
+      - A new constraint surfaced from inspecting the page (rare).
+      - You want to record a chain-of-thought note for the next worker.
+    """
+
+    name = "browser_update_task_brief"
+    description = (
+        "Update TaskBrief constraints + append a chain-of-thought note. "
+        "The brief is the brain's persistent working memory; updates "
+        "survive session restarts."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        constraint_updates: list[dict] | None = None,
+        cot_note: str | None = None,
+        new_constraint: dict | None = None,
+        **kw: Any,
+    ) -> str:
+        brief = getattr(self.s, "task_brief", None)
+        if brief is None:
+            return (
+                "[update_task_brief_failed] No TaskBrief on this session. "
+                "It is built by the orchestrator at delegation time; if "
+                "you see this on a fresh worker, the orchestrator path "
+                "is misconfigured."
+            )
+        applied = 0
+        notes: list[str] = []
+        for upd in constraint_updates or []:
+            if not isinstance(upd, dict):
+                continue
+            cv = (upd.get("canonical_value") or "").strip().lower()
+            if not cv:
+                continue
+            idx = brief.find_constraint_by_canonical(cv)
+            if idx < 0:
+                notes.append(f"  - skipped {cv!r}: no matching constraint")
+                continue
+            status = upd.get("status") or ""
+            evidence = upd.get("evidence") or ""
+            if brief.mark_constraint(idx, status, evidence, self.s.current_url):
+                applied += 1
+        if new_constraint and isinstance(new_constraint, dict):
+            try:
+                from superbrowser_bridge.task_brief import Constraint
+                brief.constraints.append(Constraint.from_dict(new_constraint))
+                brief.version += 1
+                applied += 1
+            except Exception as exc:
+                notes.append(f"  - skipped new_constraint: {exc}")
+        if cot_note:
+            turn = getattr(self.s, "_brain_turn_counter", 0) or 0
+            brief.add_cot_note(turn, cot_note)
+        total, sat, fail = brief.counts()
+        return (
+            f"[task_brief_updated] {applied} change(s) applied. "
+            f"constraints={sat}/{total} satisfied"
+            + (f", {fail} failed" if fail else "")
+            + ("\n" + "\n".join(notes) if notes else "")
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        focus_constraint_idx=IntegerSchema(
+            "1-based index of the TaskBrief constraint you're attacking "
+            "next. Defaults to the system's current_focus_idx (the "
+            "[FOCUS] line). Pass -1 to use the system recommendation.",
+            nullable=True,
+        ),
+        planned_tool=StringSchema(
+            "The tool you're about to call after this preplan. Pick the "
+            "lowest tier on the TOOL LADDER that fits: click_at | "
+            "click_selector | type_at | type | scroll | "
+            "browser_run_script | browser_navigate | etc."
+        ),
+        planned_target_label=StringSchema(
+            "Visible label of the element you're targeting (e.g. "
+            "'WiFi filter chip', 'Search button'). Required for "
+            "click_at / click_selector / type_at — the system uses it "
+            "to ratchet the tool ladder per-target."
+        ),
+        planned_target_vision_index=IntegerSchema(
+            "1-based V_n index from the latest screenshot, when known. "
+            "-1 if you don't have a V_n (e.g. selector / script paths).",
+            nullable=True,
+        ),
+        expected_outcome=StringSchema(
+            "One-sentence prediction of what should happen (e.g. "
+            "'WiFi chip becomes checked and result count drops', "
+            "'Modal closes and toast says Saved'). Compared against "
+            "vision verdict to confirm progress."
+        ),
+        expected_postcondition=StringSchema(
+            "Postcondition kind: 'bbox_state_change' (toggles, "
+            "checkboxes, filter chips), 'dom_mutated' (generic clicks), "
+            "'url_changed' (navigations), or omit for auto-derive from "
+            "planned_tool.",
+            nullable=True,
+        ),
+        required=["session_id", "planned_tool", "expected_outcome"],
+    )
+)
+class BrowserPreplanTool(Tool):
+    """Declare your next action against the TaskBrief before mutating
+    the page.
+
+    The preplan gate refuses every state-change tool unless a fresh
+    preplan has been declared since the last action. This forces the
+    *vision → preplan → action → verify* ritual: you cannot drift off
+    the user's query because every action ties back to a constraint
+    and an expected outcome the system can verify.
+
+    Lower-cost replacement for the "guess and check" loop: a 1-line
+    declaration costs ~50 tokens; a misclick that wastes an iteration
+    costs hundreds. Call this BETWEEN every fresh screenshot and the
+    next mutating tool.
+    """
+
+    name = "browser_preplan"
+    description = (
+        "Declare your next action: which TaskBrief constraint you're "
+        "attacking, which tool, what target, and what should happen. "
+        "Required before every state-change tool (click/type/drag/"
+        "navigate/run_script). Cheap discipline that prevents "
+        "hallucinated progress on multi-constraint queries."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    def _check_tool_ladder(
+        self,
+        planned_tool: str,
+        planned_target_label: str,
+        resolved_focus: int,
+    ) -> str | None:
+        """Arch v4 Move 4 — refuse a higher-tier tool when lower tiers
+        haven't been attempted-and-failed for the same target. Returns
+        the refusal message on block, or None to allow.
+
+        Tier rules:
+          1 (click_at, type_at, etc.) — always allowed.
+          2 (click_selector, type, etc.) — allowed if Tier 1 has
+            ≥1 attempt OR the brain explicitly notes "no V_n with
+            this label" (we approximate via planned_target_vision_index
+            == -1, which is the brain's signal that vision missed it).
+          3 (run_script, eval) — allowed only when Tier 1 + Tier 2
+            both attempted with at least one failure each on the same
+            target.
+          4 (browser_navigate) — only enforced for SAME-DOMAIN
+            navigates after cold-start. Cross-domain navigates and
+            cold-start navigates bypass entirely.
+
+        Each tier has a kill switch: TOOL_LADDER_TIER2=0,
+        TOOL_LADDER_TIER3=0, TOOL_LADDER_TIER4=0. The whole layer can
+        be disabled via TOOL_LADDER=0.
+        """
+        if os.environ.get("TOOL_LADDER", "1") == "0":
+            return None
+        s = self.s
+        tier = s._tier_for_tool(planned_tool)
+        if tier <= 1 or tier == 0:
+            return None  # Tier 1 always allowed; observation tools too.
+
+        # Ledger lookup: synthesize the key the way record_step would,
+        # using a transient pseudo-lock since the real lock isn't set
+        # until after this check passes.
+        pseudo_lock = PreplanLock(
+            focus_constraint_idx=int(resolved_focus),
+            planned_tool=planned_tool,
+            planned_target_label=planned_target_label,
+        )
+        key = s._ledger_key_for_lock(pseudo_lock)
+        rec = s.tool_attempts.get(key, {})
+        t1_attempts = rec.get("tier1", 0)
+        t1_failed = rec.get("tier1_failed", 0)
+        t2_attempts = rec.get("tier2", 0)
+        t2_failed = rec.get("tier2_failed", 0)
+
+        sid = s.session_id or "<session_id>"
+
+        if tier == 2:
+            if os.environ.get("TOOL_LADDER_TIER2", "1") == "0":
+                return None
+            # Allowed if Tier 1 attempted, OR brain signalled "vision
+            # missed this label" (planned_target_vision_index == -1
+            # in the lock — but we don't have access here without
+            # another arg; fall back to "is_cold_start" + no V_n in
+            # latest vision response heuristic — checked by the
+            # selector validation gate in session_tools instead).
+            # To keep the gate surgical, allow Tier 2 when EITHER
+            # condition holds: t1_attempts > 0 OR vision-missed (the
+            # selector tool's own gates already enforce
+            # SELECTOR_VISION_ALIGNMENT for the missing-label case,
+            # so we don't double-enforce here).
+            return None
+
+        if tier == 3:
+            if os.environ.get("TOOL_LADDER_TIER3", "1") == "0":
+                return None
+            if t1_failed >= 1 and t2_failed >= 1:
+                return None
+            return (
+                f"[preplan_ladder_violation tier=3 tool={planned_tool!r} "
+                f"target={planned_target_label!r}]\n"
+                f"You declared a Tier-3 tool (browser_run_script / "
+                f"browser_eval) for this target, but the cursor ladder "
+                f"hasn't been exhausted. Current per-target ledger:\n"
+                f"  Tier 1 (click_at/type_at): {t1_attempts} attempts, "
+                f"{t1_failed} failed\n"
+                f"  Tier 2 (click_selector/type): {t2_attempts} "
+                f"attempts, {t2_failed} failed\n"
+                f"JS dispatches (isTrusted=false) trip Akamai/"
+                f"PerimeterX/DataDome. Cursor clicks don't. Re-call "
+                f"browser_preplan(session_id='{sid}', planned_tool="
+                f"'click_at', planned_target_label="
+                f"'{planned_target_label}', ...) — try a fresh V_n "
+                f"first. Override: TOOL_LADDER_TIER3=0."
+            )
+
+        if tier == 4:
+            if os.environ.get("TOOL_LADDER_TIER4", "1") == "0":
+                return None
+            # Same-domain only. Cross-domain navigates are legit
+            # multi-site flows; cold-start sessions also bypass.
+            if s.is_cold_start:
+                return None
+            current = (s.current_url or "").strip()
+            # Compare hosts; "" current_url means we don't know yet,
+            # so let it through (caller can re-gate).
+            try:
+                from urllib.parse import urlsplit
+                cur_host = urlsplit(current).netloc.lower()
+            except Exception:
+                cur_host = ""
+            # Brain's planned_target_label often holds the target URL
+            # for navigate calls; check it against current host.
+            target = (planned_target_label or "").strip()
+            try:
+                from urllib.parse import urlsplit
+                tgt_host = urlsplit(target).netloc.lower()
+            except Exception:
+                tgt_host = ""
+            same_domain = bool(
+                cur_host and tgt_host and cur_host == tgt_host
+            )
+            if not same_domain:
+                # Cross-domain or unknown — allow.
+                return None
+            # Same-domain: require ≥1 cursor tactic to have failed.
+            if t1_failed >= 1 or t2_failed >= 1:
+                return None
+            return (
+                f"[preplan_ladder_violation tier=4 tool=browser_navigate "
+                f"target={planned_target_label!r}]\n"
+                f"You declared a same-domain navigate, but no cursor "
+                f"tactic has failed for the current target yet. "
+                f"Same-domain navigates skip click handlers and look "
+                f"like a bot to anti-fraud systems. On the current "
+                f"page, try clicking the visible link/button via "
+                f"browser_click_at(V_n) first. Override: "
+                f"TOOL_LADDER_TIER4=0."
+            )
+
+        return None  # unreachable
+
+    async def execute(
+        self,
+        session_id: str,
+        planned_tool: str,
+        expected_outcome: str,
+        focus_constraint_idx: int | None = None,
+        planned_target_label: str = "",
+        planned_target_vision_index: int = -1,
+        expected_postcondition: str | None = None,
+        **kw: Any,
+    ) -> str:
+        if os.environ.get("PREPLAN_GATE", "1") == "0":
+            # Even with the gate disabled, the tool still records the
+            # declaration so downstream verification + ratchet logic
+            # have something to work with.
+            pass
+        brief = getattr(self.s, "task_brief", None)
+        # Resolve focus index. Brain may pass 1-based (UI form) or -1
+        # (default). Convert to 0-based and validate.
+        if focus_constraint_idx is None or focus_constraint_idx == -1:
+            sys_focus = getattr(brief, "current_focus_idx", -1) if brief else -1
+            resolved_focus = sys_focus
+        else:
+            # Brain passes 1-based; store 0-based.
+            resolved_focus = int(focus_constraint_idx) - 1
+        warnings: list[str] = []
+        if brief is not None and brief.constraints:
+            if not (0 <= resolved_focus < len(brief.constraints)):
+                warnings.append(
+                    f"focus_constraint_idx out of range "
+                    f"(got {focus_constraint_idx}, brief has "
+                    f"{len(brief.constraints)} constraints); using "
+                    f"system focus {brief.current_focus_idx + 1}."
+                )
+                resolved_focus = brief.current_focus_idx
+            else:
+                c = brief.constraints[resolved_focus]
+                if c.status == "satisfied":
+                    warnings.append(
+                        f"focus #{resolved_focus + 1} {c.canonical_value!r} "
+                        f"is already satisfied; consider picking the "
+                        f"system focus #{brief.current_focus_idx + 1} "
+                        f"instead."
+                    )
+                elif c.status == "failed":
+                    warnings.append(
+                        f"focus #{resolved_focus + 1} {c.canonical_value!r} "
+                        f"was previously marked failed; if you're "
+                        f"retrying intentionally, proceed."
+                    )
+
+        # Auto-derive expected_postcondition when omitted. Heuristic:
+        # navigate → url_changed; click on label that hints stateful
+        # control → bbox_state_change; everything else → dom_mutated.
+        derived_pc = (expected_postcondition or "").strip().lower()
+        if not derived_pc:
+            tname = (planned_tool or "").lower()
+            label_lower = (planned_target_label or "").lower()
+            if "navigate" in tname:
+                derived_pc = "url_changed"
+            elif (
+                "click" in tname
+                and any(
+                    h in label_lower for h in (
+                        "toggle", "switch", "checkbox", "radio",
+                        "filter chip", "filter:", "chip", " on ", " off ",
+                    )
+                )
+            ):
+                derived_pc = "bbox_state_change"
+            else:
+                derived_pc = "dom_mutated"
+
+        # Arch v4 Move 4 — TOOL LADDER ratchet enforcement. Before we
+        # lock the plan, check whether the declared tool is allowed for
+        # the current target given prior attempts. Refuses Tier 3
+        # (run_script) until Tier 1 + Tier 2 both attempted-and-failed
+        # for the same target; refuses Tier 4 (same-domain navigate)
+        # unless ≥1 cursor tactic failed OR the session is cold-start.
+        # Cross-domain navigate bypasses Tier 4 entirely.
+        ladder_refusal = self._check_tool_ladder(
+            planned_tool=str(planned_tool or ""),
+            planned_target_label=str(planned_target_label or ""),
+            resolved_focus=resolved_focus,
+        )
+        if ladder_refusal is not None:
+            return ladder_refusal
+
+        # Build and stash the lock.
+        iter_n = getattr(self.s, "_brain_turn_counter", 0) or 0
+        lock = PreplanLock(
+            focus_constraint_idx=int(resolved_focus),
+            planned_tool=str(planned_tool or ""),
+            planned_target_label=str(planned_target_label or "")[:120],
+            planned_target_vision_index=int(planned_target_vision_index),
+            expected_outcome=str(expected_outcome or "")[:240],
+            expected_postcondition=str(derived_pc)[:32],
+            set_at_iter=int(iter_n),
+        )
+        self.s.preplan_lock = lock
+        self.s.preplan_lock_consumed = False
+        self.s.preplan_consecutive_refusals = 0
+
+        # Compose the confirmation. Brain reads this and proceeds to
+        # the declared tool call.
+        focus_text = ""
+        if brief is not None and 0 <= resolved_focus < len(brief.constraints):
+            fc = brief.constraints[resolved_focus]
+            focus_text = (
+                f"focus=#{resolved_focus + 1} "
+                f"{fc.canonical_value!r} ({fc.kind}, {fc.status})"
+            )
+        elif brief is not None and brief.constraints:
+            focus_text = "focus=<unset> (no constraint resolved)"
+        else:
+            focus_text = "focus=<no brief>"
+        target_bit = ""
+        if planned_target_label:
+            target_bit = f" target={planned_target_label!r}"
+            if planned_target_vision_index and planned_target_vision_index > 0:
+                target_bit += f" V_{planned_target_vision_index}"
+        warn_bit = ""
+        if warnings:
+            warn_bit = "\n  warnings: " + "; ".join(warnings)
+        return (
+            f"[preplan_locked] {focus_text}, tool={planned_tool!r}"
+            f"{target_bit}, expect={derived_pc!r}, "
+            f"outcome={expected_outcome[:120]!r}.{warn_bit}\n"
+            f"You may now call {planned_tool} once. The next state-"
+            f"change tool will consume this lock; after it runs you'll "
+            f"need to re-preplan."
+        )
+
 
 def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
     """Register all browser session tools with a nanobot instance.
@@ -11014,38 +14180,52 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
     if state is None:
         state = BrowserSessionState()
 
+    # Arch v4 Phase G — narrow the click family. Live runs showed the
+    # brain drifting to click_selector → eval → navigate when click_at
+    # would have worked, because the inventory had multiple click
+    # variants. Per user direction: ONE click tool only (vision bbox),
+    # plus targeted-only scroll. Type, select, and slider tools keep
+    # both their DOM-index and vision-bbox variants — the user said
+    # "typing tool is necessary; slider and others are necessary".
+    #
+    # Removed from registration (classes still exist for tests +
+    # legacy paths): BrowserClickTool (raw coords),
+    # BrowserClickSelectorTool (DOM selector), BrowserScrollTool
+    # (untargeted scroll — use scroll_until). Override:
+    # REGISTER_LEGACY_TOOLS=1 to restore them (debug only).
+    register_legacy = os.environ.get("REGISTER_LEGACY_TOOLS") == "1"
     tools = [
         BrowserOpenTool(state),
-        BrowserNavigateTool(state),
+        BrowserNavigateTool(state),        # Tier 4 — gated, last resort
         BrowserScreenshotTool(state),
-        BrowserLookAgainTool(state),  # careful coverage-mode pass
-        BrowserClickTool(state),
-        BrowserClickAtTool(state),
-        BrowserTypeAtTool(state),
-        BrowserFixTextAtTool(state),
-        BrowserTypeTool(state),
-        BrowserKeysTool(state),
-        BrowserScrollTool(state),
-        BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
-        BrowserInventoryFiltersTool(state),  # filter-modal scan-and-collect
+        BrowserLookAgainTool(state),       # careful coverage-mode pass
+        BrowserClickAtTool(state),         # ONE click tool — vision bbox
+        BrowserTypeAtTool(state),          # vision-bbox type
+        BrowserFixTextAtTool(state),       # vision-bbox text correction
+        BrowserTypeTool(state),            # DOM-index type
+        BrowserKeysTool(state),            # Enter / Escape / Tab keys
+        BrowserScrollUntilTool(state),     # targeted scroll-to-text only
+        # browser_inventory_filters intentionally NOT registered. Its
+        # large output (every filter selector + label) caused the brain
+        # to hallucinate filter URLs and pivot away from click_at(V_n).
+        # Restore via REGISTER_LEGACY_TOOLS=1 if needed for debugging.
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
         BrowserFormPlanTool(state),
-        BrowserEvalTool(state),
-        BrowserRunScriptTool(state),
+        BrowserEvalTool(state),            # Tier 3 — gated
+        BrowserRunScriptTool(state),       # Tier 3 — gated
         BrowserWaitForTool(state),
-        BrowserDragTool(state),
-        BrowserGetRectTool(state),         # kept: DOM rect helper
-        BrowserClickSelectorTool(state),   # kept: DOM-selector fast path
-        BrowserDragSelectorsTool(state),   # kept: selector-based drag
-        BrowserDragPathTool(state),        # kept: polyline drag
-        BrowserSetSliderTool(state),       # kept: slider family for ChaseIRA calc
-        BrowserSetSliderAtTool(state),
+        BrowserDragTool(state),            # vision-anchored drag
+        BrowserGetRectTool(state),         # DOM rect helper
+        BrowserDragSelectorsTool(state),   # selector-based drag
+        BrowserDragPathTool(state),        # polyline drag (puzzles)
+        BrowserSetSliderTool(state),       # DOM-index slider
+        BrowserSetSliderAtTool(state),     # vision-bbox slider
         BrowserListSliderHandlesTool(state),
         BrowserDragSliderUntilTool(state),
-        BrowserImageRegionTool(state),     # kept: image region helper
-        BrowserSolvePuzzleTool(state),     # kept: puzzle solver
-        BrowserGetMarkdownTool(),          # stateless
+        BrowserImageRegionTool(state),     # detail vision on a region
+        BrowserSolvePuzzleTool(state),
+        BrowserGetMarkdownTool(),          # stateless text extraction
         BrowserDialogTool(),               # stateless
         BrowserDetectCaptchaTool(state),
         BrowserCaptchaScreenshotTool(state),
@@ -11055,15 +14235,28 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserRequestHelpTool(state),
         BrowserEscalateTool(state),        # t1 → t3 migration
         BrowserPlanNextStepsTool(state),   # hierarchical planner
-        BrowserSetTaskPlanTool(state),     # task_plan: persistent multi-step checklist
+        BrowserSetTaskPlanTool(state),
         BrowserPlanSkipStepTool(state),
         BrowserPlanReplanTool(state),
-        BrowserFormBeginTool(state),       # Phase 2.1: form-fill orchestration
+        BrowserStateCheckTool(state),      # arch v3: cheap state-only pass
+        BrowserVerifyActionTool(state),    # arch v3: post-action verifier
+        BrowserUpdateTaskBriefTool(state), # arch v3: brain-driven brief updates
+        BrowserPreplanTool(state),         # arch v4: declare next action against brief
+        BrowserFormBeginTool(state),
         BrowserFormStatusTool(state),
         BrowserFormCommitTool(state),
-        BrowserRewindToCheckpointTool(state),  # kept: session-memory escape hatch
+        BrowserRewindToCheckpointTool(state),
         BrowserCloseTool(state),
     ]
+    if register_legacy:
+        # Debug-only: restore the removed-by-default tools when the
+        # caller wants the full v3 surface for comparison.
+        tools.extend([
+            BrowserClickTool(state),
+            BrowserClickSelectorTool(state),
+            BrowserScrollTool(state),
+            BrowserInventoryFiltersTool(state),
+        ])
     for tool in tools:
         bot._loop.tools.register(tool)
     return state

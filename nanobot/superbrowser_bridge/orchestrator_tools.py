@@ -106,6 +106,198 @@ BROWSER_WORKSPACE = str(_BASE / "workspace_browser")
 
 
 
+# ── v9: orchestrator-level intelligent retry on request_help bail ──
+#
+# When a worker exits via browser_request_help (or returns a "different
+# tactic" / "couldn't complete" diagnostic) AND its TaskPlan still has
+# unsatisfied steps, the orchestrator spawns ONE successor worker with
+# enriched instructions: original task + prior worker's diagnostic +
+# remaining steps + concrete recovery strategies. The successor hydrates
+# from the v2 handoff store so the live URL/session continues. Capped
+# at 1 retry per delegation. Kill switch AUTO_RETRY_ON_REQUEST_HELP=0.
+
+
+_REQUEST_HELP_BAIL_MARKERS = (
+    "different tactic",
+    "i'm unable", "i am unable", "i was unable",
+    "couldn't truthfully", "could not truthfully",
+    "couldn't complete", "could not complete",
+    "unable to complete", "unable to verify",
+    "filter state inconsistent", "blocked by",
+    "no verified matching", "could not be reliably",
+    "couldn't be reliably", "no matching wines",
+    "interaction guards blocked", "cursor safeguards",
+)
+
+
+def _looks_like_request_help_bail(content: str, worker_state: Any) -> bool:
+    """Detect when the worker bailed via request_help / give-up text.
+
+    Two signals (either is sufficient):
+      • `browser_request_help` appeared in the last 3 step_history entries
+        (most reliable — the brain explicitly asked for help)
+      • The response text matches one of the bail-marker phrases
+        (catches "I am unable to complete" style exits even when no
+        request_help tool call was made)
+    """
+    try:
+        recent = (
+            worker_state.step_history[-3:]
+            if getattr(worker_state, "step_history", None)
+            else []
+        )
+        if any(s.get("tool") == "browser_request_help" for s in recent):
+            return True
+    except Exception:
+        pass
+    if not content or not isinstance(content, str):
+        return False
+    lower = content.lower()
+    return any(m in lower for m in _REQUEST_HELP_BAIL_MARKERS)
+
+
+def _build_retry_instructions(
+    original_instructions: str,
+    prior_response: str,
+    unsatisfied_steps: list[str],
+    task_brief: Any = None,
+    failed_tactics: list[str] | None = None,
+) -> str:
+    """Craft enriched instructions for a successor worker.
+
+    Carries forward the original task, the prior worker's diagnostic
+    (so the new worker doesn't repeat the same mistake), the list of
+    unsatisfied TaskPlan steps, and a concrete recovery checklist. The
+    new worker arrives with v3 handoff hydration: same browser session,
+    same URL, same cursor-failure ledger, full TaskBrief.
+    """
+    steps_block = "\n".join(
+        f"  - {s!r}" for s in (unsatisfied_steps or [])[:6]
+    ) or "  (none — all steps satisfied; investigate why prior worker bailed)"
+    diag = (prior_response or "").strip()
+    # Arch v3: keep more diagnostic — the brief + step history compress
+    # the noise, so the brain can absorb a longer prior-worker diagnostic
+    # without burning cache. 1600 chars is ~400 tokens — affordable.
+    if len(diag) > 1600:
+        diag = diag[:1600] + "...(truncated)"
+    brief_block = ""
+    verified_block = ""
+    if task_brief is not None:
+        try:
+            brief_block = (
+                "\n## TASK BRIEF (carry forward — original_query never truncated)\n"
+                + task_brief.to_brain_text(compact=False)
+                + "\n"
+            )
+        except Exception:
+            brief_block = ""
+        # Arch v3 fix J — extract VERIFIED constraints into their own
+        # section so the new worker reads "skip these, they're done"
+        # before scanning the full brief. Reduces redo-the-work risk
+        # when the LLM scans top-down.
+        try:
+            verified = [
+                c for c in task_brief.constraints
+                if c.status in ("satisfied", "not_applicable")
+            ]
+            failed_constraints = [
+                c for c in task_brief.constraints if c.status == "failed"
+            ]
+            unverified = [
+                c for c in task_brief.constraints if c.status == "unverified"
+            ]
+            if verified or failed_constraints or unverified:
+                lines: list[str] = []
+                if verified:
+                    lines.append(
+                        f"## ALREADY VERIFIED CONSTRAINTS ({len(verified)} of "
+                        f"{len(task_brief.constraints)} — DO NOT RE-DO)"
+                    )
+                    for c in verified:
+                        marker = "[done]" if c.status == "satisfied" else "[n/a] "
+                        ev = f' — evidence: "{c.evidence[:80]}"' if c.evidence else ""
+                        lines.append(
+                            f"  {marker} {c.canonical_value or c.text} ({c.kind}){ev}"
+                        )
+                if failed_constraints:
+                    lines.append(
+                        f"## CONSTRAINTS THAT FAILED ON THE PRIOR ATTEMPT "
+                        f"({len(failed_constraints)} — try a DIFFERENT angle, "
+                        f"not the same tactic)"
+                    )
+                    for c in failed_constraints:
+                        ev = f' — reason: "{c.evidence[:80]}"' if c.evidence else ""
+                        lines.append(
+                            f"  [fail] {c.canonical_value or c.text} ({c.kind}){ev}"
+                        )
+                if unverified:
+                    lines.append(
+                        f"## REMAINING TO VERIFY ({len(unverified)} — focus here)"
+                    )
+                    for c in unverified:
+                        op_bit = ""
+                        if c.operator:
+                            op_bit = f" {c.operator}"
+                            if c.threshold:
+                                op_bit += f" {c.threshold}"
+                                if c.unit:
+                                    op_bit += c.unit
+                        lines.append(
+                            f"  [?] {c.canonical_value or c.text}{op_bit} ({c.kind})"
+                        )
+                verified_block = "\n" + "\n".join(lines) + "\n"
+        except Exception:
+            verified_block = ""
+    failed_block = ""
+    if failed_tactics:
+        ft = list(failed_tactics)[-12:]
+        failed_block = (
+            "\n## FAILED TACTICS (already tried — DO NOT REPEAT)\n"
+            + "\n".join(f"  - {t}" for t in ft)
+            + "\n"
+        )
+    return (
+        "## AUTO-RETRY (orchestrator-spawned successor)\n"
+        "The prior worker for this task made progress but bailed via "
+        "browser_request_help. Your job is to read its diagnostic and "
+        "continue from where it left off.\n\n"
+        "## ORIGINAL USER TASK\n"
+        f"{original_instructions}\n\n"
+        "## PRIOR WORKER'S DIAGNOSTIC (verbatim)\n"
+        f"{diag}\n"
+        f"{verified_block}"
+        f"{brief_block}"
+        f"{failed_block}"
+        "\n## REMAINING UNSATISFIED TASKPLAN STEPS\n"
+        f"{steps_block}\n\n"
+        "## RECOVERY STRATEGIES (try in order — your prompt's HARD RULE "
+        "now says \"do NOT call browser_open\" because the prior worker's "
+        "session is preserved)\n"
+        "1. **First call MUST be browser_screenshot** to see the current "
+        "page state (the URL is whatever the prior worker left it at).\n"
+        "2. If the prior worker's diagnostic says filter state was lost "
+        "on a URL change (common on sites where sub-filter clicks "
+        "navigate away): use `browser_inventory_filters` to refresh the "
+        "manifest, then apply ALL filters via `browser_form_begin` "
+        "in ONE batch — transactional, can't lose state mid-application.\n"
+        "3. If the prior worker hit \"selector didn't work\" / silent "
+        "clicks: prefer `browser_click_at(vision_index=V_n, target_label=...)` "
+        "from a fresh screenshot. The v8 target_label gate ensures you "
+        "READ the V_n labels — don't reflexively click V_1.\n"
+        "4. If page navigates unexpectedly mid-flow: take a screenshot "
+        "BEFORE the next click to verify state hasn't been lost.\n"
+        "5. **Do NOT call browser_request_help again** unless you have "
+        "tried at least 3 distinct recovery moves on each unsatisfied "
+        "step. The orchestrator already retried once; a second bail "
+        "means you must call done(success=False) with the most honest "
+        "summary of what you found AND what you couldn't verify.\n"
+        "6. If you found candidates the prior worker missed — even "
+        "without verifying every constraint — present them in your final "
+        "answer with explicit caveats (\"verified X, did not verify Y\"). "
+        "Honest hedged answers are SUCCESS, not failure.\n"
+    )
+
+
 def _task_fingerprint(instructions: str) -> str:
     """SHA1 fingerprint of a normalized task-instruction string.
 
@@ -560,6 +752,7 @@ class DelegateBrowserTaskTool(Tool):
         # Default True so a human can solve captchas the auto-solver fails on.
         # Pass False only for fully unattended runs.
         enable_human_handoff: bool = True,
+        _is_retry: bool = False,  # internal: set True only by v9 auto-retry path
         **kw: Any,
     ) -> str:
         # --- Outer-loop circuit breaker --------------------------------
@@ -811,6 +1004,34 @@ class DelegateBrowserTaskTool(Tool):
             is_research=is_research,
         )
         worker_state.task_id = task_id
+
+        # Arch v3: build the persistent TaskBrief at delegation time.
+        # Always-LLM extraction (per user decision); failure is non-fatal
+        # — the brief still carries the verbatim original_query.
+        if os.environ.get("TASK_BRIEF_ENABLED", "1") != "0":
+            try:
+                from superbrowser_bridge.task_brief import build_task_brief_sync
+                from urllib.parse import urlparse as _urlparse
+                _domain = ""
+                try:
+                    _domain = _urlparse(url or "").hostname or ""
+                except Exception:
+                    _domain = ""
+                worker_state.task_brief = build_task_brief_sync(
+                    instructions or "",
+                    target_url=url or "",
+                    domain=_domain,
+                )
+                _brief = worker_state.task_brief
+                if _brief is not None:
+                    total, sat, fail = _brief.counts()
+                    print(
+                        f"   [task_brief] {total} constraints extracted "
+                        f"({sat} satisfied, {fail} failed) "
+                        f"via {_brief.extraction_model}"
+                    )
+            except Exception as exc:
+                print(f"   [task_brief build skipped — {exc}]")
         # Stash the orchestrator-level dedup key on the state so the
         # worker hook / close path can save handoff state under the
         # SAME key the next delegate call will look up. Without this,
@@ -830,10 +1051,54 @@ class DelegateBrowserTaskTool(Tool):
         resumed_handoff = None
         if os.environ.get("WORKER_HANDOFF_RESUME", "1") != "0":
             try:
-                from superbrowser_bridge.handoff_store import take as _ho_take
+                from superbrowser_bridge.handoff_store import (
+                    take as _ho_take,
+                    take_recent_for_domain as _ho_take_domain,
+                )
                 resumed_handoff = _ho_take(_dedup_key)
+                if resumed_handoff is None:
+                    # Arch v3 fix H — exact-key miss is common when the
+                    # orchestrator's LLM crafts NEW retry instructions
+                    # (different sha1, different dedup_key). Fall back to
+                    # the most-recent handoff for the same domain so the
+                    # successor inherits prior progress instead of fresh-
+                    # starting at brief=0.
+                    if _domain:
+                        resumed_handoff = _ho_take_domain(_domain)
+                        if resumed_handoff is not None:
+                            print(
+                                f"   [handoff resumed via domain-fallback] "
+                                f"{resumed_handoff.short_summary()}"
+                            )
                 if resumed_handoff is not None:
+                    # Carry over the prior brief BEFORE hydrate (which
+                    # overwrites worker_state.task_brief). We need both
+                    # the new brief (built fresh from this delegation's
+                    # instructions) and the old brief's progress.
+                    _new_brief = getattr(worker_state, "task_brief", None)
                     worker_state.hydrate_from_handoff(resumed_handoff)
+                    # Arch v3 fix I — if both new and old briefs exist,
+                    # merge old's satisfied/failed statuses into new and
+                    # use new (which reflects current instructions).
+                    _old_brief = getattr(worker_state, "task_brief", None)
+                    if _new_brief is not None and _old_brief is not None:
+                        try:
+                            from superbrowser_bridge.task_brief import (
+                                merge_brief_progress,
+                            )
+                            transferred = merge_brief_progress(
+                                old=_old_brief, new=_new_brief,
+                            )
+                            worker_state.task_brief = _new_brief
+                            if transferred > 0:
+                                _, sat, _ = _new_brief.counts()
+                                print(
+                                    f"   [brief progress merged] "
+                                    f"{transferred} statuses transferred → "
+                                    f"{sat}/{len(_new_brief.constraints)} satisfied"
+                                )
+                        except Exception as exc:
+                            print(f"   [brief merge skipped — {exc}]")
                     print(
                         f"   [handoff resumed] {resumed_handoff.short_summary()}"
                     )
@@ -2056,6 +2321,80 @@ CRITICAL RULES:
                 _ho_save(_dedup_key, worker_state)
             except Exception as _ho_exc:
                 print(f"   [handoff save skipped — {_ho_exc}]")
+
+            # --- v9: orchestrator-level auto-retry on request_help bail ---
+            # When the worker exited via request_help (or a "couldn't
+            # complete" diagnostic) AND TaskPlan still has unsatisfied
+            # steps AND we're not already in a retry, spawn ONE successor
+            # worker with enriched instructions. The successor hydrates
+            # from the v2 handoff store so the live URL/session continues.
+            # Capped at one retry per delegation. Kill switch
+            # AUTO_RETRY_ON_REQUEST_HELP=0.
+            if (
+                not _is_retry
+                and os.environ.get("AUTO_RETRY_ON_REQUEST_HELP", "1") != "0"
+                and _looks_like_request_help_bail(content, worker_state)
+                and worker_state.task_plan is not None
+                and any(
+                    s.status in ("pending", "in_progress")
+                    for s in worker_state.task_plan.steps
+                )
+            ):
+                try:
+                    unsatisfied = [
+                        s.name
+                        for s in worker_state.task_plan.steps
+                        if s.status in ("pending", "in_progress")
+                    ]
+                    enriched = _build_retry_instructions(
+                        original_instructions=instructions,
+                        prior_response=content,
+                        unsatisfied_steps=unsatisfied,
+                        task_brief=getattr(worker_state, "task_brief", None),
+                        failed_tactics=list(
+                            getattr(worker_state, "failed_tactics", []) or []
+                        ),
+                    )
+                    # Save handoff under the RETRY's dedup_key so the
+                    # recursive call's v2 handoff hydration finds it.
+                    # (handoff_store.take is one-shot per key; we save
+                    # under both keys so the original prior-worker save
+                    # above isn't redundant either.)
+                    try:
+                        retry_dedup_key = (
+                            f"{_attempt_domain or 'no-domain'}::"
+                            f"{hashlib.sha1(enriched.encode('utf-8')).hexdigest()[:12]}"
+                        )
+                        from superbrowser_bridge.handoff_store import save as _ho_save_retry
+                        _ho_save_retry(retry_dedup_key, worker_state)
+                    except Exception as _hexc:
+                        print(f"   [auto-retry handoff save skipped — {_hexc}]")
+                    print(
+                        f"\n>> [auto-retry] worker bailed via request_help — "
+                        f"spawning successor with enriched instructions "
+                        f"({len(unsatisfied)} unsatisfied steps)"
+                    )
+                    # Recursive call. force=True bypasses the substantive-
+                    # result circuit breaker since the worker explicitly
+                    # asked for help (not a substantive answer). _is_retry
+                    # blocks further auto-retries.
+                    retry_content = await self.execute(
+                        instructions=enriched,
+                        url=url,
+                        force=True,
+                        enable_human_handoff=enable_human_handoff,
+                        _is_retry=True,
+                    )
+                    if retry_content and len(str(retry_content)) > 100:
+                        return (
+                            f"{retry_content}\n\n"
+                            f"[auto-retry note: orchestrator spawned this "
+                            f"successor after the original worker bailed via "
+                            f"browser_request_help. Original diagnostic "
+                            f"(first 200 chars): {content[:200]!r}]"
+                        )
+                except Exception as _retry_exc:
+                    print(f"   [auto-retry failed — {_retry_exc}]")
 
             return content
 

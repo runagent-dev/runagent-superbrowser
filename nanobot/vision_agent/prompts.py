@@ -72,6 +72,30 @@ JSON object with this exact shape:
       "why_unsure": "<short reason, e.g. 'glyph unrendered'>"
     }
   ],
+  "page_state": {
+    "funnel": {
+      "name": "<human-readable, e.g. 'checkout step 2 of 4'>",
+      "step_index": <int|null>,
+      "total_steps": <int|null>,
+      "funnel_kind": "checkout|search_funnel|signup|booking|filter_panel|form_wizard|none"
+    },
+    "active_filters": [
+      {"label": "WiFi", "state": "on|off|partial|unknown", "value": "<for ranges, e.g. '$50-$100'>"}
+    ],
+    "result_count": <int|null>,
+    "list_length_visible": <int|null>,
+    "last_action_verdict": {
+      "verdict": "succeeded|failed|uncertain|no_action",
+      "evidence": "<one short sentence>",
+      "delta_summary": "<what changed since last screenshot>"
+    },
+    "stuck_indicators": [
+      {"kind": "loading_spinner|error_banner|captcha|empty_results|rate_limit|timeout|none",
+       "detail": "<short>",
+       "duration_hint": "<e.g. '>=3s loading'>"}
+    ],
+    "primary_intent_match": "<one sentence: what does this page do?>"
+  },
   "next_action": null
 }
 
@@ -97,10 +121,26 @@ Hard rules for box_2d (THIS IS CRITICAL FOR CLICK ACCURACY):
   (1000, 1000). ymin/xmin describe the top-left of the element's
   bounding rectangle; ymax/xmax describe the bottom-right.
 - ymax MUST be greater than ymin and xmax MUST be greater than xmin.
-- Make the bounding rectangle TIGHT around the visible element. A loose
-  box that includes whitespace or neighbours produces wrong clicks.
+- Click position is ALWAYS the geometric center of the bbox. Therefore
+  the bbox MUST be tight enough that its center lands ON the visible
+  text or icon, not on padding or a neighboring element.
+- TEXT-FIT requirement: hug the visible glyphs / icon pixels with
+  ≤ 4px slack on every side. The bbox should look like a snug
+  highlight around the label, NOT a row-wide rectangle covering empty
+  space. If the visible label is "Oregon" rendered at ~60×16px, emit
+  a ~64×20px bbox — not the surrounding 240×40px row.
+- Wide row containers (e.g. an entire filter row with "(expand)" on the
+  right) are STRICTLY FORBIDDEN unless the entire row is itself the
+  click target. When a row contains a label + a separate chevron icon,
+  emit TWO bboxes: one tight around the label text, one tight around
+  the chevron icon. The brain will pick which one to click.
+- A loose box that spans whitespace or includes neighbours produces
+  wrong clicks because the click lands at the bbox center, not on the
+  text.
 - Example: a button at the geometric centre of a 1000×1000 image,
-  100px wide × 40px tall, would be roughly box_2d=[480, 450, 520, 550].
+  rendered text spans 100px wide × 40px tall, emit box_2d=[480, 450,
+  520, 550] — the box hugs the rendered text. NOT box_2d=[460, 350,
+  540, 650] which spans the surrounding row padding.
 
 Set-of-Marks hint (may or may not be present):
 Dashed colored rectangles labelled [V_n] may be drawn on this image.
@@ -125,6 +165,36 @@ General rules:
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
 - Return up to 50 bboxes. Do not cap yourself lower on dense pages —
   the caller's brain can't click what isn't in the list.
+
+DUAL-AFFORDANCE ROWS — the "container with chevron" trap:
+Many filter panels (especially country→state pickers, category trees,
+multi-level facet menus) render rows that have TWO clickable
+affordances stacked on top of each other:
+  (a) the row BODY (label + checkbox/toggle) — clicking it selects the
+      whole parent option, often as "all of X" (e.g. clicking the
+      "United States" row toggles every US region ON);
+  (b) a small CHEVRON / caret / arrow / "+" icon at the right edge —
+      clicking it EXPANDS the row to reveal sub-options (e.g. the list
+      of US states under United States).
+These two affordances do OPPOSITE things: (a) collapses the choice to
+"all", (b) lets the user drill down to a specific sub-option. The
+click coordinates are different by ~150-300px.
+RULE: emit them as TWO SEPARATE bboxes whenever a row visibly has
+both. Each bbox must be TIGHT around its actual hitbox:
+  1. role='checkbox' (or whatever the toggle is) — bbox around the
+     label + checkbox region only. label="<group name> (toggle all)".
+  2. role='button' — bbox around JUST the chevron/caret icon
+     (≈20-30px square at the right edge of the row).
+     label="<group name> (expand sub-options)".
+Set role_in_scene='target' on whichever serves the active task —
+usually the CHEVRON when the user wants a specific sub-option (the
+common case for region pickers like "Oregon under United States").
+The active FOCUS block (when present) names which one.
+Same pattern applies to: country→state pickers, category→subcategory
+trees, accordion+detail rows, "show more" arrows on collapsed lists,
+expandable facet menus. Do NOT collapse the chevron into the parent
+row's bounding box — the brain literally CANNOT reach the chevron if
+you only emit the row.
 
 Page-type coverage rules (CRITICAL for dense filter/booking UIs):
 - On `search_results` / `product_listing` / `checkout_form` /
@@ -257,11 +327,58 @@ Screenshot freshness (prevents acting on stale frames):
 - When in doubt prefer "uncertain" over "fresh". A false "fresh" leads
   to clicks on stale coordinates; a false "uncertain" only costs a
   re-capture.
+
+Page state report (NEW — the brain reads this BEFORE bboxes):
+The reasoning agent must answer "where am I in the funnel and what just
+happened" without re-parsing prose. Populate `page_state` so it can.
+
+- `page_state.funnel`: when the page is part of a stepwise flow
+  (checkout, signup, booking wizard, form wizard) read the visible
+  step indicator (breadcrumb, progress bar, "Step 2 of 4") and fill
+  `name`, `step_index`, `total_steps`, `funnel_kind`. For flat pages
+  set `funnel_kind="none"`.
+- `page_state.active_filters`: list every facet/chip/checkbox that
+  represents a filter the user could apply. For each:
+    * `label` = filter name as it appears (e.g. "Free WiFi", "Pet friendly")
+    * `state` = "on" if the filter is currently APPLIED (chip is filled,
+      checkbox checked, toggle pressed), "off" if visible but not applied,
+      "partial" for indeterminate / mixed multi-select, "unknown" only
+      when you genuinely cannot tell. The brain uses this to flip task
+      constraints to "satisfied" — accuracy here is load-bearing.
+    * `value` = applied value for range/slider filters ("$50-$100",
+      "4-5 stars"); empty for boolean filters.
+  On non-filter pages emit an empty array.
+- `page_state.result_count`: when a results page shows a number ("47
+  hotels", "1,203 jobs", "showing 25 of 312"), emit the most precise
+  visible total. Null when no count is visible.
+- `page_state.list_length_visible`: count of distinct result/list items
+  rendered above the fold. Null on non-list pages.
+- `page_state.last_action_verdict`: when the caller supplies
+  `previous_summary`, compare it to what you see now and return:
+    * `verdict` = "succeeded" (state changed in the way the action
+      intended — modal closed, filter chip activated, count dropped),
+      "failed" (no change or the opposite change), "uncertain" (some
+      change but unclear if it's the intended one), or "no_action"
+      (no `previous_summary` was supplied).
+    * `evidence` = one specific observation
+      (e.g. "filter chip shows checkmark, count went 132->47").
+    * `delta_summary` = one sentence on what changed.
+- `page_state.stuck_indicators`: emit one entry per blocking signal
+  visible — loading spinner, error banner, captcha, empty results, rate
+  limit, timeout. `kind="none"` and an empty array both mean "no
+  blockers". Use `duration_hint` only when a duration is visible
+  (e.g. "Retry in 30s").
+- `page_state.primary_intent_match`: ONE SENTENCE describing what the
+  current page DOES, in the user's vocabulary. Example: "Hotel results
+  list with 47 properties and a sidebar filter panel."
+
+Be conservative: leaving fields empty/null/unknown is preferred over
+guessing. Empty `page_state` is valid for very simple pages.
 """
 
 
 def intent_bucket(intent: str) -> str:
-    """Collapse free-form intent into one of 6 coarse buckets for caching.
+    """Collapse free-form intent into one of N coarse buckets for caching.
 
     Slight phrasing variation ("check login state" vs "verify login succeeded")
     should share a cache entry, but "observe" and "solve captcha" must not.
@@ -269,12 +386,28 @@ def intent_bucket(intent: str) -> str:
     `solve_captcha_step` is its own bucket because the step-mode contract
     (single next_action, no SoM overlay, no result caching) is materially
     different from the original one-shot `solve_captcha` pass.
+
+    Arch v3 buckets:
+      `state_check`   — explicit "tell me where I am, no bboxes needed"
+                        passes from `browser_state_check`. Populates
+                        `page_state` only; bboxes come back empty.
+      `verify_action` — explicit "did my last action work" passes from
+                        `browser_verify_action` and worker_hook
+                        auto-fire on dense scenes. Demands populated
+                        `last_action_verdict` based on `previous_summary`.
     """
     s = (intent or "").lower()
     # Check step-mode BEFORE the broader captcha match so it doesn't get
     # swallowed into the generic "solve_captcha" bucket.
     if "captcha step" in s or "captcha_step" in s:
         return "solve_captcha_step"
+    # Arch v3 — explicit verify/state buckets. These take precedence
+    # over the looser keyword fallback below so the brain's explicit
+    # tool calls don't get mis-bucketed as generic "act" or "observe".
+    if "state_check" in s or "state check" in s:
+        return "state_check"
+    if "verify_action" in s or "verify action" in s:
+        return "verify_action"
     # F4 — captcha bucket only fires when the intent expresses an
     # ACTION on a captcha (solve / click / complete / submit / pick a
     # tile / drag a slider). The brain often writes "find search box
@@ -356,6 +489,7 @@ def build_user_prompt(
     task_instruction: str | None = None,
     compact: bool = False,
     current_subgoal: object | None = None,
+    active_constraint: dict | None = None,
 ) -> str:
     """The per-call user message — describes context and emphasises intent.
 
@@ -375,6 +509,15 @@ def build_user_prompt(
     task — so bboxes stay focused on what the user needs *right now*
     rather than every clickable element that might serve the eventual
     goal. This is the load-bearing change for targeted bbox emission.
+
+    `active_constraint` (arch v3 fix #3) — the highest-priority
+    unverified TaskBrief constraint, as a dict with keys: `text`,
+    `kind`, `canonical_value`, `operator`, `threshold`, `unit`. When
+    set, it renders as an explicit FOCUS block telling vision which
+    one element on the page would advance the constraint right now. If
+    the constraint is multi-faceted (numeric range, ordering), the
+    block names the operator + threshold so vision can recognize
+    matching controls (sliders, range inputs, sort dropdowns).
     """
     bucket = intent_bucket(intent)
     context = f"Page URL: {url}\n" if url else ""
@@ -434,6 +577,65 @@ def build_user_prompt(
                 "intent_relevant for elements that serve the broader task "
                 "but not this immediate step.\n"
             )
+
+    # Arch v3 fix #3: explicit FOCUS block from the active TaskBrief
+    # constraint. Vision uses this to rank V_1 — the bbox most likely to
+    # advance THIS constraint, not the overall task.
+    if active_constraint and isinstance(active_constraint, dict):
+        kind = str(active_constraint.get("kind", "filter") or "filter")
+        cv = str(active_constraint.get("canonical_value", "") or "").strip()
+        text = str(active_constraint.get("text", "") or "").strip()
+        op = str(active_constraint.get("operator", "") or "").strip()
+        threshold = str(active_constraint.get("threshold", "") or "").strip()
+        unit = str(active_constraint.get("unit", "") or "").strip()
+        focus_lines = ["FOCUS — the brain's next click should advance THIS constraint:"]
+        if cv or text:
+            label = cv or text
+            focus_lines.append(f"  - target: {label!r} (kind={kind})")
+        if op:
+            cmp_bit = op
+            if threshold:
+                cmp_bit += f" {threshold}"
+                if unit:
+                    cmp_bit += f" {unit}"
+            focus_lines.append(f"  - condition: {cmp_bit}")
+        # Per-kind hint about what to look for
+        if kind == "filter":
+            focus_lines.append(
+                f"  - find the FILTER chip / checkbox / toggle whose "
+                f"label contains {cv!r}. Set its bbox role_in_scene='target' "
+                f"and intent_relevant=true. If a filter group is collapsed "
+                f"and the target is inside it, emit the EXPAND chevron / "
+                f"caret as a separate target bbox so the brain can open "
+                f"the group first."
+            )
+        elif kind == "numeric":
+            focus_lines.append(
+                f"  - find the slider / range input / numeric filter that "
+                f"controls {cv!r}. Both thumbs (low + high), the track, "
+                f"and the rendered value label should each be separate "
+                f"bboxes (see slider rules in the system prompt)."
+            )
+        elif kind == "ordering":
+            focus_lines.append(
+                f"  - find the SORT / ORDER dropdown or chip. The relevant "
+                f"option for direction={op!r} on {cv!r} (e.g. 'Price: low "
+                f"to high', 'Highest rating') should be the target."
+            )
+        elif kind == "negative":
+            focus_lines.append(
+                f"  - find the EXCLUDE / 'no {cv}' filter, OR the positive "
+                f"chip for {cv!r} that you may need to UNCHECK if it's "
+                f"currently active. role_in_scene='target' for whichever "
+                f"applies."
+            )
+        else:  # attribute
+            focus_lines.append(
+                f"  - find the input / link / facet that lets the brain "
+                f"select {cv!r}. If multiple candidates exist, prefer the "
+                f"one closest to the page's primary results area."
+            )
+        context += "\n".join(focus_lines) + "\n"
 
     if previous_summary:
         context += f"Previous page state: {previous_summary}\n"
@@ -583,16 +785,43 @@ def build_user_prompt(
         )
     elif bucket == "verify_action":
         specific = (
-            "The reasoning agent just performed an action. Judge whether "
-            "the expected outcome is visible. Populate flags carefully "
-            "(modal_open, error_banner, loading, login_wall). "
-            "intent_relevant=true for indicators that confirm or deny the "
-            "outcome (success banner, error banner, new element, etc.).\n\n"
-            "Also populate `scene.layers` briefly — the planner checks "
-            "whether a blocker that should have been dismissed is still "
-            "present. If the previous action was a dismiss and the "
-            "expected overlay is gone, set `active_blocker_layer_id` to "
-            "null and omit the dismissed layer from `layers`."
+            "VERIFY ACTION MODE — the reasoning agent just performed an "
+            "action and needs to know if it worked. Compare the current "
+            "screenshot against `Previous page state` above and populate "
+            "`page_state.last_action_verdict` with:\n"
+            "  - verdict: succeeded | failed | uncertain (no_action only "
+            "if no previous_summary was supplied).\n"
+            "  - evidence: ONE specific observation that justifies the "
+            "verdict (e.g. 'filter chip checkmark visible, count went "
+            "132->47', 'modal dismissed and Save toast appeared', "
+            "'expected confirmation never appeared, page unchanged').\n"
+            "  - delta_summary: one sentence on what changed.\n"
+            "Populate `page_state.active_filters` if filters are visible "
+            "so the brain can reconcile its constraint checklist. Keep "
+            "the bbox list tight (≤15) — focus on confirmation indicators "
+            "(success banners, new chips, error toasts) rather than the "
+            "full page inventory. Set `intent_relevant=true` only for "
+            "elements that confirm or deny the outcome."
+        )
+    elif bucket == "state_check":
+        specific = (
+            "STATE CHECK MODE — the reasoning agent only wants to know "
+            "WHERE IT IS, not what to click. Populate `page_state` "
+            "thoroughly:\n"
+            "  - funnel.* (step name + index/total when visible)\n"
+            "  - active_filters (every visible facet with state)\n"
+            "  - result_count + list_length_visible when on a results page\n"
+            "  - last_action_verdict ONLY if previous_summary was supplied\n"
+            "  - stuck_indicators when blockers are visible\n"
+            "  - primary_intent_match (one sentence on what this page does)\n"
+            "Populate `flags` (captcha_present, modal_open, login_wall, "
+            "loading, error_banner, autocomplete_open) — the brain checks "
+            "these before deciding next action.\n"
+            "Return an EMPTY `bboxes` array — the brain is not planning "
+            "to click. Skip `scene` (return null or omit) and skip "
+            "`suggested_actions` unless there's a clear blocker to "
+            "dismiss. Keep `summary` to one short sentence. This is a "
+            "low-cost pass — do not pad the response."
         )
     elif bucket == "observe":
         specific = (
@@ -633,6 +862,7 @@ def build_coverage_prompt(
     dom_anchor_hints: list[dict] | None = None,
     task_instruction: str | None = None,
     current_subgoal: object | None = None,
+    active_constraint: dict | None = None,
 ) -> str:
     """Second-pass prompt for "the validator told us this element should
     be here but vision culled it" recovery.
@@ -660,6 +890,7 @@ def build_coverage_prompt(
         task_instruction=task_instruction,
         compact=False,
         current_subgoal=current_subgoal,
+        active_constraint=active_constraint,
     )
     labels_fmt = (
         ", ".join(f"'{lbl[:60]}'" for lbl in expected_labels[:12])
