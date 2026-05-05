@@ -66,7 +66,7 @@ class BrowserNavigateTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
+    async def execute(self, session_id: str, url: str, intent: str | None = None, force_detail: bool = False, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
         # Post-mutation observation gate
         if self.s._mutation_needs_observation:
@@ -540,7 +540,6 @@ class BrowserNavigateTool(Tool):
         # for extraction" flows happen AFTER the listing is filtered;
         # by definition the filter checklist is done by then. Override
         # via explicit force_detail=true for the rare legitimate case.
-        force_detail = bool(kw.get("force_detail"))
         brief = getattr(self.s, "task_brief", None)
         if brief is not None and not force_detail:
             open_filters = [

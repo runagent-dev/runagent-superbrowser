@@ -518,6 +518,11 @@ async def _append_fresh_vision(
                                     + new_brain
                                 )
                                 result = result + bbox_section
+                                # The brain now has fresh V_n labels —
+                                # this IS observation. Clear the gate so
+                                # it can act on them immediately.
+                                state._mutation_needs_observation = False
+                                state._scripts_since_observation = 0
                         except Exception:
                             pass
         except Exception:
