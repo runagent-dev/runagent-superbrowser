@@ -29,6 +29,35 @@ class BrowserClickTool(Tool):
         gate = await _feedback_gate("browser_click")
         if gate:
             return gate
+        # CURSOR_ONLY_MODE: when the orchestrator decomposed a multi-
+        # condition query (task_brief is set), DOM-index clicks are
+        # disabled. They drift between vision pass and click and they
+        # don't fire humanized cursor events — both are why the brain's
+        # multi-step filter flows fail. Force the brain through
+        # browser_click_at(V_n) (vision-bbox + humanized cursor) or
+        # browser_click_selector (CSS hook + humanized cursor).
+        if (
+            getattr(self.s, "task_brief", None) is not None
+            and os.environ.get("CURSOR_ONLY_MODE", "1") not in ("0", "false", "no")
+        ):
+            self.s.record_step(
+                "browser_click", f"index={index}",
+                "REFUSED: CURSOR_ONLY_MODE active",
+            )
+            return (
+                f"[CURSOR_ONLY_MODE] browser_click([{index}]) by DOM "
+                f"index is DISABLED in multi-condition mode. DOM "
+                f"indices drift between vision pass and click; "
+                f"humanized cursor events fire only via the vision-"
+                f"bbox path. Use ONE of:\n"
+                f"  1) browser_click_at(vision_index=V_n) — preferred. "
+                f"Pick from the V_n list in the most recent screenshot.\n"
+                f"  2) browser_click_selector(selector='<css>') — when "
+                f"the target has a stable hook (id, data-test-id, "
+                f"role+text).\n"
+                f"If no V_n matches your intended target, call "
+                f"browser_screenshot first to refresh the bbox list."
+            )
         # Phase 1.1: hard sync gate. Wait for any in-flight vision
         # prefetch from the previous action before dispatching.
         sync_block = await self.s.ensure_vision_synced(reason="browser_click")
@@ -36,6 +65,7 @@ class BrowserClickTool(Tool):
             return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=index)
+        await self.s.inter_action_pause()
         # Cross-index flail guard. If the last two clicks timed out,
         # force a re-screenshot before dispatching another HTTP click —
         # the backend is hung (blocker, loader, nav in flight) and
@@ -514,6 +544,7 @@ class BrowserClickAtTool(Tool):
         # click_at addresses by vision bbox or pixel coords, not DOM
         # index — pass None so target_disappeared isn't computed.
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return (
                 f"[BLOCKED] browser_click_at used "
@@ -1172,6 +1203,7 @@ class BrowserTypeAtTool(Tool):
             return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         if text is None:
             text = ""
 
@@ -1425,6 +1457,7 @@ class BrowserFixTextAtTool(Tool):
             text = ""
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
 
         # Cross-index repeat-type guard. fix_text_at is the worst offender
         # for the "type 40 six times" cascade because it's pitched as the
@@ -1589,12 +1622,32 @@ class BrowserTypeTool(Tool):
         gate = await _feedback_gate("browser_type")
         if gate:
             return gate
+        # CURSOR_ONLY_MODE — see the matching block in BrowserClickTool.
+        if (
+            getattr(self.s, "task_brief", None) is not None
+            and os.environ.get("CURSOR_ONLY_MODE", "1") not in ("0", "false", "no")
+        ):
+            self.s.record_step(
+                "browser_type", f"index={index} text={text[:30]!r}",
+                "REFUSED: CURSOR_ONLY_MODE active",
+            )
+            return (
+                f"[CURSOR_ONLY_MODE] browser_type([{index}], …) by DOM "
+                f"index is DISABLED in multi-condition mode. DOM "
+                f"indices drift; the keystrokes often land on an "
+                f"adjacent non-input element. Use:\n"
+                f"  browser_type_at(vision_index=V_n, text={text!r})\n"
+                f"Pick the V_n that vision labels as the input field "
+                f"you want. Call browser_screenshot first if no V_n "
+                f"matches."
+            )
         # Phase 1.1: hard sync gate.
         sync_block = await self.s.ensure_vision_synced(reason="browser_type")
         if sync_block:
             return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=index)
+        await self.s.inter_action_pause()
 
         # --- Dead-type guard --------------------------------------------
         # The LLM's most destructive misread: type "khulna" → autocomplete
@@ -1958,6 +2011,7 @@ class BrowserKeysTool(Tool):
         print(f"\n>> browser_keys({keys})")
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/keys",
@@ -2003,6 +2057,7 @@ class BrowserDragTool(Tool):
         print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
 
@@ -2091,6 +2146,7 @@ class BrowserClickSelectorTool(Tool):
             return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls += 1
 

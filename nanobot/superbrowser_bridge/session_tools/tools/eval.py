@@ -89,6 +89,7 @@ class BrowserRunScriptTool(Tool):
         if bool(mutates):
             self.s._brain_turn_counter += 1
             self.s.capture_action_snapshot(target_index=None)
+            await self.s.inter_action_pause()
         # Phase 3.1: cursor-first lockout. Read-only scripts always
         # allowed (data extraction). Mutating scripts require evidence
         # that the brain has tried — and failed — at least 2 distinct

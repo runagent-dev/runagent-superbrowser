@@ -412,6 +412,68 @@ async def _append_fresh_vision(
                 note_parts.append(miss_note)
         except Exception:
             pass
+    # --- Auto-vision-on-real-delta ---------------------------------
+    # When state.last_action_delta says the page actually changed
+    # (URL changed, DOM hash changed, target disappeared, or 3+ elems
+    # added/removed), force a fresh vision pass and append the full
+    # V_n bbox list to the response. The brain reads post-action
+    # ground-truth bboxes in the SAME iteration — no need to spend a
+    # separate browser_screenshot call. Cache-busted so we can't
+    # return the pre-change cached response.
+    if state is not None:
+        try:
+            ld = getattr(state, "last_action_delta", None)
+            if ld and isinstance(ld.get("delta"), dict):
+                d = ld["delta"]
+                _real_change = (
+                    bool(d.get("url_changed"))
+                    or bool(d.get("dom_changed"))
+                    or bool(d.get("target_disappeared"))
+                    or abs(int(d.get("elem_delta") or 0)) >= 3
+                )
+                if _real_change and getattr(state, "session_id", ""):
+                    # Bust per-session vision cache so the next prefetch
+                    # cannot return the pre-change cached bboxes.
+                    try:
+                        from nanobot.vision_agent import (
+                            get_vision_agent, vision_agent_enabled,
+                        )
+                        if vision_agent_enabled():
+                            agent = get_vision_agent()
+                            cache = getattr(agent, "_cache", None)
+                            if cache is not None and hasattr(cache, "bust_session"):
+                                await cache.bust_session(state.session_id)
+                    except Exception:
+                        pass
+                    # Force-await a fresh vision pass — _force_fresh_vision
+                    # schedules + awaits with an 8s timeout. On success
+                    # the new bbox list lives in state._last_vision_response.
+                    refreshed = await _force_fresh_vision(
+                        state, state.session_id, timeout_s=6.0,
+                    )
+                    if refreshed:
+                        try:
+                            new_resp = state._last_vision_response
+                            new_brain = (
+                                new_resp.as_brain_text()
+                                if new_resp is not None
+                                else ""
+                            )
+                            if new_brain:
+                                # Add a clear marker so the brain knows
+                                # this is post-action vision, not the
+                                # pre-action cached bbox list.
+                                bbox_section = (
+                                    "\n\n[POST_ACTION_VISION] Fresh "
+                                    "bbox list reflecting the page state "
+                                    "AFTER your last action:\n"
+                                    + new_brain
+                                )
+                                result = result + bbox_section
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     if not note_parts:
         return result
     sep = "" if result.endswith("\n") else "\n"

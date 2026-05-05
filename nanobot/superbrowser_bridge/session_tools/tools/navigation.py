@@ -72,6 +72,34 @@ class BrowserNavigateTool(Tool):
         if gate:
             return gate
 
+        # --- Known-bad URL lockout ---------------------------------------
+        # Fire BEFORE any other guard. If this exact URL (or its
+        # normalized variant) returned 4xx/5xx earlier in this session,
+        # refuse without a roundtrip. Eliminates the "404 → re-navigate
+        # to same URL" loop observed in the wineaccess.com trace.
+        try:
+            _norm_check = self.s._normalize_url(url)
+        except Exception:
+            _norm_check = url
+        _prior_failure = self.s.failed_navigation_urls.get(_norm_check)
+        if _prior_failure:
+            self.s.record_step(
+                "browser_navigate", url,
+                f"BLOCKED: url_known_bad (prior HTTP {_prior_failure['status']})",
+            )
+            return (
+                f"[URL_KNOWN_BAD] Refused navigate to {url} — this URL "
+                f"returned HTTP {_prior_failure['status']} earlier in "
+                f"this session. Re-navigating will hit the same error. "
+                f"The URL path is likely guessed (e.g. "
+                f"/store/regions/<x>/ when the site uses "
+                f"/store/?region=<x>). Apply the filter on the current "
+                f"page via browser_click_at(V_n) on the actual filter "
+                f"chip, OR call browser_brief_mark(constraint_id=<n>, "
+                f"status='not_applicable', evidence='<reason>') if the "
+                f"filter genuinely doesn't exist on the site."
+            )
+
         # --- Per-focus navigate lockout ----------------------------------
         # If a previous navigate on the same focus was refused
         # (filter_hack / detail_nav / deliberation), refuse this one too
@@ -218,17 +246,64 @@ class BrowserNavigateTool(Tool):
                 1 for (k, _v) in _params_fh
                 if any(p in k.lower() for p in _filter_key_patterns)
             )
-            if _multi_value or _filter_keys_seen >= 2:
+            # Path-style filter hallucination — same intent as the
+            # query-string version but the brain encoded the filter into
+            # the path: /store/regions/oregon/, /products/colors/red/,
+            # etc. Almost always wrong: real sites use query strings or
+            # specific slug-only paths, not freely-composable segments.
+            # Trigger when ≥1 path segment matches our filter dictionary
+            # AND the brain has marked zero filter constraints done so
+            # far (= the brain is guessing the URL, not following a real
+            # link).
+            _path_lower = (_parsed_fh.path or "").lower()
+            _path_filter_segments = (
+                "/regions/", "/region/",
+                "/categories/", "/category/",
+                "/collections/",
+                "/colors/", "/color/",
+                "/types/", "/type/",
+                "/brands/", "/brand/",
+                "/tags/", "/tag/",
+                "/filters/", "/filter/",
+            )
+            _path_segments_seen = sum(
+                1 for seg in _path_filter_segments if seg in _path_lower
+            )
+            _filter_brief_progress = 0
+            _brief_check = getattr(self.s, "task_brief", None)
+            if _brief_check is not None:
+                try:
+                    _filter_brief_progress = sum(
+                        1 for c in _brief_check.constraints
+                        if c.kind == "filter" and c.status == "done"
+                    )
+                except Exception:
+                    _filter_brief_progress = 0
+            _path_hack = (
+                _path_segments_seen >= 1
+                and _filter_brief_progress == 0
+                and bool(_brief_check)
+            )
+
+            if _multi_value or _filter_keys_seen >= 2 or _path_hack:
                 self.s.record_step(
                     "browser_navigate", url,
                     f"BLOCKED: filter_hack "
-                    f"(multi_value={_multi_value} filter_keys={_filter_keys_seen})",
+                    f"(multi_value={_multi_value} filter_keys={_filter_keys_seen} path_segments={_path_segments_seen})",
                 )
                 _record_nav_refusal(self.s, url, "navigate_filter_hack_refused")
-                hint = (
-                    "multi-value comma param" if _multi_value
-                    else f"{_filter_keys_seen} filter-style query params"
-                )
+                if _path_hack and not (_multi_value or _filter_keys_seen >= 2):
+                    hint = (
+                        f"{_path_segments_seen} filter-style path segment(s) "
+                        f"(e.g. /regions/, /categories/) with zero filter "
+                        f"constraints marked done — looks like a guessed URL "
+                        f"path, not one you reached by clicking"
+                    )
+                else:
+                    hint = (
+                        "multi-value comma param" if _multi_value
+                        else f"{_filter_keys_seen} filter-style query params"
+                    )
                 return (
                     f"[navigate_filter_hack_refused] Refused {url} — "
                     f"contains {hint}. Sites' filter param names are "
@@ -357,6 +432,7 @@ class BrowserNavigateTool(Tool):
         # the brain "page navigated → re-screenshot" loud and clear.
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
 
         # CF-interstitial nav guard: if the last navigate to THIS URL was
         # Cloudflare-blocked and nothing has been done to resolve it, a
@@ -438,6 +514,12 @@ class BrowserNavigateTool(Tool):
                 caption += _build_network_block_message(
                     status_code, actual_url, block_class=_block_class,
                 )
+                # Cloudflare interstitials shouldn't poison the URL —
+                # they often clear after solve_captcha. Other 4xx/5xx
+                # genuinely won't change without a different URL, so
+                # add to the known-bad ledger.
+                if _block_class != "cloudflare":
+                    self.s.record_failed_navigation(actual_url, status_code)
                 if _block_class == "cloudflare":
                     self.s.record_step(
                         "browser_navigate", url,
@@ -451,6 +533,7 @@ class BrowserNavigateTool(Tool):
                 return caption
             elif status_code == 404:
                 caption += _build_network_block_message(404, actual_url)
+                self.s.record_failed_navigation(actual_url, 404)
                 self.s.record_step("browser_navigate", url, f"HTTP 404 at {actual_url}")
                 return caption
 
@@ -513,6 +596,7 @@ class BrowserScrollTool(Tool):
             return gate
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         payload: dict[str, Any] = {}
         if percent is not None:
             payload["percent"] = percent
@@ -705,6 +789,7 @@ class BrowserScrollUntilTool(Tool):
             return gate
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
 
         if not (target_text and target_text.strip()) and not (target_role and target_role.strip()):
             return (

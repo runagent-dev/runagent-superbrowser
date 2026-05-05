@@ -80,6 +80,7 @@ class BrowserDragSelectorsTool(Tool):
         print(f"\n>> browser_drag_selectors({from_selector!r} → {to_selector!r}, method={method})")
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
+        await self.s.inter_action_pause()
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0
 

@@ -335,6 +335,13 @@ class BrowserSessionState:
         # can express. Cleared together with action_snapshot_pre.
         self.action_snapshot_extras: dict = {}
 
+        # URL-failure ledger. Populated when navigate response shows
+        # status >= 400. Subsequent navigates to any URL in this dict
+        # are refused with [URL_KNOWN_BAD] before any HTTP roundtrip.
+        # Keyed by _normalize_url (so trailing-slash etc. variants
+        # don't bypass the lockout).
+        self.failed_navigation_urls: dict = {}
+
         # Per-focus navigate lockout. Set to the focus_id whose navigate
         # was just refused (filter_hack / detail_nav / deliberation_gate).
         # The next navigate against the same focus is rejected with a
@@ -765,6 +772,49 @@ class BrowserSessionState:
             "url": self.current_url,
             "time": datetime.now().strftime("%H:%M:%S"),
         })
+
+    # --- Inter-action pacing ----------------------------------------------
+    #
+    # Wallclock pause inserted before every mutating tool dispatches.
+    # 1500ms default — long enough for typical filter-reflow / lazy-load
+    # delays (200–800ms) plus margin, AND long enough for the awaited
+    # vision prefetch (when delta detects real change) to land before
+    # the brain reads the next response. Configurable via
+    # INTER_ACTION_DELAY_MS env var; set to 0 in CI / tests.
+    INTER_ACTION_DELAY_MS_DEFAULT = 1500
+
+    async def inter_action_pause(self) -> None:
+        """Sleep INTER_ACTION_DELAY_MS before the current mutating tool
+        dispatches. Called from each mutating tool's execute() right
+        after capture_action_snapshot."""
+        try:
+            delay_ms = int(
+                os.environ.get(
+                    "INTER_ACTION_DELAY_MS",
+                    self.INTER_ACTION_DELAY_MS_DEFAULT,
+                )
+            )
+        except ValueError:
+            delay_ms = self.INTER_ACTION_DELAY_MS_DEFAULT
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
+
+    # --- URL-failure ledger ------------------------------------------------
+    #
+    # Populated when navigate response returns status >= 400. Subsequent
+    # navigates to a URL in this dict are refused with [URL_KNOWN_BAD]
+    # before any HTTP roundtrip — kills the "404 → re-navigate to same
+    # URL" loop observed in the wineaccess.com trace.
+
+    def record_failed_navigation(self, url: str, status_code: int) -> None:
+        """Mark a URL as known-bad for the rest of this session."""
+        if not url:
+            return
+        norm = self._normalize_url(url)
+        self.failed_navigation_urls[norm] = {
+            "status": int(status_code),
+            "when": time.time(),
+        }
 
     # --- Action-delta snapshot ----------------------------------------------
 
