@@ -669,11 +669,6 @@ export class PageWrapper {
         const cy0 = Math.round((b.y0 + b.y1) / 2);
         // Scroll-into-view rule: scroll if ANY part of the bbox is
         // within MARGIN of the viewport edge OR off-screen entirely.
-        // Sticky headers / footers commonly eat ~50-100 px at top and
-        // bottom. A bbox at y=850-930 on a 900-px viewport has its
-        // center technically in viewport (890), but the actual element
-        // is clipped by the sticky footer. Scrolling so the bbox sits
-        // centered avoids the silent miss.
         const MARGIN = 100;
         const vh = window.innerHeight;
         const vw = window.innerWidth;
@@ -693,20 +688,93 @@ export class PageWrapper {
           window.scrollTo({ left: targetLeft, top: window.scrollY, behavior: 'instant' as ScrollBehavior });
           scrolledX = window.scrollX - before;
         }
-        const fx = cx0 - scrolledX;
-        const fy = cy0 - scrolledY;
-        // Best-effort label for the live viewer overlay only — we do
-        // NOT change click coords based on this lookup.
-        let label = '';
+        // Convert bbox + center to post-scroll viewport coords.
+        const cx = cx0 - scrolledX;
+        const cy = cy0 - scrolledY;
+        const sb = {
+          x0: b.x0 - scrolledX, y0: b.y0 - scrolledY,
+          x1: b.x1 - scrolledX, y1: b.y1 - scrolledY,
+        };
+        // Intra-bbox snap-to-interactive: when vision points at a
+        // wrapper / label / icon and the actual click handler is on a
+        // child or sibling inside the same bbox, the geometric centre
+        // hits a non-interactive parent. The CDP click fires but no
+        // listener responds — the silent-miss path that produced
+        // [click_at(V3)] x2 with no effect in the wineaccess trace.
+        // Two-step recovery, all inside the bbox:
+        //   1. centre elementFromPoint → walk to closest interactive
+        //      ancestor whose rect overlaps the bbox.
+        //   2. 3×3 grid scan → pick the interactive element with the
+        //      largest bbox-rect intersection.
+        // If both fail, fall back to raw centre (vision-trust).
+        const SEL = 'a,button,input,select,textarea,'
+          + '[role="button"],[role="link"],[role="checkbox"],'
+          + '[role="tab"],[role="menuitem"],[role="option"],'
+          + '[role="radio"],[onclick],[tabindex]';
+        const overlaps = (r: DOMRect): boolean => {
+          return !(r.right <= sb.x0 || r.left >= sb.x1
+                || r.bottom <= sb.y0 || r.top >= sb.y1);
+        };
+        const describe = (el: Element): string => {
+          const tag = el.tagName.toLowerCase();
+          const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
+          const txt = (el.textContent || '').trim().slice(0, 30);
+          return `${tag}${id}${txt ? `[${txt}]` : ''}`;
+        };
+        let snapEl: Element | null = null;
         try {
-          const el = document.elementFromPoint(fx, fy);
-          if (el && el !== document.documentElement && el !== document.body) {
-            const tag = el.tagName.toLowerCase();
-            const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
-            const txt = (el.textContent || '').trim().slice(0, 30);
-            label = `${tag}${id}${txt ? `[${txt}]` : ''}`;
+          const centerEl = document.elementFromPoint(cx, cy);
+          if (centerEl) {
+            const interactive = (centerEl as Element).closest(SEL);
+            if (interactive && overlaps(interactive.getBoundingClientRect())) {
+              snapEl = interactive;
+            } else if (
+              centerEl.tagName !== 'HTML'
+              && centerEl.tagName !== 'BODY'
+            ) {
+              // Center hit a non-interactive element inside the bbox —
+              // accept centre coords as-is so vision-trust is preserved.
+              snapEl = centerEl;
+            }
           }
-        } catch { /* label is cosmetic */ }
+        } catch { /* fall through */ }
+        // Step 2: 3×3 grid scan if step 1 didn't find an interactive el.
+        if (!snapEl || !((snapEl as Element).matches?.(SEL))) {
+          let best: Element | null = null;
+          let bestArea = 0;
+          for (let i = 1; i < 4; i++) {
+            for (let j = 1; j < 4; j++) {
+              const px = sb.x0 + ((sb.x1 - sb.x0) * i) / 4;
+              const py = sb.y0 + ((sb.y1 - sb.y0) * j) / 4;
+              let stack: Element[] = [];
+              try { stack = document.elementsFromPoint(px, py); } catch { /* */ }
+              for (const el of stack) {
+                const hit = (el as Element).closest(SEL);
+                if (!hit) continue;
+                const r = hit.getBoundingClientRect();
+                if (!overlaps(r)) continue;
+                const ix = Math.max(0, Math.min(r.right, sb.x1) - Math.max(r.left, sb.x0));
+                const iy = Math.max(0, Math.min(r.bottom, sb.y1) - Math.max(r.top, sb.y0));
+                const area = ix * iy;
+                if (area > bestArea) { bestArea = area; best = hit; }
+              }
+            }
+          }
+          if (best) snapEl = best;
+        }
+        let fx = cx;
+        let fy = cy;
+        let label = '';
+        if (snapEl) {
+          // If we found an interactive element, click its rect centre
+          // (clamped inside the bbox) so the listener actually fires.
+          if ((snapEl as Element).matches?.(SEL)) {
+            const r = snapEl.getBoundingClientRect();
+            fx = Math.round(Math.max(sb.x0, Math.min(sb.x1, r.left + r.width / 2)));
+            fy = Math.round(Math.max(sb.y0, Math.min(sb.y1, r.top + r.height / 2)));
+          }
+          label = describe(snapEl);
+        }
         return { resolvedX: fx, resolvedY: fy, target: label };
       },
       bbox,
