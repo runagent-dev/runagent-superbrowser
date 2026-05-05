@@ -451,19 +451,16 @@ class BrowserSessionState:
         documented in the orchestrator SOUL.md. Empty / falsy input
         leaves ``self.task_brief`` as ``None`` so the worker hook skips
         the brief-injection branch and behaves like the pre-feature path.
+
+        DISABLED: The brief/focus system creates hallucination pressure —
+        the brain tries to satisfy named constraints and fabricates URLs
+        rather than exploring the page naturally. Guards that depend on
+        task_brief (deliberation gate, detail-page guard, filter-hack
+        path check) cause cascading refusals. Disable by always setting
+        None — the brain receives the original query via the prompt and
+        works freely.
         """
-        if not checklist:
-            self.task_brief = None
-            return
-        try:
-            from superbrowser_bridge.task_brief import TaskBrief
-        except Exception:
-            # Defensive — if the module fails to import for any reason
-            # we keep behaving like the legacy code path rather than
-            # crashing the worker.
-            self.task_brief = None
-            return
-        self.task_brief = TaskBrief(original_query, checklist)
+        self.task_brief = None
 
     def enter_captcha_mode(self) -> None:
         """Relax screenshot limits for the next N iterations.

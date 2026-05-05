@@ -19,6 +19,24 @@ class BrowserEvalTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
+        # Navigation bypass guard (same regex as run_script)
+        import re as _re
+        _NAV_PATTERN = _re.compile(
+            r'(?:'
+            r'location\s*\.\s*(?:href|assign|replace)\s*[\(=]'
+            r'|window\s*\.\s*location\s*='
+            r'|document\s*\.\s*location\s*='
+            r'|page\s*\.\s*goto\s*\('
+            r')',
+            _re.IGNORECASE,
+        )
+        if _NAV_PATTERN.search(script):
+            return (
+                "[eval_refused:navigation_blocked] The script attempts to "
+                "navigate via location/page.goto. Use browser_navigate("
+                "url=...) instead, or click the link via "
+                "browser_click_at(vision_index=V_n)."
+            )
         # Post-mutation observation gate (same as run_script)
         if self.s._mutation_needs_observation:
             return (

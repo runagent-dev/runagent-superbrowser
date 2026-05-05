@@ -180,34 +180,18 @@ class BrowserClickAtTool(Tool):
         else:
             if x is None or y is None:
                 return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
-            # Refuse raw (x, y) when vision data is healthy. The brain
-            # bypassing V_n with guessed coords is the failure pattern
-            # this tool was built to prevent — vision returns labelled
-            # bboxes, brain picks one, click lands on a real element.
-            # Raw coords only land if the brain literally counted pixels,
-            # which is brittle and the source of every "click hits nothing"
-            # trace. Allow only when vision is unavailable (cold session,
-            # captcha widget where bboxes intentionally aren't emitted).
-            resp = self.s.vision_for_target_resolution()
-            if resp is not None and getattr(resp, "bboxes", None):
-                freshness = getattr(resp, "screenshot_freshness", "fresh")
-                if freshness == "fresh":
-                    bbox_count = len(resp.bboxes)
-                    return (
-                        f"[click_at_refused:raw_coords] You passed raw "
-                        f"(x={x}, y={y}) but vision has {bbox_count} "
-                        f"labelled bboxes for this page. Pick the V_n "
-                        f"whose label most specifically matches your "
-                        f"intended target — V_n is positional (top-to-"
-                        f"bottom), so the right target is rarely V1 by "
-                        f"default. If none of the listed labels match, "
-                        f"call browser_screenshot(intent=\"<one specific "
-                        f"sentence about the control you need>\") to "
-                        f"force vision to surface that specific control."
-                    )
-            payload = {"x": float(x), "y": float(y)}
-            log_target = f"({x},{y})"
-            print(f"\n>> browser_click_at({x}, {y})")
+            # Raw (x, y) clicks are unconditionally blocked. The brain
+            # must use vision_index=V_n from the last screenshot. Raw
+            # pixel coordinates are brittle (DPR mismatch, layout shift,
+            # guessed values) and produce "click hits nothing" failures.
+            return (
+                f"[click_at_refused:raw_coords] Raw (x={x}, y={y}) "
+                f"coordinates are not supported. Use "
+                f"vision_index=V_n from your last browser_screenshot "
+                f"to click elements. If the target isn't in the V_n "
+                f"list, call browser_screenshot(intent=\"<describe the "
+                f"specific control you need>\") to surface it."
+            )
 
         # Vision-trust mode: bbox coords from the most recent vision
         # pass are dispatched directly. No DOM↔vision IoU crosscheck,
