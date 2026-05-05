@@ -83,6 +83,18 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Post-mutation observation gate: after a click/navigate, the brain
+        # must observe before running scripts. Even read-only scripts query
+        # a DOM the brain hasn't seen — results will be misinterpreted.
+        if self.s._mutation_needs_observation:
+            return (
+                "[run_script_refused:observe_first] Your last action changed "
+                "the page but you haven't taken a browser_screenshot or "
+                "browser_get_markdown to see what happened. The DOM may "
+                "look completely different now — running a script against "
+                "your stale mental model will return unexpected results. "
+                "Observe first, then script if needed."
+            )
         # Capture pre-snapshot only when this script is allowed to mutate
         # — read-only scripts return raw data, not a build_text_only
         # response, so the delta block would be misleading.

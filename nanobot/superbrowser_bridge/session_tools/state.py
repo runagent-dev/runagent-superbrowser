@@ -364,6 +364,14 @@ class BrowserSessionState:
         # next deliberation tool.
         self.rewind_just_fired: bool = False
 
+        # Post-mutation observation gate. Set True after a successful
+        # mutating action (click_at, type_at, navigate, keys Enter/Tab).
+        # Cleared by deliberation tools (screenshot, get_markdown,
+        # brief_mark). Mutating tools refuse when this is True — forces
+        # the brain to observe the result of its last action before acting
+        # again, preventing hallucination from stale mental models.
+        self._mutation_needs_observation: bool = False
+
         # Phase 1: hard sync gate. Tracks the most recent prefetch task
         # so the NEXT mutating tool can wait for it before acting on
         # potentially-stale state. Replaces the soft 2s budget that

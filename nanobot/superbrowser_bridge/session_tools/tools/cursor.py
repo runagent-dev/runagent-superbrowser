@@ -44,6 +44,17 @@ class BrowserClickAtTool(Tool):
         y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Post-mutation observation gate: refuse if the brain hasn't
+        # observed the result of its last action yet.
+        if self.s._mutation_needs_observation:
+            return (
+                "[click_at_refused:observe_first] Your last action changed "
+                "the page but you haven't observed what happened. Call "
+                "browser_screenshot (to see the current state and get fresh "
+                "V_n labels) or browser_get_markdown (if you only need text) "
+                "BEFORE clicking again. Acting on stale assumptions causes "
+                "misclicks and hallucinated interactions."
+            )
         # Phase 1.1: hard sync gate. Block until the in-flight vision
         # prefetch from the previous action lands — without this the
         # brain's V_n resolves against a frozen epoch but the freshness
@@ -437,6 +448,8 @@ class BrowserClickAtTool(Tool):
                     )
         except Exception as exc:
             print(f"[v_priority_check_error] {exc}")
+        # Mark that the brain must observe before its next mutation.
+        self.s._mutation_needs_observation = True
         return await _append_fresh_vision(
             _vision_task,
             self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note + v_priority_note,

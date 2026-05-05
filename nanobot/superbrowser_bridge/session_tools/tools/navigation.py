@@ -68,6 +68,15 @@ class BrowserNavigateTool(Tool):
 
     async def execute(self, session_id: str, url: str, intent: str | None = None, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
+        # Post-mutation observation gate
+        if self.s._mutation_needs_observation:
+            return (
+                "[navigate_refused:observe_first] Your last action changed "
+                "the page but you haven't observed what happened. Call "
+                "browser_screenshot or browser_get_markdown BEFORE "
+                "navigating — you may already be on the right page and "
+                "navigating would lose that state."
+            )
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
@@ -653,6 +662,8 @@ class BrowserNavigateTool(Tool):
                 f"Call browser_solve_captcha(session_id='{session_id}', method='auto') to solve it."
             )
 
+        # Mark that the brain must observe before its next mutation.
+        self.s._mutation_needs_observation = True
         if data.get("screenshot") and self.s.screenshot_budget > 0:
             self.s.screenshot_budget -= 1
             if actual_url:
@@ -660,6 +671,8 @@ class BrowserNavigateTool(Tool):
                     actual_url,
                     self.s.hash_page_content(data.get("elements", "") or data.get("title", "")),
                 )
+            # Navigate with screenshot counts as observation — clear gate.
+            self.s._mutation_needs_observation = False
             return await self.s.build_tool_result_blocks(
                 data["screenshot"],
                 caption,
