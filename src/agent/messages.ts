@@ -76,7 +76,47 @@ export class MessageManager {
   ): void {
     const msg = buildStateMessage(state, useVision, stepInfo);
     this.messages.push(msg);
+    this.invalidateOldStateIndices();
     this.trimToFit();
+  }
+
+  /**
+   * Collapse element indices from all prior state messages.
+   * Only the most recent state message retains its full element tree.
+   * This prevents the LLM from referencing stale indices from earlier steps.
+   */
+  private invalidateOldStateIndices(): void {
+    let foundCurrent = false;
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const msg = this.messages[i];
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.find((b) => b.type === 'text')?.text ?? ''
+          : '';
+      if (!text.includes('[Current state starts here]')) continue;
+
+      if (!foundCurrent) {
+        foundCurrent = true;
+        continue;
+      }
+
+      // Collapse old element tree
+      const collapsed = text.replace(
+        /Interactive elements:[\s\S]*?\[Current state ends here\]/,
+        'Interactive elements: [previous step — indices no longer valid]\n[Current state ends here]',
+      );
+      if (collapsed === text) continue;
+
+      if (typeof msg.content === 'string') {
+        msg.content = collapsed;
+      } else if (Array.isArray(msg.content)) {
+        const textBlock = msg.content.find((b) => b.type === 'text');
+        if (textBlock && textBlock.type === 'text') {
+          textBlock.text = collapsed;
+        }
+      }
+    }
   }
 
   /** Add the model's response as an assistant message. */

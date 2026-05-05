@@ -18,6 +18,7 @@ Current URL: ${state.url}
 Page Title: ${state.title}
 Scroll: ${state.scrollY}/${state.scrollHeight} (viewport: ${state.viewportHeight})
 Current step: ${stepInfo.current}/${stepInfo.max}
+NOTE: Element indices below are ONLY valid for this step — do not reuse from previous steps.
 
 Interactive elements:
 ${state.elementTree.clickableElementsToString()}`;

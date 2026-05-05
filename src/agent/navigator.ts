@@ -18,6 +18,7 @@ import type { HumanInputManager } from './human-input.js';
 import { buildObservation, coordBand, type ActionKind, type StepOutcome, type VisibleChange } from './step-observation.js';
 import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { feedbackBus } from './feedback-bus.js';
+import { VisionEpoch } from './vision-epoch.js';
 
 // Actions that likely change the page — stop sequence after them
 const PAGE_CHANGING_ACTIONS = new Set([
@@ -67,6 +68,7 @@ export class NavigatorAgent {
   private captchaFailures = new Map<string, number>();
   /** Remaining handoffs across the navigator's lifetime. */
   private handoffsRemaining: number;
+  private visionEpoch = new VisionEpoch();
 
   constructor(
     private llm: LLMProvider,
@@ -110,11 +112,12 @@ export class NavigatorAgent {
       return captchaShortCircuit;
     }
 
-    // 1. Get current page state
+    // 1. Get current page state and freeze the vision epoch
     const state = await page.getState({
       useVision: this.options.useVision,
       includeConsole: true,
     });
+    this.visionEpoch.freeze(state.url);
 
     // 1a. Error-page short-circuit: if the last navigation landed on
     // a chrome-error, 4xx body, DNS/TLS failure page, don't bother the
@@ -173,36 +176,33 @@ export class NavigatorAgent {
 
       const [name, params] = entries[0];
 
-      // Settle pause between actions. The real guard against acting on a
-      // stale DOM is the selectorMap-delta check below, not this sleep.
-      //
-      // Jitter matters: a detector scoring inter-event timing variance
-      // flags constant delays as automated. We sample from a clipped
-      // gaussian centered at 300ms with heavy tails — a real user's
-      // "think about next action" varies from fast (~120ms) to slow (~900ms).
+      // Inter-action jitter for anti-bot evasion
       if (i > 0) {
         const mean = 300;
         const stdev = 180;
-        // Box-Muller gaussian, clamped to [120, 900]
         const u1 = Math.random() || Number.MIN_VALUE;
         const u2 = Math.random();
         const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
         const sampled = Math.round(mean + z * stdev);
         const delayMs = Math.max(120, Math.min(900, sampled));
         await new Promise((r) => setTimeout(r, delayMs));
+      }
 
-        // DOM stability check: break if new elements appeared.
-        try {
-          const newState = await page.getState({ useVision: false, includeConsole: false });
-          const oldCount = state.selectorMap.size;
-          const newCount = newState.selectorMap.size;
-          if (newCount !== oldCount) {
-            // DOM changed — stop multi-action, let next step re-evaluate
-            break;
-          }
-        } catch {
-          // State check failed — continue cautiously
+      // Epoch gate: reject indexed actions if state is stale
+      const action = this.actionRegistry.get(name);
+      if (action?.hasIndex) {
+        const currentUrl = page.getRawPage().url();
+        const staleCheck = this.visionEpoch.isStale(currentUrl);
+        if (staleCheck.stale) {
+          results.push({
+            success: false,
+            reason: 'stale_selector',
+            error: `[vision_stale] Element indices are outdated: ${staleCheck.reason}. Take a fresh screenshot before using element indices.`,
+            includeInMemory: true,
+          });
+          break;
         }
+        this.visionEpoch.incrementBrainTurn();
       }
 
       const result = await this.actionRegistry.execute(name, params, page, state);
@@ -264,6 +264,9 @@ export class NavigatorAgent {
 
       // Stop after page-changing actions — state needs refresh
       if (PAGE_CHANGING_ACTIONS.has(name)) break;
+
+      // Stop after any successful indexed action — force re-observation
+      if (action?.hasIndex) break;
     }
 
     this.messageManager.addActionResults(results);

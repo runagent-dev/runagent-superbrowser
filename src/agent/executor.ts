@@ -251,8 +251,11 @@ export class BrowserExecutor {
           console.log('🔄 Navigator signals completion — planner will validate');
         }
 
-        // Track failures
-        if (results.every((r: ActionResult) => !r.success)) {
+        // Track failures (skip stale-vision rejections — those are expected control flow)
+        const isStaleRejection = results.some(
+          (r: ActionResult) => r.reason === 'stale_selector' && r.error?.includes('[vision_stale]'),
+        );
+        if (!isStaleRejection && results.every((r: ActionResult) => !r.success)) {
           this.consecutiveFailures++;
           console.log(`⚠️ Consecutive failures: ${this.consecutiveFailures}/${this.options.maxFailures}`);
 
