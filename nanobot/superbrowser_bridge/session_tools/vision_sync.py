@@ -44,14 +44,17 @@ def _vision_alternatives_hint(
     bboxes = list(getattr(resp, "bboxes", []) or [])
     if not bboxes:
         return ""
-    ranked = sorted(
-        enumerate(bboxes, start=1),
-        key=lambda pair: (
-            0 if getattr(pair[1], "intent_relevant", False) else 1,
-            0 if getattr(pair[1], "clickable", False) else 1,
-            -float(getattr(pair[1], "confidence", 0.0) or 0.0),
-        ),
-    )
+    # Spatial reading order (top-to-bottom, left-to-right) — same key
+    # as VisionResponse._spatial_key. The hint is "here are nearby
+    # alternatives", not "here are the best ones", since V_n is a
+    # positional ID and the brain picks by label match.
+    def _spatial(pair: tuple[int, Any]) -> tuple[int, int]:
+        b = pair[1]
+        box = getattr(b, "box_2d", None) or [0, 0, 0, 0]
+        ymin = box[0] if len(box) >= 1 else 0
+        xmin = box[1] if len(box) >= 2 else 0
+        return (ymin // 50, xmin)
+    ranked = sorted(enumerate(bboxes, start=1), key=_spatial)
     picks: list[str] = []
     for i, b in ranked:
         if exclude_index is not None and i == exclude_index:
@@ -94,15 +97,16 @@ async def _push_vision_bboxes(
     iw, ih = getattr(resp, "image_width", 0), getattr(resp, "image_height", 0)
     if iw <= 0 or ih <= 0:
         return
-    # Mirror the rank order of as_brain_text() so the overlay's V_n
+    # Mirror the spatial order of as_brain_text() so the overlay's V_n
     # labels line up with what the brain sees in tool output.
+    def _spatial_overlay(b: Any) -> tuple[int, int]:
+        box = getattr(b, "box_2d", None) or [0, 0, 0, 0]
+        ymin = box[0] if len(box) >= 1 else 0
+        xmin = box[1] if len(box) >= 2 else 0
+        return (ymin // 50, xmin)
     ordered = sorted(
         getattr(resp, "bboxes", []),
-        key=lambda b: (
-            0 if getattr(b, "intent_relevant", False) else 1,
-            0 if getattr(b, "clickable", False) else 1,
-            -getattr(b, "confidence", 0.0),
-        ),
+        key=_spatial_overlay,
     )
     payload_bboxes: list[dict[str, Any]] = []
     for i, b in enumerate(ordered, start=1):
@@ -251,10 +255,27 @@ def _schedule_vision_prefetch(
             b64 = data.get("screenshot")
             if not b64:
                 return None
+            # Capture DOM-dirty signal from the TS-side MutationObserver.
+            # Sticky on state — the next mutating tool's gate can read it
+            # and force a fresh prefetch if the page changed without a
+            # tool call (lazy-load, hover-revealed menu, JS animation).
+            try:
+                state._dom_dirty_at_last_state = bool(data.get("domDirty"))
+            except Exception:
+                pass
             agent = get_vision_agent()
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")
             dh = dom_hash_of(elements) if dom_hash_of else ""
+            # Force-fresh path: when browser_screenshot or a dom_dirty-
+            # triggered re-prefetch wants to bypass the agent cache, salt
+            # the dom_hash with a monotonic nonce so the cache key never
+            # matches a previous entry. Reset the flag after consuming it
+            # so subsequent prefetches in this session can hit the cache
+            # again normally.
+            if getattr(state, "_force_vision_refresh", False):
+                dh = f"{dh}|fresh-{time.monotonic_ns()}"
+                state._force_vision_refresh = False
             # Phase 1.2: viewport-aware secondary cache-key signal so
             # the same page at different scroll positions doesn't reuse
             # bboxes captured for the previous viewport.

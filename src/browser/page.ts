@@ -599,14 +599,37 @@ export class PageWrapper {
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
   }): Promise<void> {
+    // Scroll into view if (x, y) is in the sticky-header / sticky-footer
+    // margin or off-screen entirely. Without this, brain-supplied raw
+    // coords near the viewport edge get clipped by fixed UI chrome and
+    // the click lands on the chrome instead of the intended target.
+    const { fx, fy } = await this.page.evaluate(
+      (p: { x: number; y: number }) => {
+        const VH = window.innerHeight;
+        const VW = window.innerWidth;
+        const MARGIN = 100;
+        let sx = 0, sy = 0;
+        if (p.y < MARGIN || p.y > VH - MARGIN) {
+          const targetTop = Math.max(0, Math.round(p.y - VH / 2));
+          const before = window.scrollY;
+          window.scrollTo({ left: window.scrollX, top: targetTop, behavior: 'instant' as ScrollBehavior });
+          sy = window.scrollY - before;
+        }
+        if (p.x < MARGIN || p.x > VW - MARGIN) {
+          const targetLeft = Math.max(0, Math.round(p.x - VW / 2));
+          const before = window.scrollX;
+          window.scrollTo({ left: targetLeft, top: window.scrollY, behavior: 'instant' as ScrollBehavior });
+          sx = window.scrollX - before;
+        }
+        return { fx: p.x - sx, fy: p.y - sy };
+      },
+      { x, y },
+    );
     const client = await this.getCDPSession();
-    // Crosshair on every coord-based click (not just bbox-routed). The
-    // brain that uses raw (x, y) bypasses snap-to-element, so the
-    // crosshair is the only visible signal for "where did this land".
     if (this.sessionId) {
-      inputEventBus.emitClickTarget(this.sessionId, x, y, false);
+      inputEventBus.emitClickTarget(this.sessionId, fx, fy, false);
     }
-    await dispatchClick(client, x, y, { ...options, sessionId: this.sessionId });
+    await dispatchClick(client, fx, fy, { ...options, sessionId: this.sessionId });
     await this.waitForIdle(1000).catch(() => {});
   }
 
@@ -644,19 +667,28 @@ export class PageWrapper {
       (b: { x0: number; y0: number; x1: number; y1: number }) => {
         const cx0 = Math.round((b.x0 + b.x1) / 2);
         const cy0 = Math.round((b.y0 + b.y1) / 2);
-        // Scroll into view if the bbox centre is outside the viewport.
+        // Scroll-into-view rule: scroll if ANY part of the bbox is
+        // within MARGIN of the viewport edge OR off-screen entirely.
+        // Sticky headers / footers commonly eat ~50-100 px at top and
+        // bottom. A bbox at y=850-930 on a 900-px viewport has its
+        // center technically in viewport (890), but the actual element
+        // is clipped by the sticky footer. Scrolling so the bbox sits
+        // centered avoids the silent miss.
+        const MARGIN = 100;
         const vh = window.innerHeight;
         const vw = window.innerWidth;
         let scrolledY = 0;
         let scrolledX = 0;
-        if (cy0 < 0 || cy0 > vh - 10) {
-          const targetTop = Math.max(0, cy0 - Math.round(vh / 2));
+        const needsVScroll = b.y0 < MARGIN || b.y1 > vh - MARGIN;
+        if (needsVScroll) {
+          const targetTop = Math.max(0, Math.round(cy0 - vh / 2));
           const before = window.scrollY;
           window.scrollTo({ left: window.scrollX, top: targetTop, behavior: 'instant' as ScrollBehavior });
           scrolledY = window.scrollY - before;
         }
-        if (cx0 < 0 || cx0 > vw - 10) {
-          const targetLeft = Math.max(0, cx0 - Math.round(vw / 2));
+        const needsHScroll = b.x0 < MARGIN || b.x1 > vw - MARGIN;
+        if (needsHScroll) {
+          const targetLeft = Math.max(0, Math.round(cx0 - vw / 2));
           const before = window.scrollX;
           window.scrollTo({ left: targetLeft, top: window.scrollY, behavior: 'instant' as ScrollBehavior });
           scrolledX = window.scrollX - before;

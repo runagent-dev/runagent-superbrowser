@@ -363,6 +363,17 @@ class BrowserSessionState:
         # otherwise lets the brain proceed on cached vision when the
         # prefetch hasn't landed.
         self._pending_vision_task: Optional["asyncio.Task[Any]"] = None
+        # DOM-dirty signal from the TS-side MutationObserver. The /state
+        # endpoint returns `domDirty: true` when the DOM mutated since
+        # the last /state read. The bridge sets this so the next
+        # mutating tool's gate can force a fresh vision pass even if no
+        # mutating tool fired (lazy-load, hover-revealed menu, JS animation).
+        self._dom_dirty_at_last_state: bool = False
+        # One-shot force-fresh flag. Set by browser_screenshot before
+        # triggering a prefetch so the prefetch bypasses the agent's
+        # cache and pays a fresh Gemini call. Reset after the prefetch
+        # consumes it.
+        self._force_vision_refresh: bool = False
         # Wall-clock + brain-turn stamp captured each time the screenshot
         # tool freezes a new vision epoch. Used by the freshness gate to
         # reject clicks against an epoch that's older than
@@ -576,6 +587,22 @@ class BrowserSessionState:
         """
         if os.environ.get("VISION_HARD_SYNC", "1") in ("0", "false", "no", "False"):
             return None
+        # DOM-dirty trigger: if the MutationObserver flagged a silent
+        # DOM change since the last /state read, force a fresh prefetch
+        # before this gate proceeds. The prefetch above will pick up the
+        # current DOM and salt the cache key (force_vision_refresh) so
+        # the agent re-runs Gemini rather than serving the stale entry.
+        # Local import keeps state.py free of vision_sync circulars.
+        if getattr(self, "_dom_dirty_at_last_state", False):
+            self._dom_dirty_at_last_state = False
+            self._force_vision_refresh = True
+            try:
+                from .vision_sync import _schedule_vision_prefetch
+                refresh_task = _schedule_vision_prefetch(self, self.session_id)
+                if refresh_task is not None:
+                    self._pending_vision_task = refresh_task
+            except Exception as exc:
+                print(f"  [dom_dirty refresh skipped: {exc}]")
         task = self._pending_vision_task
         if task is None or task.done():
             return None

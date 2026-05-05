@@ -820,15 +820,30 @@ class VisionResponse(BaseModel):
         }
         return aliases.get(s, "uncertain")
 
+    @staticmethod
+    def _spatial_key(b: BBox) -> tuple[int, int]:
+        """V_n ordering key: top-to-bottom, left-to-right reading order.
+
+        V_n is a *positional* ID, not a ranking — the brain reads each
+        bbox's label and picks the one matching its current step rather
+        than reflexively defaulting to V1. Row banding (50 normalized
+        units in box_2d's [0, 1000] space ≈ 50 px on a 1000-px-tall
+        image) keeps left/right siblings on the same visual row clustered
+        so a horizontal nav bar reads in left-to-right order, then the
+        next row begins.
+        """
+        ymin, xmin, _, _ = b.box_2d
+        return (ymin // 50, xmin)
+
     def as_brain_text(self, max_bboxes: int = 50) -> str:
         """Render into a compact text block the nanobot brain consumes.
 
-        Bboxes are ranked intent-relevant first, then clickable, then by
-        confidence. The truncation cap stops a 100-element dashboard from
-        blowing the brain's context window. Pixel coords are computed
-        from `box_2d` using the attached image dimensions; if dims are
-        zero (test fixture without an image), normalized 0-1000 coords
-        are shown instead so the brain can still ground.
+        Bboxes are presented in spatial reading order (top-to-bottom,
+        left-to-right). The truncation cap stops a 100-element dashboard
+        from blowing the brain's context window. Pixel coords are
+        computed from `box_2d` using the attached image dimensions; if
+        dims are zero (test fixture without an image), normalized 0-1000
+        coords are shown instead so the brain can still ground.
         """
         header = (
             f"[VISION  intent={self.intent}  page_type={self.page_type}  "
@@ -845,20 +860,7 @@ class VisionResponse(BaseModel):
         ]
         flags_line = "Flags: " + "  ".join(flag_bits)
 
-        def _rank(b: BBox) -> tuple[int, int, int, float]:
-            # Blocker bboxes rank first so "dismiss cookie banner" never
-            # gets buried behind 20 content elements.
-            role_rank = 0 if b.role_in_scene == "blocker" else (
-                1 if b.role_in_scene == "target" else 2
-            )
-            return (
-                role_rank,
-                0 if b.intent_relevant else 1,
-                0 if b.clickable else 1,
-                -b.confidence,
-            )
-
-        ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
+        ordered = sorted(self.bboxes, key=self._spatial_key)[:max_bboxes]
         elements_lines: list[str] = []
         iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
@@ -947,24 +949,13 @@ class VisionResponse(BaseModel):
     def get_bbox(self, vision_index_1based: int) -> Optional[BBox]:
         """Look up a bbox by the [V_i] index used in `as_brain_text()`.
 
-        The brain references bboxes as [V1], [V2], ... — same ranking as
-        `as_brain_text()`. Mirror that ordering here so a downstream tool
-        call like browser_click_at(bbox=V3) resolves to the same element
-        the brain saw.
+        Uses the same spatial ordering (`_spatial_key`) so a downstream
+        `browser_click_at(vision_index=V_n)` resolves to the same element
+        the brain saw at position V_n in the rendered list.
         """
         if vision_index_1based < 1:
             return None
-        def _rank(b: BBox) -> tuple[int, int, int, float]:
-            role_rank = 0 if b.role_in_scene == "blocker" else (
-                1 if b.role_in_scene == "target" else 2
-            )
-            return (
-                role_rank,
-                0 if b.intent_relevant else 1,
-                0 if b.clickable else 1,
-                -b.confidence,
-            )
-        ordered = sorted(self.bboxes, key=_rank)
+        ordered = sorted(self.bboxes, key=self._spatial_key)
         idx = vision_index_1based - 1
         if idx >= len(ordered):
             return None

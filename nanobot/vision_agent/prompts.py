@@ -116,10 +116,14 @@ General rules:
 - Do NOT hallucinate elements. If you cannot read it, leave it out.
 - `intent_relevant` is true for bboxes that most directly serve the
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
-- Return up to __MAX_BBOXES__ bboxes, ranked by importance — V1 is your
-  strongest recommendation for the next action, V2 is the next-best, etc.
-  The caller's brain treats V1/V2 as defaults and only picks V3+ when those
-  are clearly wrong. Be ruthless about ranking; do not pad with chrome.
+- Return up to __MAX_BBOXES__ bboxes for every interactive or relevant
+  element on the page. **Do NOT rank them.** Order them however you want
+  — the caller re-sorts them spatially (top-to-bottom, left-to-right)
+  before showing them to the brain, and the brain picks the one whose
+  label matches its current step. There is no "best" bbox. Emit each
+  candidate with a clear, specific label and accurate `intent_relevant` /
+  `confidence` / `role_in_scene` fields so the brain can tell them apart.
+  Comprehensive coverage matters more than picking favorites.
 
 Page-type coverage rules (CRITICAL for dense filter/booking UIs):
 - On `search_results` / `product_listing` / `checkout_form` /

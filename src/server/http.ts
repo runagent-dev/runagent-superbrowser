@@ -679,6 +679,22 @@ export function createHttpServer(
         }
       }
 
+      // DOM-dirty flag: read and reset the MutationObserver tripwire
+      // installed at page creation. True when the DOM mutated between
+      // the previous /state call and now — even if no tool fired (lazy-
+      // load, hover-revealed menu, JS-driven filter panel). The Python
+      // bridge uses this to force a fresh vision pass before the next
+      // mutating tool dispatches.
+      let domDirty = false;
+      try {
+        domDirty = await page.getRawPage().evaluate(() => {
+          const w = window as unknown as { __sbDomDirty?: boolean };
+          const wasDirty = !!w.__sbDomDirty;
+          w.__sbDomDirty = false;
+          return wasDirty;
+        });
+      } catch { /* MutationObserver may not be installed yet */ }
+
       res.json({
         url: state.url,
         title: state.title,
@@ -696,6 +712,7 @@ export function createHttpServer(
         // catch stale-index clicks when the DOM re-renders between
         // state-fetch and click. Small payload (~16 hex chars × N).
         fingerprints: fingerprintMap(state.selectorMap),
+        domDirty,
       });
     } catch (err) {
       handleError(res, err);

@@ -27,11 +27,18 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
-        # Block until the in-flight vision prefetch lands so the screenshot
-        # we return to the brain is paired with bboxes for the *current*
-        # page state, not the prior one. The prefetch path inside
-        # _schedule_vision_prefetch fetches the screenshot + runs Gemini
-        # in one shot, so awaiting it here also awaits a fresh capture.
+        # Force-fresh: the brain is explicitly asking to re-observe.
+        # Bypass the vision agent's cache so the bboxes we return reflect
+        # the *current* page state, not a prior cached pass. Set the flag
+        # BEFORE triggering the prefetch — the prefetch reads it and
+        # salts the cache key with a nonce. Combined with the
+        # MutationObserver-driven domDirty signal from the previous
+        # /state call, this closes the "page changed silently" gap.
+        self.s._force_vision_refresh = True
+        # Schedule a fresh vision pass and immediately await it so the
+        # screenshot caption that goes to the brain is paired with the
+        # newly-computed bbox set rather than the prior one.
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
         sync_block = await self.s.ensure_vision_synced(reason="browser_screenshot")
         if sync_block:
             return sync_block

@@ -329,6 +329,25 @@ export class BrowserEngine extends EventEmitter {
     }
 
     const wrapper = new PageWrapper(page, this.config);
+    // DOM-mutation flag — installed once per page, re-runs on every new
+    // document. Lets the bridge tell whether the page has changed since
+    // the last screenshot/vision pass even if no tool fired (lazy-load,
+    // hover-revealed menu, JS animation).
+    try {
+      await page.evaluateOnNewDocument(() => {
+        const w = window as unknown as { __sbDomDirty?: boolean };
+        w.__sbDomDirty = false;
+        try {
+          const obs = new MutationObserver(() => { w.__sbDomDirty = true; });
+          obs.observe(document.documentElement, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            characterData: true,
+          });
+        } catch { /* defensive — observer is best-effort */ }
+      });
+    } catch { /* evaluateOnNewDocument may fail on closed pages */ }
     this.emit('newPage', wrapper);
     return wrapper;
   }
