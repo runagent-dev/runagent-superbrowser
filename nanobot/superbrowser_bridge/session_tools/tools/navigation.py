@@ -323,6 +323,49 @@ class BrowserNavigateTool(Tool):
                     f"state."
                 )
 
+        # --- Same-path query-string mutation guard -----------------------
+        # Brain-constructed URL pattern: navigate to the SAME host+path
+        # the page already loaded but with a different query string —
+        # `?ordering=-expert_rating`, `?sort=price`, `?page=3`. The site's
+        # actual sort/filter UI almost never accepts the param name the
+        # brain guessed, and the trace ends in 404 / ERR_TOO_MANY_REDIRECTS
+        # / blank results. The fix is the on-page control (sort dropdown,
+        # filter chip, pagination button) reached via browser_click_at(V_n).
+        try:
+            from urllib.parse import urlparse as _urlparse_qg
+            _new = _urlparse_qg(url)
+            _cur = _urlparse_qg(self.s.current_url or "")
+            _same_target = (
+                bool(_new.netloc) and bool(_cur.netloc)
+                and _new.netloc.lower() == _cur.netloc.lower()
+                and (_new.path or "/") == (_cur.path or "/")
+            )
+            if _same_target and _new.query and _new.query != _cur.query:
+                self.s.record_step(
+                    "browser_navigate", url,
+                    "BLOCKED: same_path_query_mutation",
+                )
+                _record_nav_refusal(self.s, url, "navigate_param_mutation_refused")
+                return (
+                    f"[navigate_param_mutation_refused] Refused {url} — "
+                    f"you're navigating to the SAME path you're already on "
+                    f"({_cur.path or '/'}) with a different query string "
+                    f"({_new.query!r} vs current {_cur.query!r}). "
+                    f"That's almost always a guessed param: sites use "
+                    f"different param names than the obvious ones (e.g. "
+                    f"`?ordering=-expert_rating` when the site really uses "
+                    f"`?sort=critic_score_desc`), and the wrong name 404s, "
+                    f"redirects, or returns the unsorted list with the "
+                    f"param silently dropped. Use the on-page control "
+                    f"instead: browser_screenshot to find the sort "
+                    f"dropdown / filter chip / pagination button, then "
+                    f"browser_click_at(vision_index=V_n) on it. The "
+                    f"resulting URL change is authoritative because the "
+                    f"site itself constructed it."
+                )
+        except Exception:
+            pass
+
         # --- Pre-nav deliberation gate ----------------------------------
         # The brain's failure mode in long traces: click→click→navigate
         # without ever pausing to see what changed. We require recent

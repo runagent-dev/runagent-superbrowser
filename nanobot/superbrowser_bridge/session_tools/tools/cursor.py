@@ -244,117 +244,10 @@ class BrowserClickAtTool(Tool):
             log_target = f"({x},{y})"
             print(f"\n>> browser_click_at({x}, {y})")
 
-        # DOM↔vision crosscheck before dispatch. Confirm vision and DOM
-        # agree on what's at V_n's coordinates. On disagreement (IoU < 0.5),
-        # force a fresh screenshot once, re-resolve V_n by label match,
-        # and re-check. Always proceeds with the click — the user-spec'd
-        # "trust V1/V2 even when DOM disagrees" fallback. Diagnostics
-        # are appended to the result caption so the brain can see what
-        # happened. Skip on raw (x, y) clicks — no V_n to crosscheck.
-        crosscheck_note = ""
-        if vision_index is not None:
-            try:
-                pre_iou, pre_dom, _pre_text = _vision_dom_crosscheck(
-                    self.s, int(vision_index),
-                )
-                if pre_iou >= 0.5:
-                    crosscheck_note = (
-                        f"\n[click_at_crosscheck] V{vision_index} vs "
-                        f"DOM[{pre_dom}] IoU={pre_iou:.2f} → AGREE"
-                    )
-                    print(
-                        f"  [click_at_crosscheck] V{vision_index} vs "
-                        f"DOM[{pre_dom}] IoU={pre_iou:.2f} → AGREE"
-                    )
-                else:
-                    print(
-                        f"  [click_at_crosscheck] V{vision_index} "
-                        f"IoU={pre_iou:.2f} < 0.5 → re-screenshotting"
-                    )
-                    original_label = (
-                        getattr(bbox, "label", "") or ""
-                    ).strip()
-                    refreshed = await _force_fresh_vision(
-                        self.s, session_id, timeout_s=8.0,
-                    )
-                    new_v: int | None = None
-                    new_iou = 0.0
-                    new_dom: int | None = None
-                    if refreshed:
-                        new_v = _resolve_v_by_label(self.s, original_label)
-                        new_resp = getattr(self.s, "_last_vision_response", None)
-                        if new_v and new_resp is not None:
-                            new_bbox = new_resp.get_bbox(new_v)
-                            new_iw = getattr(new_resp, "image_width", 0)
-                            new_ih = getattr(new_resp, "image_height", 0)
-                            new_dpr = float(getattr(new_resp, "dpr", 1.0) or 1.0)
-                            if new_bbox and new_iw > 0 and new_ih > 0:
-                                nx0, ny0, nx1, ny1 = new_bbox.to_pixels(
-                                    new_iw, new_ih, dpr=new_dpr,
-                                )
-                                payload = {
-                                    "bbox": {
-                                        "x0": nx0, "y0": ny0,
-                                        "x1": nx1, "y1": ny1,
-                                    }
-                                }
-                                new_label = (
-                                    getattr(new_bbox, "label", "") or ""
-                                ).strip()
-                                if new_label:
-                                    payload["expected_label"] = new_label[:120]
-                                    payload["label"] = new_label[:120]
-                                log_target = (
-                                    f"V{new_v}(retry,{nx0},{ny0}→{nx1},{ny1})"
-                                )
-                                new_iou, new_dom, _ = _vision_dom_crosscheck(
-                                    self.s, int(new_v),
-                                )
-                    if not refreshed:
-                        crosscheck_note = (
-                            f"\n[click_at_crosscheck] V{vision_index} "
-                            f"IoU={pre_iou:.2f} → DISAGREE; re-screenshot "
-                            "failed, proceeding with original bbox coords."
-                            f"\n[VISION_TRUST] DOM disagreed with V{vision_index} "
-                            "and re-screenshot didn't land — clicking the "
-                            "bbox coordinates anyway. If the wrong target gets "
-                            "hit, call browser_screenshot to refresh bboxes "
-                            "and retry browser_click_at with a different V_n."
-                        )
-                    elif new_v is None:
-                        crosscheck_note = (
-                            f"\n[click_at_retry] V{vision_index} label "
-                            f"{original_label[:30]!r} not found in fresh "
-                            "vision; proceeding with original bbox coords."
-                            f"\n[VISION_TRUST] Page may have shifted between "
-                            "vision passes. Clicking original bbox coords."
-                        )
-                    elif new_iou >= 0.5:
-                        crosscheck_note = (
-                            f"\n[click_at_retry] V{vision_index}→V{new_v} "
-                            f"IoU={new_iou:.2f} → AGREE after re-screenshot"
-                        )
-                        print(
-                            f"  [click_at_retry] V{vision_index}→V{new_v} "
-                            f"IoU={new_iou:.2f} → AGREE"
-                        )
-                    else:
-                        crosscheck_note = (
-                            f"\n[click_at_retry] V{vision_index}→V{new_v} "
-                            f"IoU={new_iou:.2f} → still DISAGREE after "
-                            "re-screenshot."
-                            f"\n[VISION_TRUST] DOM and vision disagree even "
-                            f"after refresh. Proceeding with V{new_v} bbox "
-                            "coords (vision-trust mode). If wrong target, "
-                            "call browser_screenshot for a fresh bbox list "
-                            "and retry browser_click_at with a new V_n."
-                        )
-                        print(
-                            f"  [click_at_retry] V{vision_index}→V{new_v} "
-                            f"IoU={new_iou:.2f} → DISAGREE (vision-trust)"
-                        )
-            except Exception as exc:
-                print(f"  [click_at_crosscheck_error] {exc}")
+        # Vision-trust mode: bbox coords from the most recent vision
+        # pass are dispatched directly. No DOM↔vision IoU crosscheck,
+        # no re-screenshot retry — the brain already gates on a fresh
+        # vision via ensure_vision_synced() before this tool runs.
 
         r = await _request_with_backoff(
             "POST",
@@ -592,7 +485,7 @@ class BrowserClickAtTool(Tool):
             print(f"[v_priority_check_error] {exc}")
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + crosscheck_note + verify_note + v_priority_note,
+            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note + v_priority_note,
             expected_label=_expected_label or None,
             pre_url=_pre_url,
             pre_dom_hash=_pre_dom_hash,
