@@ -88,6 +88,13 @@ class BrowserSessionState:
         self.current_url: str = ""
         self.best_checkpoint_url: str = ""
         self.url_visit_counts: dict[str, int] = {}
+        # Set of URLs the page has actually loaded — populated whenever
+        # a tool response reports a fresh URL via record_url(). Drives
+        # the strict navigate guard: browser_navigate refuses URLs the
+        # brain hasn't actually been to (i.e. constructed/hallucinated
+        # query strings like ?ordering=-expert_rating). Forces the brain
+        # to use the on-page sort/filter UI instead of guessing URLs.
+        self.observed_urls: set[str] = set()
         self.regression_count: int = 0
         # Dedupe key: (normalized_url, hash_of_content) — so a same URL with
         # changed content (e.g., after clicking "Load more") still allows a new
@@ -642,12 +649,19 @@ class BrowserSessionState:
         return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, parsed.query, ""))
 
     def record_url(self, url: str) -> None:
-        """Track a URL visit. Updates current_url and visit counts."""
+        """Track a URL visit. Updates current_url, visit counts, and
+        the observed_urls set (used by the navigate guard to refuse
+        URLs the brain hasn't actually loaded)."""
         if not url:
             return
         norm = self._normalize_url(url)
         self.current_url = url
         self.url_visit_counts[norm] = self.url_visit_counts.get(norm, 0) + 1
+        # Both forms — exact and normalized — so guard lookups can match
+        # either. Cap at 256 to keep memory bounded on long sessions.
+        if len(self.observed_urls) < 256:
+            self.observed_urls.add(url)
+            self.observed_urls.add(norm)
 
     def record_checkpoint(self, url: str, title: str, action: str) -> None:
         """Record a progress checkpoint (successful meaningful step)."""

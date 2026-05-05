@@ -75,6 +75,60 @@ class BrowserNavigateTool(Tool):
         if sync_block:
             return sync_block
 
+        # --- Hallucinated-URL lockout (strict) ---------------------------
+        # The dominant failure mode: brain pattern-completes URL params
+        # like `?ordering=-expert_rating`, `?sort=price`, `?type=white-wine`
+        # from training data. These almost never match the site's real
+        # param names and produce 404 / redirect-loop / blank-results.
+        # Rule: refuse any URL with a non-empty query string UNLESS the
+        # brain has actually loaded that exact URL before (i.e. it's in
+        # observed_urls — populated whenever a tool response reports a
+        # live URL via record_url()). Brain must use on-page sort/filter
+        # UI clicked via browser_click_at(V_n), and the resulting
+        # site-built URL becomes observed and re-navigable.
+        try:
+            from urllib.parse import urlparse as _urlparse_h
+            _new_parsed = _urlparse_h(url)
+        except Exception:
+            _new_parsed = None
+        if _new_parsed is not None and _new_parsed.query:
+            try:
+                _norm_for_check = self.s._normalize_url(url)
+            except Exception:
+                _norm_for_check = url
+            _observed = getattr(self.s, "observed_urls", set()) or set()
+            if (
+                url not in _observed
+                and _norm_for_check not in _observed
+            ):
+                self.s.record_step(
+                    "browser_navigate", url,
+                    "BLOCKED: hallucinated_query_string",
+                )
+                _record_nav_refusal(
+                    self.s, url, "navigate_hallucinated_url_refused",
+                )
+                return (
+                    f"[navigate_hallucinated_url_refused] Refused {url}. "
+                    f"It has a query string ({_new_parsed.query!r}) and "
+                    f"this exact URL is not in the set of URLs the page "
+                    f"has actually loaded. Sites use param names you "
+                    f"can't predict from training data: e.g. "
+                    f"`?ordering=-expert_rating` looks reasonable but "
+                    f"the real param might be `?sort=critic_score_desc` "
+                    f"or there might be no URL param at all (cookie-"
+                    f"backed sort). Constructed URLs 404, redirect-loop, "
+                    f"or silently drop the param.\n"
+                    f"\nUse the on-page UI instead: call "
+                    f"browser_screenshot(intent=\"locate the sort "
+                    f"dropdown / filter chip you need\") to surface the "
+                    f"V_n for that control, then "
+                    f"browser_click_at(vision_index=V_n). The URL the "
+                    f"site builds from a real click IS authoritative — "
+                    f"the bridge will record it and you can re-navigate "
+                    f"to it later via this tool."
+                )
+
         # --- Known-bad URL lockout ---------------------------------------
         # Fire BEFORE any other guard. If this exact URL (or its
         # normalized variant) returned 4xx/5xx earlier in this session,

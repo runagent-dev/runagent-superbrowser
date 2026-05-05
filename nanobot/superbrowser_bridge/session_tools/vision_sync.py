@@ -330,6 +330,18 @@ def _schedule_vision_prefetch(
             state._last_vision_url = (data.get("url", "") or state.current_url or "")
             state._last_dom_hash = dh or state._last_dom_hash
             state.vision_calls += 1
+            # Authoritative URL sync. The /state response is the live
+            # browser URL — pipe it into record_url so current_url and
+            # observed_urls reflect post-navigation reality even when
+            # the page changed via form submit / JS redirect rather
+            # than browser_navigate. Without this, navigate guards
+            # compare the brain's URL to a stale current_url.
+            try:
+                live_url = data.get("url") or ""
+                if live_url:
+                    state.record_url(live_url)
+            except Exception:
+                pass
             # Push the fresh bboxes to live viewers immediately —
             # without this, overlay only updates on the next
             # screenshot tool call, so the user sees bboxes lag by
