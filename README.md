@@ -13,7 +13,7 @@ SuperBrowser is two cooperating processes:
 - A **TypeScript server** (port 3100) that runs Puppeteer + stealth and exposes per-session HTTP endpoints — navigate, click, type, screenshot, etc.
 - A **Python bridge** (`nanobot/superbrowser_bridge`) that adds a second backend — an in-process patchright (undetected Chromium) session manager on port 3101 — plus a tiered anti-bot pipeline, the vision agent, and the tool-layer guards.
 
-Session IDs route transparently: `session-<uuid>` → Tier 1 (TS/Puppeteer), `t3-session-<uuid>` → Tier 3 (Python/patchright). The agent calls the same `browser_click`, `browser_type`, `browser_screenshot` regardless of backend.
+Session IDs route transparently: `session-<uuid>` → Tier 1 (TS/Puppeteer), `t3-session-<uuid>` → Tier 3 (Python/patchright). The agent calls the same `browser_click_at`, `browser_type_at`, `browser_screenshot` regardless of backend.
 
 ---
 
@@ -36,11 +36,11 @@ Mechanisms for detection + session rotation + proxy tiering + header generation 
 
 **Tier-transparent escalation.** `browser_escalate` exports cookies, URL, localStorage, sessionStorage from a Tier 1 session, closes it, and opens a Tier 3 session with that state pre-loaded. Subsequent tool calls route to the new backend automatically via the shared session-ID prefix convention.
 
-**Vision + bbox loop.** A dedicated Gemini call labels each screenshot with stable `[V1], [V2], ...` bboxes ranked by (intent-relevant, clickable, confidence). `browser_click_at(vision_index="V3")` resolves the label to a DOM element via point-in-bbox snapping. Vision is prefetched in the background after every mutating action (click/type/scroll/navigate) so the next screenshot call typically hits the cache instead of waiting for a fresh Gemini response.
+**Vision + bbox loop.** A dedicated Gemini call labels each screenshot with stable `[V1], [V2], ...` bboxes ranked by (intent-relevant, clickable, confidence). `browser_click_at(vision_index="V3")` is the single click pathway — DOM-index `browser_click` and CSS-selector `browser_click_selector` were removed so the brain always grounds on a fresh bbox before clicking. Vision is prefetched in the background after every mutating action and every page-changing tool plus `browser_screenshot` hard-blocks on the in-flight prefetch via `ensure_vision_synced()`, so no tool can dispatch and no screenshot can return until bboxes for the current page state have landed.
 
 **Tool-layer guards.** These refuse or warn at the tool level rather than relying on prompting:
 
-- `browser_type` tracks the last type index + text. A second type to the same field within 12s whose text is a superset of the previous (e.g. `"khulna"` → `"khulna, bangladesh"`) is rejected to prevent the field from becoming `"khulnakhulna, bangladesh"` when the agent misses an autocomplete dropdown. After every successful type, a JS probe enumerates visible `[role=listbox] [role=option]` / MUI Autocomplete / generic `.suggestions li` elements and surfaces them inline with click coordinates.
+- `browser_type` / `browser_type_at` track the last type index + text. A second type to the same field within 12s whose text is a superset of the previous (e.g. `"khulna"` → `"khulna, bangladesh"`) is rejected to prevent the field from becoming `"khulnakhulna, bangladesh"` when the agent misses an autocomplete dropdown. After every successful type, a JS probe enumerates visible `[role=listbox] [role=option]` / MUI Autocomplete / generic `.suggestions li` elements and surfaces them inline with click coordinates.
 - `browser_escalate` validates that the session is actually blocked (`network_blocked=True`, last observed status ≥400 excluding 404, or vision-flagged captcha) before migrating. Reduces the pattern where a `browser_wait_for` timeout gets recast as "HTTP 403" and triggers a tier migration for no reason. `force=true` bypasses the check.
 - `browser_navigate` rejects navigation outside the task-pinned domain, including `google.com/search`, `/images`, `/maps`, or any google.com URL with a `q=` query param — blocks the "let me check Google" pivot. OAuth (`accounts.google.com`) and CDN (`googleapis.com`, `gstatic.com`) URLs on the same hosts remain allowed.
 

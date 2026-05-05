@@ -874,8 +874,7 @@ TACTIC_ALTERNATIVES: dict[str, str] = {
     # tax that's been biting click_at specifically. Selector-based
     # tools are the second-choice fallback when semantic matching
     # can't find the target.
-    "browser_click_at": "browser_semantic_click(target='<what to click>') — atomic fresh vision + dispatch, no V-index drift; OR browser_click_selector(<css>)",
-    "browser_click": "browser_semantic_click(target='<what to click>') or browser_click_selector(<css>)",
+    "browser_click_at": "browser_screenshot to refresh the V_n bbox list, then re-issue browser_click_at(vision_index=V_n) on the corrected V_n",
     "browser_type_at": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
     "browser_type": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
     "browser_keys": "browser_run_script(mutates=true) calling helpers.reactSetValue then dispatching submit",

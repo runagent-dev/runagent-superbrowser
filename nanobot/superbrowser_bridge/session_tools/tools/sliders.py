@@ -78,6 +78,9 @@ class BrowserDragSelectorsTool(Tool):
         if method not in ("auto", "click_click", "drag"):
             return f"[drag_selectors_failed] method must be auto|click_click|drag, got {method!r}"
         print(f"\n>> browser_drag_selectors({from_selector!r} → {to_selector!r}, method={method})")
+        sync_block = await self.s.ensure_vision_synced(reason="browser_drag_selectors")
+        if sync_block:
+            return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
         await self.s.inter_action_pause()
@@ -185,6 +188,9 @@ class BrowserDragPathTool(Tool):
             return f"[drag_path_failed] points_json is not valid JSON: {exc}"
         if not isinstance(points, list) or len(points) < 2:
             return "[drag_path_failed] points_json must decode to a list of ≥2 {x,y} objects."
+        sync_block = await self.s.ensure_vision_synced(reason="browser_drag_path")
+        if sync_block:
+            return sync_block
         for i, p in enumerate(points):
             if not isinstance(p, dict) or not isinstance(p.get("x"), (int, float)) \
                or not isinstance(p.get("y"), (int, float)):
@@ -303,6 +309,9 @@ class BrowserSetSliderTool(Tool):
             parsed = json.loads(value_json)
         except (TypeError, ValueError) as exc:
             return f"[set_slider_failed] value_json is not valid JSON: {exc}"
+        sync_block = await self.s.ensure_vision_synced(reason="browser_set_slider")
+        if sync_block:
+            return sync_block
         if isinstance(parsed, (int, float)):
             value_payload: Any = float(parsed)
         elif (
@@ -461,6 +470,9 @@ class BrowserSetSliderAtTool(Tool):
         value_max: float | None = None,
         **kw: Any,
     ) -> str:
+        sync_block = await self.s.ensure_vision_synced(reason="browser_set_slider_at")
+        if sync_block:
+            return sync_block
         # Share the same lock as browser_drag_slider_until: the CDP/patchright
         # cursor is session-scoped, parallel drags clobber each other.
         if self.s.slider_drag_lock is None:
@@ -879,6 +891,9 @@ class BrowserDragSliderUntilTool(Tool):
         gate = await _feedback_gate("browser_drag_slider_until")
         if gate:
             return gate
+        sync_block = await self.s.ensure_vision_synced(reason="browser_drag_slider_until")
+        if sync_block:
+            return sync_block
         ok, gate_msg = await _require_fresh_vision(
             self.s, session_id,
             reason=f"browser_drag_slider_until(target={target_value})",

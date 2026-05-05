@@ -63,8 +63,6 @@ from .tools import (
     BrowserBriefMarkTool,
     BrowserCaptchaScreenshotTool,
     BrowserClickAtTool,
-    BrowserClickSelectorTool,
-    BrowserClickTool,
     BrowserCloseTool,
     BrowserDetectCaptchaTool,
     BrowserDialogTool,
@@ -132,13 +130,11 @@ __all__ = [
     "clear_resumption_artifact",
     "load_resumption_artifact",
     "save_resumption_artifact",
-    # Tool classes (44)
+    # Tool classes (42)
     "BrowserAskUserTool",
     "BrowserBriefMarkTool",
     "BrowserCaptchaScreenshotTool",
     "BrowserClickAtTool",
-    "BrowserClickSelectorTool",
-    "BrowserClickTool",
     "BrowserCloseTool",
     "BrowserDetectCaptchaTool",
     "BrowserDialogTool",

@@ -1,498 +1,11 @@
-"""Cursor-action tools — click / type / keys / drag / fix-text and the
-DOM-selector fast path."""
+"""Cursor-action tools — vision-bbox click_at / type / keys / drag /
+fix-text. The DOM-index `browser_click` and CSS-selector
+`browser_click_selector` paths were removed; all clicks now go through
+`browser_click_at(vision_index=V_n | x, y)`."""
 
 from __future__ import annotations
 
 from ._common import *  # noqa: F401,F403
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        index=IntegerSchema(description="Element index"),
-        button=StringSchema("Mouse button: left, right, middle", nullable=True),
-        required=["session_id", "index"],
-    )
-)
-class BrowserClickTool(Tool):
-    name = "browser_click"
-    description = "Click an interactive element by its [index] number."
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    @property
-    def exclusive(self) -> bool:
-        return True
-
-    async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
-        print(f"\n>> browser_click([{index}])")
-        gate = await _feedback_gate("browser_click")
-        if gate:
-            return gate
-        # CURSOR_ONLY_MODE: when the orchestrator decomposed a multi-
-        # condition query (task_brief is set), DOM-index clicks are
-        # disabled. They drift between vision pass and click and they
-        # don't fire humanized cursor events — both are why the brain's
-        # multi-step filter flows fail. Force the brain through
-        # browser_click_at(V_n) (vision-bbox + humanized cursor) or
-        # browser_click_selector (CSS hook + humanized cursor).
-        if (
-            getattr(self.s, "task_brief", None) is not None
-            and os.environ.get("CURSOR_ONLY_MODE", "1") not in ("0", "false", "no")
-        ):
-            self.s.record_step(
-                "browser_click", f"index={index}",
-                "REFUSED: CURSOR_ONLY_MODE active",
-            )
-            return (
-                f"[CURSOR_ONLY_MODE] browser_click([{index}]) by DOM "
-                f"index is DISABLED in multi-condition mode. DOM "
-                f"indices drift between vision pass and click; "
-                f"humanized cursor events fire only via the vision-"
-                f"bbox path. Use ONE of:\n"
-                f"  1) browser_click_at(vision_index=V_n) — preferred. "
-                f"Pick from the V_n list in the most recent screenshot.\n"
-                f"  2) browser_click_selector(selector='<css>') — when "
-                f"the target has a stable hook (id, data-test-id, "
-                f"role+text).\n"
-                f"If no V_n matches your intended target, call "
-                f"browser_screenshot first to refresh the bbox list."
-            )
-        # Phase 1.1: hard sync gate. Wait for any in-flight vision
-        # prefetch from the previous action before dispatching.
-        sync_block = await self.s.ensure_vision_synced(reason="browser_click")
-        if sync_block:
-            return sync_block
-        self.s._brain_turn_counter += 1
-        self.s.capture_action_snapshot(target_index=index)
-        await self.s.inter_action_pause()
-        # Cross-index flail guard. If the last two clicks timed out,
-        # force a re-screenshot before dispatching another HTTP click —
-        # the backend is hung (blocker, loader, nav in flight) and
-        # walking [N±1] just wastes the iteration budget.
-        if self.s.consecutive_click_timeouts >= self.s.MAX_CONSECUTIVE_CLICK_TIMEOUTS:
-            alts = _vision_alternatives_hint(self.s, limit=3)
-            self.s.log_activity(
-                f"click([{index}])(LOOP_BLOCKED)",
-                f"timeouts={self.s.consecutive_click_timeouts}",
-            )
-            return (
-                f"[click_loop_detected] {self.s.consecutive_click_timeouts} "
-                f"consecutive click timeouts. The page is likely blocked "
-                f"(loader, modal, or a pending navigation). Call "
-                f"browser_screenshot to refresh vision before any further "
-                f"click."
-                + (f"\n{alts}" if alts else "")
-            )
-        target_key = f"click[{index}]"
-        dead = self.s.check_dead_click(target_key)
-        if dead:
-            self.s.log_activity(f"click([{index}])(DEAD_CLICK_BLOCKED)", "")
-            return dead
-        self.s.register_click_attempt(target_key)
-        self.s.consecutive_click_calls += 1
-
-        # --- Click-rush detector ----------------------------------------
-        # When the brain has been clicking 4+ times in a row without
-        # taking a screenshot, reading markdown, or marking a brief
-        # constraint, it's not seeing the page — just firing actions
-        # blind. Force a context-gathering pause. Only enforced when
-        # task_brief is set (legacy path stays unchanged).
-        # consecutive_click_calls is already maintained by the click/
-        # type tools; it resets to 0 inside browser_screenshot via the
-        # build_text_only path. We additionally check
-        # last_deliberation_turn so a recent screenshot/markdown/mark
-        # exempts.
-        if (
-            getattr(self.s, "task_brief", None) is not None
-            and self.s.consecutive_click_calls >= 4
-        ):
-            turns_since_delib = (
-                self.s._brain_turn_counter
-                - self.s.last_deliberation_turn
-            )
-            if turns_since_delib >= 4:
-                print(
-                    f"[click_rush] {self.s.consecutive_click_calls} "
-                    f"consecutive clicks, {turns_since_delib} turns "
-                    f"since deliberation — forcing screenshot."
-                )
-                self.s.record_step(
-                    "browser_click",
-                    f"index={index}",
-                    "BLOCKED: click_rush — forcing screenshot",
-                )
-                return (
-                    f"[CLICK_RUSH_REFUSED] You have made "
-                    f"{self.s.consecutive_click_calls} consecutive "
-                    f"click calls without taking a browser_screenshot, "
-                    f"calling browser_get_markdown, or marking a "
-                    f"brief constraint. You are clicking blind — the "
-                    f"DOM has changed under you and indices like "
-                    f"[{index}] no longer point at what you think. "
-                    f"Take ONE browser_screenshot now to refresh your "
-                    f"view + the V_n bbox list, then pick the right "
-                    f"target from the fresh vision response. Quality > "
-                    f"speed: an extra screenshot is cheaper than a "
-                    f"chain of wrong clicks that lands you on a "
-                    f"detail page or a 404."
-                )
-
-        # --- DOM ↔ vision crosscheck ------------------------------------
-        # When vision is fresh (≤2 turns old), the brain SHOULD prefer
-        # click_at(V_n). But it often falls through to browser_click(N)
-        # by DOM index. The DOM index can drift between vision-pass and
-        # click (page reflow, ad load, lazy hydration), so the click may
-        # land on a different element than vision saw at V_n.
-        #
-        # Pre-flight: fetch the index's CSS rect, compute IoU against
-        # every vision bbox. Decision tree:
-        #   * IoU >= 0.7        → DOM and vision agree, allow silently.
-        #   * 0.5 <= IoU < 0.7  → grey zone, allow but warn in caption.
-        #   * IoU < 0.5         → REFUSE; brain must use click_at(V_best).
-        #   * best_v is None    → REFUSE; DOM index has zero overlap with
-        #                         any vision bbox (off-screen / hidden).
-        # Skipped silently when vision isn't fresh or no bounds available.
-        _crosscheck_warning: str | None = None
-        try:
-            vr_age = max(
-                0,
-                self.s._brain_turn_counter - 1
-                - (self.s._vision_epoch_turn or 0),
-            )
-            if (
-                vr_age <= 2
-                and getattr(self.s, "_last_vision_response", None) is not None
-                and len(getattr(self.s._last_vision_response, "bboxes", []) or []) > 0
-            ):
-                # Lazily refresh bounds — the DOM may have moved since
-                # the last fetch, so we always pull a fresh snapshot
-                # before the click. ~50–100ms cost; saves the brain
-                # from clicking ghost elements.
-                fetched = await _fetch_elements_with_bounds(session_id, self.s)
-                best_iou, best_v, best_label = _dom_vision_crosscheck(
-                    self.s, index
-                )
-                # Stdout diagnostic so the trace shows the crosscheck
-                # actually running. Without this the user can't tell
-                # whether the gate fired or silently no-op'd.
-                if fetched and self.s.elements_bounds.get(index):
-                    if best_v is not None:
-                        _vs = f"V{best_v}('{best_label[:30]}')"
-                    else:
-                        _vs = "(no vision overlap)"
-                    print(
-                        f"[click_crosscheck] [{index}] vs {_vs} "
-                        f"IoU={best_iou:.2f} "
-                        f"(threshold: refuse<0.5, warn<0.7, allow≥0.7)"
-                    )
-                # Threshold tuning: an earlier version allowed IoU=0.33
-                # to land a wrong-element click on wineaccess.com. Even
-                # 33% rect overlap is "two adjacent elements that share
-                # an edge" rather than "the same element from two
-                # angles". Bumped the refuse cutoff to 0.5 — anything
-                # below that is treated as a mismatch and forced
-                # through click_at(V_best) instead.
-                #
-                # Decision matrix:
-                #   IoU ≥ 0.7      → allow silently (DOM matches vision)
-                #   0.5 ≤ IoU < 0.7 → allow with caption warning (decent)
-                #   IoU < 0.5      → REFUSE; brain must use click_at(V_best)
-                #   best_v is None  → REFUSE; brain is clicking a DOM
-                #                     element vision didn't even see
-                if best_v is not None:
-                    if best_iou >= 0.7:
-                        pass  # strong agreement
-                    elif best_iou >= 0.5:
-                        _crosscheck_warning = (
-                            f"[CLICK_VISION_OVERLAP_WEAK] DOM index "
-                            f"[{index}] partially overlaps vision "
-                            f"V{best_v} ('{best_label[:40]}', IoU="
-                            f"{best_iou:.2f}). Click proceeded; if the "
-                            f"outcome looks wrong next turn, retry via "
-                            f"browser_click_at(vision_index=V{best_v})."
-                        )
-                        print(
-                            f"[click_crosscheck] PARTIAL overlap — "
-                            f"click allowed with warning."
-                        )
-                    else:
-                        # IoU < 0.5 — too risky. The DOM index and
-                        # vision bbox aren't pointing at the same
-                        # element. Force the brain to use click_at.
-                        alts = _vision_alternatives_hint(
-                            self.s, exclude_index=None, limit=4
-                        )
-                        self.s.record_step(
-                            "browser_click",
-                            f"index={index}",
-                            f"DOM_VISION_MISMATCH iou={best_iou:.2f}",
-                        )
-                        print(
-                            f"[click_crosscheck] REFUSED — IoU "
-                            f"{best_iou:.2f} < 0.5 threshold. Brain "
-                            f"must use click_at(V{best_v}) instead."
-                        )
-                        return (
-                            f"[CLICK_DOM_VISION_MISMATCH] DOM index "
-                            f"[{index}] only weakly overlaps vision "
-                            f"V{best_v} ('{best_label[:40]}', IoU="
-                            f"{best_iou:.2f} — below the 0.5 safe "
-                            f"threshold). The DOM index is pointing "
-                            f"at an adjacent or overlapping element, "
-                            f"NOT the same one vision saw. Use:\n"
-                            f"  browser_click_at(vision_index=V"
-                            f"{best_v}, target_label='{best_label[:40]}')\n"
-                            f"This dispatches a humanized cursor "
-                            f"click on the bbox vision actually "
-                            f"identified — pixel-exact, no DOM-index "
-                            f"drift. Do NOT retry "
-                            f"browser_click([{index}]); the same "
-                            f"crosscheck will refuse it again."
-                            + (f"\n{alts}" if alts else "")
-                        )
-                else:
-                    # No overlap with ANY vision bbox. Either the DOM
-                    # element is off-screen / hidden, OR the brain is
-                    # addressing an index vision deliberately culled.
-                    # Either way, clicking blindly is what landed on
-                    # /catalog/2024-fiore-... instead of the Oregon
-                    # filter. Refuse and force a screenshot.
-                    if self.s.elements_bounds.get(index):
-                        alts = _vision_alternatives_hint(
-                            self.s, exclude_index=None, limit=4
-                        )
-                        self.s.record_step(
-                            "browser_click",
-                            f"index={index}",
-                            "DOM_NO_VISION_OVERLAP",
-                        )
-                        print(
-                            f"[click_crosscheck] REFUSED — [{index}] "
-                            f"has zero overlap with any vision bbox."
-                        )
-                        return (
-                            f"[CLICK_NO_VISION_MATCH] DOM index "
-                            f"[{index}] does not overlap ANY vision "
-                            f"bbox. Either the element is off-screen, "
-                            f"covered by an overlay, or vision "
-                            f"deliberately culled it (e.g. visually "
-                            f"hidden 'a' tags inside product cards). "
-                            f"Clicking blind here is how the worker "
-                            f"landed on a product detail page instead "
-                            f"of the filter it intended. Recovery:\n"
-                            f"  1) browser_screenshot — refresh V_n "
-                            f"and pick from labelled bboxes only.\n"
-                            f"  2) browser_scroll_until(target_text=…) "
-                            f"if the element you wanted is below the "
-                            f"fold."
-                            + (f"\n{alts}" if alts else "")
-                        )
-        except Exception as exc:
-            # Defensive — never fail the click because the crosscheck
-            # itself errored. Just log.
-            print(f"[click_crosscheck_error] {exc}")
-        payload: dict[str, Any] = {"index": index}
-        if button:
-            payload["button"] = button
-        # Send the fingerprint the LLM was targeting. If the DOM shifted,
-        # the TS side returns 409 + stale_index with a suggested new index.
-        cached_fp = self.s.element_fingerprints.get(index)
-        if cached_fp:
-            payload["expected_fingerprint"] = cached_fp
-        elif self.s.element_fingerprints:
-            # The cache has entries, just not for this index — the brain
-            # is addressing an index that wasn't in the last state
-            # response. Almost always means stale. Surface fast instead
-            # of letting the TS click fail obscurely.
-            await _fetch_elements(session_id, self.s)
-            if index not in self.s.element_fingerprints:
-                return (
-                    f"[click_failed:unknown_index] [{index}] is not in "
-                    f"the current selectorMap (fingerprints={len(self.s.element_fingerprints)} "
-                    f"indices). Re-read the elements list and pick a "
-                    f"valid index, or use browser_click_at(V_n) with a "
-                    f"vision bbox."
-                )
-            cached_fp = self.s.element_fingerprints.get(index)
-            if cached_fp:
-                payload["expected_fingerprint"] = cached_fp
-
-        try:
-            r = await _request_with_backoff(
-                "POST",
-                f"{SUPERBROWSER_URL}/session/{session_id}/click",
-                json=payload,
-                timeout=30.0,
-            )
-            # 409 = stale-index guard fired. Surface the suggested
-            # index (if any) so the LLM retargets instead of blindly
-            # retrying or falling back to click_at coords.
-            if r.status_code == 409:
-                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                stale_msg = info.get("error", "Stale index")
-                suggested = info.get("suggested_index")
-                current = info.get("current_element", "")
-                hint = f" Try [{suggested}]." if suggested is not None else " Re-read elements list and pick again."
-                result = f"[stale_index] {stale_msg} Current [{index}] is {current}.{hint}"
-                self.s.log_activity(f"click([{index}])(STALE)", f"suggested={suggested}")
-                await _fetch_elements(session_id, self.s)
-                return result
-            # 400 = structured TS-side failure (element not found,
-            # not visible, disabled, etc.). Parse and return an
-            # actionable message to the LLM.
-            if r.status_code == 400:
-                info = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                reason = info.get("reason", "unknown")
-                err = info.get("error", f"click [{index}] failed")
-                alternatives = info.get("alternatives") or []
-                await _fetch_elements(session_id, self.s)
-                self.s.log_activity(f"click([{index}])({reason})", err[:60])
-                alt_lines = "\n".join(f"  - {a}" for a in alternatives[:3]) if alternatives else ""
-                fresh_hint = "\nElements have been re-read above — pick a current [index]."
-                # Phase 3.1: cursor failure ledger.
-                self.s.record_cursor_failure(
-                    strategy="click",
-                    target=f"[{index}]",
-                    reason=f"{reason}: {err[:80]}",
-                )
-                return (
-                    f"[click_failed:{reason}] {err}"
-                    + (f"\nAlternatives:\n{alt_lines}" if alt_lines else "")
-                    + fresh_hint
-                )
-            r.raise_for_status()
-            data = r.json()
-        except httpx.HTTPStatusError as e:
-            # Opaque 4xx/5xx (not 400/409). Usually network-layer.
-            self.s.log_activity(f"click([{index}])(HTTP{e.response.status_code})", str(e)[:60])
-            return (
-                f"[click_failed:http_{e.response.status_code}] {e.response.text[:200] if e.response.text else str(e)[:200]}"
-            )
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
-            # Click dispatched but the backend never responded — almost
-            # always means the page is blocked (a pending navigation, a
-            # loader still running, or an overlay intercepting events).
-            # Count it so the flail guard above trips on the next call.
-            self.s.consecutive_click_timeouts += 1
-            self.s.log_activity(
-                f"click([{index}])(TIMEOUT)",
-                f"count={self.s.consecutive_click_timeouts}",
-            )
-            alts = _vision_alternatives_hint(
-                self.s, exclude_index=None, limit=3,
-            )
-            return (
-                f"[click_failed:timeout] The backend didn't respond to "
-                f"click([{index}]) within the HTTP timeout. The page is "
-                f"likely waiting on navigation or blocked by a loader. "
-                f"Call browser_screenshot to re-vision before retrying."
-                + (f"\n{alts}" if alts else "")
-            )
-        except Exception as e:
-            # True transport error (connection refused, etc.). Server down.
-            self.s.log_activity(f"click([{index}])(TRANSPORT)", str(e)[:60])
-            return f"[click_failed:transport] {str(e)[:200]} — browser service unreachable. Retry in a few seconds."
-
-        # Successful HTTP response — clear the timeout counter so the
-        # flail guard doesn't trip on a future unrelated hiccup.
-        self.s.consecutive_click_timeouts = 0
-        actual_url = data.get("url", self.s.current_url)
-        if actual_url:
-            self.s.record_url(actual_url)
-        # Snap telemetry (P3.12).
-        snap = data.get("snap") if isinstance(data, dict) else None
-        if isinstance(snap, dict) and snap.get("snapped") is False:
-            self.s.snap_miss_count += 1
-        self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
-        self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
-        _vision_task = _schedule_vision_prefetch(self.s, session_id)
-        caption = self.s.build_text_only(data, f"Clicked [{index}]")
-        # Surface any crosscheck warning from the DOM↔vision pre-flight.
-        if _crosscheck_warning:
-            caption += "\n" + _crosscheck_warning
-
-        # Click-induced detail-page detection. The browser_navigate guard
-        # refuses overt nav-to-detail-page calls, but clicks can ALSO
-        # land on /catalog/<slug>/ pages (a click on a product card
-        # follows the link). When that happens while filter constraints
-        # are still open, we append a strong reorient hint — the brain
-        # was ALMOST CERTAINLY supposed to apply filters first, not
-        # open one item.
-        try:
-            brief = getattr(self.s, "task_brief", None)
-            if brief is not None and actual_url:
-                from urllib.parse import urlparse as _up
-                _path = (_up(actual_url).path or "").lower()
-                _detail_roots_c = (
-                    "/catalog/", "/product/", "/products/", "/p/",
-                    "/item/", "/items/", "/article/", "/articles/",
-                    "/post/", "/posts/", "/listing/", "/listings/",
-                    "/recipe/", "/recipes/",
-                )
-                _is_detail = any(
-                    _path.startswith(r) and len(_path.rstrip("/").split("/")) >= 3
-                    for r in _detail_roots_c
-                )
-                _open_filters = [
-                    c for c in brief.constraints
-                    if c.is_open() and c.kind == "filter"
-                ]
-                if _is_detail and _open_filters:
-                    open_labels = ", ".join(
-                        f"#{c.id} {c.label[:35]}" for c in _open_filters[:5]
-                    )
-                    caption += (
-                        f"\n[CLICK_LANDED_ON_DETAIL] You are now on a "
-                        f"detail page ({actual_url}) but "
-                        f"{len(_open_filters)} filter constraints are "
-                        f"still [open]: {open_labels}. This is almost "
-                        f"always wrong — filters should be applied on "
-                        f"the LISTING page first. Recovery options:\n"
-                        f"  1) Click 'Back' (or browser_keys "
-                        f"keys='Alt+Left') to return to the listing, "
-                        f"then click filter chips via "
-                        f"browser_click_at(V_n).\n"
-                        f"  2) If this detail page genuinely happens "
-                        f"to match all your filters (URL slug "
-                        f"references oregon, white-wine, etc.), call "
-                        f"browser_brief_mark for each open constraint "
-                        f"with evidence='detail-page slug confirms X' "
-                        f"BEFORE proceeding here.\n"
-                        f"Do NOT continue extracting from this single "
-                        f"page until you've reconciled the brief — "
-                        f"the orchestrator will report "
-                        f"INCOMPLETE_CHECKLIST otherwise."
-                    )
-        except Exception as exc:
-            print(f"[click_detail_check_error] {exc}")
-
-        # Vision-skip nudge: if vision recently emitted V_n bboxes (last
-        # 2 turns), the brain should normally use click_at(V_n) per the
-        # tool ladder. When it falls back to DOM index instead, append a
-        # soft hint pointing at the vision alternatives so it knows the
-        # vision pass is current. This is informative, not blocking —
-        # browser_click still works, just with a nudge in the caption.
-        try:
-            v_age = max(
-                0,
-                self.s._brain_turn_counter - 1
-                - (self.s._vision_epoch_turn or 0),
-            )
-            if v_age <= 2 and getattr(self.s, "_last_vision_response", None):
-                hint = _vision_alternatives_hint(self.s, exclude_index=None, limit=3)
-                if hint:
-                    caption += (
-                        f"\n[VISION_FRESH] Vision is current (age={v_age} turn). "
-                        f"Prefer browser_click_at(vision_index=V_n) for "
-                        f"the next click — humanized cursor, isTrusted=true. "
-                        f"{hint}"
-                    )
-        except Exception:
-            pass
-
-        return await _append_fresh_vision(_vision_task, caption)
-
 
 @tool_parameters(
     tool_parameters_schema(
@@ -550,11 +63,11 @@ class BrowserClickAtTool(Tool):
                 f"[BLOCKED] browser_click_at used "
                 f"{self.s.click_at_count} times in this session. The "
                 f"task is looping on clicks — call browser_screenshot "
-                f"to re-observe, then try browser_click_selector with "
-                f"a stable CSS hook, or browser_rewind_to_checkpoint "
-                f"if the page is stuck. Do NOT attempt "
-                f"browser_run_script to click — JS clicks are "
-                f"isTrusted=false and bot-detected."
+                f"to re-observe, then re-issue browser_click_at with a "
+                f"fresh vision_index=V_n from the new screenshot, or "
+                f"browser_rewind_to_checkpoint if the page is stuck. "
+                f"Do NOT attempt browser_run_script to click — JS clicks "
+                f"are isTrusted=false and bot-detected."
             )
 
         # Build the target key BEFORE resolving the bbox, so the guard
@@ -731,9 +244,8 @@ class BrowserClickAtTool(Tool):
             log_target = f"({x},{y})"
             print(f"\n>> browser_click_at({x}, {y})")
 
-        # DOM↔vision crosscheck before dispatch. Mirrors the inverse
-        # check on browser_click(index=N): confirm vision and DOM agree
-        # on what's at V_n's coordinates. On disagreement (IoU < 0.5),
+        # DOM↔vision crosscheck before dispatch. Confirm vision and DOM
+        # agree on what's at V_n's coordinates. On disagreement (IoU < 0.5),
         # force a fresh screenshot once, re-resolve V_n by label match,
         # and re-check. Always proceeds with the click — the user-spec'd
         # "trust V1/V2 even when DOM disagrees" fallback. Diagnostics
@@ -806,8 +318,8 @@ class BrowserClickAtTool(Tool):
                             f"\n[VISION_TRUST] DOM disagreed with V{vision_index} "
                             "and re-screenshot didn't land — clicking the "
                             "bbox coordinates anyway. If the wrong target gets "
-                            "hit, retry with browser_click(index=...) using a "
-                            "DOM index from browser_get_state."
+                            "hit, call browser_screenshot to refresh bboxes "
+                            "and retry browser_click_at with a different V_n."
                         )
                     elif new_v is None:
                         crosscheck_note = (
@@ -834,7 +346,8 @@ class BrowserClickAtTool(Tool):
                             f"\n[VISION_TRUST] DOM and vision disagree even "
                             f"after refresh. Proceeding with V{new_v} bbox "
                             "coords (vision-trust mode). If wrong target, "
-                            "try browser_click(index=...) with a DOM index."
+                            "call browser_screenshot for a fresh bbox list "
+                            "and retry browser_click_at with a new V_n."
                         )
                         print(
                             f"  [click_at_retry] V{vision_index}→V{new_v} "
@@ -1622,7 +1135,11 @@ class BrowserTypeTool(Tool):
         gate = await _feedback_gate("browser_type")
         if gate:
             return gate
-        # CURSOR_ONLY_MODE — see the matching block in BrowserClickTool.
+        # CURSOR_ONLY_MODE: when the orchestrator decomposed a multi-
+        # condition query (task_brief is set), DOM-index typing is
+        # disabled. DOM indices drift and the keystrokes often land on
+        # an adjacent non-input element. Force the brain through
+        # browser_type_at(V_n, text=...) which uses the bbox bbox path.
         if (
             getattr(self.s, "task_brief", None) is not None
             and os.environ.get("CURSOR_ONLY_MODE", "1") not in ("0", "false", "no")
@@ -1683,7 +1200,7 @@ class BrowserTypeTool(Tool):
                     f"field seconds ago. Typing again WILL concatenate "
                     f"(producing garbage like \"{self.s.last_type_text}{text}\"). "
                     f"An autocomplete dropdown probably appeared — take a "
-                    f"browser_screenshot, then browser_click the right "
+                    f"browser_screenshot, then browser_click_at the right "
                     f"suggestion (or browser_keys ArrowDown+Enter). Only "
                     f"retype if you pass clear=true AND the field is empty."
                 )
@@ -2009,6 +1526,9 @@ class BrowserKeysTool(Tool):
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
         print(f"\n>> browser_keys({keys})")
+        sync_block = await self.s.ensure_vision_synced(reason="browser_keys")
+        if sync_block:
+            return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
         await self.s.inter_action_pause()
@@ -2055,6 +1575,9 @@ class BrowserDragTool(Tool):
 
     async def execute(self, session_id: str, startX: float, startY: float, endX: float, endY: float, steps: int | None = None, **kw: Any) -> str:
         print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
+        sync_block = await self.s.ensure_vision_synced(reason="browser_drag")
+        if sync_block:
+            return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
         await self.s.inter_action_pause()
@@ -2081,126 +1604,6 @@ class BrowserDragTool(Tool):
         return self.s.build_text_only(
             data,
             f"Dragged from ({startX},{startY}) to ({endX},{endY})",
-        )
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selector=StringSchema("CSS selector of the element to click"),
-        button=StringSchema("Mouse button: left|right|middle", nullable=True),
-        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
-        linear=BooleanSchema(
-            description=(
-                "If true (default), use deterministic teleport click (pixel-exact). "
-                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
-            ),
-            nullable=True,
-        ),
-        required=["session_id", "selector"],
-    )
-)
-
-@tool_parameters(
-    tool_parameters_schema(
-        session_id=StringSchema("Session ID"),
-        selector=StringSchema("CSS selector of the element to click"),
-        button=StringSchema("Mouse button: left|right|middle", nullable=True),
-        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
-        linear=BooleanSchema(
-            description=(
-                "If true (default), use deterministic teleport click (pixel-exact). "
-                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
-            ),
-            nullable=True,
-        ),
-        required=["session_id", "selector"],
-    )
-)
-class BrowserClickSelectorTool(Tool):
-    name = "browser_click_selector"
-    description = (
-        "Click the centre of a DOM element by CSS selector. Pixel-exact, "
-        "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
-        "whenever the target has a stable hook — chess squares "
-        "(.square-54), form fields (#email), buttons with data-test-id, "
-        "captcha handles. Fails fast if the selector is missing or zero-size."
-    )
-
-    def __init__(self, state: BrowserSessionState):
-        self.s = state
-
-    async def execute(
-        self,
-        session_id: str,
-        selector: str,
-        button: str | None = None,
-        click_count: int | None = None,
-        linear: bool | None = None,
-        **kw: Any,
-    ) -> str:
-        print(f"\n>> browser_click_selector({selector!r})")
-        # Phase 1.1: hard sync gate.
-        sync_block = await self.s.ensure_vision_synced(reason="browser_click_selector")
-        if sync_block:
-            return sync_block
-        self.s._brain_turn_counter += 1
-        self.s.capture_action_snapshot(target_index=None)
-        await self.s.inter_action_pause()
-        self.s.actions_since_screenshot += 1
-        self.s.consecutive_click_calls += 1
-
-        payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
-        if button is not None:
-            payload["button"] = button
-        if click_count is not None:
-            payload["clickCount"] = click_count
-        if linear is not None:
-            payload["linear"] = linear
-
-        r = await _request_with_backoff(
-            "POST",
-            f"{SUPERBROWSER_URL}/session/{session_id}/click-selector",
-            json=payload,
-            timeout=15.0,
-        )
-        if r.status_code >= 400:
-            try:
-                err = r.json().get("error", r.text)
-            except Exception:
-                err = r.text
-            # Phase 3.1: record cursor failure so the script lockout
-            # gate counts this as a tried-and-failed cursor strategy.
-            self.s.record_cursor_failure(
-                strategy="click_selector",
-                target=selector,
-                reason=str(err)[:120],
-            )
-            return f"[click_selector_failed] {err}"
-        data = r.json()
-        clicked = data.get("clicked", {})
-        self.s.record_step(
-            "browser_click_selector",
-            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
-            data.get("url", ""),
-        )
-        # click_selector is a mutation — advance the observation token
-        # and schedule a vision prefetch so the next screenshot is warm.
-        self.s.advance_observation_token("click_selector")
-        _vision_task = _schedule_vision_prefetch(self.s, session_id)
-        caption = (
-            f"Clicked {selector} at "
-            f"({clicked.get('x','?')},{clicked.get('y','?')})"
-        )
-        if data.get("elements"):
-            caption += f"\n{data['elements']}"
-        return await _append_fresh_vision(
-            _vision_task,
-            _maybe_no_effect_prefix(
-                data, "browser_click_selector", caption,
-                session_state=self.s,
-            ),
-            state=self.s,
         )
 
 

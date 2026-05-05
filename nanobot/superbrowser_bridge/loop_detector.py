@@ -162,9 +162,7 @@ class LoopDetector:
 # Tools whose repetition typically indicates a stuck cascading-dropdown
 # loop. Anchored to the click family — eval/screenshot are normal polls.
 _CLICK_TOOLS = frozenset({
-    "browser_click",
     "browser_click_at",
-    "browser_click_selector",
     "browser_type_at",
     "browser_type",
 })

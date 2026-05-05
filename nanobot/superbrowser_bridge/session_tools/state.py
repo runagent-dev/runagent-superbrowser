@@ -671,7 +671,7 @@ class BrowserSessionState:
             if norm and key in self.screenshotted_keys:
                 return False, (
                     "[Captcha screenshot already taken for this solve round with no change. "
-                    "Call browser_solve_captcha or browser_click a tile — don't re-screenshot the same state.]"
+                    "Call browser_solve_captcha or browser_click_at a tile — don't re-screenshot the same state.]"
                 )
             return True, ""
         if self.actions_since_screenshot == 0:
@@ -1220,11 +1220,10 @@ class BrowserSessionState:
                 f"{self.MAX_CONSECUTIVE_SAME_TARGET} times in a row with "
                 "no DOM change. The previous clicks did not move the "
                 "page. Switch tactic: call browser_screenshot to "
-                "re-observe, then pick a different [V_n]/[index], try a "
+                "re-observe, then pick a different V_n, try a "
                 "different role (e.g., the form's submit button instead "
-                "of the input), try browser_click_selector with a stable "
-                "CSS hook, or browser_wait_for content you expect to "
-                "appear. Do NOT retry this exact target, and do NOT "
+                "of the input), or browser_wait_for content you expect "
+                "to appear. Do NOT retry this exact target, and do NOT "
                 "synthesize clicks via browser_run_script — JS clicks "
                 "are isTrusted=false and bot-detected."
             )

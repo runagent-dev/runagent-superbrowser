@@ -291,7 +291,7 @@ def register_high_level_tools(bot: "Nanobot") -> None:
 def register_all_tools(bot: "Nanobot") -> None:
     """Register SuperBrowser session tools for nanobot.
 
-    Session tools (browser_open, browser_click, browser_screenshot, etc.)
+    Session tools (browser_open, browser_click_at, browser_screenshot, etc.)
     give nanobot step-by-step control. The nanobot agent is the single brain —
     it sees DOM state, writes scripts, and decides what to do next.
 

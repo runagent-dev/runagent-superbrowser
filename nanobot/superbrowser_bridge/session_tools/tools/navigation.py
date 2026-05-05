@@ -71,6 +71,9 @@ class BrowserNavigateTool(Tool):
         gate = await _feedback_gate("browser_navigate")
         if gate:
             return gate
+        sync_block = await self.s.ensure_vision_synced(reason="browser_navigate")
+        if sync_block:
+            return sync_block
 
         # --- Known-bad URL lockout ---------------------------------------
         # Fire BEFORE any other guard. If this exact URL (or its
@@ -594,6 +597,9 @@ class BrowserScrollTool(Tool):
         gate = await _feedback_gate("browser_scroll")
         if gate:
             return gate
+        sync_block = await self.s.ensure_vision_synced(reason="browser_scroll")
+        if sync_block:
+            return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
         await self.s.inter_action_pause()
@@ -787,6 +793,9 @@ class BrowserScrollUntilTool(Tool):
         gate = await _feedback_gate("browser_scroll_until")
         if gate:
             return gate
+        sync_block = await self.s.ensure_vision_synced(reason="browser_scroll_until")
+        if sync_block:
+            return sync_block
         self.s._brain_turn_counter += 1
         self.s.capture_action_snapshot(target_index=None)
         await self.s.inter_action_pause()

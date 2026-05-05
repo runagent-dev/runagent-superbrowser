@@ -100,7 +100,7 @@ def test_prefix_wraps_caption_on_no_effect() -> None:
     # Base caption is preserved so vision-cached bboxes still reach the brain.
     assert "Clicked V2" in out
     # Hint text carries the alternative tactics.
-    assert "browser_click_selector" in out or "reactSetValue" in out
+    assert "browser_screenshot" in out or "browser_click_at" in out
     print("✓ test_prefix_wraps_caption_on_no_effect")
 
 

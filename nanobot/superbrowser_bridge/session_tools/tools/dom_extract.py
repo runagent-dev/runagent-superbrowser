@@ -294,8 +294,9 @@ class BrowserGetRectTool(Tool):
     description = (
         "Return getBoundingClientRect() for one or more CSS selectors. "
         "Pixel-exact, zero vision cost. Use to derive coordinates before "
-        "calling browser_click_selector / browser_drag_selectors. "
-        "Selectors ride as a JSON string (no ArraySchema in this layer)."
+        "calling browser_drag_selectors / browser_drag_path / "
+        "browser_click_at(x=..., y=...). Selectors ride as a JSON string "
+        "(no ArraySchema in this layer)."
     )
 
     def __init__(self, state: BrowserSessionState):

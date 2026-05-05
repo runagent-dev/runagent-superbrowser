@@ -67,9 +67,7 @@ _ATOMIC_FIX_TEXT_JS = """
 
 BLOCKED_BROWSER_OPEN_HARD_STOP = 3
 _CURSOR_TOOL_NAMES = frozenset({
-    "browser_click",
     "browser_click_at",
-    "browser_click_selector",
     "browser_type",
     "browser_type_at",
     "browser_fix_text_at",

@@ -167,7 +167,7 @@ class BrowserOpenTool(Tool):
                     f"to see the current view\n"
                     f"  - browser_get_markdown(session_id=\"{self.s.session_id}\") "
                     f"to read the page text\n"
-                    f"  - browser_click / browser_type to interact\n"
+                    f"  - browser_click_at / browser_type_at to interact\n"
                     f"  - browser_navigate(session_id=\"{self.s.session_id}\", "
                     f"url=\"...\") to switch URLs on the same session"
                 )
@@ -681,6 +681,9 @@ class BrowserRewindToCheckpointTool(Tool):
                 "been recorded for this session. Call browser_navigate "
                 "directly with a URL you know works, or report failure."
             )
+        sync_block = await self.s.ensure_vision_synced(reason="browser_rewind_to_checkpoint")
+        if sync_block:
+            return sync_block
 
         # Advance token FIRST — any vision prefetch already in flight
         # will see the mismatch and drop its write; the next mutation
@@ -752,9 +755,9 @@ class BrowserRewindToCheckpointTool(Tool):
             f"[POST_REWIND] Vision cache + DOM fingerprints invalidated. "
             f"Next required tool: browser_screenshot (or "
             f"browser_get_markdown / browser_brief_mark if you have "
-            f"explicit evidence to log). Do NOT browser_click / "
-            f"browser_type / browser_navigate before re-observing — the "
-            f"V_n indices and DOM [N] indices from BEFORE the rewind no "
+            f"explicit evidence to log). Do NOT browser_click_at / "
+            f"browser_type_at / browser_navigate before re-observing — the "
+            f"V_n indices from BEFORE the rewind no "
             f"longer point at anything. The brief focus is unchanged; "
             f"if [FOCUS_EXHAUSTED] fired before the rewind, the focus "
             f"is still exhausted — consider browser_brief_mark to "

@@ -4,8 +4,8 @@
 // Output: Array<{index, tag, text, attrs, bbox: [x0,y0,x1,y1],
 //                selector, role, visible, select_pos?}>
 //
-// Matches the shape the TS side emits so `browser_click(index=N)`,
-// `browser_type(index=N)`, etc., work identically on either backend.
+// Matches the shape the TS side emits so `browser_type(index=N)`,
+// `browser_drag_selectors`, etc., work identically on either backend.
 
 (() => {
   const INTERACTIVE_TAGS = new Set([

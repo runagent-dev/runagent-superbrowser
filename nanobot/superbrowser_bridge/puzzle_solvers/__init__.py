@@ -6,8 +6,9 @@ which solver applies to the current page and the orchestrator's
 `solve_puzzle` tool dispatches to the winning candidate.
 
 Every solver uses the generic selector-based input primitives
-(browser_click_selector / browser_drag_selectors / browser_drag_path /
-browser_image_region) so the tight loop has zero Gemini cost.
+(browser_drag_selectors / browser_drag_path / browser_image_region) plus
+`browser_click_at(x=..., y=...)` for raw-coord clicks, so the tight loop
+has zero Gemini cost.
 """
 
 from .base import (  # noqa: F401

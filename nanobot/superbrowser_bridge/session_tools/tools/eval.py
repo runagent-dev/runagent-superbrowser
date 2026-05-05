@@ -120,10 +120,8 @@ class BrowserRunScriptTool(Tool):
                     f"({distinct}/{min_strategies} distinct strategies "
                     f"failed; tried={tried_str}).\n"
                     "Try in order BEFORE running mutating JS:\n"
-                    "  1. browser_click_at(vision_index=V_n) on the "
-                    "target's bbox.\n"
-                    "  2. browser_click_selector(<stable-css>) if the "
-                    "target has a hook.\n"
+                    "  1. browser_screenshot to refresh the V_n bbox list.\n"
+                    "  2. browser_click_at(vision_index=V_n) on the target's bbox.\n"
                     "  3. browser_type_at / browser_scroll_until.\n"
                     "Only when 2+ DIFFERENT strategies have failed with "
                     "concrete error captions can mutates=true scripts "
@@ -168,8 +166,8 @@ class BrowserRunScriptTool(Tool):
                     f"and many sites reject isTrusted=false clicks "
                     f"anyway — or (b) switch to "
                     f"browser_click_at(vision_index=V_n) / "
-                    f"browser_type_at / browser_click_selector which "
-                    f"use humanized isTrusted=true events."
+                    f"browser_type_at which use humanized "
+                    f"isTrusted=true events."
                 )
             # Fetch current elements so agent can see what's on the page and fix the script
             elements = await _fetch_elements(session_id, self.s)

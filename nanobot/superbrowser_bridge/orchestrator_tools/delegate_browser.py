@@ -513,7 +513,7 @@ class DelegateBrowserTaskTool(Tool):
             "authoritative starting point; the orchestrator already "
             "chose it.\n"
             "The first call returns a session_id. Every later browser tool "
-            "(browser_screenshot, browser_click, browser_type, "
+            "(browser_screenshot, browser_click_at, browser_type_at, "
             "browser_navigate, browser_get_markdown, browser_run_script, …) "
             "MUST take that session_id and operate on the SAME session. "
             "A second `browser_open` call is almost always a bug — it "
@@ -534,11 +534,10 @@ class DelegateBrowserTaskTool(Tool):
             "first — it auto-detects chess, slider, jigsaw, rotation, and grid-drag "
             "puzzles and runs a dedicated solver. No vision round-trip per move.\n"
             "- **Slider / range control** (retirement calculators, filter ranges, "
-            "volume, any slider widget)? NEVER `browser_click` / "
-            "`browser_click_at` — clicks on slider thumbs do NOTHING. "
-            "NEVER `browser_drag(x1,y1,x2,y2)` with guessed coords — "
-            "it's open-loop and overshoots. Three tools, in order of "
-            "preference:\n"
+            "volume, any slider widget)? NEVER `browser_click_at` — clicks "
+            "on slider thumbs do NOTHING. NEVER `browser_drag(x1,y1,x2,y2)` "
+            "with guessed coords — it's open-loop and overshoots. Three "
+            "tools, in order of preference:\n"
             "    • `browser_list_slider_handles(session_id)` — "
             "FIRST step for any custom slider page. DOM-only "
             "enumeration: returns every slider handle with its bbox + "
@@ -577,13 +576,15 @@ class DelegateBrowserTaskTool(Tool):
             "    Do NOT navigate to the iframe URL directly "
             "(domain-pinned). Do NOT guess selectors like "
             "`[class*=slider i]`.\n"
-            "- **Target has a stable CSS hook** (chess squares like `.square-54`, "
-            "form fields, buttons with `data-test-id`, captcha handles)? Prefer "
-            "`browser_click_selector` / `browser_drag_selectors` / `browser_drag_path`. "
+            "- **Stable CSS hook for a drag** (chess squares like `.square-54`, "
+            "captcha drag handles)? `browser_drag_selectors` / "
+            "`browser_drag_path` are the selector-anchored drag paths. "
             "Zero Gemini latency; pixel-exact centre.\n"
-            "- **No obvious selector?** Use `browser_click_at(vision_index=V_n)` — "
-            "fine for cookie banners, arbitrary buttons, and elements the vision "
-            "agent has labelled."
+            "- **All clicks** go through `browser_click_at(vision_index=V_n)`. "
+            "`V_n` MUST come from the most recent `browser_screenshot` "
+            "reply — DOM-index `browser_click` and CSS-selector "
+            "`browser_click_selector` were removed precisely so the brain "
+            "always grounds on a fresh bbox before clicking."
         )
 
         if url:
@@ -666,21 +667,16 @@ class DelegateBrowserTaskTool(Tool):
             "(isTrusted=true), which WAF-protected sites don't flag.\n"
             "\n"
             "Tool preference for element interaction:\n"
-            "  1. **FIRST** `browser_click_at(vision_index=V_n)` — "
+            "  1. **PRIMARY** `browser_click_at(vision_index=V_n)` — "
             "humanized cursor click on the bbox vision just pointed at. "
             "`V_n` MUST come from the most recent screenshot's vision "
-            "output; do NOT invent indices or coords.\n"
-            "  2. `browser_click_selector(<css>)` — zero-Gemini click "
-            "when the target has a stable hook (id, data-test-id, "
-            "unique class). Chess squares, form fields, captcha "
-            "handles.\n"
-            "  3. `browser_click(index=N)` — DOM-index click when "
-            "the brain sees the element in the interactive elements "
-            "listing but vision didn't surface it.\n"
-            "  4. **LAST RESORT** `browser_run_script(mutates=true)` — "
-            "only when no bbox/selector works or the action requires "
-            "multi-step orchestration. JS clicks are isTrusted=false; "
-            "many sites 403 this; don't reach for it reflexively.\n"
+            "output; do NOT invent indices or coords. This is the ONLY "
+            "click pathway — DOM-index and CSS-selector clicks were "
+            "removed so the brain always grounds on a fresh bbox.\n"
+            "  2. **LAST RESORT** `browser_run_script(mutates=true)` — "
+            "only when no bbox works or the action requires multi-step "
+            "orchestration. JS clicks are isTrusted=false; many sites "
+            "403 this; don't reach for it reflexively.\n"
             "\n"
             "For text input: `browser_type_at(vision_index=V_n, "
             "text=...)` is the React-safe cursor path.\n"
@@ -706,16 +702,15 @@ class DelegateBrowserTaskTool(Tool):
             "the page can't scroll further.\n"
             "\n"
             "**Still missing after scrolling?** Use "
-            "`browser_get_markdown` (free) to inspect the page text "
-            "— the interactive elements listing at the bottom of "
-            "every tool reply also exposes controls vision culled. "
-            "If you see the target in the elements listing as "
-            "`[N] tag text=…`, click it via `browser_click(index=N)` "
-            "— bypasses vision entirely for stable DOM-indexed "
-            "targets. `browser_image_region(bbox_json=...)` can grab "
-            "a tight JPEG of a specific viewport region if you need "
-            "to OCR/inspect something closely (captcha tiles, price "
-            "text near a specific card).\n"
+            "`browser_get_markdown` (free) to inspect the page text. "
+            "If a control is mentioned in the markdown but not yet "
+            "labelled by vision, scroll it into view and re-screenshot "
+            "so vision picks it up — there is no DOM-index fallback "
+            "anymore, every click must come from a fresh `V_n`. "
+            "`browser_image_region(bbox_json=...)` can grab a tight "
+            "JPEG of a specific viewport region if you need to "
+            "OCR/inspect something closely (captcha tiles, price text "
+            "near a specific card).\n"
             "\n"
             "**Multi-field forms (filters, booking, signup):** call "
             "`browser_form_begin(intent=..., fields=[...])` to open a "
@@ -753,9 +748,8 @@ class DelegateBrowserTaskTool(Tool):
             "models* — not more dropdowns). STOP retrying the same "
             "label. Call `browser_get_markdown` to inspect what's "
             "actually on the page now, then either:\n"
-            "  • click a specific item from the result list "
-            "(`browser_click_selector` on a stable selector, or "
-            "`browser_click_at` after a fresh screenshot), OR\n"
+            "  • click a specific item from the result list with "
+            "`browser_click_at(vision_index=V_n)` after a fresh screenshot, OR\n"
             "  • answer questions / type into text inputs as the new "
             "stage requires.\n"
             "Do NOT keep banging on browser_form_plan with new field "
@@ -781,8 +775,8 @@ class DelegateBrowserTaskTool(Tool):
             "is locked until at least 2 distinct cursor strategies "
             "have failed in this session. List in your reasoning the "
             "exact failure captions (e.g. `[click_at_failed:...]`, "
-            "`[click_selector_failed]`) you got — if those captions "
-            "haven't appeared, the lockout will refuse the script. "
+            "`[type_at_failed:...]`, `[drag_selectors_failed]`) you got "
+            "— if those captions haven't appeared, the lockout will refuse the script. "
             "JS clicks are isTrusted=false; Cloudflare/Akamai reject "
             "them and the page navigates to a challenge URL, "
             "poisoning the run.\n"
@@ -997,7 +991,7 @@ useful next. The rules below are non-negotiable; the order above is a guide.
 
 Available tools:
 """ + browser_open_line + """
-- browser_click/type/wait_for — single actions, return updated elements.
+- browser_click_at/type_at/wait_for — single actions, return updated elements.
 - browser_run_script — run an in-page script. Use this for multi-step flows
   (fill form, submit, wait, read). Use browser_wait_for(text="...") inside
   or between steps; avoid helpers.sleep() alone.
@@ -1287,8 +1281,8 @@ CRITICAL RULES:
                     last_good = next(
                         (s for s in reversed(steps)
                          if s.get("tool") in ("browser_run_script", "browser_eval",
-                                              "browser_get_markdown", "browser_click",
-                                              "browser_type")
+                                              "browser_get_markdown", "browser_click_at",
+                                              "browser_type_at", "browser_type")
                          and "error" not in str(s.get("result", "")).lower()
                          and "failed" not in str(s.get("result", "")).lower()),
                         None,

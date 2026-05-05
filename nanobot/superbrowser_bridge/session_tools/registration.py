@@ -16,8 +16,6 @@ from .tools import (
     BrowserBriefMarkTool,
     BrowserCaptchaScreenshotTool,
     BrowserClickAtTool,
-    BrowserClickSelectorTool,
-    BrowserClickTool,
     BrowserCloseTool,
     BrowserDetectCaptchaTool,
     BrowserDialogTool,
@@ -88,7 +86,6 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserOpenTool(state),
         BrowserNavigateTool(state),
         BrowserScreenshotTool(state),
-        BrowserClickTool(state),
         BrowserClickAtTool(state),
         BrowserTypeAtTool(state),
         BrowserFixTextAtTool(state),
@@ -104,7 +101,6 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserWaitForTool(state),
         BrowserDragTool(state),
         BrowserGetRectTool(state),         # kept: DOM rect helper
-        BrowserClickSelectorTool(state),   # kept: DOM-selector fast path
         BrowserDragSelectorsTool(state),   # kept: selector-based drag
         BrowserDragPathTool(state),        # kept: polyline drag
         BrowserSetSliderTool(state),       # kept: slider family for ChaseIRA calc

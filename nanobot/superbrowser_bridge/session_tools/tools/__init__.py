@@ -12,8 +12,6 @@ from .ask import BrowserAskUserTool, BrowserRequestHelpTool
 from .captcha import BrowserDetectCaptchaTool, BrowserSolveCaptchaTool
 from .cursor import (
     BrowserClickAtTool,
-    BrowserClickSelectorTool,
-    BrowserClickTool,
     BrowserDragTool,
     BrowserFixTextAtTool,
     BrowserKeysTool,
@@ -69,8 +67,6 @@ __all__ = [
     "BrowserBriefMarkTool",
     "BrowserCaptchaScreenshotTool",
     "BrowserClickAtTool",
-    "BrowserClickSelectorTool",
-    "BrowserClickTool",
     "BrowserCloseTool",
     "BrowserDetectCaptchaTool",
     "BrowserDialogTool",

@@ -27,6 +27,14 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
+        # Block until the in-flight vision prefetch lands so the screenshot
+        # we return to the brain is paired with bboxes for the *current*
+        # page state, not the prior one. The prefetch path inside
+        # _schedule_vision_prefetch fetches the screenshot + runs Gemini
+        # in one shot, so awaiting it here also awaits a fresh capture.
+        sync_block = await self.s.ensure_vision_synced(reason="browser_screenshot")
+        if sync_block:
+            return sync_block
         # Mark this turn as a deliberation point — the navigate gate
         # uses this to detect "the brain just looked at the page".
         self.s.last_deliberation_turn = self.s._brain_turn_counter
