@@ -66,8 +66,18 @@ class BrowserScreenshotTool(Tool):
             # bounds=true returns selectorEntries (with x/y/width/height) +
             # devicePixelRatio so we can draw bbox overlays before the
             # screenshot goes to the vision LLM.
-            params={"vision": "true", "bounds": "true"},
-            timeout=15.0,
+            # settle=true waits for waitForPageReady before snapshotting
+            # so the screenshot reflects post-React-commit state, not a
+            # mid-transition frame. settleMs=4000 is enough for SPA
+            # route changes (wineaccess /store/search/... after Enter)
+            # without hanging on broken pages.
+            params={
+                "vision": "true",
+                "bounds": "true",
+                "settle": "true",
+                "settleMs": "4000",
+            },
+            timeout=20.0,
         )
         r.raise_for_status()
         data = r.json()

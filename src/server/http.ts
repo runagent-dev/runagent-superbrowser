@@ -651,12 +651,18 @@ export function createHttpServer(
       const includeBounds = req.query.bounds === 'true' || req.query.highlight === 'true';
       // Optional settle gate — Python-side prefetch sends `settle=true`
       // so the screenshot reflects a post-React-commit page instead of
-      // a mid-transition one. Bounded at 2s so a broken page doesn't
-      // hang the whole state request.
+      // a mid-transition one. settleMs caps the wait — default 2s, max
+      // 5s. SPA route changes after form submit / search Enter often
+      // need 3-4s before bboxes are stable.
       if (req.query.settle === 'true') {
         try {
+          const requested = parseInt(String(req.query.settleMs ?? '2000'), 10);
+          const settleMs = Math.min(
+            5000,
+            Math.max(500, Number.isFinite(requested) ? requested : 2000),
+          );
           const { waitForPageReady } = await import('../browser/page-readiness.js');
-          await waitForPageReady(page.getRawPage(), 2000);
+          await waitForPageReady(page.getRawPage(), settleMs);
         } catch {
           /* best-effort — never block /state on a settle failure */
         }

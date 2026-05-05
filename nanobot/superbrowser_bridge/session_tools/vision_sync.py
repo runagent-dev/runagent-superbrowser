@@ -243,11 +243,26 @@ def _schedule_vision_prefetch(
 
     async def _run() -> "Any":
         try:
+            # settle=true tells the TS /state endpoint to wait for
+            # waitForPageReady before snapshotting, so the screenshot +
+            # DOM the vision agent sees reflect a post-React-commit
+            # page instead of a mid-transition one. Without this, a
+            # navigation triggered by browser_keys(Enter) on a search
+            # input captures the OLD page's bboxes and the brain reads
+            # stale vision from the prefetch.
+            # settleMs caps the wait at 4s — long enough for SPA route
+            # changes to render but bounded so a broken page can't hang
+            # the prefetch.
             r = await _request_with_backoff(
                 "GET",
                 f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={"vision": "true", "bounds": "true"},
-                timeout=15.0,
+                params={
+                    "vision": "true",
+                    "bounds": "true",
+                    "settle": "true",
+                    "settleMs": "4000",
+                },
+                timeout=20.0,
             )
             if r.status_code != 200:
                 return None
