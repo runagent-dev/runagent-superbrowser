@@ -11,6 +11,8 @@ preserving the assistant/tool message alternation expected by LLM APIs.
 
 from __future__ import annotations
 
+import os
+
 from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
@@ -269,6 +271,19 @@ class BrowserWorkerHook(AgentHook):
         #      lose nuance the original prose preserves.
         brief = getattr(self.state, "task_brief", None)
         if brief is not None and getattr(brief, "constraints", None):
+            # Per-turn brief pin is opt-in. The pin used to fire on every
+            # tool result, which created LLM pressure to "advance the
+            # focus" even when the page state didn't support progress —
+            # producing hallucinated URLs and premature done() marks.
+            # Default OFF: brief still attaches once at task start (in the
+            # delegate prompt) and is consulted at done() time via
+            # reconciliation, but the per-turn drumbeat is silenced.
+            # Re-enable with SHOW_BRIEF_PER_TURN=1 for tasks that need
+            # the constraint checklist visible every iteration.
+            pin_brief_per_turn = (
+                os.environ.get("SHOW_BRIEF_PER_TURN", "0")
+                in ("1", "true", "yes", "True")
+            )
             v_before = brief.version
             try:
                 brief.reconcile_from_url(self.state.current_url or "")
@@ -297,26 +312,27 @@ class BrowserWorkerHook(AgentHook):
                 # have a regular pulse on long runs.
                 print(brief.diagnostic_line())
 
-            guidance_parts.append(brief.render_brief())
-            focus_line = brief.render_focus()
-            if focus_line:
-                guidance_parts.append(focus_line)
-            # FOCUS_BBOX — pre-computes which V_n in the latest vision
-            # response best matches the current focus constraint, so
-            # the brain doesn't have to do that mapping mentally on
-            # every turn. Empty string when no vision data; the hook
-            # then skips this block.
-            try:
-                focus_bbox = brief.render_focus_bbox(
-                    getattr(self.state, "_last_vision_response", None)
-                )
-                if focus_bbox:
-                    guidance_parts.append(focus_bbox)
-            except Exception as exc:
-                print(f"[brief] render_focus_bbox failed: {exc}")
-            checklist_block = brief.render_checklist()
-            if checklist_block:
-                guidance_parts.append(checklist_block)
+            if pin_brief_per_turn:
+                guidance_parts.append(brief.render_brief())
+                focus_line = brief.render_focus()
+                if focus_line:
+                    guidance_parts.append(focus_line)
+                # FOCUS_BBOX — pre-computes which V_n in the latest vision
+                # response best matches the current focus constraint, so
+                # the brain doesn't have to do that mapping mentally on
+                # every turn. Empty string when no vision data; the hook
+                # then skips this block.
+                try:
+                    focus_bbox = brief.render_focus_bbox(
+                        getattr(self.state, "_last_vision_response", None)
+                    )
+                    if focus_bbox:
+                        guidance_parts.append(focus_bbox)
+                except Exception as exc:
+                    print(f"[brief] render_focus_bbox failed: {exc}")
+                checklist_block = brief.render_checklist()
+                if checklist_block:
+                    guidance_parts.append(checklist_block)
 
             # BRIEF_PROGRESS — per-iteration narrative of what the last
             # action accomplished. The brain saw [BRIEF v=N] go up but
@@ -329,26 +345,27 @@ class BrowserWorkerHook(AgentHook):
             new_done = current_done_ids - self._prev_done_ids
             if new_done:
                 self._stagnant_turns = 0
-                # Render with the constraint label + evidence for the
-                # newly-done items. Cap to 3 to keep the line short.
-                bits: list[str] = []
-                for cid in sorted(new_done)[:3]:
-                    c = next((x for x in brief.constraints if x.id == cid), None)
-                    if c is None:
-                        continue
-                    ev = c.evidence[:40] if c.evidence else "manual mark"
-                    bits.append(f"#{cid} {c.label[:30]} ({ev})")
-                f = brief.next_focus()
-                next_focus_str = (
-                    f"next focus #{f.id} {f.label[:40]!r}"
-                    if f
-                    else "(all constraints terminal)"
-                )
-                guidance_parts.append(
-                    f"[BRIEF_PROGRESS] iter {iteration}: "
-                    f"+{len(new_done)} done ({'; '.join(bits)}); "
-                    f"{next_focus_str}"
-                )
+                if pin_brief_per_turn:
+                    # Render with the constraint label + evidence for the
+                    # newly-done items. Cap to 3 to keep the line short.
+                    bits: list[str] = []
+                    for cid in sorted(new_done)[:3]:
+                        c = next((x for x in brief.constraints if x.id == cid), None)
+                        if c is None:
+                            continue
+                        ev = c.evidence[:40] if c.evidence else "manual mark"
+                        bits.append(f"#{cid} {c.label[:30]} ({ev})")
+                    f = brief.next_focus()
+                    next_focus_str = (
+                        f"next focus #{f.id} {f.label[:40]!r}"
+                        if f
+                        else "(all constraints terminal)"
+                    )
+                    guidance_parts.append(
+                        f"[BRIEF_PROGRESS] iter {iteration}: "
+                        f"+{len(new_done)} done ({'; '.join(bits)}); "
+                        f"{next_focus_str}"
+                    )
             else:
                 # Real-progress carve-out. The brief's stagnation
                 # counter is meant to detect "no progress on the focus."
@@ -377,27 +394,28 @@ class BrowserWorkerHook(AgentHook):
                     self._stagnant_turns = 0
                 else:
                     self._stagnant_turns += 1
-                f = brief.next_focus()
-                if f is not None:
-                    if made_real_progress:
-                        guidance_parts.append(
-                            f"[BRIEF_PROGRESS] iter {iteration}: "
-                            f"0 brief items advanced but page state "
-                            f"changed (see [ACTION_DELTA] above); "
-                            f"focus still #{f.id} {f.label[:40]!r}"
-                        )
-                    else:
-                        stag_note = (
-                            " — CONSIDER alternatives"
-                            if self._stagnant_turns >= 4
-                            else ""
-                        )
-                        guidance_parts.append(
-                            f"[BRIEF_PROGRESS] iter {iteration}: "
-                            f"0 advanced; focus still #{f.id} "
-                            f"{f.label[:40]!r} ({self._stagnant_turns} "
-                            f"turns stagnant){stag_note}"
-                        )
+                if pin_brief_per_turn:
+                    f = brief.next_focus()
+                    if f is not None:
+                        if made_real_progress:
+                            guidance_parts.append(
+                                f"[BRIEF_PROGRESS] iter {iteration}: "
+                                f"0 brief items advanced but page state "
+                                f"changed (see [ACTION_DELTA] above); "
+                                f"focus still #{f.id} {f.label[:40]!r}"
+                            )
+                        else:
+                            stag_note = (
+                                " — CONSIDER alternatives"
+                                if self._stagnant_turns >= 4
+                                else ""
+                            )
+                            guidance_parts.append(
+                                f"[BRIEF_PROGRESS] iter {iteration}: "
+                                f"0 advanced; focus still #{f.id} "
+                                f"{f.label[:40]!r} ({self._stagnant_turns} "
+                                f"turns stagnant){stag_note}"
+                            )
             self._prev_done_ids = current_done_ids
 
             # --- Per-focus attempt ledger + [FOCUS_EXHAUSTED] -----------
@@ -422,14 +440,15 @@ class BrowserWorkerHook(AgentHook):
                 # Emit once per threshold per focus. The Constraint
                 # itself owns the de-dup set so re-runs of the focus
                 # (after a forced-failed mark, etc.) get a fresh slate.
-                failed_n = brief.failed_attempts_on(focus_after.id)
-                for threshold in (3, 5):
-                    if failed_n >= threshold:
-                        block = brief.render_focus_exhausted(
-                            focus_after.id, threshold
-                        )
-                        if block:
-                            guidance_parts.append(block)
+                if pin_brief_per_turn:
+                    failed_n = brief.failed_attempts_on(focus_after.id)
+                    for threshold in (3, 5):
+                        if failed_n >= threshold:
+                            block = brief.render_focus_exhausted(
+                                focus_after.id, threshold
+                            )
+                            if block:
+                                guidance_parts.append(block)
 
             # --- Post-rewind observation gate ---------------------------
             # browser_rewind_to_checkpoint sets state.rewind_just_fired.

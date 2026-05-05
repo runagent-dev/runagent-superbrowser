@@ -127,94 +127,13 @@ class BrowserClickAtTool(Tool):
                     "browser_screenshot to refresh vision before clicking."
                     + (f"\n{alts}" if alts else "")
                 )
-            # Phase 1.3 turn-based age gate. Beyond
-            # VISION_MAX_AGE_TURNS mutating actions since the last
-            # screenshot, the V_n indices the brain captured no longer
-            # reliably point at the elements they did when the
-            # screenshot was taken. The brain MUST re-screenshot. Wall-
-            # clock isn't a useful proxy because a long thinking pause
-            # doesn't mutate the page; the right unit is "actions
-            # taken between epoch and now". _brain_turn_counter was
-            # bumped by ensure_vision_synced for THIS click already, so
-            # subtract 1 to count actions BEFORE this one.
-            try:
-                max_age_turns = int(
-                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
-                )
-            except ValueError:
-                max_age_turns = 1
-            if max_age_turns > 0:
-                age_turns = max(
-                    0,
-                    self.s._brain_turn_counter - 1
-                    - self.s._vision_epoch_turn,
-                )
-                if age_turns > max_age_turns:
-                    alts = _vision_alternatives_hint(
-                        self.s, exclude_index=int(vision_index), limit=3,
-                    )
-                    return (
-                        f"[click_at_failed:epoch_too_old age_turns="
-                        f"{age_turns} max={max_age_turns}] V"
-                        f"{vision_index} resolves against a vision "
-                        f"snapshot taken {age_turns} actions ago — the "
-                        f"page state may have shifted. Call "
-                        f"browser_screenshot to refresh the V_n "
-                        f"indices before clicking."
-                        + (f"\n{alts}" if alts else "")
-                    )
-            # Blocker gate — if the scene has an active blocker layer
-            # (cookie banner, modal, consent dialog) and this bbox lives
-            # in a different layer, refuse. The planner must dismiss
-            # the blocker before acting on content beneath it.
-            scene = getattr(resp, "scene", None)
-            active_blocker = (
-                getattr(scene, "active_blocker_layer_id", None)
-                if scene is not None else None
-            )
-            if active_blocker:
-                bbox_layer = getattr(bbox, "layer_id", None)
-                if bbox_layer and bbox_layer != active_blocker:
-                    # Find the dismiss hint from the blocker layer so
-                    # the brain has a concrete target to click first.
-                    dismiss_hint = ""
-                    try:
-                        for layer in (getattr(scene, "layers", []) or []):
-                            if getattr(layer, "id", None) == active_blocker:
-                                dismiss_hint = (
-                                    getattr(layer, "dismiss_hint", "") or ""
-                                )
-                                break
-                    except Exception:
-                        dismiss_hint = ""
-                    hint = f" Dismiss '{dismiss_hint}' first." if dismiss_hint else ""
-                    return (
-                        f"[click_at_failed:blocker_active layer={active_blocker}] "
-                        f"A blocker layer ({active_blocker}) is on top of "
-                        f"content, and V{vision_index} sits in a different "
-                        f"layer ({bbox_layer}).{hint} Then re-screenshot."
-                    )
-            # Confidence gate — a low-confidence bbox is Gemini's way of
-            # saying "I'm not sure this is really here". Clicking it
-            # lands on the wrong target more often than not. Threshold
-            # is tuned via VISION_MIN_CLICK_CONFIDENCE (default 0.45).
-            try:
-                min_conf = float(
-                    os.environ.get("VISION_MIN_CLICK_CONFIDENCE") or "0.45"
-                )
-            except ValueError:
-                min_conf = 0.45
-            if getattr(bbox, "confidence", 0.5) < min_conf:
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                return (
-                    f"[click_at_failed:low_confidence V{vision_index}] "
-                    f"bbox confidence={bbox.confidence:.2f} < "
-                    f"{min_conf:.2f}. Call browser_screenshot to re-run "
-                    "vision, then retry with a higher-confidence target."
-                    + (f"\n{alts}" if alts else "")
-                )
+            # Trust the bbox: vision returns coords, brain picks V_n,
+            # we click the centre. The previous epoch_too_old /
+            # blocker_active / low_confidence gates were heuristics
+            # that refused legitimate clicks when vision was briefly
+            # noisy and forced extra screenshot round-trips. The
+            # ensure_vision_synced gate above already guarantees the
+            # bboxes were produced for the current page state.
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return (
@@ -227,6 +146,16 @@ class BrowserClickAtTool(Tool):
             dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
             x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
             payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+            # One-line debug so the user can spot coord-space bugs at a
+            # glance: confirms image dims + DPR + the [0..1000] box_2d
+            # the model produced. Disable with VISION_CLICK_DEBUG=0.
+            if os.environ.get("VISION_CLICK_DEBUG", "1") not in ("0", "false", "no"):
+                print(
+                    f"  [click_at_debug] V{vision_index} "
+                    f"image=({iw}x{ih}) dpr={dpr_val} "
+                    f"box_2d={list(bbox.box_2d)} → "
+                    f"css=({x0},{y0},{x1},{y1})"
+                )
             # Carry the vision label into the click payload so the T3
             # backend can run a post-snap semantic match check. Empty
             # label → the check is skipped on the backend, which is

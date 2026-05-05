@@ -632,99 +632,69 @@ export class PageWrapper {
     bbox: { x0: number; y0: number; x1: number; y1: number },
     options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
   ): Promise<{ x: number; y: number; snapped: boolean; target?: string }> {
-    const snap = await this.page.evaluate(
+    // Trust the bbox: vision said "click here", we click here. Scroll the
+    // bbox into view if its centre is off-screen, then dispatch a CDP
+    // click at the centre. No snap hunt, no grid scan, no off-screen
+    // hard-fallback — those layers silently turned mis-targeted bboxes
+    // into clicks at empty pixels.
+    const cx = Math.round((bbox.x0 + bbox.x1) / 2);
+    const cy = Math.round((bbox.y0 + bbox.y1) / 2);
+
+    const { resolvedX, resolvedY, target } = await this.page.evaluate(
       (b: { x0: number; y0: number; x1: number; y1: number }) => {
-        const SEL = 'a,button,input,select,textarea,'
-          + '[role="button"],[role="link"],[role="checkbox"],'
-          + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
-        const cx = Math.round((b.x0 + b.x1) / 2);
-        const cy = Math.round((b.y0 + b.y1) / 2);
-        const describe = (el: Element): string => {
-          const tag = el.tagName.toLowerCase();
-          const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
-          const cls = (el as HTMLElement).className && typeof (el as HTMLElement).className === 'string'
-            ? `.${(el as HTMLElement).className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
-            : '';
-          const txt = (el.textContent || '').trim().slice(0, 30);
-          return `${tag}${id}${cls}${txt ? `[${txt}]` : ''}`;
-        };
-        // 1. Pinpoint: click the bbox centre. Sanity-check that SOMETHING
-        //    is rendered there (not transparent padding, not off-page).
-        //    If the centre hits any element at all — even a wrapping
-        //    <div> — we trust Gemini's bbox and fire at (cx, cy).
-        let centreStack: Element[] = [];
-        try { centreStack = document.elementsFromPoint(cx, cy); } catch { centreStack = []; }
-        const centreEl = centreStack.find(
-          (el) => el !== document.documentElement && el !== document.body,
-        );
-        if (centreEl) {
-          // Look for an interactive ancestor ONLY to label the target
-          // nicely in the UI overlay. The click coordinates stay at the
-          // bbox centre — we don't move them.
-          const interactive = (centreEl as Element).closest(SEL) || centreEl;
-          return {
-            x: cx,
-            y: cy,
-            snapped: true,
-            target: describe(interactive),
-          };
+        const cx0 = Math.round((b.x0 + b.x1) / 2);
+        const cy0 = Math.round((b.y0 + b.y1) / 2);
+        // Scroll into view if the bbox centre is outside the viewport.
+        const vh = window.innerHeight;
+        const vw = window.innerWidth;
+        let scrolledY = 0;
+        let scrolledX = 0;
+        if (cy0 < 0 || cy0 > vh - 10) {
+          const targetTop = Math.max(0, cy0 - Math.round(vh / 2));
+          const before = window.scrollY;
+          window.scrollTo({ left: window.scrollX, top: targetTop, behavior: 'instant' as ScrollBehavior });
+          scrolledY = window.scrollY - before;
         }
-        // 2. Centre fell on empty space — bbox is probably loose or
-        //    off-page. Grid-scan fallback: pick the interactive element
-        //    whose rect overlaps the bbox most, click its own centre.
-        let best: Element | null = null;
-        let bestArea = 0;
-        for (let i = 1; i < 5; i++) {
-          for (let j = 1; j < 5; j++) {
-            const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
-            const py = b.y0 + ((b.y1 - b.y0) * j) / 5;
-            let stack: Element[] = [];
-            try { stack = document.elementsFromPoint(px, py); } catch { stack = []; }
-            for (const el of stack) {
-              const hit = (el as Element).closest(SEL);
-              if (!hit) continue;
-              const r = hit.getBoundingClientRect();
-              const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
-              const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
-              const area = ix * iy;
-              if (area > bestArea) { bestArea = area; best = hit; }
-            }
+        if (cx0 < 0 || cx0 > vw - 10) {
+          const targetLeft = Math.max(0, cx0 - Math.round(vw / 2));
+          const before = window.scrollX;
+          window.scrollTo({ left: targetLeft, top: window.scrollY, behavior: 'instant' as ScrollBehavior });
+          scrolledX = window.scrollX - before;
+        }
+        const fx = cx0 - scrolledX;
+        const fy = cy0 - scrolledY;
+        // Best-effort label for the live viewer overlay only — we do
+        // NOT change click coords based on this lookup.
+        let label = '';
+        try {
+          const el = document.elementFromPoint(fx, fy);
+          if (el && el !== document.documentElement && el !== document.body) {
+            const tag = el.tagName.toLowerCase();
+            const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
+            const txt = (el.textContent || '').trim().slice(0, 30);
+            label = `${tag}${id}${txt ? `[${txt}]` : ''}`;
           }
-        }
-        if (best) {
-          const r = best.getBoundingClientRect();
-          return {
-            x: Math.round(r.left + r.width / 2),
-            y: Math.round(r.top + r.height / 2),
-            snapped: true,
-            target: describe(best),
-          };
-        }
-        // 3. Hard fallback: click the raw centre anyway. snapped=false
-        //    so the UI crosshair shows amber — operator can see we had
-        //    no visual confirmation.
-        return { x: cx, y: cy, snapped: false };
+        } catch { /* label is cosmetic */ }
+        return { resolvedX: fx, resolvedY: fy, target: label };
       },
       bbox,
     );
 
-    // Broadcast resolved target to live viewers BEFORE the click so the
-    // crosshair appears in the same frame the click lands.
     if (this.sessionId) {
       inputEventBus.emitClickTarget(
         this.sessionId,
-        snap.x,
-        snap.y,
-        snap.snapped,
+        resolvedX,
+        resolvedY,
+        true,
         bbox,
-        snap.target,
+        target || undefined,
       );
     }
 
     const client = await this.getCDPSession();
-    await dispatchClick(client, snap.x, snap.y, { ...options, sessionId: this.sessionId });
+    await dispatchClick(client, resolvedX, resolvedY, { ...options, sessionId: this.sessionId });
     await this.waitForIdle(1000).catch(() => {});
-    return snap;
+    return { x: resolvedX, y: resolvedY, snapped: true, target: target || undefined };
   }
 
   /** Hover over an element (from BrowserOS hover). */
