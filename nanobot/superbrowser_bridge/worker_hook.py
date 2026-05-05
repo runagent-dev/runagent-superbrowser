@@ -28,6 +28,20 @@ class BrowserWorkerHook(AgentHook):
         self._captcha_solve_attempts: int = 0
         self._captcha_escalation_pending: bool = False
         self._captcha_escalation_turns: int = 0
+        # No-progress detector for task brief. When the brief version
+        # hasn't bumped for several iterations, the brain is stuck or
+        # rushing toward a wrong action — emit a guidance line forcing
+        # it to articulate which constraint it's trying to advance.
+        self._last_brief_version_seen: int = 0
+        self._last_brief_progress_iter: int = -1
+        self._no_progress_nudged_at: int = -1
+        # [BRIEF_PROGRESS] tracking. Set of constraint ids done at the
+        # END of the previous iteration; we diff against the current
+        # set each turn to attribute newly-flipped items. Also tracks
+        # the iteration when the brief last advanced so the brain
+        # sees a stagnation counter ("3 turns stagnant").
+        self._prev_done_ids: set[int] = set()
+        self._stagnant_turns: int = 0
         # Generic loop + stagnation detector (replaces consecutive_click_calls +
         # ad-hoc _stagnation_url/_stagnation_count logic).
         self._loop = LoopDetector()
@@ -238,6 +252,287 @@ class BrowserWorkerHook(AgentHook):
                     "must use. Do NOT retry on the current session — Akamai-"
                     "class protections will not relent on the same IP+TLS "
                     "fingerprint."
+                )
+
+        # --- Multi-condition task brief — reconcile + pin ---------------
+        # When the orchestrator pre-decomposed the user's query into a
+        # checklist (`delegate_browser_task(task_checklist=[...])`), the
+        # worker_state carries a TaskBrief here. Each iteration we:
+        #   1. Auto-flip filter constraints whose URL or page_text
+        #      predicates match the current state.
+        #   2. Pin the up-to-date [BRIEF] / [FOCUS] / [CHECKLIST] blocks
+        #      onto the next tool result so the brain can't lose its
+        #      constraints as the conversation lengthens.
+        #   3. Re-broadcast the original query verbatim every 5 iters
+        #      (and at the iteration-budget warning thresholds) so the
+        #      free-text framing stays in recent context too — labels
+        #      lose nuance the original prose preserves.
+        brief = getattr(self.state, "task_brief", None)
+        if brief is not None and getattr(brief, "constraints", None):
+            v_before = brief.version
+            try:
+                brief.reconcile_from_url(self.state.current_url or "")
+            except Exception as exc:
+                print(f"[brief] reconcile_from_url failed: {exc}")
+            try:
+                brief.reconcile_from_page_state(
+                    getattr(self.state, "_last_vision_response", None),
+                    getattr(self.state, "_last_markdown", "") or "",
+                )
+            except Exception as exc:
+                print(f"[brief] reconcile_from_page_state failed: {exc}")
+            # Log once per iteration so trace logs make brief progress visible.
+            if brief.version != v_before:
+                # State changed this turn — print which item flipped.
+                print(brief.diagnostic_line())
+                for c in brief.constraints:
+                    if c.status == "done" and c.evidence:
+                        # Cheap dedup: only print rows whose evidence is
+                        # fresh-looking. We don't track per-iter flips
+                        # explicitly, so this just prints the current
+                        # done set; it's noisy but tractable.
+                        pass  # full state is implied by diagnostic_line
+            elif iteration % 5 == 0:
+                # Periodic snapshot even when nothing flipped, so logs
+                # have a regular pulse on long runs.
+                print(brief.diagnostic_line())
+
+            guidance_parts.append(brief.render_brief())
+            focus_line = brief.render_focus()
+            if focus_line:
+                guidance_parts.append(focus_line)
+            # FOCUS_BBOX — pre-computes which V_n in the latest vision
+            # response best matches the current focus constraint, so
+            # the brain doesn't have to do that mapping mentally on
+            # every turn. Empty string when no vision data; the hook
+            # then skips this block.
+            try:
+                focus_bbox = brief.render_focus_bbox(
+                    getattr(self.state, "_last_vision_response", None)
+                )
+                if focus_bbox:
+                    guidance_parts.append(focus_bbox)
+            except Exception as exc:
+                print(f"[brief] render_focus_bbox failed: {exc}")
+            checklist_block = brief.render_checklist()
+            if checklist_block:
+                guidance_parts.append(checklist_block)
+
+            # BRIEF_PROGRESS — per-iteration narrative of what the last
+            # action accomplished. The brain saw [BRIEF v=N] go up but
+            # didn't have a one-line "did this work?" feedback. Now it
+            # does, with stagnation counting so chronic-stuck states
+            # become explicit rather than implicit.
+            current_done_ids = {
+                c.id for c in brief.constraints if c.status == "done"
+            }
+            new_done = current_done_ids - self._prev_done_ids
+            if new_done:
+                self._stagnant_turns = 0
+                # Render with the constraint label + evidence for the
+                # newly-done items. Cap to 3 to keep the line short.
+                bits: list[str] = []
+                for cid in sorted(new_done)[:3]:
+                    c = next((x for x in brief.constraints if x.id == cid), None)
+                    if c is None:
+                        continue
+                    ev = c.evidence[:40] if c.evidence else "manual mark"
+                    bits.append(f"#{cid} {c.label[:30]} ({ev})")
+                f = brief.next_focus()
+                next_focus_str = (
+                    f"next focus #{f.id} {f.label[:40]!r}"
+                    if f
+                    else "(all constraints terminal)"
+                )
+                guidance_parts.append(
+                    f"[BRIEF_PROGRESS] iter {iteration}: "
+                    f"+{len(new_done)} done ({'; '.join(bits)}); "
+                    f"{next_focus_str}"
+                )
+            else:
+                # Real-progress carve-out. The brief's stagnation
+                # counter is meant to detect "no progress on the focus."
+                # But the brain may legitimately make page-state
+                # progress (expand an accordion, scroll into a section,
+                # type into a field) that doesn't immediately flip a
+                # brief predicate. Reading state.last_action_delta lets
+                # us reset the counter when the page genuinely changed
+                # this turn — without it, [NO_PROGRESS_4] would unfairly
+                # nag the brain for working through a multi-step UI.
+                last_delta_info = getattr(self.state, "last_action_delta", None)
+                made_real_progress = False
+                if (
+                    last_delta_info
+                    and isinstance(last_delta_info.get("delta"), dict)
+                ):
+                    d = last_delta_info["delta"]
+                    if (
+                        d.get("url_changed")
+                        or d.get("dom_changed")
+                        or d.get("target_disappeared")
+                        or abs(int(d.get("elem_delta") or 0)) >= 3
+                    ):
+                        made_real_progress = True
+                if made_real_progress:
+                    self._stagnant_turns = 0
+                else:
+                    self._stagnant_turns += 1
+                f = brief.next_focus()
+                if f is not None:
+                    if made_real_progress:
+                        guidance_parts.append(
+                            f"[BRIEF_PROGRESS] iter {iteration}: "
+                            f"0 brief items advanced but page state "
+                            f"changed (see [ACTION_DELTA] above); "
+                            f"focus still #{f.id} {f.label[:40]!r}"
+                        )
+                    else:
+                        stag_note = (
+                            " — CONSIDER alternatives"
+                            if self._stagnant_turns >= 4
+                            else ""
+                        )
+                        guidance_parts.append(
+                            f"[BRIEF_PROGRESS] iter {iteration}: "
+                            f"0 advanced; focus still #{f.id} "
+                            f"{f.label[:40]!r} ({self._stagnant_turns} "
+                            f"turns stagnant){stag_note}"
+                        )
+            self._prev_done_ids = current_done_ids
+
+            # --- Per-focus attempt ledger + [FOCUS_EXHAUSTED] -----------
+            # Record the most recent step on the currently-focused
+            # constraint. Then check if we've crossed the warn (3) or
+            # mandatory (5) thresholds and emit the directive once per
+            # threshold. The reactive guards (click crosscheck, repeat-
+            # type, filter-hack) catch individual bad calls; this catches
+            # the *cumulative* "I keep trying the wrong tool family on
+            # the same focus" pattern that those guards miss.
+            focus_after = brief.next_focus()
+            if focus_after is not None and last_step is not None:
+                try:
+                    brief.record_attempt(
+                        tool=last_step.get("tool") or "",
+                        target=last_step.get("args") or "",
+                        result=last_step.get("result") or "",
+                        iteration=iteration,
+                    )
+                except Exception as exc:
+                    print(f"[brief] record_attempt failed: {exc}")
+                # Emit once per threshold per focus. The Constraint
+                # itself owns the de-dup set so re-runs of the focus
+                # (after a forced-failed mark, etc.) get a fresh slate.
+                failed_n = brief.failed_attempts_on(focus_after.id)
+                for threshold in (3, 5):
+                    if failed_n >= threshold:
+                        block = brief.render_focus_exhausted(
+                            focus_after.id, threshold
+                        )
+                        if block:
+                            guidance_parts.append(block)
+
+            # --- Post-rewind observation gate ---------------------------
+            # browser_rewind_to_checkpoint sets state.rewind_just_fired.
+            # Until the brain takes a deliberation action (screenshot /
+            # markdown / brief_mark), refuse-by-warning any other tool
+            # call. This closes the rewind→hallucinated-navigate loop
+            # observed in the wineaccess.com trace.
+            if getattr(self.state, "rewind_just_fired", False):
+                _DELIBERATION_TOOLS = {
+                    "browser_screenshot",
+                    "browser_get_markdown",
+                    "browser_brief_mark",
+                }
+                last_tool = (last_step or {}).get("tool") or ""
+                # The rewind step itself doesn't count as the "next" call
+                # — clear the flag only when a downstream tool runs.
+                if last_tool == "browser_rewind_to_checkpoint":
+                    pass
+                elif last_tool in _DELIBERATION_TOOLS:
+                    self.state.rewind_just_fired = False
+                elif last_tool:
+                    # Brain skipped re-observation. Emit the warning and
+                    # clear the flag — one-shot, the warning is loud
+                    # enough that re-emitting on every subsequent turn
+                    # would be noise.
+                    guidance_parts.append(
+                        f"[REWIND_NOT_OBSERVED] You called "
+                        f"{last_tool!r} immediately after a rewind without "
+                        f"taking a browser_screenshot, "
+                        f"browser_get_markdown, or browser_brief_mark "
+                        f"first. The rewind invalidated all V_n indices "
+                        f"and DOM fingerprints; whatever you did just now "
+                        f"was operating on stale assumptions. Take a "
+                        f"screenshot before the next mutation."
+                    )
+                    self.state.rewind_just_fired = False
+
+            # --- Clear per-focus navigate lockout on deliberation -------
+            # When the brain re-grounds itself (screenshot / markdown /
+            # brief_mark), the prior nav refusal no longer applies — the
+            # brain has fresh evidence and may legitimately retry navigate.
+            if getattr(self.state, "last_navigate_refusal_focus_id", None) is not None:
+                _DELIB_TOOLS = {
+                    "browser_screenshot",
+                    "browser_get_markdown",
+                    "browser_brief_mark",
+                }
+                last_tool = (last_step or {}).get("tool") or ""
+                # Also clear when the focus has advanced past the locked id.
+                cur_focus = brief.next_focus()
+                cur_focus_id = cur_focus.id if cur_focus else None
+                if last_tool in _DELIB_TOOLS:
+                    self.state.last_navigate_refusal_focus_id = None
+                elif cur_focus_id != self.state.last_navigate_refusal_focus_id:
+                    self.state.last_navigate_refusal_focus_id = None
+
+            # Periodic full-text replay. Triggers on the iteration
+            # budget warning thresholds (already computed above) and
+            # every 5th iteration thereafter — so the original phrasing
+            # of the query stays in cache-warm context even on long runs.
+            replay_due = (
+                (iteration > 0 and iteration % 5 == 0)
+                or remaining <= int(self.max_iterations * 0.4)
+            )
+            if replay_due and brief.original_query:
+                guidance_parts.append(
+                    f"[TASK_REMINDER iteration={iteration}] "
+                    f"Original query (do not drop any condition):\n"
+                    f"{brief.original_query}\n"
+                    f"Open constraints: {brief.open_count()} of "
+                    f"{len(brief.constraints)}."
+                )
+
+            # Strong-stagnation guidance: when the new BRIEF_PROGRESS
+            # diff has reported "stagnant" for 4+ turns, escalate from
+            # the per-line counter to a full guidance block once. The
+            # detailed instructions below are useful but cost tokens
+            # — only emit on the first turn the threshold is crossed
+            # so we don't spam the brain on every subsequent stagnant
+            # turn.
+            if (
+                self._stagnant_turns == 4
+                and brief.open_count() > 0
+            ):
+                f = brief.next_focus()
+                focus_label = f.label if f else "(none)"
+                guidance_parts.append(
+                    f"[NO_PROGRESS_4] The brief checklist has not "
+                    f"advanced in 4 iterations. You are either stuck "
+                    f"or rushing toward an action that does NOT "
+                    f"advance the [FOCUS] item.\n"
+                    f"Before your next tool call, state to yourself "
+                    f"in concrete terms:\n"
+                    f"  • Which V_n bbox would flip constraint "
+                    f"{focus_label!r} to [done]? Check the "
+                    f"[FOCUS_BBOX] block above for the recommendation.\n"
+                    f"  • If the recommended V_n doesn't exist on "
+                    f"this page, scroll (browser_scroll_until) or "
+                    f"expand a collapsed section.\n"
+                    f"Do NOT navigate to a constructed URL; do NOT "
+                    f"open a detail page; do NOT JS-click via "
+                    f"browser_run_script. The constraint advances by "
+                    f"clicking the actual filter UI vision shows you."
                 )
 
         # --- Phase 2: form-fill checklist reminder ----------------------

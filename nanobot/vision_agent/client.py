@@ -29,7 +29,7 @@ from typing import Optional
 from pydantic import ValidationError
 
 from .cache import CacheKey, VisionCache
-from .prompts import SYSTEM_PROMPT, build_user_prompt, intent_bucket
+from .prompts import SYSTEM_PROMPT, build_user_prompt, get_system_prompt, intent_bucket
 from .providers import VisionProvider, select_fallback_provider, select_provider
 from .schemas import BBox, DiffInfo, PageFlags, SceneGraph, SceneLayer, VisionResponse
 
@@ -292,9 +292,13 @@ class VisionAgent:
                 current_subgoal=current_subgoal,
             )
             try:
+                try:
+                    _sys_cap = int(os.environ.get("VISION_MAX_BBOXES") or "5")
+                except ValueError:
+                    _sys_cap = 5
                 raw_ = await provider.chat_with_image(
                     screenshot_b64=screenshot_b64,
-                    system_prompt=SYSTEM_PROMPT,
+                    system_prompt=get_system_prompt(_sys_cap),
                     user_prompt=prompt,
                     timeout_s=timeout_s,
                 )
@@ -411,9 +415,9 @@ class VisionAgent:
         # cap would otherwise exclude it, so "in-and-out", "F-150",
         # and "Ford" controls survive the trim.
         try:
-            max_bboxes = int(os.environ.get("VISION_MAX_BBOXES") or "50")
+            max_bboxes = int(os.environ.get("VISION_MAX_BBOXES") or "5")
         except ValueError:
-            max_bboxes = 50
+            max_bboxes = 5
         # Phase 2.3: dense filter / search / checkout pages routinely
         # have 60+ controls (filter chips, amenity toggles, range
         # selectors, sort menus). Capping at 50 forces the rank-and-trim
@@ -423,10 +427,10 @@ class VisionAgent:
         if page_type_now in {"checkout_form", "search_results", "product_listing", "map_or_booking"}:
             try:
                 max_bboxes_form = int(
-                    os.environ.get("VISION_FORM_MAX_BBOXES") or "80"
+                    os.environ.get("VISION_FORM_MAX_BBOXES") or "8"
                 )
             except ValueError:
-                max_bboxes_form = 80
+                max_bboxes_form = 8
             if max_bboxes_form > max_bboxes:
                 max_bboxes = max_bboxes_form
         if max_bboxes > 0 and len(parsed.bboxes) > max_bboxes:

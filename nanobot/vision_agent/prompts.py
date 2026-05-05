@@ -116,8 +116,10 @@ General rules:
 - Do NOT hallucinate elements. If you cannot read it, leave it out.
 - `intent_relevant` is true for bboxes that most directly serve the
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
-- Return up to 50 bboxes. Do not cap yourself lower on dense pages —
-  the caller's brain can't click what isn't in the list.
+- Return up to __MAX_BBOXES__ bboxes, ranked by importance — V1 is your
+  strongest recommendation for the next action, V2 is the next-best, etc.
+  The caller's brain treats V1/V2 as defaults and only picks V3+ when those
+  are clearly wrong. Be ruthless about ranking; do not pad with chrome.
 
 Page-type coverage rules (CRITICAL for dense filter/booking UIs):
 - On `search_results` / `product_listing` / `checkout_form` /
@@ -632,8 +634,19 @@ def build_coverage_prompt(
     )
 
 
+def get_system_prompt(max_bboxes: int) -> str:
+    """Substitute the runtime bbox cap into SYSTEM_PROMPT.
+
+    The static template contains the sentinel ``__MAX_BBOXES__`` so the
+    cap can be tuned per-call (e.g. from VISION_MAX_BBOXES) without
+    keeping a stale "up to 50" message after lowering the default.
+    """
+    return SYSTEM_PROMPT.replace("__MAX_BBOXES__", str(max_bboxes))
+
+
 __all__ = [
     "SYSTEM_PROMPT",
+    "get_system_prompt",
     "intent_bucket",
     "build_user_prompt",
     "build_coverage_prompt",

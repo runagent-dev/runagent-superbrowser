@@ -1,8 +1,12 @@
-"""
-Orchestrator tools for the two-agent architecture.
+"""DelegateBrowserTaskTool — orchestrator's primary entry into the
+worker agent. ~1,400 lines of phase-orchestration: outer-loop circuit
+breaker, pre-flight URL probe, classifier gate, fresh worker spawn,
+captcha-learnings update, and post-execution block detection /
+fallback to delegate_search_task.
 
-The orchestrator delegates browser work to a fresh browser worker instance,
-manages site-specific learnings, and never touches browser tools directly.
+Imports are kept maximal so the body of ``execute`` (preserved
+verbatim from the legacy session_tools.py monolith) sees the same
+namespace it always has.
 """
 
 from __future__ import annotations
@@ -10,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import os
-import re as _re
 import time as _time
 import uuid
 from pathlib import Path
@@ -21,72 +24,16 @@ import httpx
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import (
     ArraySchema,
+    BooleanSchema,
     NumberSchema,
+    ObjectSchema,
     StringSchema,
     tool_parameters_schema,
 )
 
-# Outer-loop circuit breaker.
-#
-# Keyed by (domain, sha1(instructions)[:12]) so the same task on the same
-# domain is what gets counted — an orchestrator legitimately delegating two
-# different browser tasks against the same site is fine.
-#
-# Each value is (attempt_count, first_seen_ts, last_worker_result). Entries
-# older than one hour are treated as stale and reset on next touch; the
-# orchestrator may have recovered and the user may be retrying something
-# intentional. The result text is kept so a 2nd-delegation gate can inspect
-# it for structured-data markers and refuse re-delegation when the previous
-# run actually answered the question.
-_DELEGATION_ATTEMPTS: dict[str, tuple[int, float, str]] = {}
-_DELEGATION_MAX_ATTEMPTS = 2
-_DELEGATION_WINDOW_SEC = 60 * 60
-
-
-# Phase 4: result-quality detector. A worker result is "substantive" when it
-# contains markers of verified live data — concrete prices, named addresses,
-# specific time stamps, or boolean flags from the page. The orchestrator's
-# default reflex on a hedged "Unable to complete this truthfully" phrasing
-# is to re-delegate, even when the worker returned 1500+ chars of verified
-# findings; that re-delegation throws away progress and starts a fresh
-# session that usually fares worse. This signal lets us intercept that
-# reflex.
-_SUBSTANTIVE_PRICE_RE = _re.compile(r"\$\s?\d+(?:[.,]\d+)?")
-_SUBSTANTIVE_KEYWORDS = (
-    "in & out", "in&out", "in and out", "in-and-out",
-    "garage", "verified", "found", "options",
-)
-
-
-def _result_is_substantive(text: str) -> tuple[bool, list[str]]:
-    """Return (is_substantive, reasons) for a worker result.
-
-    Substantive means: ≥ 400 chars AND at least one of:
-      - contains a price token like "$15.72" or "$ 6"
-      - contains a numbered list of options ("1.", "2.")
-      - contains domain-specific keywords ("In & Out", "garage", "verified")
-    Used to refuse a 2nd re-delegation that would discard verified work.
-    The 400-char floor avoids false positives from short error captions
-    that happen to contain a price or keyword (e.g. "[error: $0 returned"
-    on a 50-char failure).
-    """
-    if not text:
-        return False, []
-    reasons: list[str] = []
-    if len(text) < 400:
-        return False, []
-    if _SUBSTANTIVE_PRICE_RE.search(text):
-        reasons.append("price_tokens")
-    lower = text.lower()
-    kw_hits = [kw for kw in _SUBSTANTIVE_KEYWORDS if kw in lower]
-    if kw_hits:
-        reasons.append(f"keywords({','.join(kw_hits[:3])})")
-    if "1." in text and "2." in text:
-        reasons.append("numbered_list")
-    return (bool(reasons), reasons)
-
 from superbrowser_bridge.routing import (
     LEARNINGS_DIR,
+    TACTIC_ALTERNATIVES,
     _captcha_learnings_path,
     _classify_task,
     _domain_from_url,
@@ -97,414 +44,21 @@ from superbrowser_bridge.routing import (
     _rewrite_for_search,
     _routing_path,
     learning_reads_enabled,
+    tactic_penalty_summary,
 )
 
-# Where the browser worker workspace lives (relative to this file)
-_BASE = Path(__file__).resolve().parent.parent
-BROWSER_WORKSPACE = str(_BASE / "workspace_browser")
-
-
-
-
-def _task_fingerprint(instructions: str) -> str:
-    """SHA1 fingerprint of a normalized task-instruction string.
-
-    Used to gate the "Resume From Checkpoint" injection so checkpoints
-    from a completed task can't leak into the prompt of a SUBSEQUENT,
-    different task on the same domain. Normalization is aggressive on
-    purpose — whitespace collapsed, lowercased, punctuation stripped —
-    so that tiny prompt tweaks (extra space, casing) still match.
-    """
-    import hashlib as _hashlib
-    import re as _re
-    if not instructions:
-        return ""
-    s = (instructions or "").lower()
-    # Strip punctuation beyond alnum/space; collapse whitespace.
-    s = _re.sub(r"[^a-z0-9 ]+", " ", s)
-    s = _re.sub(r"\s+", " ", s).strip()
-    return _hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-
-
-def _update_captcha_learnings(domain: str, steps: list[dict]) -> dict | None:
-    """Parse captcha solve results from step_history and update per-domain JSON.
-
-    Looks for browser_solve_captcha steps whose result payload contains a
-    structured JSON block (we emit one from BrowserSolveCaptchaTool). Each
-    solve contributes:
-      - method/subMethod that succeeded, plus vendor + duration
-      - success_rate over the last 10 attempts
-      - median_solve_ms of successful attempts
-
-    Stale entries (>30 days or ≥5 consecutive failures) are pruned when the
-    file is rewritten. The schema is intentionally small so future tasks
-    can read it quickly.
-    """
-    from datetime import datetime, timezone
-    import statistics
-
-    # Extract solve attempts from steps.
-    new_attempts: list[dict] = []
-    for step in steps or []:
-        if step.get("tool") != "browser_solve_captcha":
-            continue
-        result = step.get("result") or ""
-        # The tool returns "<summary>\n\nResult JSON:\n{...}" — pull the JSON.
-        brace = result.find("{")
-        if brace < 0:
-            continue
-        try:
-            parsed = _json.loads(result[brace:])
-        except (_json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        parsed["observed_at"] = datetime.now(timezone.utc).isoformat()
-        parsed["step_url"] = step.get("url") or ""
-        new_attempts.append(parsed)
-
-    if not new_attempts:
-        return None
-
-    path = _captcha_learnings_path(domain)
-    existing: dict = {"attempts": [], "updated_at": None}
-    if learning_reads_enabled() and os.path.exists(path):
-        try:
-            with open(path) as f:
-                existing = _json.load(f)
-        except (ValueError, OSError):
-            existing = {"attempts": [], "updated_at": None}
-
-    # Prune stale attempts (>30 days old).
-    cutoff = (datetime.now(timezone.utc).timestamp() - 30 * 86400)
-    def _is_fresh(a: dict) -> bool:
-        ts = a.get("observed_at")
-        if not ts:
-            return False
-        try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() >= cutoff
-        except ValueError:
-            return False
-    kept = [a for a in existing.get("attempts", []) if _is_fresh(a)]
-    kept.extend(new_attempts)
-    # Cap at last 50 attempts to keep the file bounded.
-    kept = kept[-50:]
-
-    # Consecutive-failure decay: if last 5 attempts all failed, mark domain
-    # as cold so future workers know not to trust the cached "winning method".
-    last_five = kept[-5:]
-    cold = len(last_five) == 5 and all(not a.get("solved") for a in last_five)
-
-    # Compute per-method stats.
-    per_method: dict[str, dict] = {}
-    for a in kept:
-        method = a.get("method") or "unknown"
-        bucket = per_method.setdefault(
-            method,
-            {"attempts": 0, "solved": 0, "durations": [], "steps": []},
-        )
-        bucket["attempts"] += 1
-        if a.get("solved"):
-            bucket["solved"] += 1
-            if a.get("durationMs"):
-                bucket["durations"].append(int(a["durationMs"]))
-            # Iterative loop emits a "steps" field. Track for budget
-            # tuning: if p95 steps creeps up on a domain, the site has
-            # likely hardened its challenge cadence and we should widen
-            # the screenshot budget or shortcut to human handoff earlier.
-            if isinstance(a.get("steps"), int) and a["steps"] > 0:
-                bucket["steps"].append(int(a["steps"]))
-
-    # Pick the winning method = highest success rate, tiebreak by speed.
-    best_method = None
-    best_rate = -1.0
-    best_duration = float("inf")
-    for method, bucket in per_method.items():
-        rate = bucket["solved"] / bucket["attempts"] if bucket["attempts"] else 0.0
-        median = statistics.median(bucket["durations"]) if bucket["durations"] else float("inf")
-        if rate > best_rate or (rate == best_rate and median < best_duration):
-            best_method = method
-            best_rate = rate
-            best_duration = median
-
-    last10 = kept[-10:]
-    last10_success = sum(1 for a in last10 if a.get("solved"))
-    # Human-handoff flag: if any captcha ever succeeded via the
-    # human_handoff strategy on this domain, record it so future tasks can
-    # auto-enable the handoff path. Existing value is sticky once true
-    # (cheap, and a false negative would silently re-break the flow).
-    any_human_success = any(
-        a.get("solved") and (a.get("method") or "").startswith("human_handoff")
-        for a in kept
-    )
-    needs_human = bool(existing.get("needs_human_handoff")) or any_human_success
-
-    summary = {
-        "domain": domain,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "winning_method": best_method,
-        "winning_success_rate": round(best_rate, 3) if best_rate >= 0 else None,
-        "winning_median_ms": None if best_duration == float("inf") else int(best_duration),
-        "success_rate_last_10": round(last10_success / len(last10), 3) if last10 else None,
-        "cold": cold,
-        "needs_human_handoff": needs_human,
-        "per_method": {
-            m: {
-                "attempts": b["attempts"],
-                "solved": b["solved"],
-                "success_rate": round(b["solved"] / b["attempts"], 3) if b["attempts"] else 0.0,
-                "median_ms": int(statistics.median(b["durations"])) if b["durations"] else None,
-                "steps_p50": int(statistics.median(b["steps"])) if b["steps"] else None,
-                "steps_p95": (
-                    int(statistics.quantiles(b["steps"], n=20)[18])
-                    if len(b["steps"]) >= 2 else (
-                        b["steps"][0] if b["steps"] else None
-                    )
-                ),
-            }
-            for m, b in per_method.items()
-        },
-        "attempts": kept,
-    }
-
-    try:
-        with open(path, "w") as f:
-            _json.dump(summary, f, indent=2, default=str)
-    except OSError:
-        return None
-    return summary
-
-
-def _domain_needs_human_handoff(domain: str) -> bool:
-    """Return True if a prior task on this domain succeeded via human handoff.
-
-    Cheap read on the captcha-learnings JSON. Missing file / malformed
-    JSON / missing field all return False so this is safe to call on
-    first-touch domains.
-    """
-    if not domain:
-        return False
-    if not learning_reads_enabled():
-        return False
-    try:
-        path = _captcha_learnings_path(domain)
-    except Exception:
-        return False
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path) as f:
-            data = _json.load(f)
-    except (ValueError, OSError):
-        return False
-    return bool(data.get("needs_human_handoff"))
-
-
-async def _probe_url(url: str) -> dict:
-    """Lightweight HTTP probe — no browser, no JS rendering.
-
-    Two-stage:
-      1. Fast `httpx` GET. Cheap path for unprotected sites.
-      2. On transport error (timeout / connect / H2 RST), fall back to
-         `curl_cffi` with `impersonate='chrome124'` + residential proxy from
-         `proxy_tiers.default()`. Datacenter IPs that Akamai/Cloudflare
-         silently drop need the real-browser TLS+H2 fingerprint to even get
-         a response.
-
-    Returns a dict with:
-      - classification: "ok" | "soft_blocked" | "hard_unreachable"
-      - protection: "" | "akamai" | "akamai_suspected" | "cloudflare" |
-                    "datadome" | "imperva" | "perimeterx" | "kasada" |
-                    "generic" | "rate_limited" | "structural" | "empty"
-      - unreachable, blocked, status, error, reason, title (back-compat)
-
-    A "soft_blocked" result is a routing signal, NOT an abort: the worker
-    (Tier-3 patchright + residential proxy) still has a real shot.
-    """
-    import re as _re_probe
-    from urllib.parse import urlparse
-
-    result: dict = {
-        "classification": "",
-        "protection": "",
-        "unreachable": False,
-        "blocked": False,
-        "status": 0,
-        "error": "",
-        "reason": "",
-        "title": "",
-    }
-
-    def _set_title(body: str) -> None:
-        m = _re_probe.search(
-            r"<title[^>]*>(.*?)</title>", body, _re_probe.IGNORECASE | _re_probe.DOTALL,
-        )
-        if m:
-            result["title"] = m.group(1).strip()[:200]
-
-    # --- Stage 1: httpx fast path -------------------------------------------
-    httpx_transport_error: str | None = None
-    try:
-        async with httpx.AsyncClient(
-            timeout=6.0,
-            follow_redirects=True,
-            verify=False,  # some sites have self-signed certs
-        ) as client:
-            r = await client.get(url, headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml",
-            })
-            result["status"] = r.status_code
-            body = r.text or ""
-            _set_title(body[:5000])
-            if r.status_code >= 500:
-                # Genuine origin death — bytes received, server is sick.
-                result["classification"] = "hard_unreachable"
-                result["unreachable"] = True
-                result["error"] = f"HTTP {r.status_code}"
-                return result
-            blocked, reason = _looks_blocked(body[:5000])
-            result["blocked"] = blocked
-            result["reason"] = reason
-            if blocked:
-                result["classification"] = "soft_blocked"
-                # Try typed verdict for protection class
-                try:
-                    from superbrowser_bridge.antibot import bot_detect as _bd
-                    verdict = _bd.detect(body, r.status_code, dict(r.headers))
-                    if verdict.blocked and verdict.klass:
-                        result["protection"] = verdict.klass
-                        if not result["reason"]:
-                            result["reason"] = verdict.reason
-                except Exception:
-                    pass
-                return result
-            result["classification"] = "ok"
-            return result
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-        # Transport-level failure. Don't conclude unreachable yet — fall
-        # through to curl_cffi which has a real-browser TLS+H2 fingerprint
-        # and can route through the residential proxy. The IP-block-on-bot
-        # signature (silent TCP drop or H2 RST) is exactly what Akamai/CF
-        # do at the edge from datacenter egress.
-        httpx_transport_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-    except Exception as exc:
-        # Unexpected — record and try the cffi fallback as well; if that
-        # also fails we'll mark hard_unreachable.
-        httpx_transport_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-
-    # --- Stage 2: curl_cffi fallback with proxy -----------------------------
-    cffi_status = 0
-    cffi_body = ""
-    cffi_headers: dict = {}
-    cffi_error: str | None = None
-    try:
-        from curl_cffi import requests as _curl_requests
-        from superbrowser_bridge.antibot import bot_detect as _bd
-        from superbrowser_bridge.antibot import proxy_tiers as _proxy_tiers
-        from superbrowser_bridge.antibot.headers import for_profile as _for_profile
-
-        host = urlparse(url).hostname or ""
-        proxy_url = _proxy_tiers.default().pick(host)
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        headers = _for_profile("chrome125_mac")
-
-        async with _curl_requests.AsyncSession(
-            impersonate="chrome124",
-            timeout=12.0,
-            proxies=proxies,
-        ) as client:
-            resp = await client.get(url, headers=headers, allow_redirects=True)
-            cffi_status = int(resp.status_code or 0)
-            cffi_body = resp.text or ""
-            try:
-                cffi_headers = dict(resp.headers or {})
-            except Exception:
-                cffi_headers = {}
-    except Exception as exc:
-        cffi_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-
-    # If curl_cffi also failed at transport layer, the next question is
-    # whether this looks like (a) a real dead URL — DNS failure, refused
-    # connection, bad SSL cert — or (b) a WAF-fronted host actively dropping
-    # our datacenter IP. (b) is a routing signal, not an abort.
-    if cffi_status == 0:
-        combined_err = (
-            f"{httpx_transport_error or ''} | {cffi_error or ''}"
-        ).lower()
-        # Hard-unreachable signatures: DNS resolution failure, peer refused
-        # connection, SSL cert problem. These are genuine dead URLs.
-        hard_signatures = (
-            "could not resolve", "name or service not known",
-            "no address associated", "nodename nor servname",
-            "getaddrinfo", "[errno -2]", "[errno -3]",
-            "connection refused", "connectionrefused",
-            "ssl", "certificate",
-            "ssl: certificate_verify_failed",
-        )
-        is_hard = any(sig in combined_err for sig in hard_signatures)
-        if is_hard:
-            result["classification"] = "hard_unreachable"
-            result["unreachable"] = True
-            result["error"] = cffi_error or httpx_transport_error or "unknown"
-            return result
-        # Otherwise: silent TCP drop / read timeout on both stacks. That's
-        # the signature of edge IP-blocking on a WAF-fronted host — the
-        # worker on residential egress still has a shot.
-        result["classification"] = "soft_blocked"
-        result["protection"] = "akamai_suspected"
-        result["error"] = f"httpx={httpx_transport_error}; curl_cffi={cffi_error}"
-        result["reason"] = (
-            "transport-level drop on both httpx and curl_cffi — "
-            "consistent with edge IP-block on a WAF-fronted host"
-        )
-        return result
-
-    # We have a curl_cffi response. Populate status + title.
-    result["status"] = cffi_status
-    _set_title(cffi_body[:5000])
-
-    # Genuine origin death (5xx with bytes) → hard_unreachable.
-    if cffi_status >= 500:
-        result["classification"] = "hard_unreachable"
-        result["unreachable"] = True
-        result["error"] = f"HTTP {cffi_status}"
-        return result
-
-    # Typed verdict on what came back.
-    try:
-        from superbrowser_bridge.antibot import bot_detect as _bd  # noqa: F811
-        verdict = _bd.detect(cffi_body, cffi_status, cffi_headers)
-    except Exception:
-        verdict = None
-
-    if verdict is not None and verdict.blocked:
-        result["classification"] = "soft_blocked"
-        result["protection"] = verdict.klass or "generic"
-        result["blocked"] = True
-        result["reason"] = verdict.reason or ""
-        return result
-
-    # Some 4xx without WAF markers — report blocked but unknown protection,
-    # still let the worker try.
-    if cffi_status in (401, 403, 429):
-        result["classification"] = "soft_blocked"
-        result["protection"] = "generic"
-        result["blocked"] = True
-        result["reason"] = f"HTTP {cffi_status} from curl_cffi probe"
-        return result
-
-    # 2xx clean.
-    result["classification"] = "ok"
-    return result
-
-
-from nanobot.agent.tools.schema import BooleanSchema
-
+from .captcha_learnings import (
+    _domain_needs_human_handoff,
+    _update_captcha_learnings,
+)
+from .constants import (
+    BROWSER_WORKSPACE,
+    _DELEGATION_ATTEMPTS,
+    _DELEGATION_MAX_ATTEMPTS,
+    _DELEGATION_WINDOW_SEC,
+)
+from .delegation_registry import _result_is_substantive, _task_fingerprint
+from .url_probe import _probe_url
 
 @tool_parameters(
     tool_parameters_schema(
@@ -528,6 +82,46 @@ from nanobot.agent.tools.schema import BooleanSchema
                 "where a human will not be available to respond."
             ),
             default=True,
+        ),
+        task_checklist=ArraySchema(
+            description=(
+                "Decomposed list of constraints / conditions extracted from "
+                "the user query. REQUIRED for any query with 2+ filters, "
+                "conditions, or sequenced steps — the worker uses this to "
+                "track per-constraint progress and refuses to claim success "
+                "while items remain open. The worker will see [BRIEF] / "
+                "[FOCUS] / [CHECKLIST] blocks pinned to every tool result. "
+                "Pass null / omit for single-condition tasks. See orchestrator "
+                "SOUL.md 'Decomposing multi-condition queries' for the full "
+                "predicate vocabulary and a worked example."
+            ),
+            items=ObjectSchema(
+                label=StringSchema(
+                    "Short human-readable label for the constraint, e.g. "
+                    "'Oregon region', 'Price under $40', 'Pairs with fish'. "
+                    "Shown to the worker on every tool result."
+                ),
+                kind=StringSchema(
+                    "One of: filter | action | extraction | navigation | "
+                    "verification. Defaults to 'filter'. Hint to the worker "
+                    "about what flavor of progress the item demands.",
+                    nullable=True,
+                ),
+                predicate=ObjectSchema(
+                    description=(
+                        "How the item auto-completes. ANY listed match flips "
+                        "it to done. Keys: url_contains (list[str]), "
+                        "url_param (object key→list[str]), page_text "
+                        "(list[str]), vision_active_label (list[str]), "
+                        "manual (bool). For action/extraction items use "
+                        "{manual: true} and the worker calls "
+                        "browser_brief_mark when verified."
+                    ),
+                    nullable=True,
+                ),
+                required=["label"],
+            ),
+            nullable=True,
         ),
         required=["instructions"],
     )
@@ -560,6 +154,7 @@ class DelegateBrowserTaskTool(Tool):
         # Default True so a human can solve captchas the auto-solver fails on.
         # Pass False only for fully unattended runs.
         enable_human_handoff: bool = True,
+        task_checklist: list[dict] | None = None,
         **kw: Any,
     ) -> str:
         # --- Outer-loop circuit breaker --------------------------------
@@ -812,6 +407,45 @@ class DelegateBrowserTaskTool(Tool):
         )
         worker_state.task_id = task_id
 
+        # Multi-condition query tracking. When the orchestrator passed a
+        # decomposed checklist, attach a TaskBrief so the worker hook
+        # can pin live [BRIEF]/[FOCUS]/[CHECKLIST] blocks onto every
+        # tool result. When the orchestrator forgot to pass one — which
+        # happens regularly because LLMs forget optional params — we
+        # fall back to a heuristic decomposition. The heuristic uses
+        # ``manual: true`` predicates so nothing auto-flips, but the
+        # brain still gets a checklist + periodic task reminder, which
+        # alone solves most "lost-condition" reports.
+        effective_checklist = task_checklist
+        checklist_source = "orchestrator"
+        if not effective_checklist:
+            try:
+                from superbrowser_bridge.task_brief import heuristic_decompose
+                effective_checklist = heuristic_decompose(instructions)
+                if effective_checklist:
+                    checklist_source = "heuristic"
+            except Exception as exc:
+                print(f"   [task_brief heuristic failed: {exc}]")
+        if effective_checklist:
+            try:
+                worker_state.set_task_brief(instructions, effective_checklist)
+                print(
+                    f"   [task_brief attached source={checklist_source} "
+                    f"constraints={len(worker_state.task_brief.constraints)} "
+                    f"open={worker_state.task_brief.open_count()}]"
+                )
+                # Echo the constraints once so trace logs make it obvious
+                # which list the worker is operating against.
+                for c in worker_state.task_brief.constraints:
+                    print(
+                        f"     · #{c.id} [{c.kind}] {c.label[:80]} "
+                        f"predicate={c.predicate}"
+                    )
+            except Exception as exc:
+                print(f"   [task_brief failed to attach: {exc}]")
+        else:
+            print("   [task_brief: none — single-condition query or empty]")
+
         # Resolve the target domain once, up front — used by human-handoff
         # auto-enable (below), learnings injection (further down), and the
         # success-outcome recorder at the end. Must be defined before the
@@ -997,6 +631,25 @@ class DelegateBrowserTaskTool(Tool):
             parts.append(_probe_warning)
 
         parts.append(f"\n## Task\n{instructions}")
+
+        # When the orchestrator decomposed the query into a checklist,
+        # render it into the system prompt so the brain reads the full
+        # constraint list at task start. The worker hook re-pins the
+        # live state on every tool result, but having it here too makes
+        # the structure visible BEFORE the first action — important on
+        # tasks where the very first click should already advance a
+        # specific constraint.
+        if worker_state.task_brief and worker_state.task_brief.constraints:
+            parts.append(
+                "\n## Constraints (every tool result re-pins live state)\n"
+                + worker_state.task_brief.render_for_prompt()
+                + "\n\nWork the [FOCUS] item. Filter constraints auto-flip "
+                "to [done] when their predicate matches the URL or page "
+                "text. For action / extraction items marked manual, call "
+                "browser_brief_mark(constraint_id, status, evidence) when "
+                "you have the evidence. Do NOT call done(success=True) "
+                "while any constraint is still [open] or [active]."
+            )
 
         # Strategy block — bias the brain toward cursor-based actions
         # over scripts. Empirically the LLM reaches for
@@ -1429,6 +1082,29 @@ CRITICAL RULES:
                     f"refusal. Worker's own text:\n\n{content}"
                 )
 
+            # Honest partial-completion surfacing. When the orchestrator
+            # decomposed the query into a checklist, the brief tracks
+            # which constraints were satisfied. If any remain open at
+            # the end of the worker run, prepend an [INCOMPLETE_CHECKLIST]
+            # block so the orchestrator can tell the user what's missing
+            # rather than rubber-stamping a partial success.
+            brief = getattr(worker_state, "task_brief", None)
+            if brief is not None and not brief.is_complete():
+                open_ct = brief.open_count()
+                total = len(brief.constraints)
+                if open_ct > 0:
+                    content = (
+                        f"[INCOMPLETE_CHECKLIST] {open_ct} of {total} "
+                        f"constraints remained unverified after the worker "
+                        f"finished. Open items:\n"
+                        f"{brief.summary_open_items()}\n"
+                        f"Original query: {brief.original_query}\n"
+                        f"Treat the worker's reply below as PARTIAL — surface "
+                        f"the missing constraints to the user, do not claim "
+                        f"the task succeeded.\n\n"
+                        + content
+                    )
+
             # Read the activity log the worker saved on close
             task_dir = f"/tmp/superbrowser/{task_id}"
             activity_path = "/tmp/superbrowser/last_activity.md"
@@ -1822,257 +1498,3 @@ CRITICAL RULES:
             )
             print(f"\n>> Worker error: {error_msg}")
             return error_msg
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        site=StringSchema("Site domain or URL to check learnings for (e.g., 'gozayaan.com')"),
-        required=["site"],
-    )
-)
-class CheckLearningsTool(Tool):
-    """Check what we've learned about a site from past tasks."""
-
-    name = "check_learnings"
-    description = (
-        "Learning reads are disabled in this deployment "
-        "(LEARNING_READS_ENABLED=0). Skip calling this; proceed straight "
-        "to delegate_browser_task or delegate_search_task."
-        if not learning_reads_enabled()
-        else (
-            "Read past learnings for a website. Returns what worked and what failed. "
-            "ALWAYS call this before delegate_browser_task to avoid repeating mistakes."
-        )
-    )
-
-    @property
-    def read_only(self) -> bool:
-        return True
-
-    async def execute(self, site: str, **kw: Any) -> str:
-        if not learning_reads_enabled():
-            return (
-                f"Learning reads disabled (LEARNING_READS_ENABLED=0). "
-                f"No prior history consulted for {site}; proceed with the task."
-            )
-        domain = _domain_from_url(site)
-        path = _learnings_path(domain)
-
-        # Always surface the routing preference if we have one — even if
-        # no markdown learnings exist yet, past search/browser outcomes
-        # are useful for the orchestrator's next decision.
-        sections: list[str] = []
-        pref = _preferred_approach(domain)
-        if pref:
-            sections.append(
-                f"## Routing preference for {domain}\n"
-                f"- Preferred: **{pref['approach']}** (confidence {pref['confidence']:.2f})\n"
-                f"- Reason: {pref['reason']}\n"
-                f"- Action: call `delegate_{pref['approach']}_task` first. "
-                f"The classifier will also enforce this automatically."
-            )
-
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    md = f.read().strip()
-                if md:
-                    sections.append(f"## Task learnings for {domain}\n{md}")
-            except OSError:
-                pass
-
-        if not sections:
-            return f"No learnings or routing history found for {domain}. This is the first task on this site."
-
-        # Preface: past learnings are PATTERNS, not verbatim answers.
-        # Without this guidance, the LLM copies concrete values (e.g.
-        # `makes[]=bmw` from a BMW task) into an unrelated follow-up
-        # query (e.g. a Mercedes task on the same site).
-        preamble = (
-            "## How to use these learnings\n"
-            "These are PATTERNS learned from PAST tasks on this site. "
-            "They are NOT the answer to the current task. When you see "
-            "concrete values in a URL / selector / script (e.g. a "
-            "specific brand, year range, price, ID), treat them as "
-            "placeholders you MUST replace with values from the CURRENT "
-            "user task. If the current task is about a DIFFERENT entity "
-            "than a past learning mentions, the URL pattern still "
-            "applies — just swap the query params. Do NOT echo concrete "
-            "values from these learnings back to the user as if they "
-            "were the current task's answer."
-        )
-        return "\n\n".join([preamble, *sections])
-
-
-@tool_parameters(
-    tool_parameters_schema(
-        site=StringSchema("Site domain or URL"),
-        problem=StringSchema(
-            "One-sentence description of the problem this learning addresses "
-            "(e.g. 'Trade-in form has 8 cascading dropdowns that hallucinate "
-            "when click-looped'). Required for structured saves.",
-            nullable=True,
-        ),
-        root_cause=StringSchema(
-            "Why the naive approach failed (e.g. 'DOM indices renumber on "
-            "every pick; vision V-indices stale at 10s'). Required for structured saves.",
-            nullable=True,
-        ),
-        working_recipe=ArraySchema(
-            description=(
-                "Ordered, executable steps a future worker can follow. "
-                "Use placeholders for task-specific values: <brand>, <year>, "
-                "etc. At least 2 steps required for structured saves."
-            ),
-            items=StringSchema(""),
-            nullable=True,
-        ),
-        anti_patterns=ArraySchema(
-            description="Optional. Things NOT to do. Each entry one sentence.",
-            items=StringSchema(""),
-            nullable=True,
-        ),
-        confidence=NumberSchema(
-            description=(
-                "0..1. How confident this recipe will work next time. "
-                "Structured saves require ≥0.5 — don't save guesses."
-            ),
-            nullable=True,
-        ),
-        learning=StringSchema(
-            "DEPRECATED free-text path (legacy). Prefer the structured "
-            "fields. If only `learning` is provided, the entry is saved "
-            "but flagged as low-trust — future workers may skip it.",
-            nullable=True,
-        ),
-        required=["site"],
-    )
-)
-class SaveLearningTool(Tool):
-    """Save a learning about a site for future tasks.
-
-    Two modes:
-      • STRUCTURED (preferred) — provide problem/root_cause/working_recipe.
-        Saved with stable markdown headings so future workers can grep
-        deterministic anchors instead of parsing prose.
-      • LEGACY free-text — accepted with a low-trust marker so vague
-        "FAILED: dropdown reset" entries don't poison the next worker's
-        prompt. New writes should always use the structured path.
-
-    Reject criteria for structured saves: empty working_recipe, fewer
-    than 2 recipe steps, or confidence < 0.5. The bar exists because
-    a vague "save_learning" call costs a future worker context tokens
-    and biases its plan — non-actionable learnings are net negative.
-    """
-
-    name = "save_learning"
-    description = (
-        "Save an ACTIONABLE, GENERALIZABLE learning for a site. Prefer "
-        "the structured fields (problem, root_cause, working_recipe, "
-        "anti_patterns, confidence) — those produce reusable recipes. "
-        "Free-text `learning` is accepted but saved as low-trust. "
-        "Use placeholders for task-specific values: <brand>, <year>, "
-        "<min_price>. Structural bits (param names, selector paths, "
-        "wait durations) stay concrete."
-    )
-
-    async def execute(
-        self,
-        site: str,
-        problem: str | None = None,
-        root_cause: str | None = None,
-        working_recipe: list[str] | None = None,
-        anti_patterns: list[str] | None = None,
-        confidence: float | None = None,
-        learning: str | None = None,
-        **kw: Any,
-    ) -> str:
-        domain = _domain_from_url(site)
-        path = _learnings_path(domain)
-
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        # Branch: structured if any of problem/root_cause/working_recipe set.
-        structured = any(x for x in (problem, root_cause, working_recipe))
-
-        if structured:
-            recipe = [str(s).strip() for s in (working_recipe or []) if str(s).strip()]
-            if len(recipe) < 2:
-                return (
-                    "[save_learning_rejected] Structured save needs "
-                    "working_recipe with ≥2 ordered steps. Provide concrete "
-                    "actions a future worker can execute (e.g. "
-                    "'browser_navigate(<base_url>/trade-in)', "
-                    "'browser_form_plan(fields=[{label:Brand,value:<brand>}, ...])')."
-                )
-            try:
-                conf = float(confidence) if confidence is not None else 0.5
-            except (TypeError, ValueError):
-                conf = 0.5
-            if conf < 0.5:
-                return (
-                    f"[save_learning_rejected] confidence={conf:.2f} is below "
-                    "the 0.5 threshold. Don't save guesses — verify the "
-                    "recipe end-to-end first, or save as anti_patterns instead."
-                )
-
-            lines: list[str] = [f"\n### {timestamp}  (confidence={conf:.2f})"]
-            if problem:
-                lines.append(f"## problem\n{problem.strip()}")
-            if root_cause:
-                lines.append(f"## root_cause\n{root_cause.strip()}")
-            lines.append("## working_recipe")
-            lines.extend(f"  {i+1}. {step}" for i, step in enumerate(recipe))
-            if anti_patterns:
-                lines.append("## anti_patterns")
-                lines.extend(f"  - {str(s).strip()}" for s in anti_patterns if str(s).strip())
-            entry = "\n".join(lines) + "\n"
-
-            with open(path, "a") as f:
-                f.write(entry)
-            return f"Learning saved (structured, {len(recipe)} steps) for {domain}."
-
-        # Legacy free-text path. Mark as low-trust so future workers can
-        # discount vague entries when they read the file back.
-        if not learning or not learning.strip():
-            return (
-                "[save_learning_rejected] Empty learning. Provide either "
-                "structured fields (problem/root_cause/working_recipe) or "
-                "a non-empty `learning` string."
-            )
-        entry = f"\n### {timestamp}  [legacy:low-trust]\n{learning.strip()}\n"
-        with open(path, "a") as f:
-            f.write(entry)
-        return f"Learning saved (legacy free-text, low-trust) for {domain}."
-
-
-def register_orchestrator_tools(bot: "Nanobot") -> None:
-    """Register orchestrator-specific tools (delegation + learnings + search)."""
-    from superbrowser_bridge.search_tools import register_search_tools
-    from superbrowser_bridge.antibot import (
-        FetchArchiveTool,
-        FetchAutoTool,
-        FetchImpersonateTool,
-        FetchUndetectedTool,
-    )
-
-    tools = [
-        DelegateBrowserTaskTool(),
-        CheckLearningsTool(),
-        SaveLearningTool(),
-        FetchAutoTool(),
-        FetchImpersonateTool(),
-        FetchUndetectedTool(),
-        FetchArchiveTool(),
-    ]
-    for tool in tools:
-        bot._loop.tools.register(tool)
-
-    # Register the search delegation tool
-    register_search_tools(bot)
-
-    # Remove direct web search tools — orchestrator must delegate ALL web
-    # research to the search worker (API-based) or browser worker (browser-based).
-    for name in ("web_search", "web_fetch"):
-        bot._loop.tools.unregister(name)
