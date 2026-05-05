@@ -103,6 +103,12 @@ class BrowserSessionState:
         self.last_screenshot_url: str = ""
         self.last_page_content_hash: str = ""
         self.step_history: list[dict] = []
+        # Consecutive read-only script calls since the last observation
+        # (screenshot) or visual interaction (click_at). Caps at
+        # MAX_SCRIPTS_BEFORE_INTERACT to stop the brain from ignoring
+        # vision bboxes and falling into a DOM-scraping loop.
+        self._scripts_since_observation: int = 0
+        self.MAX_SCRIPTS_BEFORE_INTERACT: int = 2
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
         # Hard guard against the brain re-clicking a target that produced

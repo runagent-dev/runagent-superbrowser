@@ -95,6 +95,26 @@ class BrowserRunScriptTool(Tool):
                 "your stale mental model will return unexpected results. "
                 "Observe first, then script if needed."
             )
+        # Consecutive-script cap: the brain's dominant failure mode is
+        # ignoring the V_n bbox labels from the last screenshot and
+        # falling into a DOM-scraping loop (6+ scripts trying to
+        # reverse-engineer the site's data). Cap read-only scripts to
+        # force the brain back to visual interaction.
+        if not bool(mutates):
+            self.s._scripts_since_observation += 1
+            if self.s._scripts_since_observation > self.s.MAX_SCRIPTS_BEFORE_INTERACT:
+                return (
+                    f"[run_script_refused:use_visual_path] You have run "
+                    f"{self.s._scripts_since_observation - 1} consecutive "
+                    f"scripts without clicking any element. Your last "
+                    f"browser_screenshot gave you labelled V_n targets — "
+                    f"use browser_click_at(vision_index=V_n) to interact "
+                    f"with the page controls (filter dropdowns, sort "
+                    f"buttons, checkboxes). Scraping the DOM to find a "
+                    f"shortcut almost never works — the site's real "
+                    f"filter/sort param names differ from training data. "
+                    f"Click the actual UI elements instead."
+                )
         # Capture pre-snapshot only when this script is allowed to mutate
         # — read-only scripts return raw data, not a build_text_only
         # response, so the delta block would be misleading.

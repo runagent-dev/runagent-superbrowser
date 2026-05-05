@@ -46,6 +46,7 @@ class BrowserScreenshotTool(Tool):
         # uses this to detect "the brain just looked at the page".
         self.s.last_deliberation_turn = self.s._brain_turn_counter
         self.s._mutation_needs_observation = False
+        self.s._scripts_since_observation = 0
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""

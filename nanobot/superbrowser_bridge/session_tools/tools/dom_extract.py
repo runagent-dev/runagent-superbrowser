@@ -38,6 +38,7 @@ class BrowserGetMarkdownTool(Tool):
             # BrowserSessionState.last_deliberation_turn.
             self.s.last_deliberation_turn = self.s._brain_turn_counter
             self.s._mutation_needs_observation = False
+            self.s._scripts_since_observation = 0
         return body
 
 

@@ -65,6 +65,7 @@ class BrowserClickAtTool(Tool):
         self.s._brain_turn_counter += 1
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
+        self.s._scripts_since_observation = 0
         # click_at addresses by vision bbox or pixel coords, not DOM
         # index — pass None so target_disappeared isn't computed.
         self.s.capture_action_snapshot(target_index=None)
