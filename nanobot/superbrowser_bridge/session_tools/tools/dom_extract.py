@@ -38,7 +38,9 @@ class BrowserGetMarkdownTool(Tool):
             # BrowserSessionState.last_deliberation_turn.
             self.s.last_deliberation_turn = self.s._brain_turn_counter
             self.s._mutation_needs_observation = False
-            self.s._scripts_since_observation = 0
+            # Do NOT reset _scripts_since_observation here. Only
+            # browser_screenshot provides V_n labels; markdown gives text
+            # only. Resetting here enables click→markdown→eval×2 loops.
         return body
 
 

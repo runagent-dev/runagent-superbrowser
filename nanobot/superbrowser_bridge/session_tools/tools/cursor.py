@@ -124,11 +124,10 @@ class BrowserClickAtTool(Tool):
             # the model itself said it couldn't trust.
             freshness = getattr(resp, "screenshot_freshness", "fresh")
             if freshness != "fresh":
-                self.s.record_cursor_failure(
-                    strategy="click_at",
-                    target=f"V{vision_index}",
-                    reason=f"stale_vision freshness={freshness}",
-                )
+                # Don't record this as a cursor failure — it's a system
+                # pre-condition gate (vision stale), not a real click
+                # attempt. Recording it lets the brain cheaply unlock
+                # mutates=true scripts via the cursor-first lockout.
                 alts = _vision_alternatives_hint(
                     self.s, exclude_index=int(vision_index), limit=3,
                 )

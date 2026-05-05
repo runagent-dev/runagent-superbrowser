@@ -99,6 +99,26 @@ class BrowserRunScriptTool(Tool):
         mutates: bool = False,
         **kw: Any,
     ) -> str:
+        # Navigation bypass guard: block scripts that navigate via location
+        # APIs. The brain must use browser_navigate which has URL guards.
+        import re as _re
+        _NAV_PATTERN = _re.compile(
+            r'(?:'
+            r'location\s*\.\s*(?:href|assign|replace)\s*[\(=]'
+            r'|window\s*\.\s*location\s*='
+            r'|document\s*\.\s*location\s*='
+            r'|page\s*\.\s*goto\s*\('
+            r')',
+            _re.IGNORECASE,
+        )
+        if _NAV_PATTERN.search(script):
+            return (
+                "[run_script_refused:navigation_blocked] The script attempts "
+                "to navigate via location/page.goto. Use browser_navigate("
+                "url=...) instead — it enforces URL guards (domain "
+                "allowlist, fabrication detection). Direct navigation in "
+                "scripts bypasses all safety checks and is blocked."
+            )
         print(f"\n>> browser_run_script({script[:80]}...)")
         # Post-mutation observation gate: after a click/navigate, the brain
         # must observe before running scripts. Even read-only scripts query
@@ -224,6 +244,9 @@ class BrowserRunScriptTool(Tool):
             if elements:
                 tip += f"\n\nCurrent interactive elements:\n{elements}"
             return f"Script error: {error}{tip}"
+
+        if bool(mutates):
+            self.s._mutation_needs_observation = True
 
         parts = []
         result = data.get("result")
