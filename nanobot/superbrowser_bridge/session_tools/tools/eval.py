@@ -19,6 +19,23 @@ class BrowserEvalTool(Tool):
         self.s = state
 
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
+        # Post-mutation observation gate (same as run_script)
+        if self.s._mutation_needs_observation:
+            return (
+                "[eval_refused:observe_first] Your last action changed the "
+                "page but you haven't observed what happened. Call "
+                "browser_screenshot or browser_get_markdown first."
+            )
+        # Consecutive-script cap (shares counter with run_script)
+        self.s._scripts_since_observation += 1
+        if self.s._scripts_since_observation > self.s.MAX_SCRIPTS_BEFORE_INTERACT:
+            return (
+                f"[eval_refused:use_visual_path] You have run "
+                f"{self.s._scripts_since_observation - 1} consecutive "
+                f"eval/script calls without clicking any element. Use "
+                f"browser_click_at(vision_index=V_n) to interact with "
+                f"the page filters and controls instead of scraping DOM."
+            )
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
         print(f"\n>> browser_eval({script[:60]}...)")

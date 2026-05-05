@@ -285,6 +285,7 @@ class BrowserNavigateTool(Tool):
             _params_fh = _parse_qsl(_parsed_fh.query or "", keep_blank_values=False)
             _target_host_fh = (_parsed_fh.hostname or "").lower().replace("www.", "")
         except Exception:
+            _parsed_fh = None
             _params_fh = []
             _target_host_fh = ""
         # Only police same-domain or pinned-domain navigations. OAuth
@@ -331,6 +332,10 @@ class BrowserNavigateTool(Tool):
                 "/brands/", "/brand/",
                 "/tags/", "/tag/",
                 "/filters/", "/filter/",
+                "/varietals/", "/varietal/",
+                "/grapes/", "/grape/",
+                "/countries/", "/country/",
+                "/appellations/", "/appellation/",
             )
             _path_segments_seen = sum(
                 1 for seg in _path_filter_segments if seg in _path_lower
@@ -386,6 +391,64 @@ class BrowserNavigateTool(Tool):
                     f"state."
                 )
 
+        # --- Path-style filter hallucination (standalone) -----------------
+        # Catches /store/regions/oregon/, /products/colors/red/ etc. even
+        # when there are NO query params. The brain encodes guessed filters
+        # into the path — these almost always 404 or return unfiltered
+        # results. Must run outside the `if _params_fh` block above.
+        if (
+            _parsed_fh is not None
+            and not _params_fh
+            and (_same_domain or not self.s.pinned_domain)
+        ):
+            _path_lower_s = (_parsed_fh.path or "").lower()
+            _path_filter_segments_s = (
+                "/regions/", "/region/",
+                "/categories/", "/category/",
+                "/collections/",
+                "/colors/", "/color/",
+                "/types/", "/type/",
+                "/brands/", "/brand/",
+                "/tags/", "/tag/",
+                "/filters/", "/filter/",
+                "/varietals/", "/varietal/",
+                "/grapes/", "/grape/",
+                "/countries/", "/country/",
+                "/appellations/", "/appellation/",
+            )
+            _path_segs_s = sum(
+                1 for seg in _path_filter_segments_s if seg in _path_lower_s
+            )
+            _brief_s = getattr(self.s, "task_brief", None)
+            _filter_done_s = 0
+            if _brief_s is not None:
+                try:
+                    _filter_done_s = sum(
+                        1 for c in _brief_s.constraints
+                        if c.kind == "filter" and c.status == "done"
+                    )
+                except Exception:
+                    pass
+            if _path_segs_s >= 1 and _filter_done_s == 0 and bool(_brief_s):
+                self.s.record_step(
+                    "browser_navigate", url,
+                    f"BLOCKED: path_filter_hallucination (segments={_path_segs_s})",
+                )
+                _record_nav_refusal(self.s, url, "navigate_path_filter_refused")
+                return (
+                    f"[navigate_path_filter_refused] Refused {url} — "
+                    f"the path contains {_path_segs_s} filter-style "
+                    f"segment(s) (e.g. /regions/, /categories/) but you "
+                    f"haven't completed any filter constraints yet. "
+                    f"This URL is almost certainly fabricated from "
+                    f"training data — real sites rarely expose filters "
+                    f"as freely-composable path segments. Use the on-page "
+                    f"filter UI instead: browser_screenshot to find the "
+                    f"filter controls, then browser_click_at(vision_index="
+                    f"V_n) to apply them one by one. The site's JS will "
+                    f"construct the correct navigation URL."
+                )
+
         # --- Same-path query-string mutation guard -----------------------
         # Brain-constructed URL pattern: navigate to the SAME host+path
         # the page already loaded but with a different query string —
@@ -436,12 +499,8 @@ class BrowserNavigateTool(Tool):
         # mark within the last 3 brain turns — before any navigate
         # while a task_brief is active. Skipped when no brief is set
         # (legacy single-condition behaviour).
-        # Also skipped when the brain explicitly passes intent= (the
-        # explicit intent argument is treated as the brain's commitment
-        # to the navigation reason).
         if (
             getattr(self.s, "task_brief", None) is not None
-            and not intent
         ):
             turns_since_delib = (
                 self.s._brain_turn_counter - self.s.last_deliberation_turn
@@ -468,10 +527,7 @@ class BrowserNavigateTool(Tool):
                     f"likely to advance the [FOCUS] constraint.\n"
                     f"  2) browser_get_markdown if you only need text.\n"
                     f"  3) browser_brief_mark to flip a constraint you "
-                    f"have evidence for, then retry the nav.\n"
-                    f"  4) Re-call browser_navigate WITH an intent= arg "
-                    f"explaining which constraint this nav advances "
-                    f"and why now is the right moment."
+                    f"have evidence for, then retry the nav."
                 )
 
         # --- Detail-page nav refusal during open-filter constraints ----
