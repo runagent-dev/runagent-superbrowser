@@ -40,6 +40,14 @@ export interface ErrorPage {
  * visual stability (would defeat the purpose of letting the agent
  * observe a loading spinner). The goal is "DOM is no longer mid-
  * construction", not "everything has settled".
+ *
+ * Phase A3: optional layout-quiet-period after the readyState check.
+ * Production wineaccess.com trace showed clicks landing on padding
+ * because the screenshot captured DURING a lazy-image swap or font
+ * FOUC; the bbox the model produced pointed at where the element WAS
+ * before the relayout pushed it off the resolved coords. The CLS
+ * quiet-period waits for a window with no MutationObserver activity
+ * before returning. Tunable via `LAYOUT_QUIET_MS` (set 0 to disable).
  */
 export async function waitForPageReady(
   page: Page,
@@ -47,6 +55,7 @@ export async function waitForPageReady(
   pollIntervalMs: number = 100,
 ): Promise<'ready' | 'timeout'> {
   const deadline = Date.now() + timeoutMs;
+  let readyAt = 0;
   while (Date.now() < deadline) {
     try {
       const ready = await page.evaluate(() => {
@@ -56,13 +65,70 @@ export async function waitForPageReady(
         if (document.body?.getAttribute('aria-busy') === 'true') return false;
         return true;
       });
-      if (ready) return 'ready';
+      if (ready) {
+        readyAt = Date.now();
+        break;
+      }
     } catch {
       // page closed / navigated — treat as still-loading
     }
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
-  return 'timeout';
+  if (readyAt === 0) return 'timeout';
+
+  const quietMsRaw = (typeof process !== 'undefined' && process.env?.LAYOUT_QUIET_MS) || '200';
+  const quietMs = Math.max(0, Math.min(parseInt(quietMsRaw, 10) || 0, 2000));
+  if (quietMs === 0) return 'ready';
+
+  // Wait for `quietMs` of MutationObserver silence on the document.
+  // Each mutation pushes the deadline back by `quietMs`. Caps at the
+  // outer deadline so we never wait indefinitely on a chronic-shifting
+  // page (analytics widget, animated banner). Returns 'ready' regardless
+  // — the wait is best-effort layout settle, not a hard precondition.
+  const remainingMs = Math.max(0, deadline - Date.now());
+  if (remainingMs === 0) return 'ready';
+  try {
+    await page.evaluate(
+      async (cfg: { quietMs: number; maxWaitMs: number }) => {
+        await new Promise<void>((resolve) => {
+          const start = Date.now();
+          let lastMutation = Date.now();
+          const observer = new MutationObserver(() => {
+            lastMutation = Date.now();
+          });
+          observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            characterData: true,
+          });
+          const tick = () => {
+            const now = Date.now();
+            const sinceMutation = now - lastMutation;
+            const elapsed = now - start;
+            if (sinceMutation >= cfg.quietMs || elapsed >= cfg.maxWaitMs) {
+              observer.disconnect();
+              resolve();
+              return;
+            }
+            const next = Math.min(
+              cfg.quietMs - sinceMutation,
+              cfg.maxWaitMs - elapsed,
+              50,
+            );
+            setTimeout(tick, Math.max(10, next));
+          };
+          setTimeout(tick, Math.min(50, cfg.quietMs));
+        });
+      },
+      { quietMs, maxWaitMs: Math.min(remainingMs, 1500) },
+    );
+  } catch {
+    // page closed / navigated mid-wait — caller's next read will fail
+    // with a clear error; we don't want to block the readiness call on
+    // it.
+  }
+  return 'ready';
 }
 
 /** Text patterns that reliably indicate an error page body (not a real one). */

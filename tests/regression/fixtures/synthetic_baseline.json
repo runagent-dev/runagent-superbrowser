@@ -1,0 +1,38 @@
+[
+  {
+    "name": "synthetic_no_dpr_simple",
+    "url": "https://example.com",
+    "image_width": 1280,
+    "image_height": 800,
+    "dpr": 1.0,
+    "box_2d": [500, 500, 600, 600],
+    "expected_target": "button.primary",
+    "expected_coords": [704, 440],
+    "tolerance_px": 1,
+    "notes": "Identity baseline — no DPR, mid-image bbox."
+  },
+  {
+    "name": "synthetic_retina_centre",
+    "url": "https://example.com",
+    "image_width": 2560,
+    "image_height": 1600,
+    "dpr": 2.0,
+    "box_2d": [490, 490, 510, 510],
+    "expected_target": "button.primary",
+    "expected_coords": [640, 400],
+    "tolerance_px": 1,
+    "notes": "Retina viewport — DPR=2 should NOT shift centre."
+  },
+  {
+    "name": "synthetic_top_left_corner",
+    "url": "https://example.com",
+    "image_width": 1024,
+    "image_height": 768,
+    "dpr": 1.0,
+    "box_2d": [0, 0, 50, 50],
+    "expected_target": "a.skip-link",
+    "expected_coords": [25, 19],
+    "tolerance_px": 2,
+    "notes": "Top-left corner; checks rounding + zero-coord behaviour."
+  }
+]

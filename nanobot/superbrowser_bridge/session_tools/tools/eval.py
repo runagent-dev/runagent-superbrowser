@@ -98,9 +98,19 @@ class BrowserEvalTool(Tool):
 class BrowserRunScriptTool(Tool):
     name = "browser_run_script"
     description = (
-        "Execute a Puppeteer script with full page API access. "
-        "READ-ONLY by default — pass mutates=true to allow click/type/"
-        "dispatchEvent/value-setter operations (rare)."
+        "**LAST RESORT.** Execute a Puppeteer script with full page API "
+        "access. Try `browser_click_selector`, `browser_click_at`, "
+        "`browser_type_at`, and `browser_keys` FIRST — this tool is "
+        "hard-blocked until you have attempted **at least 3 cursor "
+        "interactions** (click/type/keys/drag) on the current vision "
+        "epoch. A fresh screenshot resets the counter, so run_script "
+        "must be re-earned on every page state. The 3-attempt threshold "
+        "stops the brain from reaching for JS as a first hammer; "
+        "use the cursor path until you've genuinely exhausted it. "
+        "READ-ONLY by default; pass `mutates=true` to allow click/type/"
+        "dispatchEvent/value-setter operations — but JS clicks fire "
+        "`isTrusted=false` and are routinely rejected by Cloudflare/"
+        "Akamai. Tunable via `RUN_SCRIPT_MIN_CURSOR_ATTEMPTS`."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -138,6 +148,45 @@ class BrowserRunScriptTool(Tool):
                 "scripts bypasses all safety checks and is blocked."
             )
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Phase 4 hard gate: refuse run_script until the brain has
+        # tried at least RUN_SCRIPT_MIN_CURSOR_ATTEMPTS (default 3)
+        # cursor interactions (click_*/type_*/keys/drag) on the current
+        # vision epoch. One try is too easy to game (a single
+        # throw-away click then escalate); three attempts is the
+        # minimum that proves the cursor path was genuinely explored
+        # (e.g. selector click → vision_index click → keys, OR three
+        # clicks at different bboxes). The next browser_screenshot
+        # resets the counter. Disable entirely with
+        # `RUN_SCRIPT_EPOCH_GATE=0`.
+        try:
+            min_attempts = int(
+                os.environ.get("RUN_SCRIPT_MIN_CURSOR_ATTEMPTS") or "3"
+            )
+        except ValueError:
+            min_attempts = 3
+        if (
+            os.environ.get("RUN_SCRIPT_EPOCH_GATE", "1") not in ("0", "false", "no")
+            and self.s.epoch_interact_attempts < min_attempts
+        ):
+            return (
+                f"[run_script_blocked:epoch_cursor_quota] "
+                f"You have attempted {self.s.epoch_interact_attempts} of "
+                f"{min_attempts} required cursor interactions on this "
+                f"screenshot — run_script stays locked until you've "
+                f"genuinely explored the cursor path. Try in this order "
+                f"BEFORE escalating:\n"
+                "  1. browser_click_selector(<css>) — pixel-exact, zero "
+                "vision cost, when the target has a stable hook.\n"
+                "  2. browser_click_at(vision_index=V_n) — vision bbox "
+                "click for everything else.\n"
+                "  3. browser_type_at / browser_keys for text input.\n"
+                "Each click/type/keys/drag counts as one attempt — "
+                "success OR failure both increment. The next "
+                "browser_screenshot resets the counter. Three attempts "
+                "is the minimum threshold that proves the cursor path "
+                "was genuinely explored; one quick throw-away click "
+                "doesn't count."
+            )
         # Post-mutation observation gate: after a click/navigate, the brain
         # must observe before running scripts. Even read-only scripts query
         # a DOM the brain hasn't seen — results will be misinterpreted.

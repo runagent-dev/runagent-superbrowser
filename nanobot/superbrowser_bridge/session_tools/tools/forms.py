@@ -53,6 +53,16 @@ class BrowserSelectTool(Tool):
             "Visible text or value of the option to pick (e.g. 'Dell', 'Intel', "
             "'2017'). Matching is exact-ci → startsWith → contains → fuzzy."
         ),
+        section=StringSchema(
+            "Section heading (e.g. 'Region', 'Filter by', 'Pairings') to "
+            "scope the label search to. **REQUIRED** when the page has "
+            "a filter sidebar with multiple sections — without it, the "
+            "tool may match the wrong dropdown (the wineaccess.com case "
+            "where 'Region' label matched the SORT dropdown). On ambiguity "
+            "the tool refuses with `requires_section` and lists the "
+            "section candidates so you can re-call with the right one.",
+            nullable=True,
+        ),
         fuzzy=BooleanSchema(
             description="Allow fuzzy match (Levenshtein ≥0.7). Default true.",
             default=True,
@@ -69,6 +79,15 @@ class BrowserSelectTool(Tool):
             items=StringSchema(""),
             nullable=True,
         ),
+        require_section_on_ambiguity=BooleanSchema(
+            description=(
+                "If true (default), refuse with `requires_section` when "
+                "the label matches triggers in 2+ distinct sections AND "
+                "no `section=` is provided. Set false to fall back to "
+                "first-match (risks picking wrong dropdown)."
+            ),
+            default=True,
+        ),
         required=["session_id", "label", "value"],
     )
 )
@@ -79,6 +98,12 @@ class BrowserSelectOptionTool(Tool):
     combobox+listbox, Headless-UI Listbox, etc. You never pass an index or
     vision V-index, so re-renders between cascade steps don't matter.
 
+    Phase C: when working in a filter sidebar with multiple sections
+    (Region, Variety, Price, etc.), pass ``section=<heading>`` so the
+    label search is scoped to that section's subtree. The wineaccess.com
+    case where ``select_option(label='Region', value='Oregon')`` matched
+    the *sort* dropdown is exactly what this prevents.
+
     On ambiguity (no exact/fuzzy match) the tool returns the candidate list
     instead of guessing — retry with a corrected `value`. For ≥2 dependent
     dropdowns prefer `browser_form_plan` so progress is tracked structurally.
@@ -87,9 +112,11 @@ class BrowserSelectOptionTool(Tool):
     name = "browser_select_option"
     description = (
         "Pick a dropdown option by label+value. Works on native <select> "
-        "AND custom listbox/combobox widgets. Returns {ok, picked_text, "
-        "verified, candidates?} — on ambiguity, retry with one of the "
-        "candidates instead of clicking blindly."
+        "AND custom listbox/combobox widgets. **For filter sidebars with "
+        "multiple sections, pass `section=<heading>` to scope the label "
+        "search** — without it the tool may match the wrong dropdown. "
+        "Returns {ok, picked_text, verified, candidates?} — on ambiguity, "
+        "retry with one of the candidates instead of clicking blindly."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -104,13 +131,18 @@ class BrowserSelectOptionTool(Tool):
         session_id: str,
         label: str,
         value: str,
+        section: str | None = None,
         fuzzy: bool = True,
         timeout: int | None = None,
         extra_option_selectors: list[str] | None = None,
+        require_section_on_ambiguity: bool = True,
         **kw: Any,
     ) -> str:
-        print(f"\n>> browser_select_option(label={label!r}, value={value!r})")
+        print(f"\n>> browser_select_option(label={label!r}, value={value!r}, section={section!r})")
         payload: dict[str, Any] = {"label": label, "value": value, "fuzzy": bool(fuzzy)}
+        if section:
+            payload["section"] = section.strip()
+        payload["require_section_on_ambiguity"] = bool(require_section_on_ambiguity)
         if timeout is not None:
             payload["timeout"] = int(timeout)
         if extra_option_selectors:
@@ -144,10 +176,27 @@ class BrowserSelectOptionTool(Tool):
                 self.s.cursor_failure_strategies.add(f"select_option:{reason}")
 
         if ok:
-            note = f"Picked '{picked}' for '{label}'" + ("" if verified else " (verify pending)")
-            print(f"   [select_option] ok -> {picked!r} (verified={verified})")
+            auto_expanded = bool(data.get("auto_expanded"))
+            note_parts = [f"Picked '{picked}' for '{label}'"]
+            if not verified:
+                note_parts.append("(verify pending)")
+            if auto_expanded:
+                note_parts.append(
+                    f"[auto_expanded section={section!r}] — the section "
+                    "was collapsed; the tool clicked its expand control "
+                    "before selecting."
+                )
+            note = " ".join(note_parts)
+            print(
+                f"   [select_option] ok -> {picked!r} "
+                f"(verified={verified}, auto_expanded={auto_expanded})"
+            )
             self.s.log_activity(f"select_option({label})", picked[:40])
-            self.s.record_step("browser_select_option", f"{label}={picked}", "ok")
+            self.s.record_step(
+                "browser_select_option",
+                f"{label}={picked}" + (" auto_expanded" if auto_expanded else ""),
+                "ok",
+            )
             return self.s.build_text_only(data, note)
 
         # Ambiguity / failure path — surface candidates so the LLM corrects
@@ -159,7 +208,39 @@ class BrowserSelectOptionTool(Tool):
         print(f"   [select_option] FAIL reason={reason or '?'}{cand_preview}")
 
         msg_parts = [f"[select_option_failed] reason={reason or 'unknown'} label={label!r} value={value!r}"]
-        if reason == "trigger_not_found":
+        server_message = data.get("message")
+        if reason == "requires_section":
+            # Phase C1: ambiguity refusal — surface the section list and
+            # re-call instructions. This is the wineaccess case (Region
+            # label matches both filter and sort; we want filter).
+            cand_list = ", ".join(repr(c) for c in candidates[:8])
+            msg_parts.append(
+                f"The label {label!r} matches triggers in multiple "
+                f"sections: {cand_list}. Re-call browser_select_option "
+                f"with `section=<one of these>` to disambiguate. e.g. "
+                f"browser_select_option(label={label!r}, value={value!r}, "
+                f"section='{candidates[0] if candidates else 'Region'}'). "
+                "If you're unsure which section, call browser_get_markdown"
+                "(outline=true) to see the page structure first, OR "
+                "browser_find_target to locate the value across viewport."
+            )
+        elif reason == "section_not_found":
+            cand_list = ", ".join(repr(c) for c in candidates[:8]) or "(none)"
+            msg_parts.append(
+                f"Section {section!r} was not detected on this page. "
+                f"Sections found: {cand_list}. Either correct the section "
+                f"name or call browser_find_target(label={value!r}) to "
+                "locate the target without a section hint."
+            )
+        elif reason == "section_match_no_value":
+            cand_list = ", ".join(repr(c) for c in candidates[:8]) or "(none)"
+            msg_parts.append(
+                f"Section {section!r} exists but no element matching "
+                f"{value!r} was inside it. The section may be collapsed "
+                "(click its header to expand), or the value text may "
+                "differ. Sections on page: " + cand_list + "."
+            )
+        elif reason == "trigger_not_found":
             msg_parts.append(
                 "The label was not found on this page. Two common causes:\n"
                 "  (a) the cascading dropdown stage is over and the page "
@@ -170,9 +251,15 @@ class BrowserSelectOptionTool(Tool):
                 "on the matching item.\n"
                 "  (b) the label text in the page is different from what "
                 "you passed — call browser_screenshot to read actual labels, "
-                "then retry with the exact text."
+                "then retry with the exact text.\n"
+                "  (c) the section is collapsed — try browser_find_target"
+                f"(label={value!r}, section={label!r}) which detects "
+                "collapsed accordions and reports them as a structured "
+                "next-action hint."
             )
-        if candidates:
+        if server_message and server_message not in "\n".join(msg_parts):
+            msg_parts.append(server_message)
+        if candidates and reason not in {"requires_section", "section_not_found", "section_match_no_value"}:
             shown = ", ".join(repr(c) for c in candidates[:15])
             msg_parts.append(f"candidates: {shown}")
             msg_parts.append(

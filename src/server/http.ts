@@ -31,6 +31,7 @@ import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
 import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot } from './effect.js';
+import { mountHealthVersion } from './health.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -102,6 +103,11 @@ export function createHttpServer(
   app.get('/metrics', (_req, res) => {
     res.json(limiter.getMetrics());
   });
+
+  // Phase K: build-staleness probe. Returns build mtime, newest src mtime,
+  // a `stale` boolean, and the top stale source paths. Operators / CI hit
+  // this to detect Python/TS deploy drift after a rebuild was forgotten.
+  mountHealthVersion(app);
 
   // --- Feedback state ---
   // Python bridge polls this before dispatching a browser tool to check
@@ -732,7 +738,7 @@ export function createHttpServer(
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const { index, x, y, bbox, button, clickCount, expected_fingerprint } = req.body as {
+      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label } = req.body as {
         index?: number;
         x?: number;
         y?: number;
@@ -747,6 +753,11 @@ export function createHttpServer(
          *  has a different fingerprint — prevents clicking a different
          *  element than the LLM intended after a DOM re-render. */
         expected_fingerprint?: string;
+        /** Phase J2: vision-supplied label for the bbox. When the
+         *  snap takes the grid_scan fallback path, the resolved
+         *  element's text is compared against this. Zero token
+         *  overlap → drift_detected:label_mismatch. */
+        expected_label?: string;
       };
 
       if (bbox !== undefined) {
@@ -754,7 +765,11 @@ export function createHttpServer(
         // click at the snapped centre, return the resolved point so
         // the bridge can log/trace which element actually received
         // the input.
-        const snap = await page.clickInBbox(bbox, { button, clickCount });
+        const snap = await page.clickInBbox(bbox, {
+          button,
+          clickCount,
+          expectedLabel: typeof expected_label === 'string' ? expected_label : undefined,
+        });
         await settleForEffect(page.getRawPage());
         const effectAfter = await captureEffect(page.getRawPage());
         const newState = await page.getState({ useVision: false, includeConsole: true });
@@ -1080,6 +1095,44 @@ export function createHttpServer(
           scrollHeight: newState.scrollHeight,
           viewportHeight: newState.viewportHeight,
         },
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Phase B1: locate a target element by label across viewport boundaries.
+   *
+   * Combines DOM walk + section-path detection + collapsed-accordion
+   * detection + (optional) auto-scroll. Returns structured candidate
+   * info so the brain learns: target is visible / above-fold / below-
+   * fold / in-collapsed-section, plus its section_path so it can pick
+   * the right `select_option(section=...)` call.
+   */
+  app.post('/session/:id/find-target', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { label, section, role, autoScroll, maxCandidates } = req.body ?? {};
+      if (typeof label !== 'string' || !label.trim()) {
+        res.status(400).json({ error: 'label is required' });
+        return;
+      }
+      const result = await page.findTarget({
+        label: label.trim(),
+        section: typeof section === 'string' ? section.trim() || undefined : undefined,
+        role: typeof role === 'string' ? role.trim() || undefined : undefined,
+        autoScroll: autoScroll !== false,
+        maxCandidates: typeof maxCandidates === 'number' ? maxCandidates : 5,
+      });
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: result.found,
+        ...result,
+        url: newState.url,
+        title: newState.title,
       });
     } catch (err) {
       handleError(res, err);
@@ -1498,7 +1551,10 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
-    const { label, value, fuzzy, timeout, extra_option_selectors } = req.body || {};
+    const {
+      label, value, fuzzy, timeout, extra_option_selectors,
+      section, require_section_on_ambiguity,
+    } = req.body || {};
     if (typeof label !== 'string' || !label.trim()) {
       res.status(400).json({ error: 'label (string) is required' });
       return;
@@ -1516,6 +1572,8 @@ export function createHttpServer(
         fuzzy: fuzzy !== false,
         timeout: typeof timeout === 'number' ? timeout : undefined,
         extraOptionSelectors: Array.isArray(extra_option_selectors) ? extra_option_selectors : undefined,
+        section: typeof section === 'string' ? section : undefined,
+        requireSectionOnAmbiguity: require_section_on_ambiguity !== false,
       });
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
@@ -1530,14 +1588,106 @@ export function createHttpServer(
     }
   });
 
-  /** Extract page content as markdown. */
+  /** Extract page content as markdown.
+   *
+   * Phase B2: optional structural outline. Pass ``?outline=1`` to get a
+   * list of headings with their y-offset relative to the current
+   * viewport top, so the brain can plan scrolling without a vision
+   * round-trip. Outline includes h1-h6, [role="heading"], summary
+   * elements, and major landmark sections.
+   */
   app.get('/session/:id/markdown', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
       const markdown = await page.getMarkdownContent();
-      res.json({ content: markdown });
+      const wantOutline = (req.query.outline === '1' || req.query.outline === 'true');
+      const result: { content: string; outline?: unknown; viewport?: unknown } = { content: markdown };
+      if (wantOutline) {
+        const outline = await page.getRawPage().evaluate(() => {
+          const headings = Array.from(document.querySelectorAll(
+            'h1, h2, h3, h4, h5, h6, [role="heading"], summary, fieldset > legend',
+          ));
+          const out: Array<{
+            level: number;
+            text: string;
+            y_offset_px: number;
+            collapsed: boolean;
+            ancestor_section: string;
+          }> = [];
+          const ancestorSection = (el: Element): string => {
+            let cur: Element | null = el.parentElement;
+            let depth = 0;
+            while (cur && cur !== document.body && depth < 12) {
+              const tag = cur.tagName.toLowerCase();
+              const role = cur.getAttribute('role') || '';
+              if (
+                tag === 'section' || tag === 'aside' || tag === 'nav'
+                || role === 'region' || role === 'navigation'
+              ) {
+                const aria = cur.getAttribute('aria-label')
+                  || cur.getAttribute('aria-labelledby');
+                if (aria) {
+                  if (aria.startsWith('#') || aria.match(/^[a-zA-Z][\w-]*$/)) {
+                    const ref = document.getElementById(aria);
+                    if (ref) return ((ref.textContent || '').trim().slice(0, 40));
+                  }
+                  return aria.slice(0, 40);
+                }
+                return tag;
+              }
+              cur = cur.parentElement;
+              depth++;
+            }
+            return '';
+          };
+          const isCollapsed = (el: Element): boolean => {
+            let cur: Element | null = el;
+            let depth = 0;
+            while (cur && cur !== document.body && depth < 6) {
+              if (cur.getAttribute('aria-expanded') === 'false') return true;
+              if (cur.tagName.toLowerCase() === 'details' && !cur.hasAttribute('open')) return true;
+              cur = cur.parentElement;
+              depth++;
+            }
+            return false;
+          };
+          for (const h of headings) {
+            const text = ((h.textContent || '').trim().slice(0, 80));
+            if (!text) continue;
+            const r = h.getBoundingClientRect();
+            const tag = h.tagName.toLowerCase();
+            let level = 6;
+            if (tag === 'h1') level = 1;
+            else if (tag === 'h2') level = 2;
+            else if (tag === 'h3') level = 3;
+            else if (tag === 'h4') level = 4;
+            else if (tag === 'h5') level = 5;
+            else if (tag === 'h6') level = 6;
+            else if (tag === 'summary') level = 3;
+            else if (tag === 'legend') level = 4;
+            else level = parseInt(h.getAttribute('aria-level') || '3', 10) || 3;
+            out.push({
+              level,
+              text,
+              y_offset_px: Math.round(r.top),
+              collapsed: isCollapsed(h),
+              ancestor_section: ancestorSection(h),
+            });
+          }
+          // Cap to a sensible size — pages with hundreds of headings
+          // (legal docs, sitemaps) blow context if uncapped.
+          return out.slice(0, 80);
+        });
+        result.outline = outline;
+        result.viewport = await page.getRawPage().evaluate(() => ({
+          scrollY: window.scrollY,
+          innerHeight: window.innerHeight,
+          pageHeight: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+        }));
+      }
+      res.json(result);
     } catch (err) {
       handleError(res, err);
     }

@@ -12,6 +12,8 @@ from .ask import BrowserAskUserTool, BrowserRequestHelpTool
 from .captcha import BrowserDetectCaptchaTool, BrowserSolveCaptchaTool
 from .cursor import (
     BrowserClickAtTool,
+    BrowserClickSelectorTool,
+    BrowserClickTool,
     BrowserDragTool,
     BrowserFixTextAtTool,
     BrowserKeysTool,
@@ -26,6 +28,7 @@ from .dom_extract import (
     BrowserVerifyFactTool,
 )
 from .eval import BrowserEvalTool, BrowserRunScriptTool
+from .find import BrowserFindTargetTool
 from .forms import (
     BrowserDialogTool,
     BrowserFormBeginTool,
@@ -67,6 +70,8 @@ __all__ = [
     "BrowserBriefMarkTool",
     "BrowserCaptchaScreenshotTool",
     "BrowserClickAtTool",
+    "BrowserClickSelectorTool",
+    "BrowserClickTool",
     "BrowserCloseTool",
     "BrowserDetectCaptchaTool",
     "BrowserDialogTool",
@@ -76,6 +81,7 @@ __all__ = [
     "BrowserDragTool",
     "BrowserEscalateTool",
     "BrowserEvalTool",
+    "BrowserFindTargetTool",
     "BrowserFixTextAtTool",
     "BrowserFormBeginTool",
     "BrowserFormCommitTool",

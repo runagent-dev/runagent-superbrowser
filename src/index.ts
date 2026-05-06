@@ -12,9 +12,23 @@ import { createHttpServer } from './server/http.js';
 import { createMCPServer } from './server/mcp.js';
 import { attachWebSocketServer } from './server/websocket.js';
 import { BrowserExecutor } from './agent/executor.js';
+import { warnIfBuildStale } from './server/health.js';
 
 async function main(): Promise<void> {
   const mode = process.argv[2] || 'http'; // 'http', 'mcp', or 'task'
+
+  // Phase K: build-staleness check. Production runs `node build/index.js`
+  // but TS edits land in `src/`. If `npm run build` wasn't re-run after
+  // changes, the running server silently misses them. Warn on stale,
+  // hard-fail when STRICT_BUILD=1 (CI / prod opt-in).
+  const isStale = warnIfBuildStale();
+  if (isStale && process.env.STRICT_BUILD === '1') {
+    console.error(
+      '[STRICT_BUILD] Refusing to start with stale build. '
+        + 'Run `npm run build` to update build/ or unset STRICT_BUILD.',
+    );
+    process.exit(2);
+  }
 
   // Initialize browser engine
   const engine = new BrowserEngine({

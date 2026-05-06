@@ -16,7 +16,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .constants import SCREENSHOT_DIR
 from .telemetry import _compute_screenshot_budget
@@ -25,6 +25,125 @@ from .vision_sync import (
     _push_vision_bboxes,
     _read_image_dims,
 )
+
+
+def _enrich_bboxes_with_dom_metadata(
+    vision_response: Any,
+    elements_with_bounds: list[dict],
+    *,
+    image_w: int,
+    image_h: int,
+    dpr: float = 1.0,
+) -> None:
+    """Phase R: copy DOM-derived attributes onto each Gemini bbox.
+
+    For each ``vision_response.bboxes[i]``, find the
+    ``elements_with_bounds`` entry whose viewport-pixel rect overlaps
+    most with the bbox (after denormalising box_2d into CSS pixels),
+    and write metadata (dom_index, href, aria_expanded, name,
+    is_disabled, is_active_filter) onto the bbox in place.
+
+    Cheap: O(B × E) IoU computation where B ≤ 50 and E ≤ a few hundred,
+    all integer arithmetic. Adds ~5 ms even on dense pages.
+    """
+    if not elements_with_bounds or not getattr(vision_response, "bboxes", None):
+        return
+    iw = max(1, int(image_w))
+    ih = max(1, int(image_h))
+    dpr_clamp = max(dpr, 1e-6)
+
+    # Pre-extract viewport-pixel rects for all selectorEntries.
+    # `bounds` from selectorEntries is in viewport CSS pixels; bboxes
+    # from Gemini are in [0, 1000] space normalised against the
+    # screenshot — denormalise via `iw / dpr` to get viewport CSS
+    # pixels too. Both must end up in the same coordinate space for
+    # the IoU comparison to be meaningful.
+    entries: list[tuple[float, float, float, float, dict]] = []
+    for e in elements_with_bounds:
+        b = e.get("bounds") or {}
+        if not isinstance(b, dict):
+            continue
+        try:
+            bx = float(b.get("x", 0))
+            by = float(b.get("y", 0))
+            bw = float(b.get("w") if "w" in b else b.get("width", 0))
+            bh = float(b.get("h") if "h" in b else b.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        if bw <= 0 or bh <= 0:
+            continue
+        entries.append((bx, by, bx + bw, by + bh, e))
+    if not entries:
+        return
+
+    # Filter-state attributes — these mark a bbox as an "active filter
+    # chip" the brain should NOT re-click.
+    _ACTIVE_TRUE = {"true", "1", "yes"}
+    _SCALE_W = iw / dpr_clamp
+    _SCALE_H = ih / dpr_clamp
+
+    for b in vision_response.bboxes:
+        try:
+            ymin, xmin, ymax, xmax = b.box_2d
+            ax0 = (xmin / 1000.0) * _SCALE_W
+            ay0 = (ymin / 1000.0) * _SCALE_H
+            ax1 = (xmax / 1000.0) * _SCALE_W
+            ay1 = (ymax / 1000.0) * _SCALE_H
+            a_area = max(0.0, (ax1 - ax0) * (ay1 - ay0))
+        except Exception:
+            continue
+        if a_area <= 0:
+            continue
+        best_iou = 0.0
+        best_entry: Optional[dict] = None
+        for ex0, ey0, ex1, ey1, entry in entries:
+            ix = max(0.0, min(ax1, ex1) - max(ax0, ex0))
+            iy = max(0.0, min(ay1, ey1) - max(ay0, ey0))
+            inter = ix * iy
+            if inter <= 0:
+                continue
+            e_area = (ex1 - ex0) * (ey1 - ey0)
+            union = a_area + e_area - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_entry = entry
+        # Match threshold: 0.30 IoU is conservative — too low and we
+        # match unrelated nearby elements; too high and we miss
+        # legitimate matches when Gemini's bbox is loose. 0.30 was
+        # chosen empirically from the wineaccess listings page where
+        # listing card bboxes have ~0.4 IoU with the underlying <a>.
+        if best_entry is None or best_iou < 0.30:
+            continue
+        attrs = best_entry.get("attributes") or {}
+        try:
+            b.dom_index = int(best_entry["index"]) if best_entry.get("index") is not None else None
+        except (TypeError, ValueError):
+            b.dom_index = None
+        href = attrs.get("href")
+        if href:
+            # Trim to a reasonable length — some pages have absurdly
+            # long catalog hrefs with tracking params.
+            b.href = str(href)[:300]
+        ariaexp = attrs.get("aria-expanded")
+        if ariaexp:
+            b.aria_expanded = str(ariaexp).lower()
+        nm = attrs.get("name")
+        if nm:
+            b.name = str(nm)[:60]
+        # Disabled state — the standard `disabled` attribute OR
+        # aria-disabled='true'.
+        if attrs.get("disabled") is not None or (
+            (attrs.get("aria-disabled") or "").lower() in _ACTIVE_TRUE
+        ):
+            b.is_disabled = True
+        # Active filter — aria-checked / aria-pressed / aria-selected.
+        if (
+            (attrs.get("aria-checked") or "").lower() in _ACTIVE_TRUE
+            or (attrs.get("aria-pressed") or "").lower() in _ACTIVE_TRUE
+            or (attrs.get("aria-selected") or "").lower() in _ACTIVE_TRUE
+        ):
+            b.is_active_filter = True
 
 
 @dataclass
@@ -95,6 +214,21 @@ class BrowserSessionState:
         # query strings like ?ordering=-expert_rating). Forces the brain
         # to use the on-page sort/filter UI instead of guessing URLs.
         self.observed_urls: set[str] = set()
+        # Phase D: per-session set of query-string keys we've actually
+        # seen on real URLs (loaded via the browser, not fabricated by
+        # the brain). The navigate guard refuses navigations whose
+        # query keys are NOT in this set — catches Django/Rails-style
+        # patterns like `?category__in=...&ordering=-expert_rating`
+        # that the brain pattern-completes from training data even
+        # when the site uses different param names.
+        self.observed_query_keys: set[str] = set()
+        # Phase N: per-session set of full link URLs harvested from
+        # markdown extraction + click responses + page state.
+        # The navigate guard refuses URLs whose path contains a UUID
+        # (`[0-9a-f]{8}-[0-9a-f]{4}-...`) when the URL isn't in this
+        # set — catches the wineaccess case where the brain fabricated
+        # `/catalog/<slug>_<UUID>/` URLs from training data.
+        self.observed_link_hrefs: set[str] = set()
         self.regression_count: int = 0
         # Dedupe key: (normalized_url, hash_of_content) — so a same URL with
         # changed content (e.g., after clicking "Load more") still allows a new
@@ -109,6 +243,15 @@ class BrowserSessionState:
         # vision bboxes and falling into a DOM-scraping loop.
         self._scripts_since_observation: int = 0
         self.MAX_SCRIPTS_BEFORE_INTERACT: int = 2
+        # Phase 4 hard gate: number of cursor interactions
+        # (click_*/type_*/keys/drag*) attempted on the current vision
+        # epoch. Reset to 0 every time a fresh screenshot is taken.
+        # `browser_run_script` refuses to execute while this is 0 —
+        # the brain must try a cursor strategy first. After one
+        # attempt this gate clears even if the cursor failed, so
+        # legitimate "page genuinely has no interactive controls"
+        # cases can still escalate to a script.
+        self.epoch_interact_attempts: int = 0
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
         # Hard guard against the brain re-clicking a target that produced
@@ -123,6 +266,17 @@ class BrowserSessionState:
         self.last_click_dom_hash: str = ""
         self.consecutive_dead_clicks: int = 0
         self.MAX_CONSECUTIVE_SAME_TARGET = 3
+        # Phase A4: longer-memory click ledger for the looser guard.
+        # Each entry: {target_key, coords, turn, url, ts}. Capped at 12
+        # entries (keeps allocation tiny, covers the worst observed
+        # cascade in the wineaccess.com trace).
+        self.recent_click_attempts: list[dict] = []
+        # Phase E1: when the worker_hook detects a cursor cascade
+        # (≥3 failures in 6 turns and last vision is ≥3 turns old) it
+        # sets this flag. cursor.py / forms.py / eval.py refuse
+        # mutating tools while this is set; the next browser_screenshot
+        # clears it.
+        self._force_reobserve_pending: bool = False
         # Cross-index flail guard. consecutive_dead_clicks only catches
         # REPEATS of the same target. When the brain walks
         # [21]→[22]→[20] with every dispatch timing out, each looks like
@@ -284,6 +438,9 @@ class BrowserSessionState:
         # REPEAT_WINDOW_S so the brain is forced to take a screenshot
         # and verify what actually happened.
         self.recent_typed_values: list[tuple[str, float]] = []
+        # Phase L: per-target_key turn-window ledger. Each entry:
+        # {target_key: str, value_norm: str, turn: int}. Capped at 30.
+        self.recent_typed_per_target: list[dict] = []
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
@@ -452,15 +609,27 @@ class BrowserSessionState:
         leaves ``self.task_brief`` as ``None`` so the worker hook skips
         the brief-injection branch and behaves like the pre-feature path.
 
-        DISABLED: The brief/focus system creates hallucination pressure —
-        the brain tries to satisfy named constraints and fabricates URLs
-        rather than exploring the page naturally. Guards that depend on
-        task_brief (deliberation gate, detail-page guard, filter-hack
-        path check) cause cascading refusals. Disable by always setting
-        None — the brain receives the original query via the prompt and
-        works freely.
+        Phase 6 re-enable: the brief was previously force-disabled
+        because the constraint-tracking system pressured the brain to
+        fabricate URLs. The Planner agent (planner_agent.py) now
+        produces *higher-quality* checklists than the heuristic and
+        re-plans on stalls, so brittle predicates that caused that
+        pressure are gone — the steps emitted are outcome-shaped
+        ("filter to under $50") not URL-shaped. Disable per session
+        with ``SUPERBROWSER_TASK_BRIEF=0``.
         """
-        self.task_brief = None
+        if os.environ.get("SUPERBROWSER_TASK_BRIEF", "1") in ("0", "false", "no"):
+            self.task_brief = None
+            return
+        if not checklist:
+            self.task_brief = None
+            return
+        try:
+            from superbrowser_bridge.task_brief import TaskBrief
+            self.task_brief = TaskBrief(original_query, checklist)
+        except Exception as exc:
+            print(f"[set_task_brief failed: {exc}]")
+            self.task_brief = None
 
     def enter_captcha_mode(self) -> None:
         """Relax screenshot limits for the next N iterations.
@@ -491,6 +660,7 @@ class BrowserSessionState:
         self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
+        self.epoch_interact_attempts = 0
         # Epoch from a prior session is meaningless for the new one.
         self._vision_epoch_response = None
         self._vision_epoch_id = 0
@@ -660,9 +830,12 @@ class BrowserSessionState:
         return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, parsed.query, ""))
 
     def record_url(self, url: str) -> None:
-        """Track a URL visit. Updates current_url, visit counts, and
-        the observed_urls set (used by the navigate guard to refuse
-        URLs the brain hasn't actually loaded)."""
+        """Track a URL visit. Updates current_url, visit counts, the
+        observed_urls set (used by the navigate guard to refuse URLs
+        the brain hasn't actually loaded), and observed_query_keys
+        (Phase D — per-session keyset for stronger fabrication
+        detection).
+        """
         if not url:
             return
         norm = self._normalize_url(url)
@@ -673,6 +846,40 @@ class BrowserSessionState:
         if len(self.observed_urls) < 256:
             self.observed_urls.add(url)
             self.observed_urls.add(norm)
+        # Phase D: harvest query keys for the per-session keyset.
+        try:
+            from urllib.parse import urlparse, parse_qsl
+            parsed = urlparse(url)
+            if parsed.query:
+                for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+                    if key:
+                        self.observed_query_keys.add(key)
+        except Exception:
+            pass
+        # Phase N: any URL we navigated to is a real link — record it.
+        if len(self.observed_link_hrefs) < 1024:
+            self.observed_link_hrefs.add(url)
+
+    def harvest_link_hrefs(self, hrefs: "Iterable[str]") -> int:
+        """Phase N: bulk-add link hrefs from markdown extraction or
+        page state. Returns count newly added.
+
+        Caps at 1024 entries per session to keep memory bounded — UUID
+        URLs are usually a few-hundred per page max.
+        """
+        added = 0
+        for h in hrefs:
+            if not isinstance(h, str) or not h:
+                continue
+            # Skip non-HTTP(S) hrefs (mailto, tel, javascript, fragments).
+            if not h.startswith(("http://", "https://", "/")):
+                continue
+            if len(self.observed_link_hrefs) >= 1024:
+                break
+            if h not in self.observed_link_hrefs:
+                self.observed_link_hrefs.add(h)
+                added += 1
+        return added
 
     def record_checkpoint(self, url: str, title: str, action: str) -> None:
         """Record a progress checkpoint (successful meaningful step)."""
@@ -1190,12 +1397,28 @@ class BrowserSessionState:
     # next one. 3 lets the brain retry once after a real failure (e.g. the
     # field was unfocused) but stops the price-40-six-times cascade.
     REPEAT_TYPE_REFUSE_AT = 3
+    # Phase L: per-target_key turn-window guard. The wallclock window
+    # above is too tight for slow LLM deliberation (the wineaccess
+    # trace had ~32s between repeated `type_at(V1, "Oregon white wine")`
+    # because the brain was deliberating between turns). A turn-window
+    # is bounded by tool calls, not time, so it catches the cascade
+    # regardless of how slowly the brain thinks.
+    REPEAT_TYPE_TURN_WINDOW = 6
+    # Per (target_key, value) pairs typed recently — entries are
+    # {target_key, value_norm, turn}. Capped at 30 entries.
+    recent_typed_per_target: list[dict] = []  # type: ignore[assignment]  # initialized in __init__
 
-    def check_repeat_type(self, text: str) -> str | None:
+    def check_repeat_type(
+        self,
+        text: str,
+        target_key: str | None = None,
+    ) -> str | None:
         """Cross-index variant of the dead-type guard. Returns a
         structured refusal string when the brain has typed ``text``
         ``REPEAT_TYPE_REFUSE_AT`` or more times in the last
-        ``REPEAT_TYPE_WINDOW_S`` seconds, or None to allow the type.
+        ``REPEAT_TYPE_WINDOW_S`` seconds OR the same (target_key,
+        value) pair was typed twice in the last
+        ``REPEAT_TYPE_TURN_WINDOW`` brain turns.
 
         Stripping is normalized — surrounding whitespace and trailing
         currency-style punctuation don't disqualify a repeat.
@@ -1213,6 +1436,41 @@ class BrowserSessionState:
         if len(self.recent_typed_values) > 50:
             self.recent_typed_values = self.recent_typed_values[-25:]
         same = sum(1 for (t, _) in self.recent_typed_values if t == norm)
+
+        # Phase L: per-target_key turn-window check.
+        if target_key:
+            current_turn = self._brain_turn_counter
+            window = self.REPEAT_TYPE_TURN_WINDOW
+            recent_pt = getattr(self, "recent_typed_per_target", None) or []
+            # Walk and count matches within the window.
+            same_target_count = 0
+            for entry in recent_pt:
+                try:
+                    if (current_turn - int(entry.get("turn", 0))) > window:
+                        continue
+                    if (
+                        entry.get("target_key") == target_key
+                        and entry.get("value_norm") == norm
+                    ):
+                        same_target_count += 1
+                except (TypeError, ValueError):
+                    continue
+            # Refuse on the 3rd identical (target_key, value) pair
+            # within the turn window. 1 = first time, 2 = first retry
+            # is fine (field may have lost focus), 3+ = cascade.
+            if same_target_count >= 2:
+                return (
+                    f"[REPEAT_TYPE_REJECTED:per_target] You have typed "
+                    f"{text!r} into {target_key} {same_target_count + 1} "
+                    f"times in the last {window} turns. Stop retyping — "
+                    "did the previous Enter/submit fire? Either: "
+                    "(a) press Enter via browser_keys('Enter') if you "
+                    "haven't yet; (b) screenshot to see whether the "
+                    "input actually accepted the value; or (c) pick a "
+                    "different target — the field may have shifted "
+                    "between vision passes."
+                )
+
         if same >= self.REPEAT_TYPE_REFUSE_AT - 1:
             # We're about to issue the 3rd identical type — refuse.
             return (
@@ -1230,11 +1488,23 @@ class BrowserSessionState:
             )
         return None
 
-    def record_typed_value(self, text: str) -> None:
-        """Append to the cross-index type ledger after a successful type."""
+    def record_typed_value(self, text: str, target_key: str | None = None) -> None:
+        """Append to the cross-index type ledger after a successful type.
+        Phase L: also append per-(target_key, value) entry for the
+        turn-window guard."""
         norm = (text or "").strip().rstrip("$.,").lower()
-        if norm:
-            self.recent_typed_values.append((norm, time.time()))
+        if not norm:
+            return
+        self.recent_typed_values.append((norm, time.time()))
+        if target_key:
+            self.recent_typed_per_target.append({
+                "target_key": target_key,
+                "value_norm": norm,
+                "turn": self._brain_turn_counter,
+            })
+            # Cap to keep memory bounded.
+            if len(self.recent_typed_per_target) > 30:
+                del self.recent_typed_per_target[0]
 
     def check_dead_click(self, click_target: str) -> str | None:
         """Pre-flight check before dispatching a click.
@@ -1281,11 +1551,103 @@ class BrowserSessionState:
             )
         return None
 
-    def register_click_attempt(self, click_target: str) -> None:
+    def check_dead_click_loose(
+        self,
+        click_target: str,
+        coords: tuple[int, int] | None = None,
+    ) -> str | None:
+        """Phase A4 secondary guard with a longer memory window.
+
+        The strict ``check_dead_click`` only fires on consecutive
+        identical-target clicks with byte-identical DOM hashes. Trivial
+        DOM jitter (animations, anti-bot beacons, lazy ad refreshes)
+        bumps the hash and resets its counter — which is exactly what
+        let the wineaccess.com cascade through three V2 clicks.
+
+        This looser variant fires when:
+          * the brain has clicked the same target_key OR coordinates
+            within ±5 px in the last six turns at least twice, AND
+          * the URL hasn't changed across those attempts.
+
+        That signature catches "same physical button, vision relabeled
+        the V_n" and "I clicked it twice with a screenshot in between
+        and nothing happened" — both of which the strict guard misses.
+
+        Returns a structured refusal string OR None.
+        """
+        recent = getattr(self, "recent_click_attempts", None)
+        if not recent:
+            return None
+        current_turn = self._brain_turn_counter
+        current_url = self.current_url or ""
+        WINDOW_TURNS = 6
+        COORD_TOLERANCE = 5
+        similar: list[dict] = []
+        for a in recent:
+            try:
+                if (current_turn - int(a.get("turn", 0))) > WINDOW_TURNS:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            target_match = a.get("target_key") == click_target
+            coord_match = False
+            if not target_match and coords is not None:
+                a_coords = a.get("coords")
+                if a_coords:
+                    try:
+                        ax, ay = int(a_coords[0]), int(a_coords[1])
+                        cx, cy = int(coords[0]), int(coords[1])
+                        coord_match = (
+                            abs(ax - cx) <= COORD_TOLERANCE
+                            and abs(ay - cy) <= COORD_TOLERANCE
+                        )
+                    except (TypeError, ValueError, IndexError):
+                        coord_match = False
+            # URL parity is the "page actually moved" signal. We only
+            # block if URL unchanged — a navigation between attempts
+            # means the click DID do something, even if the brain is
+            # circling back.
+            if (target_match or coord_match) and a.get("url", "") == current_url:
+                similar.append(a)
+        if len(similar) >= 2:
+            return (
+                f"[dead_click_blocked:looser_match] {click_target} (or a "
+                "coord-equivalent target within 5px) has been clicked "
+                f"{len(similar) + 1} times in the last {WINDOW_TURNS} "
+                "turns with no URL change. Vision may have relabeled "
+                "the same physical button as a different V_n; the page "
+                "is dead-clicking. Stop retrying this target — call "
+                "browser_screenshot, then either pick a structurally "
+                "different V_n, scroll the page, OR call "
+                "browser_find_target(label='<what you actually want>') "
+                "so the system can locate it across the viewport."
+            )
+        return None
+
+    def register_click_attempt(
+        self,
+        click_target: str,
+        coords: tuple[int, int] | None = None,
+    ) -> None:
         """Stamp the current click target + DOM hash so the next call to
-        `check_dead_click` can compare against them."""
+        ``check_dead_click`` can compare against them. Phase A4 also
+        appends to ``recent_click_attempts`` for the looser guard."""
         self.last_click_target = click_target
         self.last_click_dom_hash = self._last_dom_hash
+        # Phase A4: longer-memory ledger. Capped at 12 entries.
+        recent = getattr(self, "recent_click_attempts", None)
+        if recent is None:
+            self.recent_click_attempts = []
+            recent = self.recent_click_attempts
+        recent.append({
+            "target_key": click_target,
+            "coords": (int(coords[0]), int(coords[1])) if coords else None,
+            "turn": self._brain_turn_counter,
+            "url": self.current_url or "",
+            "ts": time.time(),
+        })
+        if len(recent) > 12:
+            del recent[0]
 
     def advance_observation_token(self, source: str = "") -> None:
         """No-op shim retained so kept tools (click_selector,
@@ -1510,12 +1872,38 @@ class BrowserSessionState:
                     image_height=img_h,
                     task_instruction=self.task_instruction or None,
                 )
+                # Phase R: enrich each Gemini bbox with DOM-derived
+                # metadata (href, aria-expanded, dom_index, name,
+                # disabled state, active-filter flag) by IoU-matching
+                # against the elements_with_bounds we already fetched
+                # for this state. Brain sees real hrefs → can't
+                # fabricate UUID URLs; sees aria-expanded → knows when
+                # a section is collapsed; sees dom_index → can fall
+                # back to browser_click(index=N) when bbox snap fails.
+                try:
+                    if elements_with_bounds and resp.bboxes:
+                        _enrich_bboxes_with_dom_metadata(
+                            resp,
+                            elements_with_bounds,
+                            image_w=img_w,
+                            image_h=img_h,
+                            dpr=device_pixel_ratio,
+                        )
+                except Exception as exc:
+                    print(f"  [bbox-enrichment failed: {exc}]")
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
                 self._last_vision_ts = time.time()
                 self._last_vision_url = effective_url or self.current_url or ""
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
+                # Phase 4: a fresh screenshot opens a new vision epoch
+                # → reset the cursor-attempt gate so run_script must be
+                # earned again on this view.
+                self.epoch_interact_attempts = 0
+                # Phase E1: a fresh screenshot clears the force-reobserve
+                # gate — the brain has refreshed its view.
+                self._force_reobserve_pending = False
                 # Freeze this response as the current epoch. The brain
                 # is about to see `as_brain_text()` output — subsequent
                 # V_n references MUST resolve to this snapshot, not to
@@ -1598,6 +1986,9 @@ class BrowserSessionState:
         """
         self.vision_calls += 1
         self.actions_since_screenshot = 0
+        # Phase 4: new screenshot → new vision epoch → reset the
+        # cursor-attempt gate so run_script is hard-blocked again.
+        self.epoch_interact_attempts = 0
         label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
 
         final_b64 = b64

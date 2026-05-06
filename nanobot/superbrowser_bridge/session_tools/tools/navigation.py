@@ -68,6 +68,17 @@ class BrowserNavigateTool(Tool):
 
     async def execute(self, session_id: str, url: str, intent: str | None = None, force_detail: bool = False, **kw: Any) -> Any:
         print(f"\n>> browser_navigate({url})")
+        # Phase T pre-snapshot: capture the observed-URL state BEFORE
+        # any pre-flight code (which may call record_url and pollute
+        # the set). The 404 branch below uses this snapshot to
+        # distinguish "URL was observed before this call" (real 404)
+        # from "URL was never observed" (fabrication).
+        _phase_t_pre_observed_urls: frozenset[str] = frozenset(
+            getattr(self.s, "observed_urls", set()) or set()
+        )
+        _phase_t_pre_observed_link_hrefs: frozenset[str] = frozenset(
+            getattr(self.s, "observed_link_hrefs", set()) or set()
+        )
         # Post-mutation observation gate
         if self.s._mutation_needs_observation:
             return (
@@ -100,6 +111,181 @@ class BrowserNavigateTool(Tool):
             _new_parsed = _urlparse_h(url)
         except Exception:
             _new_parsed = None
+        # Phase N: UUID-in-path fabrication guard. Detect `[0-9a-f]{8}-
+        # [0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}` anywhere in
+        # the URL path. UUIDs are NEVER constructable — they're
+        # extracted from listing pages. If the brain navigates to a
+        # UUID URL that wasn't in observed_link_hrefs, it's fabricated.
+        # The wineaccess case had the brain construct
+        # `/catalog/<slug>_a7c9d9f8-350d-440f-b4bc-4acf9b1ec7b8/` from
+        # training data.
+        try:
+            import re as _re_uuid
+            _UUID_PATTERN = _re_uuid.compile(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+            )
+        except Exception:
+            _UUID_PATTERN = None
+        _path_for_uuid = ""
+        if _new_parsed is not None:
+            _path_for_uuid = _new_parsed.path or ""
+        if (
+            _UUID_PATTERN is not None
+            and _path_for_uuid
+            and _UUID_PATTERN.search(_path_for_uuid)
+        ):
+            _observed_hrefs = getattr(
+                self.s, "observed_link_hrefs", set()
+            ) or set()
+            # Match exact URL OR base-path (URL without trailing slash
+            # and query). Some sites canonicalize trailing slash.
+            _url_no_query = url.split("?", 1)[0].rstrip("/")
+            _hrefs_canonical = {
+                h.split("?", 1)[0].rstrip("/")
+                for h in _observed_hrefs
+                if isinstance(h, str)
+            }
+            if (
+                url not in _observed_hrefs
+                and _url_no_query not in _hrefs_canonical
+            ):
+                self.s.record_step(
+                    "browser_navigate", url,
+                    "BLOCKED: invented_uuid_path",
+                )
+                _record_nav_refusal(
+                    self.s, url, "navigate_invented_uuid_path",
+                )
+                self.s.record_cursor_failure(
+                    strategy="navigate",
+                    target=url[:120],
+                    reason="invented_uuid_path",
+                )
+                _uuid_match = _UUID_PATTERN.search(_path_for_uuid)
+                _uuid_str = _uuid_match.group(0) if _uuid_match else "?"
+                return (
+                    f"[navigate_refused_invented_uuid] Refused {url}\n"
+                    f"The URL path contains a UUID ({_uuid_str}) and "
+                    "this exact URL is not in the set of links you've "
+                    "observed on the page so far. UUIDs in paths are "
+                    "EXTRACTED from listing pages, not constructed — "
+                    "they identify specific records and you can't "
+                    "guess them from a wine name + year + region.\n"
+                    "What to do instead: go back to the listing page "
+                    "and click the wine's listing card via "
+                    "browser_click_at(vision_index=V_n) (or "
+                    "browser_click(index=N) if vision missed it). "
+                    "The real URL with the real UUID will be recorded "
+                    "and you can re-navigate to it later."
+                )
+
+        # Phase S: multi-segment path fabrication guard. URLs with
+        # ≥ 3 path segments that the brain has never observed are
+        # almost certainly invented from training-data URL shapes
+        # (the wineaccess case: brain guessed
+        # /store/white-wine/regions/oregon/ when real path was
+        # /store/regions/oregon/ — extra "white-wine" segment from
+        # /category/<slug>/<filter>/<value>/ pattern). The existing
+        # _path_hack guard short-circuits to lenient once any filter
+        # constraint completes; this check fires regardless.
+        #
+        # When refusing, surface up to 5 similar observed hrefs (those
+        # containing the last path segment as a token) so the brain
+        # gets a redirect — not just a NACK.
+        if _new_parsed is not None:
+            _path_segments_s = [
+                s for s in (_new_parsed.path or "").strip("/").split("/")
+                if s
+            ]
+            if len(_path_segments_s) >= 3:
+                # Skip on early session — until the brain has observed
+                # more than just the homepage, refusing all deep paths
+                # would block legitimate first-navigation. Threshold:
+                # ≥2 distinct observed entries (homepage + one click).
+                _observed_urls_set = getattr(
+                    self.s, "observed_urls", set(),
+                ) or set()
+                _observed_link_hrefs = getattr(
+                    self.s, "observed_link_hrefs", set(),
+                ) or set()
+                _all_observed_for_path = _observed_urls_set | _observed_link_hrefs
+                if len(_all_observed_for_path) > 1:
+                    # Canonical-strip URL (drop query + trailing slash)
+                    # for matching against observed.
+                    _url_canon = url.split("?", 1)[0].rstrip("/")
+                    _observed_canon = {
+                        h.split("?", 1)[0].rstrip("/")
+                        for h in _all_observed_for_path
+                        if isinstance(h, str)
+                    }
+                    if (
+                        _url_canon not in _observed_canon
+                        and url not in _all_observed_for_path
+                    ):
+                        # Find similar observed hrefs whose URL contains
+                        # the last (most specific) path segment as a
+                        # substring. Token match is too strict; substring
+                        # is permissive enough to surface
+                        # /store/regions/oregon/ when looking for
+                        # ../regions/oregon/.
+                        _last_seg = _path_segments_s[-1].lower()
+                        _similar = [
+                            h for h in _all_observed_for_path
+                            if isinstance(h, str)
+                            and _last_seg
+                            and _last_seg in h.lower()
+                        ]
+                        # Prefer hrefs that ALSO contain the second-to-last
+                        # segment (e.g. "regions/oregon" beats just "oregon").
+                        if len(_path_segments_s) >= 2:
+                            _second_last = _path_segments_s[-2].lower()
+                            _similar.sort(
+                                key=lambda h: (
+                                    0 if _second_last in h.lower() else 1,
+                                    len(h),
+                                ),
+                            )
+                        _similar = _similar[:5]
+                        _similar_block = (
+                            "\n".join(f"  · {h}" for h in _similar)
+                            if _similar
+                            else "  (none — try browser_get_markdown(outline=true) to load page links first)"
+                        )
+                        self.s.record_step(
+                            "browser_navigate", url,
+                            f"BLOCKED: unobserved_multi_segment_path "
+                            f"(segments={len(_path_segments_s)})",
+                        )
+                        _record_nav_refusal(
+                            self.s, url, "navigate_refused_unobserved_path",
+                        )
+                        self.s.record_cursor_failure(
+                            strategy="navigate",
+                            target=url[:120],
+                            reason=f"unobserved_multi_segment_path "
+                                   f"(segments={len(_path_segments_s)})",
+                        )
+                        return (
+                            f"[navigate_refused_unobserved_path] Refused {url}\n"
+                            f"\nPath '/{'/'.join(_path_segments_s)}' has "
+                            f"{len(_path_segments_s)} segments and was "
+                            "never observed on this site. Brain pattern-"
+                            "matching paths from training data ('/category/"
+                            "slug/filter/value/' shapes) is the #1 source "
+                            "of 404s — what's idiomatic on one site rarely "
+                            "is on another.\n"
+                            f"\nSimilar observed hrefs containing "
+                            f"'{_last_seg}':\n{_similar_block}\n"
+                            "\nWhat to do: pick from the list above, OR "
+                            "call browser_get_markdown(outline=true) to "
+                            "load fresh page links into the observed set, "
+                            "OR click into the navigation via "
+                            "browser_click_at(V_n) — the resolved URL "
+                            "becomes observed and you can navigate to it "
+                            "directly afterward."
+                        )
+
         if _new_parsed is not None and _new_parsed.query:
             try:
                 _norm_for_check = self.s._normalize_url(url)
@@ -136,6 +322,55 @@ class BrowserNavigateTool(Tool):
                     f"site builds from a real click IS authoritative — "
                     f"the bridge will record it and you can re-navigate "
                     f"to it later via this tool."
+                )
+            # Phase D: even if the EXACT URL or its normalized form is
+            # in observed_urls (because the path was visited before),
+            # refuse if any individual query KEY has never appeared in
+            # any real URL we've seen. The wineaccess case had base
+            # `/store/` observed but the brain fabricated
+            # `?category__in=...&ordering=-expert_rating` keys that the
+            # real site doesn't use. This catches that class without
+            # needing every guard to enumerate the key list.
+            try:
+                from urllib.parse import parse_qsl as _parse_qsl
+                _new_keys = [
+                    k for k, _ in _parse_qsl(
+                        _new_parsed.query, keep_blank_values=True,
+                    ) if k
+                ]
+            except Exception:
+                _new_keys = []
+            _observed_keys = getattr(
+                self.s, "observed_query_keys", set(),
+            ) or set()
+            _unknown_keys = [
+                k for k in _new_keys if k not in _observed_keys
+            ]
+            if _unknown_keys:
+                self.s.record_step(
+                    "browser_navigate", url,
+                    f"BLOCKED: unknown_query_keys={_unknown_keys!r}",
+                )
+                _record_nav_refusal(
+                    self.s, url, "navigate_unknown_query_key",
+                )
+                return (
+                    f"[navigate_refused_unknown_query_key keys={_unknown_keys!r}] "
+                    f"Refused {url}. The query keys {_unknown_keys!r} "
+                    "have NEVER appeared in any URL the browser has "
+                    "loaded this session. They are almost certainly "
+                    "fabricated patterns from training data — common "
+                    "Django (`category__in`, `ordering`), Rails "
+                    "(`q[s]`, `page`), or REST templates that look "
+                    "plausible but the site uses different names. "
+                    f"Observed query keys so far: "
+                    f"{sorted(_observed_keys)[:12] if _observed_keys else '(none)'}. "
+                    "Use the on-page filter UI: "
+                    "browser_screenshot to surface the filter "
+                    "dropdowns, then browser_click_at(vision_index=V_n) "
+                    "or browser_select_option(section=..., label=..., "
+                    "value=...). The site-built URL after a real click "
+                    "is authoritative."
                 )
 
         # --- Known-bad URL lockout ---------------------------------------
@@ -300,14 +535,29 @@ class BrowserNavigateTool(Tool):
                 "," in v for (k, v) in _params_fh
                 if k.lower() not in ("scope", "code", "state", "redirect_uri", "state_token")
             )
-            # Filter-style key names. Conservative list — keys like
-            # `q`, `page`, `sort` aren't filters (they're search/pagination).
+            # Filter-style key names. The brain pattern-completes
+            # Django/Rails-style URL params from training data even
+            # when the site uses different names. Phase D expands the
+            # list to cover the wineaccess.com cascade where
+            # `?category__in=...&ordering=-expert_rating` slipped past
+            # a 2-filter-key threshold because `ordering` wasn't
+            # listed. The new keys cover Django-ORM lookups (`__in`,
+            # `__lte`), Rails Ransack (`q[s]`), and common e-commerce
+            # sort/score patterns.
             _filter_key_patterns = (
                 "category", "region", "country", "type", "kind",
                 "color", "size", "brand", "price", "min_", "max_",
                 "from_", "to_", "before_", "after_", "in_",
                 "filter", "tag", "feature", "amenity", "pairing",
                 "rating", "score", "year", "date_",
+                # Phase D additions:
+                "ordering", "order_by", "sort", "sort_by", "sortby",
+                "sort_order", "expert_rating", "critic", "stars",
+                "review", "discount", "facet", "refine",
+                "__in", "__lte", "__gte", "__exact", "__contains",
+                "__iexact", "__icontains",  # Django ORM lookups
+                "q[s]", "q[m]", "q[g]", "q[c]",  # Rails Ransack
+                "search_query", "keyword",
             )
             _filter_keys_seen = sum(
                 1 for (k, _v) in _params_fh
@@ -696,9 +946,65 @@ class BrowserNavigateTool(Tool):
                     )
                 return caption
             elif status_code == 404:
-                caption += _build_network_block_message(404, actual_url)
+                # Phase T: distinguish 404-on-fabricated-URL from
+                # genuine page-gone. Use the PRE-NAV snapshot (taken
+                # at the top of execute) so record_url calls earlier
+                # in this method don't pollute the check — the URL
+                # being navigated to has already been added to
+                # observed_urls by the time we reach here.
+                _was_observed = False
+                _all_obs = _phase_t_pre_observed_urls | _phase_t_pre_observed_link_hrefs
+                # Canonical-strip for matching (drop query + trailing /)
+                _url_canon_t = url.split("?", 1)[0].rstrip("/")
+                _actual_canon_t = (actual_url or "").split("?", 1)[0].rstrip("/")
+                _obs_canon = {
+                    h.split("?", 1)[0].rstrip("/")
+                    for h in _all_obs
+                    if isinstance(h, str)
+                }
+                if (
+                    url in _all_obs
+                    or _url_canon_t in _obs_canon
+                    or actual_url in _all_obs
+                    or _actual_canon_t in _obs_canon
+                ):
+                    _was_observed = True
                 self.s.record_failed_navigation(actual_url, 404)
-                self.s.record_step("browser_navigate", url, f"HTTP 404 at {actual_url}")
+                if _was_observed:
+                    # Real 404 — page genuinely missing.
+                    caption += _build_network_block_message(404, actual_url)
+                    self.s.record_step(
+                        "browser_navigate", url,
+                        f"HTTP 404 (real) at {actual_url}",
+                    )
+                else:
+                    # Fabricated URL — tell brain it's THEIR mistake,
+                    # not network/edge blocking. Emit a label that the
+                    # orchestrator's network-block matcher does NOT
+                    # match (the matcher keys off "NETWORK_BLOCKED").
+                    self.s.record_cursor_failure(
+                        strategy="navigate",
+                        target=url[:120],
+                        reason="404_fabricated",
+                    )
+                    self.s.record_step(
+                        "browser_navigate", url,
+                        f"HTTP 404 (fabricated) at {actual_url}",
+                    )
+                    caption += (
+                        f"\n\n[navigate_404_fabricated] {actual_url} "
+                        "returned 404. This URL was NEVER in your "
+                        "observed-links set before this navigation, so "
+                        "you almost certainly invented the path from "
+                        "training-data URL shapes. **This is NOT a "
+                        "network or edge block** — the site is "
+                        "reachable, you just guessed the wrong URL.\n"
+                        "Recovery: call browser_get_markdown(outline="
+                        "true) to see what real paths exist on the "
+                        "current page, OR click into the navigation "
+                        "via browser_click_at(V_n) — the site-built "
+                        "URL is authoritative."
+                    )
                 return caption
 
         self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")

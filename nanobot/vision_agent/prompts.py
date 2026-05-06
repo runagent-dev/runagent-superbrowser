@@ -30,7 +30,7 @@ JSON object with this exact shape:
       "role": "button|link|input|checkbox|captcha_tile|captcha_widget|slider_handle|image|text_block|other",
       "confidence": <float 0..1>,
       "intent_relevant": <bool>,
-      "role_in_scene": "blocker|target|chrome|content|unknown",
+      "role_in_scene": "blocker|target|chrome|content|collapsed_section|unknown",
       "layer_id": "<id of the SceneLayer this bbox sits in, e.g. 'L0_modal'>"
     }
   ],
@@ -116,14 +116,8 @@ General rules:
 - Do NOT hallucinate elements. If you cannot read it, leave it out.
 - `intent_relevant` is true for bboxes that most directly serve the
   user's stated intent. Be conservative — usually 0 to 3 regions qualify.
-- Return up to __MAX_BBOXES__ bboxes for every interactive or relevant
-  element on the page. **Do NOT rank them.** Order them however you want
-  — the caller re-sorts them spatially (top-to-bottom, left-to-right)
-  before showing them to the brain, and the brain picks the one whose
-  label matches its current step. There is no "best" bbox. Emit each
-  candidate with a clear, specific label and accurate `intent_relevant` /
-  `confidence` / `role_in_scene` fields so the brain can tell them apart.
-  Comprehensive coverage matters more than picking favorites.
+- Return up to 50 bboxes. Do not cap yourself lower on dense pages —
+  the caller's brain can't click what isn't in the list.
 
 Page-type coverage rules (CRITICAL for dense filter/booking UIs):
 - On `search_results` / `product_listing` / `checkout_form` /
@@ -211,7 +205,46 @@ Scene hierarchy (NEW — enables a "clear blockers before main goal" planner):
                     "read the top article").
     - "chrome"   = site header/nav/footer that is not the target.
     - "content"  = article body, product card on a listing, map tile.
+    - "collapsed_section" = a section header (often inside a sidebar,
+                    accordion or filter panel) that has NO expanded
+                    options visible underneath it. Examples: a "Region"
+                    label with a chevron/+/▸ icon and no list of regions
+                    beneath it; a "Filters" caption with the filter body
+                    folded away. The brain MUST click these to expand
+                    before the contents become discoverable. Mark BOTH
+                    the chevron/icon and the section header text as
+                    role_in_scene='collapsed_section' when they're
+                    sibling bboxes — either is a valid click target to
+                    expand.
     - "unknown"  = unsure; leave as default when you can't decide.
+
+Compound rows — emit SEPARATE bboxes for each interactive sub-control:
+- A filter row like `[checkbox] Oregon (12)` has THREE distinct
+  controls: the checkbox, the label (often clickable, toggles the
+  same checkbox), and the count badge. Emit ONE bbox per control,
+  not one bbox for the whole row. Use TIGHT bboxes (around the
+  checkbox alone, not the row that contains it). Set role accordingly:
+    role='checkbox' for the checkbox
+    role='text_block' for a count badge that's not interactive,
+        role='button' if it's a real button
+    role='button' for the chevron / expand triangle ▸▾▼ on a section
+        header row. Set its label to its accessible name when present
+        (aria-label='expand region' / 'collapse region'), else
+        'expand <section_name>'.
+- A search-result card like `[Title] [Add to cart] [♡]` has separate
+  bboxes for the title link, the cart button, and the favourite
+  heart icon. Don't emit a card-wide bbox; the brain wants the
+  specific control.
+- A modal close button (X) inside a banner row gets its own bbox
+  separate from the row's content bbox.
+- When several sub-controls share a row's outer container, you may
+  ALSO emit the row container as role_in_scene='content' so the
+  brain understands the grouping — but NEVER mark the row container
+  as `clickable=true`. The clickable bboxes are the sub-controls.
+- A chevron is small and lives at the edge of a row. Don't extend
+  its bbox to cover the label text. Off-by-pixel chevron bboxes
+  are fine; off-by-100px ones (covering the whole row) cause clicks
+  to land on the label and miss the expand action.
 - `layer_id` on every bbox = the id of the SceneLayer it belongs to.
   A bbox in the cookie banner gets layer_id="L0_modal" (or whatever id
   you gave that layer). A bbox in the site nav below the modal gets
@@ -639,11 +672,11 @@ def build_coverage_prompt(
 
 
 def get_system_prompt(max_bboxes: int) -> str:
-    """Substitute the runtime bbox cap into SYSTEM_PROMPT.
-
-    The static template contains the sentinel ``__MAX_BBOXES__`` so the
-    cap can be tuned per-call (e.g. from VISION_MAX_BBOXES) without
-    keeping a stale "up to 50" message after lowering the default.
+    """Backwards-compat shim — Phase 2 reverted to v2's hard-coded
+    "up to 50 bboxes" wording, so the ``__MAX_BBOXES__`` sentinel no
+    longer exists in the prompt and ``max_bboxes`` is ignored. Kept so
+    that callers (``vision_agent/client.py:301``) don't have to be
+    rewritten if the sentinel is restored later.
     """
     return SYSTEM_PROMPT.replace("__MAX_BBOXES__", str(max_bboxes))
 

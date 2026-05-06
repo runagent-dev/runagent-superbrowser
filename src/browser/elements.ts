@@ -244,6 +244,11 @@ export interface SelectOptionByLabelResult {
   reason?: string;
   verified?: boolean;
   took_ms: number;
+  message?: string;
+  /** Phase C3: true when the tool auto-clicked a collapsed accordion
+   *  header to expose the section before finding the trigger. The
+   *  caller surfaces this so the brain learns the dialect. */
+  auto_expanded?: boolean;
 }
 
 /**
@@ -264,6 +269,30 @@ export async function selectOptionByLabel(
     timeout?: number;
     extraOpenSelectors?: string[];
     extraOptionSelectors?: string[];
+    /**
+     * Phase C1: scope the label search to a specific section subtree.
+     * When provided, the label search runs ONLY within DOM containers
+     * whose heading/aria-label matches `section`. This is the fix for
+     * the wineaccess.com failure where `selectOptionByLabel('Region',
+     * 'Oregon')` matched the SORT dropdown ("For You / Most Popular")
+     * because the trigger search walked all interactive elements with
+     * no section context.
+     */
+    section?: string;
+    /**
+     * Phase C1: when true (default), refuse with `requires_section`
+     * if the label matches triggers in 2+ distinct sections AND no
+     * section= is supplied. When false, the caller has accepted that
+     * the global search may pick the wrong dropdown.
+     */
+    requireSectionOnAmbiguity?: boolean;
+    /**
+     * Phase C3: when true (default), auto-click the section's
+     * expand-control and retry the trigger search if the requested
+     * section exists but appears collapsed (aria-expanded="false" or
+     * <details> without [open]). Capped at one auto-expand per call.
+     */
+    autoExpandSection?: boolean;
   },
 ): Promise<SelectOptionByLabelResult> {
   const start = Date.now();
@@ -272,77 +301,629 @@ export async function selectOptionByLabel(
   const fuzzy = opts.fuzzy !== false;
   const timeout = Math.max(500, Math.min(20000, opts.timeout ?? 4000));
   const extraOptionSelectors = opts.extraOptionSelectors ?? [];
+  const section = opts.section?.trim() || '';
+  const requireSection = opts.requireSectionOnAmbiguity !== false;
+  const autoExpandSection = opts.autoExpandSection !== false;
+  let autoExpanded = false;
 
   // 1. Locate trigger by label text (label-for, aria-labelledby, aria-label,
   //    or text). Tag it with data-sb-trigger so subsequent calls survive
   //    DOM-index renumbering.
-  const trigger = await page.evaluate((lbl: string) => {
-    const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
-    const lower = (s: string) => norm(s).toLowerCase();
-    const target = lower(lbl);
-    if (!target) return null;
+  //
+  // Phase C1: when `section` is provided, the label search is scoped to
+  // the subtree of the matching section element (heading text or
+  // aria-labelledby match). The brain is responsible for naming the
+  // section ("Region", "Filter by", "Pairings") — we walk ancestors
+  // looking for sections, headings, fieldsets, summaries, or
+  // [role="region"] elements whose label contains it.
+  type TriggerShape = {
+    selector: string;
+    isNativeSelect: boolean;
+    currentText: string;
+    role: string;
+    ariaExpanded: string;
+  };
+  const triggerResult: { trigger: TriggerShape | null; sections: string[]; sectionFound: boolean } = await page.evaluate(
+    (cfg: { lbl: string; section: string }) => {
+      const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+      const lower = (s: string) => norm(s).toLowerCase();
+      const target = lower(cfg.lbl);
+      const sectionTarget = lower(cfg.section);
+      if (!target) return { trigger: null, sections: [], sectionFound: false };
 
-    const tag = (el: Element) => {
-      const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
-      el.setAttribute('data-sb-trigger', id);
-      const isSelect = el.tagName.toLowerCase() === 'select';
-      return {
-        selector: `[data-sb-trigger="${id}"]`,
-        isNativeSelect: isSelect,
-        currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
-        role: el.getAttribute('role') || '',
-        ariaExpanded: el.getAttribute('aria-expanded') || '',
+      const tagEl = (el: Element) => {
+        const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
+        el.setAttribute('data-sb-trigger', id);
+        const isSelect = el.tagName.toLowerCase() === 'select';
+        return {
+          selector: `[data-sb-trigger="${id}"]`,
+          isNativeSelect: isSelect,
+          currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
+          role: el.getAttribute('role') || '',
+          ariaExpanded: el.getAttribute('aria-expanded') || '',
+        };
       };
+
+      // Walk an element's ancestors collecting section labels.
+      const sectionPathOf = (el: Element): string[] => {
+        const path: string[] = [];
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && cur !== document.body && depth < 16) {
+          const t = cur.tagName.toLowerCase();
+          const role = cur.getAttribute('role') || '';
+          if (
+            t === 'section' || t === 'aside' || t === 'nav'
+            || t === 'fieldset' || t === 'details'
+            || role === 'region' || role === 'group'
+            || role === 'tablist' || role === 'navigation'
+            || (cur.classList && (
+              cur.classList.contains('filter') || cur.classList.contains('accordion') || cur.classList.contains('sidebar')
+              || cur.classList.contains('section')
+            ))
+          ) {
+            const labelledby = cur.getAttribute('aria-labelledby');
+            if (labelledby) {
+              const labelEl = document.getElementById(labelledby);
+              if (labelEl) {
+                path.unshift(((labelEl.textContent || '').trim().slice(0, 60)));
+                cur = cur.parentElement;
+                depth++;
+                continue;
+              }
+            }
+            const heading = cur.querySelector('h1,h2,h3,h4,h5,h6,legend,summary,[role="heading"]');
+            if (heading) {
+              path.unshift(((heading.textContent || '').trim().slice(0, 60)));
+            } else {
+              const aria = cur.getAttribute('aria-label');
+              if (aria) path.unshift(aria.slice(0, 60));
+            }
+          }
+          cur = cur.parentElement;
+          depth++;
+        }
+        return path.filter(Boolean);
+      };
+
+      // Section-scoped variant — Phase F1 word-boundary match.
+      //
+      // Earlier behaviour did substring matching on the section path,
+      // which let "Type and Sort Options" match `inSection('type')`
+      // and pulled the SORT dropdown into the scoped candidate set on
+      // wineaccess.com. Word-boundary matching makes the predicate
+      // refuse that path: "type" must appear as a standalone token
+      // in the path string, not as a substring of another word.
+      //
+      // We additionally accept exact equality (case-insensitive) on
+      // any single path segment as a strong-signal match.
+      const tokenizeSection = (s: string): Set<string> => {
+        const tokens = new Set<string>();
+        for (const m of s.toLowerCase().match(/[a-z0-9]+/g) || []) {
+          tokens.add(m);
+        }
+        return tokens;
+      };
+      const sectionTokens = sectionTarget
+        ? tokenizeSection(sectionTarget)
+        : new Set<string>();
+      const inSection = (el: Element): boolean => {
+        if (!sectionTarget) return true;
+        const path = sectionPathOf(el);
+        for (const seg of path) {
+          const segLower = seg.toLowerCase().trim();
+          if (segLower === sectionTarget) return true;
+          // Token superset check: every token of the target must be a
+          // distinct word in the path segment. "Variety" target tokens
+          // = {variety}; segment "Wine Variety" tokens = {wine,variety}
+          // → match. Segment "Type and Sort Options" tokens
+          // = {type,and,sort,options}; target "Type" tokens = {type}
+          // → match. The latter is intended: the user explicitly named
+          // 'Type' as the section, and the heading says "Type and Sort
+          // Options" — that IS the type section with a wider label.
+          // For the wineaccess bug, the issue was the SORT dropdown
+          // also being inside that container; F2 + F4 below filter
+          // that out via Strategy-D demotion + filter-section
+          // preference.
+          const segTokens = tokenizeSection(seg);
+          let allFound = sectionTokens.size > 0;
+          for (const t of sectionTokens) {
+            if (!segTokens.has(t)) {
+              allFound = false;
+              break;
+            }
+          }
+          if (allFound) return true;
+        }
+        return false;
+      };
+
+      // Phase F4: filter-section predicate. Real filter sidebars live
+      // under <aside>, [role="region"] with aria-label containing
+      // "filter"/"refine"/"facet", or classes like .filter / .facets.
+      // The wineaccess SORT dropdown lives in a top-level <header> /
+      // <form> banner. When section= is specified AND the page has at
+      // least one "real filter" container, prefer candidates inside
+      // those containers; de-rank candidates inside <header>/<form>.
+      const isInFilterContainer = (el: Element): boolean => {
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && cur !== document.body && depth < 16) {
+          const t = cur.tagName.toLowerCase();
+          const role = cur.getAttribute('role') || '';
+          const aria = (cur.getAttribute('aria-label') || '').toLowerCase();
+          const classList = cur.classList ? Array.from(cur.classList) : [];
+          if (t === 'aside') return true;
+          if (role === 'region' && /(filter|refine|facet|search)/.test(aria)) {
+            return true;
+          }
+          if (
+            classList.some((c) => /filter|facet|refine|sidebar/i.test(c))
+          ) {
+            return true;
+          }
+          cur = cur.parentElement;
+          depth++;
+        }
+        return false;
+      };
+      const isInChromeContainer = (el: Element): boolean => {
+        // Sort dropdowns + result-page chrome usually live in <header>
+        // or generic <form> banners. Demote those when scoped.
+        let cur: Element | null = el;
+        let depth = 0;
+        while (cur && cur !== document.body && depth < 16) {
+          const t = cur.tagName.toLowerCase();
+          const role = cur.getAttribute('role') || '';
+          if (t === 'header' || role === 'banner') return true;
+          cur = cur.parentElement;
+          depth++;
+        }
+        return false;
+      };
+
+      // Collect ALL trigger candidates first, then apply section
+      // scoping at the end. This lets us:
+      //   * detect ambiguity (multiple distinct sections match)
+      //   * report what sections DID exist when the request was scoped
+      const candidates: Array<{ el: Element; matchKind: string; sectionPath: string[]; inFilterContainer: boolean; inChrome: boolean }> = [];
+      const seen = new Set<Element>();
+      const consider = (el: Element | null, matchKind: string) => {
+        if (!el || seen.has(el)) return;
+        if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') return;
+        seen.add(el);
+        candidates.push({
+          el,
+          matchKind,
+          sectionPath: sectionPathOf(el),
+          inFilterContainer: isInFilterContainer(el),
+          inChrome: isInChromeContainer(el),
+        });
+      };
+
+      // A. <label for="x">Lbl</label> + #x
+      for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label[for]'))) {
+        if (lower(lab.textContent || '').includes(target)) {
+          const ctrl = document.getElementById(lab.htmlFor);
+          consider(ctrl, 'label_for');
+        }
+      }
+      // B. aria-labelledby
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-labelledby]'))) {
+        const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+        const labText = ids
+          .map((id) => lower(document.getElementById(id)?.textContent || ''))
+          .join(' ');
+        if (labText.includes(target)) consider(el, 'aria_labelledby');
+      }
+      // C. aria-label on combobox/button/listbox/input
+      const interactive = Array.from(document.querySelectorAll<HTMLElement>(
+        '[role="combobox"], [role="listbox"], [role="button"], [aria-haspopup], button, select, input',
+      ));
+      for (const el of interactive) {
+        const aria = lower(el.getAttribute('aria-label') || '');
+        if (aria.includes(target)) consider(el, 'aria_label');
+      }
+      // D. Visible text on interactive element
+      for (const el of interactive) {
+        const txt = lower((el as HTMLElement).textContent || '').slice(0, 200);
+        if (txt.includes(target)) consider(el, 'visible_text');
+      }
+      // E. Wrapping <label>
+      for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label'))) {
+        if (lower(lab.textContent || '').includes(target)) {
+          const ctrl = lab.querySelector<HTMLElement>('select, input, [role="combobox"], [role="listbox"]');
+          consider(ctrl, 'wrap_label');
+        }
+      }
+
+      // Distinct sections seen across all candidates — for ambiguity
+      // detection and for the error-message candidate list.
+      const allSections = new Set<string>();
+      for (const c of candidates) {
+        const head = c.sectionPath.length > 0 ? c.sectionPath[c.sectionPath.length - 1] : '';
+        if (head) allSections.add(head);
+      }
+
+      // Section-scoped pick: Phase F2/F4 logic.
+      //
+      // F2 — Strategy D (visible-text) is the broadest and the source
+      // of the wineaccess Sort/Type collision: any interactive whose
+      // textContent contains "type" was admitted. When section= is
+      // set, demote Strategy D candidates UNLESS they're inside a
+      // real filter container (aside / [role=region][aria-label*=
+      // "filter"] / .filter classes). Strategies A/B/C/E are more
+      // semantically anchored.
+      //
+      // F4 — among the survivors, prefer candidates inside filter
+      // containers over candidates inside <header> banners. The
+      // wineaccess sort dropdown is in <header>; the real filter
+      // sidebar is in <aside>.
+      if (sectionTarget) {
+        const inSectionAll = candidates.filter((c) => inSection(c.el));
+        const filterPreferred = inSectionAll.filter((c) => {
+          // Always allow strong-signal strategies in the filter scope.
+          if (c.matchKind !== 'visible_text') return true;
+          // Strategy D candidates require filter-container backing.
+          return c.inFilterContainer;
+        });
+        // F4: among survivors, prefer non-chrome candidates.
+        const nonChrome = filterPreferred.filter((c) => !c.inChrome);
+        const ranked = nonChrome.length > 0 ? nonChrome : filterPreferred;
+        if (ranked.length > 0) {
+          // Stable sort: filter-container candidates first within the
+          // ranked set, so a filter-anchored Strategy A beats a non-
+          // filter Strategy A in the same scope.
+          ranked.sort((a, b) => {
+            const aScore = (a.inFilterContainer ? 2 : 0) + (a.inChrome ? -1 : 0);
+            const bScore = (b.inFilterContainer ? 2 : 0) + (b.inChrome ? -1 : 0);
+            return bScore - aScore;
+          });
+          return {
+            trigger: tagEl(ranked[0].el),
+            sections: Array.from(allSections),
+            sectionFound: true,
+          };
+        }
+        // F3: section requested but no high-quality match. Return
+        // sectionFound=false; the outer code refuses with
+        // section_not_found / section_match_no_value, listing
+        // sectionsSeen so the brain can re-call with a real section.
+        return {
+          trigger: null,
+          sections: Array.from(allSections),
+          sectionFound: false,
+        };
+      }
+
+      // No section scoping requested — pick the first candidate but
+      // also report how many distinct sections matched (for ambiguity).
+      if (candidates.length === 0) {
+        return { trigger: null, sections: [], sectionFound: false };
+      }
+      return {
+        trigger: tagEl(candidates[0].el),
+        sections: Array.from(allSections),
+        sectionFound: true,
+      };
+    },
+    { lbl: label, section },
+  );
+
+  let trigger = triggerResult.trigger;
+  let sectionsSeen = triggerResult.sections;
+
+  // Phase C3: auto-expand collapsed accordion. If the requested
+  // section exists in the DOM (or we couldn't find the trigger inside
+  // it because it's hidden) AND we haven't already retried, try to
+  // locate + click the section's expander control. Then re-run the
+  // initial trigger search exactly once. Capped at one auto-expand
+  // per call so a chronically-broken page can't trigger an
+  // expand-then-collapse-then-expand storm.
+  if (
+    autoExpandSection
+    && section
+    && !trigger
+    && !autoExpanded
+  ) {
+    const expandResult = await page.evaluate((sec: string) => {
+      const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+      const lower = (s: string) => norm(s).toLowerCase();
+      const want = lower(sec);
+      if (!want) return { ok: false, reason: 'empty_section' };
+      // Find any element whose accessible name matches `section` AND is
+      // an expand control. Strategies, in order:
+      //   1. <button aria-expanded="false"> with text matching want
+      //   2. <summary> inside <details> not [open] with matching text
+      //   3. [aria-controls=X] on an element whose text matches want,
+      //      where #X has [aria-expanded="false"] OR is hidden
+      const candidates: Array<{ el: Element; rank: number }> = [];
+      // 1. aria-expanded buttons
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-expanded="false"]'))) {
+        const txt = lower(el.textContent || '');
+        const aria = lower(el.getAttribute('aria-label') || '');
+        if (txt.includes(want) || aria.includes(want)) {
+          if (el.offsetParent !== null) candidates.push({ el, rank: 1 });
+        }
+      }
+      // 2. <summary> inside collapsed <details>
+      for (const sm of Array.from(document.querySelectorAll<HTMLElement>('details:not([open]) > summary'))) {
+        const txt = lower(sm.textContent || '');
+        if (txt.includes(want) && sm.offsetParent !== null) {
+          candidates.push({ el: sm, rank: 2 });
+        }
+      }
+      // 3. [aria-controls] heuristic
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-controls]'))) {
+        const ctrlId = el.getAttribute('aria-controls') || '';
+        if (!ctrlId) continue;
+        const target = document.getElementById(ctrlId);
+        if (!target) continue;
+        const collapsed = target.getAttribute('aria-expanded') === 'false'
+          || (window.getComputedStyle(target).display === 'none');
+        if (!collapsed) continue;
+        const txt = lower(el.textContent || '');
+        const aria = lower(el.getAttribute('aria-label') || '');
+        if ((txt.includes(want) || aria.includes(want)) && el.offsetParent !== null) {
+          candidates.push({ el, rank: 3 });
+        }
+      }
+      if (candidates.length === 0) return { ok: false, reason: 'no_expander' };
+      candidates.sort((a, b) => a.rank - b.rank);
+      const target = candidates[0].el;
+      try {
+        (target as HTMLElement).click();
+      } catch (err) {
+        return { ok: false, reason: `click_failed:${err}` };
+      }
+      return {
+        ok: true,
+        expandedSelector: target.tagName.toLowerCase()
+          + ((target as HTMLElement).id ? `#${(target as HTMLElement).id}` : '')
+          + (target.getAttribute('aria-controls') ? `[aria-controls="${target.getAttribute('aria-controls')}"]` : ''),
+        expandedText: ((target.textContent || '').trim().slice(0, 60)),
+      };
+    }, section);
+
+    if (expandResult.ok) {
+      autoExpanded = true;
+      // Brief settle so the expanded content lays out before re-searching.
+      await new Promise((r) => setTimeout(r, 250));
+      // Re-run the initial label search exactly as before. We extract
+      // it into a small helper here rather than refactor the whole
+      // function — copy-paste of the block above with the same
+      // cfg/return shape.
+      type TriggerShape2 = {
+        selector: string;
+        isNativeSelect: boolean;
+        currentText: string;
+        role: string;
+        ariaExpanded: string;
+      };
+      const retry: { trigger: TriggerShape2 | null; sections: string[]; sectionFound: boolean } = await page.evaluate(
+        (cfg: { lbl: string; section: string }) => {
+          const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+          const lower = (s: string) => norm(s).toLowerCase();
+          const target = lower(cfg.lbl);
+          const sectionTarget = lower(cfg.section);
+          const tagEl = (el: Element) => {
+            const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
+            el.setAttribute('data-sb-trigger', id);
+            const isSelect = el.tagName.toLowerCase() === 'select';
+            return {
+              selector: `[data-sb-trigger="${id}"]`,
+              isNativeSelect: isSelect,
+              currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
+              role: el.getAttribute('role') || '',
+              ariaExpanded: el.getAttribute('aria-expanded') || '',
+            };
+          };
+          const sectionPathOf = (el: Element): string[] => {
+            const path: string[] = [];
+            let cur: Element | null = el;
+            let depth = 0;
+            while (cur && cur !== document.body && depth < 16) {
+              const t = cur.tagName.toLowerCase();
+              const role = cur.getAttribute('role') || '';
+              if (
+                t === 'section' || t === 'aside' || t === 'nav'
+                || t === 'fieldset' || t === 'details'
+                || role === 'region' || role === 'group'
+                || role === 'tablist' || role === 'navigation'
+                || (cur.classList && (
+                  cur.classList.contains('filter') || cur.classList.contains('accordion')
+                  || cur.classList.contains('sidebar') || cur.classList.contains('section')
+                ))
+              ) {
+                const labelledby = cur.getAttribute('aria-labelledby');
+                if (labelledby) {
+                  const labelEl = document.getElementById(labelledby);
+                  if (labelEl) {
+                    path.unshift(((labelEl.textContent || '').trim().slice(0, 60)));
+                    cur = cur.parentElement;
+                    depth++;
+                    continue;
+                  }
+                }
+                const heading = cur.querySelector('h1,h2,h3,h4,h5,h6,legend,summary,[role="heading"]');
+                if (heading) {
+                  path.unshift(((heading.textContent || '').trim().slice(0, 60)));
+                } else {
+                  const aria = cur.getAttribute('aria-label');
+                  if (aria) path.unshift(aria.slice(0, 60));
+                }
+              }
+              cur = cur.parentElement;
+              depth++;
+            }
+            return path.filter(Boolean);
+          };
+          // Phase F1 retry: word-boundary tokenized matching.
+          const tokenizeSection = (s: string): Set<string> => {
+            const tokens = new Set<string>();
+            for (const m of s.toLowerCase().match(/[a-z0-9]+/g) || []) {
+              tokens.add(m);
+            }
+            return tokens;
+          };
+          const sectionTokens = sectionTarget
+            ? tokenizeSection(sectionTarget)
+            : new Set<string>();
+          const inSection = (el: Element): boolean => {
+            if (!sectionTarget) return true;
+            const path = sectionPathOf(el);
+            for (const seg of path) {
+              const segLower = seg.toLowerCase().trim();
+              if (segLower === sectionTarget) return true;
+              const segTokens = tokenizeSection(seg);
+              let allFound = sectionTokens.size > 0;
+              for (const t of sectionTokens) {
+                if (!segTokens.has(t)) {
+                  allFound = false;
+                  break;
+                }
+              }
+              if (allFound) return true;
+            }
+            return false;
+          };
+          // Phase F4 retry: filter-vs-chrome predicates.
+          const isInFilterContainer = (el: Element): boolean => {
+            let cur: Element | null = el;
+            let depth = 0;
+            while (cur && cur !== document.body && depth < 16) {
+              const t = cur.tagName.toLowerCase();
+              const role = cur.getAttribute('role') || '';
+              const aria = (cur.getAttribute('aria-label') || '').toLowerCase();
+              const classList = cur.classList ? Array.from(cur.classList) : [];
+              if (t === 'aside') return true;
+              if (role === 'region' && /(filter|refine|facet|search)/.test(aria)) return true;
+              if (classList.some((c) => /filter|facet|refine|sidebar/i.test(c))) return true;
+              cur = cur.parentElement;
+              depth++;
+            }
+            return false;
+          };
+          const isInChromeContainer = (el: Element): boolean => {
+            let cur: Element | null = el;
+            let depth = 0;
+            while (cur && cur !== document.body && depth < 16) {
+              const t = cur.tagName.toLowerCase();
+              const role = cur.getAttribute('role') || '';
+              if (t === 'header' || role === 'banner') return true;
+              cur = cur.parentElement;
+              depth++;
+            }
+            return false;
+          };
+          const interactive = Array.from(document.querySelectorAll<HTMLElement>(
+            '[role="combobox"], [role="listbox"], [role="button"], [aria-haspopup], button, select, input',
+          ));
+          const candidates: Array<{ el: Element; matchKind: string; sectionPath: string[]; inFilterContainer: boolean; inChrome: boolean }> = [];
+          const seen = new Set<Element>();
+          const consider = (el: Element | null, matchKind: string) => {
+            if (!el || seen.has(el)) return;
+            if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') return;
+            seen.add(el);
+            candidates.push({
+              el,
+              matchKind,
+              sectionPath: sectionPathOf(el),
+              inFilterContainer: isInFilterContainer(el),
+              inChrome: isInChromeContainer(el),
+            });
+          };
+          for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label[for]'))) {
+            if (lower(lab.textContent || '').includes(target)) consider(document.getElementById(lab.htmlFor), 'label_for');
+          }
+          for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-labelledby]'))) {
+            const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+            const labText = ids.map((id) => lower(document.getElementById(id)?.textContent || '')).join(' ');
+            if (labText.includes(target)) consider(el, 'aria_labelledby');
+          }
+          for (const el of interactive) {
+            const aria = lower(el.getAttribute('aria-label') || '');
+            if (aria.includes(target)) consider(el, 'aria_label');
+          }
+          for (const el of interactive) {
+            const txt = lower((el as HTMLElement).textContent || '').slice(0, 200);
+            if (txt.includes(target)) consider(el, 'visible_text');
+          }
+          for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label'))) {
+            if (lower(lab.textContent || '').includes(target)) {
+              const ctrl = lab.querySelector<HTMLElement>('select, input, [role="combobox"], [role="listbox"]');
+              consider(ctrl, 'wrap_label');
+            }
+          }
+          const allSections = new Set<string>();
+          for (const c of candidates) {
+            const head = c.sectionPath.length > 0 ? c.sectionPath[c.sectionPath.length - 1] : '';
+            if (head) allSections.add(head);
+          }
+          if (sectionTarget) {
+            const inSectionAll = candidates.filter((c) => inSection(c.el));
+            const filterPreferred = inSectionAll.filter((c) => c.matchKind !== 'visible_text' || c.inFilterContainer);
+            const nonChrome = filterPreferred.filter((c) => !c.inChrome);
+            const ranked = nonChrome.length > 0 ? nonChrome : filterPreferred;
+            if (ranked.length > 0) {
+              ranked.sort((a, b) => {
+                const aScore = (a.inFilterContainer ? 2 : 0) + (a.inChrome ? -1 : 0);
+                const bScore = (b.inFilterContainer ? 2 : 0) + (b.inChrome ? -1 : 0);
+                return bScore - aScore;
+              });
+              return {
+                trigger: tagEl(ranked[0].el),
+                sections: Array.from(allSections),
+                sectionFound: true,
+              };
+            }
+            return { trigger: null, sections: Array.from(allSections), sectionFound: false };
+          }
+          if (candidates.length === 0) {
+            return { trigger: null, sections: [], sectionFound: false };
+          }
+          return {
+            trigger: tagEl(candidates[0].el),
+            sections: Array.from(allSections),
+            sectionFound: true,
+          };
+        },
+        { lbl: label, section },
+      );
+      if (retry.trigger) {
+        trigger = retry.trigger;
+        sectionsSeen = retry.sections;
+      }
+    }
+  }
+
+  // Phase C1: section was requested but not found / contained no match.
+  if (section && !triggerResult.sectionFound && !trigger) {
+    return {
+      ok: false,
+      reason: sectionsSeen.length > 0 ? 'section_match_no_value' : 'section_not_found',
+      took_ms: Date.now() - start,
+      candidates: sectionsSeen,
+      message: sectionsSeen.length > 0
+        ? `Section ${JSON.stringify(section)} found, but no element matching ${JSON.stringify(label)} inside it. Sections detected on this page: ${sectionsSeen.slice(0, 8).join(', ')}.`
+        : `No section matching ${JSON.stringify(section)} on this page. Sections detected: ${sectionsSeen.slice(0, 8).join(', ') || '(none)'}.`,
     };
+  }
 
-    // A. <label for="x">Lbl</label> + #x
-    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label[for]'))) {
-      if (lower(lab.textContent || '').includes(target)) {
-        const ctrl = document.getElementById(lab.htmlFor);
-        if (ctrl) return tag(ctrl);
-      }
-    }
-
-    // B. aria-labelledby
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-labelledby]'))) {
-      const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
-      const labText = ids
-        .map((id) => lower(document.getElementById(id)?.textContent || ''))
-        .join(' ');
-      if (labText.includes(target)) return tag(el);
-    }
-
-    // C. aria-label on combobox/button/listbox/input
-    const interactive = Array.from(document.querySelectorAll<HTMLElement>(
-      '[role="combobox"], [role="listbox"], [role="button"], [aria-haspopup], button, select, input',
-    ));
-    for (const el of interactive) {
-      const aria = lower(el.getAttribute('aria-label') || '');
-      if (aria.includes(target)) {
-        // Skip elements that are clearly off-screen / hidden.
-        if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') continue;
-        return tag(el);
-      }
-    }
-
-    // D. Visible text — prefer the smallest interactive element whose text
-    //    contains the label. Walk parents from the matching text node.
-    for (const el of interactive) {
-      if ((el as HTMLElement).offsetParent === null && el.tagName !== 'SELECT') continue;
-      const txt = lower((el as HTMLElement).textContent || '').slice(0, 200);
-      if (txt.includes(target)) return tag(el);
-    }
-
-    // E. Wrapping <label> — <label>Lbl <input/></label>
-    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label'))) {
-      if (lower(lab.textContent || '').includes(target)) {
-        const ctrl = lab.querySelector<HTMLElement>('select, input, [role="combobox"], [role="listbox"]');
-        if (ctrl) return tag(ctrl);
-      }
-    }
-
-    return null;
-  }, label);
+  // Phase C1: ambiguity refusal — when no section= supplied and the
+  // label matches triggers in 2+ distinct sections, the caller likely
+  // meant a specific one. The wineaccess "Region" / Sort case where
+  // both sections legitimately had triggers matching "Region" would
+  // hit this. The brain should re-call with section= set.
+  if (!section && requireSection && sectionsSeen.length >= 2) {
+    return {
+      ok: false,
+      reason: 'requires_section',
+      took_ms: Date.now() - start,
+      candidates: sectionsSeen,
+      message: `Label ${JSON.stringify(label)} matches triggers in ${sectionsSeen.length} distinct sections: ${sectionsSeen.slice(0, 8).join(', ')}. Re-call with section=<one of these> to disambiguate. (Set requireSectionOnAmbiguity=false to accept the first match — risks picking the wrong dropdown.)`,
+    };
+  }
 
   if (!trigger) {
     return { ok: false, reason: 'trigger_not_found', took_ms: Date.now() - start };
@@ -380,6 +961,7 @@ export async function selectOptionByLabel(
         ok: true, picked_text: value,
         trigger_selector: trigger.selector, verified: true,
         took_ms: Date.now() - start,
+        auto_expanded: autoExpanded,
       };
     } catch (e) {
       return {
@@ -551,5 +1133,6 @@ export async function selectOptionByLabel(
     option_selector: pick.option_selector,
     verified: verify.contains_pick,
     took_ms: Date.now() - start,
+    auto_expanded: autoExpanded,
   };
 }

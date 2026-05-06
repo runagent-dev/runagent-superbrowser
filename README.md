@@ -185,6 +185,18 @@ The medium-term target is a serverless deployment on [RunAgent Cloud](https://ru
 - **Kubernetes.** One pod per instance; PVC for the jar and handoff ledger.
 - **[RunAgent Cloud](https://runagent.cloud).** Managed stateful-serverless deployment. Part of the RunAgent family (OpenClaw, PicoClaw, ZeroClaw).
 
+### Rebuilding TS after edits
+
+`npm start` runs `node build/index.js`. After modifying anything under `src/*.ts`, **run `npm run build` before restarting** — otherwise the running server silently keeps the old code while the Python side sees your edits, and behaviour goes inconsistent.
+
+The server prints a loud startup banner if any `src/*.ts` is newer than `build/index.js`, and `GET /health/version` returns:
+
+```json
+{ "build": { "mtime": "..." }, "src": { "newest_mtime": "..." }, "stale": true|false, "stale_source_count": N }
+```
+
+CI and prod can set `STRICT_BUILD=1` to upgrade the warning to a hard exit.
+
 ---
 
 ## Contributing

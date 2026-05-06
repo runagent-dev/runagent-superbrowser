@@ -7,16 +7,141 @@ loops, regression navigation, stagnation, iteration budget pressure).
 
 Guidance is injected by appending text to the last tool result message,
 preserving the assistant/tool message alternation expected by LLM APIs.
+
+Phase 3 — context eviction: before injecting fresh guidance each turn,
+older tool messages have their stale ``[VISION ...]`` / ``[BRIEF ...]`` /
+``[CHECKLIST]`` / ``[FOCUS_BBOX]`` / ``[ACTION_DELTA]`` etc. blocks
+stripped and replaced with a one-line placeholder. The brain doesn't
+need to remember the bbox list from 4 turns ago — only the action that
+was taken.
 """
 
 from __future__ import annotations
 
 import os
+import re
+from typing import Any
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
 from superbrowser_bridge.loop_detector import LoopDetector
+
+
+# Evictable tag set — bracketed CAPS markers that worker_hook or the
+# vision pipeline emit and that go stale once the next screenshot
+# lands. Tool-error markers like [click_at_failed] / [BLOCKED] /
+# [click_silent] are deliberately lowercase or have non-CAPS prefixes
+# in this codebase, so they're naturally excluded — they carry signal
+# the brain still needs even after eviction.
+_EVICTABLE_TAG_RE = re.compile(
+    r"(?:^|\n)\["
+    r"(?:"
+    r"VISION"
+    r"|BRIEF(?:_PROGRESS)?"
+    r"|CHECKLIST"
+    r"|FOCUS_BBOX"
+    r"|FOCUS_EXHAUSTED"
+    r"|PLAN"
+    r"|ACTION_DELTA"
+    r"|V_PRIORITY"
+    r"|CURSOR_FAILURES_SO_FAR"
+    r"|GUIDANCE"
+    r"|PLANNER_GUIDANCE"
+    r"|CACHED VISION"
+    r")"
+    r"[^\]]*\]"
+)
+
+
+def _evict_stale_text(text: str, placeholder: str) -> str:
+    """Truncate `text` at the first evictable bracketed tag and append
+    `placeholder`. Returns the original `text` unchanged when no
+    evictable tag is found (read-only tool results, plain action
+    summaries with no vision/brief decoration).
+    """
+    if not text:
+        return text
+    m = _EVICTABLE_TAG_RE.search(text)
+    if m is None:
+        return text
+    head = text[: m.start()].rstrip()
+    # Cap the surviving head — older tool results sometimes include
+    # multi-kilobyte page text dumps in the prefix. Keep enough for
+    # the brain to know what the action did, drop the rest.
+    if len(head) > 240:
+        head = head[:240].rstrip() + "…"
+    return f"{head}\n{placeholder}" if head else placeholder
+
+
+def _step_one_liner(step: dict[str, Any] | None) -> str:
+    """Render a step_history entry as a single-line eviction placeholder.
+
+    The brain's continuity comes from this line — it's all that's left
+    of the turn after eviction. Format: ``[step K: tool(args) → result]``.
+    """
+    if not step:
+        return "[evicted: stale guidance trimmed]"
+    tool = (step.get("tool") or "?").strip()
+    args = (step.get("args") or "").strip()
+    if len(args) > 60:
+        args = args[:60].rstrip() + "…"
+    result = (step.get("result") or "").strip().split("\n")[0]
+    if len(result) > 80:
+        result = result[:80].rstrip() + "…"
+    return f"[evicted: {tool}({args}) → {result}]"
+
+
+def _evict_old_tool_messages(
+    messages: list[dict[str, Any]],
+    state: BrowserSessionState,
+    keep_turns: int,
+) -> None:
+    """In-place strip stale guidance from tool messages older than the
+    keep window. The most recent `keep_turns` tool results stay fully
+    intact (the brain's V_n indices resolve against the most recent
+    [VISION] block; the focus block on it is also still load-bearing).
+
+    Order matters: this runs BEFORE the guidance-injection loop in
+    after_iteration. If you reverse the order, fresh guidance gets
+    immediately stripped because eviction can't tell new from old.
+    """
+    if keep_turns < 1 or not messages:
+        return
+    tool_age = 0
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "tool":
+            continue
+        age = tool_age
+        tool_age += 1
+        if age < keep_turns:
+            continue
+        # Map tool-message age back to step_history. step_history
+        # appends one entry per tool that called record_step, so the
+        # mapping is best-effort: walk backward `age` entries.
+        step = None
+        try:
+            if state.step_history and -(age + 1) >= -len(state.step_history):
+                step = state.step_history[-(age + 1)]
+        except Exception:
+            step = None
+        placeholder = _step_one_liner(step)
+        content = msg.get("content")
+        if isinstance(content, str):
+            new = _evict_stale_text(content, placeholder)
+            if new != content:
+                msg["content"] = new
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                ):
+                    txt = block.get("text", "") or ""
+                    new = _evict_stale_text(txt, placeholder)
+                    if new != txt:
+                        block["text"] = new
 
 
 class BrowserWorkerHook(AgentHook):
@@ -50,6 +175,17 @@ class BrowserWorkerHook(AgentHook):
         # Tier-auto-escalation: fires at most once per session to avoid
         # loop-cascading the LLM into repeated escalations.
         self._auto_escalated: bool = False
+        # Phase 6 Planner re-plan tracking. When _stagnant_turns crosses
+        # _PLANNER_STALL_THRESHOLD, call Planner.replan(...). Cooldown
+        # via _last_planner_replan_iter to prevent re-plan spam (one
+        # call per 8 iterations max).
+        self._last_planner_replan_iter: int = -1
+        self._planner_replan_count: int = 0
+        self._planner_advice_pending: str = ""
+
+    _PLANNER_STALL_THRESHOLD: int = 5  # turns of no progress
+    _PLANNER_REPLAN_COOLDOWN: int = 8  # iterations between replans
+    _PLANNER_MAX_REPLANS: int = 3  # per session — abandon after this
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -418,6 +554,43 @@ class BrowserWorkerHook(AgentHook):
                             )
             self._prev_done_ids = current_done_ids
 
+            # --- Phase 6: Planner stall-replan -------------------------
+            # Surface any pending advice from the previous turn's
+            # replan FIRST so the brain sees it as a header on this
+            # turn's results (the advice was generated AFTER its last
+            # action; it should appear BEFORE its next action).
+            if self._planner_advice_pending:
+                guidance_parts.append(
+                    f"[PLANNER_GUIDANCE] {self._planner_advice_pending}"
+                )
+                self._planner_advice_pending = ""
+
+            # Trigger a replan when the worker has stagnated past the
+            # threshold and the cooldown has elapsed. Bounded to
+            # _PLANNER_MAX_REPLANS per session — beyond that, repeated
+            # replans usually mean the task is genuinely unreachable
+            # and we should let the iteration budget run out so the
+            # orchestrator surfaces the partial result.
+            if (
+                os.environ.get("PLANNER_REPLAN_ENABLED", "1") not in ("0", "false", "no")
+                and self._stagnant_turns >= self._PLANNER_STALL_THRESHOLD
+                and self._planner_replan_count < self._PLANNER_MAX_REPLANS
+                and (
+                    self._last_planner_replan_iter < 0
+                    or (iteration - self._last_planner_replan_iter)
+                    >= self._PLANNER_REPLAN_COOLDOWN
+                )
+            ):
+                advice = await self._maybe_replan(iteration, brief)
+                if advice:
+                    # Show the advice IMMEDIATELY on this turn (the
+                    # injection loop below will append guidance_parts
+                    # to the last tool result). Also stash for next
+                    # turn so the brain sees it framed as forward-
+                    # looking guidance even if it ignored this round.
+                    guidance_parts.append(f"[PLANNER_GUIDANCE] {advice}")
+                    self._planner_advice_pending = advice
+
             # --- Per-focus attempt ledger + [FOCUS_EXHAUSTED] -----------
             # Record the most recent step on the currently-focused
             # constraint. Then check if we've crossed the warn (3) or
@@ -575,11 +748,15 @@ class BrowserWorkerHook(AgentHook):
             except Exception:
                 pass
 
-        # --- Phase 3.1: cursor-failure ledger reminder ------------------
-        # When the brain has failed at least one cursor strategy, surface
-        # the ledger so it knows to try a DIFFERENT cursor strategy next
-        # rather than reach for browser_run_script (which the lockout
-        # gate will refuse anyway until a second strategy fails).
+        # --- Phase 3.1 + Phase E: cursor-failure ledger -----------------
+        # Stage 1 (existing): when distinct < 2, nudge to try a different
+        # cursor strategy.
+        # Stage 2 (Phase E1): when records ≥ 3 within recent turns AND
+        # last screenshot is stale, set a force-reobserve flag that
+        # cursor.py and forms.py refuse against until a fresh
+        # screenshot lands.
+        # Stage 3 (Phase E2): when records ≥ 3, render the last 3 with
+        # concrete remediation pointing at browser_find_target.
         try:
             recs = getattr(self.state, "cursor_failure_records", None) or []
             distinct = len(getattr(self.state, "cursor_failure_strategies", set()) or set())
@@ -593,8 +770,62 @@ class BrowserWorkerHook(AgentHook):
                     "will refuse it until 2 distinct cursor strategies have "
                     "failed."
                 )
+            # Phase E2: concrete remediation when ≥3 records.
+            if len(recs) >= 3:
+                last_three = recs[-3:]
+                lines = ["[CURSOR_CASCADE last 3 failures]"]
+                for rec in last_three:
+                    lines.append(
+                        f"  · {rec.get('strategy','?')}({(rec.get('target') or '')[:40]}) "
+                        f"→ {(rec.get('reason') or '')[:60]}"
+                    )
+                lines.append(
+                    "Stop guessing — switch tactic. Best next moves:\n"
+                    "  1. browser_find_target(label='<what you want>', "
+                    "section='<filter section name if any>') — locates "
+                    "the target across viewport + collapsed accordions, "
+                    "auto-scrolls. This is the canonical fix for the "
+                    "'I know it's there but no V_n labels it' loop.\n"
+                    "  2. browser_get_markdown(outline=true) to see the "
+                    "page section structure with viewport-relative y "
+                    "offsets.\n"
+                    "  3. browser_screenshot if your last vision is stale "
+                    "(>3 turns old) — fresh V_n labels."
+                )
+                guidance_parts.append("\n".join(lines))
+            # Phase E1: force-reobserve gate when cascade is real.
+            self._maybe_set_force_reobserve(recs)
         except Exception:
             pass
+
+        # --- Phase E (auto-call find_target) ----------------------------
+        # When the brain searched for a focus label but found no V_n
+        # match in the last vision pass AND the label IS in the cached
+        # markdown, proactively inject a [AUTO_FIND_TARGET] block with
+        # the structured candidate info. The brain still has to call
+        # find_target itself (we don't run mutating tools on its
+        # behalf), but the guidance includes the exact recommended
+        # call. This is the "I know it's there but vision missed it"
+        # pattern from the wineaccess trace.
+        try:
+            self._inject_auto_find_target_hint(guidance_parts)
+        except Exception as exc:
+            print(f"[auto_find_target hint failed: {exc}]")
+
+        # --- Phase 3: evict stale guidance/vision blocks from older
+        # tool results BEFORE injecting fresh guidance. Strip-then-inject
+        # ordering is critical — the inverse path strips fresh guidance
+        # immediately because the eviction pass can't tell new from old.
+        try:
+            keep_turns = int(
+                os.environ.get("SUPERBROWSER_GUIDANCE_KEEP_TURNS") or "3"
+            )
+        except ValueError:
+            keep_turns = 3
+        if keep_turns >= 1 and context.messages:
+            _evict_old_tool_messages(
+                context.messages, self.state, keep_turns,
+            )
 
         # --- Inject guidance into the last tool result message ---
         if guidance_parts and context.messages:
@@ -609,3 +840,281 @@ class BrowserWorkerHook(AgentHook):
                         # Multimodal content (image blocks) — append as text block
                         msg["content"].append({"type": "text", "text": guidance_text})
                     break
+
+    async def _maybe_replan(
+        self,
+        iteration: int,
+        brief: Any,
+    ) -> str:
+        """Call Planner.replan and install the revised brief.
+
+        Returns advice text to surface as ``[PLANNER_GUIDANCE]``, or
+        an empty string when the planner declined to revise (no
+        credentials, parse failure, judge said "stay the course").
+
+        Side effects:
+            * ``self.state.task_brief`` may be replaced with a fresh
+              brief constructed from the planner's revised steps.
+            * ``self._last_planner_replan_iter`` is updated regardless
+              of outcome — failed replans count toward the cooldown
+              so we don't hammer the API on repeat failures.
+        """
+        self._last_planner_replan_iter = iteration
+        try:
+            from superbrowser_bridge.planner_agent import default_planner
+            planner = default_planner()
+            if not planner.enabled:
+                return ""
+            recent_steps = (
+                getattr(self.state, "step_history", []) or []
+            )[-10:]
+            last_vision = ""
+            try:
+                resp = getattr(self.state, "_last_vision_response", None)
+                last_vision = (getattr(resp, "summary", "") or "") if resp else ""
+            except Exception:
+                last_vision = ""
+            brief_text = ""
+            try:
+                brief_text = brief.render_for_prompt()
+            except Exception:
+                brief_text = "(brief unavailable)"
+            task = (
+                getattr(self.state, "task_instruction", None)
+                or getattr(brief, "original_query", "")
+                or ""
+            )
+            result = await planner.replan(
+                task=task,
+                brief_render=brief_text,
+                recent_steps=recent_steps,
+                last_vision_summary=last_vision,
+                stall_reason=f"stagnant_turns={self._stagnant_turns}",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            print(f"[planner replan failed: {exc}]")
+            return ""
+
+        if result.abandon:
+            self._planner_replan_count += 1
+            return (
+                f"Planner judges the goal unreachable from here: "
+                f"{result.reason} — call done(success=False) and "
+                "report what you learned."
+            )
+        if not result.steps:
+            return ""
+
+        # Install the revised brief in place. Keep the original_query
+        # but bump version semantics by reusing set_task_brief which
+        # constructs a fresh TaskBrief.
+        try:
+            original_query = (
+                getattr(brief, "original_query", "")
+                or getattr(self.state, "task_instruction", "")
+                or ""
+            )
+            self.state.set_task_brief(original_query, result.steps)
+            # Reset stagnation counter so the new brief gets a fair
+            # start; otherwise the brain immediately sees [NO_PROGRESS_4]
+            # against a brief that's only 1 turn old.
+            self._stagnant_turns = 0
+            self._prev_done_ids = set()
+            self._planner_replan_count += 1
+            print(
+                f"[planner replanned iter={iteration} steps={len(result.steps)} "
+                f"replan_count={self._planner_replan_count}]"
+            )
+        except Exception as exc:
+            print(f"[planner brief install failed: {exc}]")
+            return ""
+
+        labels = "; ".join(
+            f"#{i+1} {s['label'][:50]}"
+            for i, s in enumerate(result.steps[:6])
+        )
+        return (
+            f"Stalled for {self._stagnant_turns}+ turns; revised plan "
+            f"installed ({len(result.steps)} steps): {labels}. "
+            "Re-read the [BRIEF] / [CHECKLIST] blocks above and pursue "
+            "the new focus item."
+        )
+
+    def _maybe_set_force_reobserve(self, recs: list[dict]) -> None:
+        """Phase E1: when cursor failures pile up without a fresh
+        screenshot, set ``state._force_reobserve_pending`` so the
+        cursor / forms / eval tools refuse until a screenshot lands.
+
+        Trigger: 3+ failures in the last 6 brain turns AND last
+        vision epoch is older than 3 turns. The cap on turn-window
+        prevents the gate from firing on stale failures from much
+        earlier in the session.
+        """
+        if not recs:
+            return
+        current_turn = self.state._brain_turn_counter
+        window_turns = 6
+        recent_failures = [
+            r for r in recs
+            if (current_turn - int(r.get("turn", 0))) <= window_turns
+        ]
+        if len(recent_failures) < 3:
+            # Reset gate when cascade clears.
+            if getattr(self.state, "_force_reobserve_pending", False):
+                self.state._force_reobserve_pending = False
+            return
+        epoch_turn = getattr(self.state, "_vision_epoch_turn", 0) or 0
+        epoch_age_turns = current_turn - int(epoch_turn)
+        if epoch_age_turns >= 3:
+            self.state._force_reobserve_pending = True
+
+    def _inject_auto_find_target_hint(self, guidance_parts: list[str]) -> None:
+        """Phase E (auto find_target): detect "label is in markdown but
+        no V_n labels it" and inject a structured ``[AUTO_FIND_TARGET]``
+        block with the recommended call.
+
+        We don't actually CALL find_target on the brain's behalf — the
+        brain decides. But we surface enough info that the next turn's
+        choice is obvious: "you want X, X is at y=1240px in the
+        Region accordion (collapsed), here's the recommended call."
+        """
+        brief = getattr(self.state, "task_brief", None)
+        if brief is None:
+            return
+        focus = brief.next_focus()
+        if focus is None:
+            return
+        focus_label = (focus.label or "").strip()
+        if len(focus_label) < 3:
+            return
+        # Did the most recent vision pass have any bbox roughly matching
+        # this focus label? If yes, the brain already has a V_n to use —
+        # no need to nudge.
+        resp = getattr(self.state, "_last_vision_response", None)
+        if resp is not None:
+            label_lower = focus_label.lower()
+            # Strip generic "filter" / "section" descriptor words that
+            # appear in TaskBrief labels but rarely in bbox labels — the
+            # brief says "Oregon filter" while vision says "Oregon (12)".
+            content_tokens = [
+                t for t in _word_tokens(label_lower)
+                if t not in _GENERIC_FOCUS_WORDS and len(t) >= 3
+            ]
+            for b in (getattr(resp, "bboxes", []) or []):
+                bbox_label = (getattr(b, "label", "") or "").strip().lower()
+                if not bbox_label:
+                    continue
+                if label_lower in bbox_label or bbox_label in label_lower:
+                    return
+                # Strong signal: any content-bearing focus token appears
+                # in the bbox label as a whole word.
+                bbox_tokens = set(_word_tokens(bbox_label))
+                if content_tokens and any(t in bbox_tokens for t in content_tokens):
+                    return
+                # Token-overlap fallback (Jaccard ≥ 0.5) on full token
+                # sets — catches cases where the focus has multiple
+                # content tokens and most of them are in the bbox.
+                a_tokens = set(_word_tokens(label_lower))
+                if a_tokens and bbox_tokens:
+                    overlap = len(a_tokens & bbox_tokens)
+                    union = len(a_tokens | bbox_tokens)
+                    if union and overlap / union >= 0.5:
+                        return
+        # No vision match — does markdown contain the label?
+        md = (getattr(self.state, "_last_markdown", "") or "").lower()
+        if not md:
+            return
+        focus_lower = focus_label.lower()
+        # Token-level check on markdown to avoid false positives. The
+        # focus has to share at least 50% of its tokens with the
+        # markdown, AND at least one token must be present as a whole
+        # word.
+        focus_tokens = set(_word_tokens(focus_lower))
+        if not focus_tokens:
+            return
+        md_present = sum(1 for t in focus_tokens if t in md)
+        if md_present == 0:
+            return
+        if md_present / len(focus_tokens) < 0.5:
+            return
+        # Don't re-emit on every iteration. Track when we last fired so
+        # the brain has a turn or two to act before we nag again.
+        last_fired = getattr(self, "_last_auto_find_iter", -100)
+        current_iter = self.state._brain_turn_counter
+        if current_iter - last_fired < 3:
+            return
+        self._last_auto_find_iter = current_iter
+        # Build a recommended call. If the brief's brief.original_query
+        # mentions a section keyword (Region/Filter/Variety/etc.), use
+        # it as the section= hint.
+        section_hint = _guess_section_hint(focus_label)
+        rec = (
+            f"browser_find_target(label={focus_label!r}"
+            + (f", section={section_hint!r}" if section_hint else "")
+            + ")"
+        )
+        guidance_parts.append(
+            f"[AUTO_FIND_TARGET focus={focus_label!r}]\n"
+            f"  Your current focus is {focus_label!r}, which appears "
+            "in the page markdown but has no matching V_n in the last "
+            "vision pass. The target is likely below the fold OR in a "
+            "collapsed accordion section. RECOMMENDED next call:\n"
+            f"  {rec}\n"
+            "find_target searches markdown + DOM for the label, detects "
+            "collapsed sections, auto-scrolls into view, and returns a "
+            "structured next-action hint. Don't keep guessing V_n on a "
+            "stale screenshot or fabricating URL params."
+        )
+
+
+# Module-level helpers for _inject_auto_find_target_hint.
+import re as _re_word_helper
+
+
+# Generic descriptor words that appear in TaskBrief labels but rarely
+# in vision bbox labels — strip these from focus before token matching
+# so "Oregon filter" matches "Oregon (12)" via the content-token path.
+_GENERIC_FOCUS_WORDS: frozenset[str] = frozenset({
+    "filter", "filters", "section", "sidebar", "panel",
+    "by", "of", "the", "a", "an", "for", "with",
+    "click", "select", "open", "expand", "show", "view",
+    "and", "or", "to", "from", "in", "at", "on",
+})
+
+
+def _word_tokens(text: str) -> list[str]:
+    return _re_word_helper.findall(r"\w+", text or "")
+
+
+def _guess_section_hint(focus_label: str) -> str:
+    """Heuristic: extract a section keyword from the focus label.
+
+    'Oregon filter' → 'Region'? Too aggressive — we'd have to know
+    the site's taxonomy. Better: return any single-word noun in the
+    label that maps to a known filter category. For now we look for
+    explicit section words.
+    """
+    lower = (focus_label or "").lower()
+    # Word -> common section heading mapping. Keep small; bigger
+    # mappings encourage the brain to trust this guess.
+    HINTS = {
+        "white": "Type",
+        "red": "Type",
+        "rosé": "Type",
+        "rose": "Type",
+        "oregon": "Region",
+        "california": "Region",
+        "france": "Region",
+        "italy": "Region",
+        "fish": "Pairings",
+        "dessert": "Pairings",
+        "chicken": "Pairings",
+        "beef": "Pairings",
+        "vegetarian": "Pairings",
+        "price": "Price",
+        "rating": "Rating",
+    }
+    for word, section in HINTS.items():
+        if word in lower:
+            return section
+    return ""

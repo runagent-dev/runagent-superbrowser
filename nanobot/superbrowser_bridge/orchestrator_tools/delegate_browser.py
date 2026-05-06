@@ -418,6 +418,36 @@ class DelegateBrowserTaskTool(Tool):
         # alone solves most "lost-condition" reports.
         effective_checklist = task_checklist
         checklist_source = "orchestrator"
+        # Phase 6: Planner agent. When the orchestrator didn't supply a
+        # checklist AND the task is long enough to plausibly be multi-step,
+        # ask the Planner LLM to decompose. Fall back to the heuristic on
+        # any failure (no API key, parse error, too-short task). Disable
+        # entirely with PLANNER_ENABLED=0 — cheap escape hatch for cost
+        # or latency concerns.
+        if (
+            not effective_checklist
+            and os.environ.get("PLANNER_ENABLED", "1") not in ("0", "false", "no")
+            and len((instructions or "")) >= 80
+        ):
+            try:
+                from superbrowser_bridge.planner_agent import default_planner
+                planner = default_planner()
+                if planner.enabled:
+                    result = await planner.decompose(instructions)
+                    if result.steps:
+                        effective_checklist = result.steps
+                        checklist_source = "planner"
+                        print(
+                            f"   [planner decomposed source=planner "
+                            f"steps={len(result.steps)} "
+                            f"model={planner.model}]"
+                        )
+                    elif result.abandon:
+                        print(
+                            f"   [planner abandoned: {result.reason}]"
+                        )
+            except Exception as exc:
+                print(f"   [planner failed: {exc}]")
         if not effective_checklist:
             try:
                 from superbrowser_bridge.task_brief import heuristic_decompose

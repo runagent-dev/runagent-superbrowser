@@ -6,11 +6,29 @@ from __future__ import annotations
 from ._common import *  # noqa: F401,F403
 
 @tool_parameters(
-    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        outline=BooleanSchema(
+            description=(
+                "If true, also return a structured outline of section "
+                "headings with their viewport-relative y-offset and "
+                "collapsed state. Useful for planning scroll: '[Region] "
+                "is at y=1240px (collapsed), [Variety] is at y=1860px'. "
+                "Default: false (markdown body only)."
+            ),
+            default=False,
+        ),
+        required=["session_id"],
+    )
 )
 class BrowserGetMarkdownTool(Tool):
     name = "browser_get_markdown"
-    description = "Extract page content as markdown. FREE — no screenshot cost."
+    description = (
+        "Extract page content as markdown. FREE — no screenshot cost. "
+        "Pass `outline=true` to also get a structured list of section "
+        "headings with viewport-relative positions + collapsed-state "
+        "flags, so you can plan scroll without burning vision budget."
+    )
 
     def __init__(self, state: BrowserSessionState | None = None):
         # state is optional so the tool stays usable in stateless contexts.
@@ -23,12 +41,16 @@ class BrowserGetMarkdownTool(Tool):
     def read_only(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, **kw: Any) -> str:
-        r = await _request_with_backoff(
-            "GET",
-            f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
-            timeout=15.0,
-        )
+    async def execute(
+        self,
+        session_id: str,
+        outline: bool = False,
+        **kw: Any,
+    ) -> str:
+        url = f"{SUPERBROWSER_URL}/session/{session_id}/markdown"
+        if outline:
+            url = f"{url}?outline=1"
+        r = await _request_with_backoff("GET", url, timeout=15.0)
         r.raise_for_status()
         data = r.json()
         body = data.get("content", "No content extracted")[:10000]
@@ -41,6 +63,59 @@ class BrowserGetMarkdownTool(Tool):
             # Do NOT reset _scripts_since_observation here. Only
             # browser_screenshot provides V_n labels; markdown gives text
             # only. Resetting here enables click→markdown→eval×2 loops.
+            # Phase N: harvest link hrefs from the markdown body. The
+            # TS-side getMarkdownContent returns markdown-formatted
+            # output that preserves `[text](url)` link syntax; we also
+            # accept bare http(s):// URLs that appear in line. This
+            # populates observed_link_hrefs so the navigate guard can
+            # refuse fabricated UUID-in-path URLs.
+            try:
+                import re as _re_local
+                hrefs: list[str] = []
+                # Markdown links: [anything](URL)
+                for m in _re_local.finditer(
+                    r"\[(?:[^\]]*)\]\((https?://[^)\s]+|/[^)\s]+)\)",
+                    body,
+                ):
+                    hrefs.append(m.group(1))
+                # Bare URLs in body (catalog cards often render as
+                # plain text in markdown).
+                for m in _re_local.finditer(
+                    r"https?://[a-zA-Z0-9._-]+(?:/[^\s)\]]*)?",
+                    body,
+                ):
+                    hrefs.append(m.group(0))
+                added = self.s.harvest_link_hrefs(hrefs)
+                if added:
+                    print(
+                        f"  [markdown_hrefs] harvested {added} new link "
+                        f"hrefs (total observed: "
+                        f"{len(self.s.observed_link_hrefs)})"
+                    )
+            except Exception as exc:
+                print(f"  [markdown_hrefs failed: {exc}]")
+        # Render outline as a compact text block the brain can read.
+        if outline:
+            outline_data = data.get("outline") or []
+            viewport = data.get("viewport") or {}
+            scroll_y = viewport.get("scrollY", 0)
+            page_h = viewport.get("pageHeight", 0)
+            vp_h = viewport.get("innerHeight", 0)
+            lines: list[str] = [
+                f"[OUTLINE viewport: scrollY={scroll_y}px innerHeight={vp_h}px "
+                f"pageHeight={page_h}px]",
+            ]
+            for h in outline_data[:60]:
+                indent = "  " * max(0, int(h.get("level", 3)) - 1)
+                tag = "[collapsed]" if h.get("collapsed") else ""
+                section = h.get("ancestor_section") or ""
+                section_str = f" (in {section})" if section else ""
+                lines.append(
+                    f"{indent}- {h.get('text','')!r:50} y={h.get('y_offset_px',0)}px"
+                    f"{section_str} {tag}".rstrip()
+                )
+            outline_block = "\n".join(lines)
+            return f"{body}\n\n{outline_block}"
         return body
 
 
@@ -174,12 +249,47 @@ class BrowserBriefMarkTool(Tool):
                 f"[brief_mark_failed] status must be 'done' | 'failed' | "
                 f"'not_applicable', got {status!r}"
             )
-        ok = brief.mark(cid, status, evidence or "")
+        # Phase M: enable evidence validation. The mark() implementation
+        # appends a sentinel "[refused:...]" to the constraint's
+        # evidence string when validation fails — surface that as the
+        # tool's response so the brain learns what went wrong.
+        ok = brief.mark(cid, status, evidence or "", validate_evidence=True)
         if not ok:
-            ids = ", ".join(str(c.id) for c in brief.constraints)
+            # Two failure modes: constraint not found, OR evidence
+            # validation refused. Distinguish by inspecting the
+            # constraint's evidence for the sentinel.
+            target_c = next(
+                (c for c in brief.constraints if c.id == cid), None,
+            )
+            if target_c is None:
+                ids = ", ".join(str(c.id) for c in brief.constraints)
+                return (
+                    f"[brief_mark_failed] no constraint with id={cid}. "
+                    f"Known ids: {ids}"
+                )
+            # Evidence-validation refusal — strip the sentinel from the
+            # constraint state (don't pollute future evidence) and
+            # surface the structured reason.
+            ev = target_c.evidence or ""
+            if "[refused:" in ev:
+                refusal = ev.split("[refused:", 1)[1].rstrip("] ")
+                target_c.evidence = ev.split(" [refused:", 1)[0]
+                return (
+                    f"[brief_mark_refused:weak_evidence] "
+                    f"Cannot mark constraint #{cid} {target_c.label!r} "
+                    f"as {status}: {refusal}\n"
+                    f"Your evidence was: {(evidence or '')[:160]!r}\n"
+                    "Provide evidence that references the constraint's "
+                    "predicate. For 'Oregon region', that's text "
+                    "containing 'Oregon' / 'Willamette' / 'Dundee' — "
+                    "NOT 'United States' or 'Pacific Northwest'. "
+                    "Click the actual filter option (Oregon checkbox, "
+                    "Oregon region link), then re-issue brief_mark "
+                    "with evidence quoting the now-active filter chip."
+                )
             return (
-                f"[brief_mark_failed] no constraint with id={cid}. "
-                f"Known ids: {ids}"
+                f"[brief_mark_failed] mark() returned False for #{cid}. "
+                "Internal error."
             )
         # Marking a constraint counts as deliberation.
         self.s.last_deliberation_turn = self.s._brain_turn_counter

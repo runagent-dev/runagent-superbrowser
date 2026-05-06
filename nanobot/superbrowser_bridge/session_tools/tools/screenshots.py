@@ -98,13 +98,18 @@ class BrowserScreenshotTool(Tool):
             entries = data.get("selectorEntries") or []
             dpr = float(data.get("devicePixelRatio") or 1.0)
             # Rename tagName → tag for the overlay (both naming schemes work
-            # but tag is the overlay's canonical key).
+            # but tag is the overlay's canonical key). Phase R: also
+            # carry the full `attributes` dict and `text` so the
+            # post-vision enrichment step can copy href / aria-* /
+            # name onto each Gemini bbox.
             overlay_elements = [
                 {
                     "index": e.get("index"),
                     "tag": e.get("tagName") or e.get("tag"),
                     "role": e.get("role") or (e.get("attributes") or {}).get("role"),
                     "bounds": e.get("bounds"),
+                    "attributes": e.get("attributes") or {},
+                    "text": (e.get("text") or "")[:160],
                 }
                 for e in entries
                 if e.get("bounds") and e.get("index") is not None

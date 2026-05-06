@@ -212,12 +212,17 @@ class VisionAgent:
 
         # Set-of-Marks feedback: overlay the bboxes we emitted on the
         # previous pass so Gemini can re-anchor visually instead of
-        # re-guessing every element from scratch. Opt-out via
-        # VISION_SOM_OVERLAY=0 for A/B testing. Any failure here falls
-        # through to the raw screenshot — overlay must never block a
-        # vision call.
+        # re-guessing every element from scratch. Opt-IN via
+        # VISION_SOM_OVERLAY=1 — the default is OFF as of Phase 2.
+        # Hypothesis from production traces: drawing colored rectangles
+        # on the screenshot before sending to Gemini shifts the model's
+        # perception of small/dense controls (filter chips, calculator
+        # widgets) and produces looser bboxes than the bare-screenshot
+        # path. v2 had no SoM and bboxes were tighter. Re-enable per
+        # session if a workflow benefits from anchoring (e.g. captcha
+        # step mode).
         #
-        # Suppressed when:
+        # Even when opted in, suppressed when:
         #   - intent is solve_captcha_step (tiles re-render between steps)
         #   - previous pass is older than _SOM_STALE_AFTER_S (anchor too
         #     cold to trust; layout probably shifted)
@@ -233,7 +238,7 @@ class VisionAgent:
         )
         _som_url_changed = bool(prev_url) and (prev_url != (url or ""))
         if (
-            os.environ.get("VISION_SOM_OVERLAY", "1") != "0"
+            os.environ.get("VISION_SOM_OVERLAY", "0") == "1"
             and _bucket != "solve_captcha_step"
             and not _som_prev_stale
             and not _som_url_changed

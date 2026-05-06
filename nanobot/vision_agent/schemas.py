@@ -92,19 +92,88 @@ class BBox(BaseModel):
     confidence: float = Field(default=0.5)
     intent_relevant: bool = Field(default=False)
     role_in_scene: Literal[
-        "blocker", "target", "chrome", "content", "unknown",
+        "blocker", "target", "chrome", "content", "collapsed_section", "unknown",
     ] = Field(
         default="unknown",
         description=(
             "What this bbox IS relative to the current task — `blocker` for "
             "cookie/consent buttons, `target` for the actual goal element, "
             "`chrome` for navigation/footer, `content` for article body, "
+            "`collapsed_section` for a section header with no expanded "
+            "options visible underneath (filter sidebar accordions etc.) — "
+            "click to expand before searching for child controls, "
             "`unknown` when uncertain. Drives the action planner."
         ),
     )
     layer_id: Optional[str] = Field(
         default=None,
         description="ID of the SceneLayer this bbox belongs to. None when scene is absent.",
+    )
+    sub_elements: Optional[list[dict]] = Field(
+        default=None,
+        description=(
+            "Phase G2 fallback: when a single bbox visually contains "
+            "multiple distinct interactive controls and you cannot "
+            "emit them as separate top-level bboxes (e.g. you've hit "
+            "the 50-bbox cap and a row collapses to one), describe "
+            "the sub-controls here. Each entry: "
+            "{label: str, role: str, position: 'left'|'right'|'top'|"
+            "'bottom'|'center', bbox_offset_pct: [x_min, y_min, x_max, "
+            "y_max] in 0..100 fractions of the parent bbox}. The "
+            "preferred path is still emitting separate top-level "
+            "bboxes per the compound-row guidance — sub_elements is "
+            "the lossy fallback."
+        ),
+    )
+    # ---- Phase R: DOM-derived metadata (populated post-vision) ----
+    # These fields are NOT emitted by Gemini. They're written by the
+    # server-side enrichment step that IoU-matches each Gemini bbox
+    # against the DOM selectorEntries and copies attributes onto the
+    # bbox. Surfacing them in `as_brain_text()` gives the brain the
+    # real `href` (so it doesn't fabricate UUIDs), aria-expanded state
+    # (so it knows whether a section is collapsed), DOM index (so it
+    # can fall back to `browser_click(index=N)` when bbox snap fails),
+    # etc.
+    dom_index: Optional[int] = Field(
+        default=None,
+        description="DOM-side [N] index for browser_click(index=N).",
+    )
+    href: Optional[str] = Field(
+        default=None,
+        description=(
+            "Real href URL when the bbox is an <a> tag. The brain can "
+            "navigate to this directly via browser_navigate(url=...) "
+            "without fabricating UUIDs."
+        ),
+    )
+    aria_expanded: Optional[str] = Field(
+        default=None,
+        description=(
+            "aria-expanded attribute value ('true'|'false'|None). When "
+            "'false', the bbox is a collapsed disclosure trigger — "
+            "click it to reveal child content."
+        ),
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description=(
+            "name attribute on form controls — useful for "
+            "browser_click_selector('[name=...]')."
+        ),
+    )
+    is_disabled: Optional[bool] = Field(
+        default=None,
+        description="True when the element is disabled — clicks won't fire.",
+    )
+    is_active_filter: Optional[bool] = Field(
+        default=None,
+        description=(
+            "True when the bbox represents an active filter chip "
+            "(aria-checked='true' / aria-pressed='true' / "
+            "aria-selected='true'). Lets the brain see which filters "
+            "are CURRENTLY applied without re-reading a separate "
+            "'active filters' section."
+        ),
     )
 
     @field_validator("box_2d", mode="before")
@@ -201,7 +270,7 @@ class BBox(BaseModel):
         if not isinstance(v, str):
             return "unknown"
         s = v.strip().lower().replace("-", "_").replace(" ", "_")
-        valid = {"blocker", "target", "chrome", "content", "unknown"}
+        valid = {"blocker", "target", "chrome", "content", "collapsed_section", "unknown"}
         if s in valid:
             return s
         aliases = {
@@ -215,6 +284,11 @@ class BBox(BaseModel):
             "navigation": "chrome",
             "header": "chrome",
             "footer": "chrome",
+            "collapsed": "collapsed_section",
+            "accordion": "collapsed_section",
+            "expandable": "collapsed_section",
+            "expand": "collapsed_section",
+            "section_header": "collapsed_section",
             "body": "content",
             "article": "content",
         }
@@ -878,11 +952,33 @@ class VisionResponse(BaseModel):
             else:
                 ymin, xmin, ymax, xmax = b.box_2d
                 coord_text = f"(box_2d=[{ymin},{xmin},{ymax},{xmax}])"
+            # Phase R: render DOM-derived metadata inline. Only emit
+            # the bits that actually differ from defaults so the line
+            # stays scannable on dense pages.
+            meta_bits: list[str] = []
+            if b.dom_index is not None:
+                meta_bits.append(f"idx={b.dom_index}")
+            if b.href:
+                # Truncate long catalog URLs so they don't blow lines.
+                _h = b.href if len(b.href) <= 90 else b.href[:87] + "..."
+                meta_bits.append(f"href={_h}")
+            if b.aria_expanded == "false":
+                meta_bits.append("collapsed")
+            elif b.aria_expanded == "true":
+                meta_bits.append("expanded")
+            if b.name:
+                meta_bits.append(f"name={b.name}")
+            if b.is_disabled:
+                meta_bits.append("DISABLED")
+            if b.is_active_filter:
+                meta_bits.append("active=true")
+            meta_suffix = ("  " + " ".join(meta_bits)) if meta_bits else ""
             elements_lines.append(
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "
                 f"{coord_text}"
                 f"{role_tag}"
+                f"{meta_suffix}"
             )
         truncated = (
             f"  … {len(self.bboxes) - max_bboxes} more bboxes truncated"
@@ -929,6 +1025,20 @@ class VisionResponse(BaseModel):
             parts.extend(elements_lines)
             if truncated:
                 parts.append(truncated)
+            # Phase I1: explicit V_n range footer. The brain reads this
+            # every screenshot and self-bounds — prevents references to
+            # V_n indices that don't exist in the current epoch (the
+            # wineaccess trace had clicks like V47 / V29 referenced
+            # against an epoch with fewer bboxes; the refusal said
+            # "out of range" but didn't tell the brain the *valid*
+            # range, so it kept guessing).
+            parts.append(
+                f"[V_RANGE valid=V1..V{len(elements_lines)}]  "
+                "Only V_n in this range will resolve. References "
+                "outside it will be refused as bad_vision_index — "
+                "they're either stale (from an evicted older "
+                "screenshot) or hallucinated."
+            )
         if self.suggested_actions:
             parts.append("Suggested actions:")
             for sa in sorted(self.suggested_actions, key=lambda a: a.priority):

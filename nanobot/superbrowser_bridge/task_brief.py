@@ -33,6 +33,22 @@ _STATUSES = ("open", "active", "done", "failed", "not_applicable")
 # a hint for the brain about what flavor of progress to make.
 _KINDS = ("filter", "action", "extraction", "navigation", "verification")
 
+# Phase M: stop-words excluded from token-overlap validation in
+# `_evidence_validation_error`. These appear in too many constraint
+# labels / evidence strings to be discriminating.
+_GENERIC_EVIDENCE_STOPWORDS: frozenset[str] = frozenset({
+    "filter", "section", "type", "kind", "options", "option", "value",
+    "values", "the", "and", "for", "with", "from", "into", "this",
+    "that", "any", "all", "shows", "showing", "show", "page", "result",
+    "results", "list", "item", "items", "active", "applied", "selected",
+    "set", "done", "match", "matches", "matched", "manual", "default",
+    "page_text", "page_url", "url_contains", "url_param", "url_query",
+    "vision_active_label", "predicate", "constraint",
+    # HTTP/URL plumbing tokens that shouldn't credit evidence.
+    "https", "http", "www", "com", "org", "net", "store", "search",
+    "catalog", "category", "categories",
+})
+
 
 @dataclass
 class Constraint:
@@ -103,21 +119,142 @@ class TaskBrief:
                 return c
         return None
 
-    def mark(self, constraint_id: int, status: str, evidence: str = "") -> bool:
+    def mark(
+        self,
+        constraint_id: int,
+        status: str,
+        evidence: str = "",
+        validate_evidence: bool = False,
+    ) -> bool:
         """Set a constraint's status. Returns True if the constraint
         existed and the status was applied. Idempotent — re-marking with
         the same status is a no-op but still returns True.
+
+        Phase M: when ``validate_evidence`` is True (passed by
+        ``BrowserBriefMarkTool``), filter constraints marked ``done``
+        require the evidence string to reference at least one
+        predicate-relevant token. Prevents the wineaccess case where
+        the brain marked "Oregon region" done with evidence about
+        "United States" — wrong region, real cascade trigger.
         """
         if status not in _STATUSES:
             return False
         for c in self.constraints:
             if c.id == constraint_id:
+                if (
+                    validate_evidence
+                    and status == "done"
+                    and c.kind == "filter"
+                ):
+                    err = self._evidence_validation_error(c, evidence or "")
+                    if err:
+                        # Stash the error for the caller — the tool layer
+                        # converts it into a structured refusal message.
+                        # Don't flip status; mark as a sentinel so the
+                        # tool can detect it.
+                        c.evidence = (
+                            (c.evidence or "")
+                            + f" [refused:{err}]"
+                        )[:200]
+                        return False
                 if c.status != status:
                     c.status = status
                     c.evidence = (evidence or c.evidence)[:200]
                     self.version += 1
                 return True
         return False
+
+    @staticmethod
+    def _evidence_validation_error(
+        constraint: "Constraint",
+        evidence: str,
+    ) -> str:
+        """Phase M: return a short error string when evidence does NOT
+        reference a predicate-VALUE token, or empty string when
+        evidence is acceptable.
+
+        Strategy: predicate VALUE tokens (vision_active_label items,
+        url_contains items, url_param values) are the ground truth —
+        they're the specific things that prove the constraint was
+        actually applied. Label tokens are display-only and contain
+        category words ("region", "filter") that match indiscriminately.
+        We prefer value tokens over label tokens; only fall back to
+        label tokens when the predicate has no value tokens (i.e.
+        `manual: True` with nothing else) AND the label has at least
+        one non-stop-word token.
+        """
+        ev_lower = (evidence or "").lower()
+        if not ev_lower.strip():
+            return "empty_evidence"
+
+        import re as _re_local
+
+        # Predicate-value tokens come from the actual values that prove
+        # the constraint is satisfied. For "Oregon region" with
+        # predicate.vision_active_label=['Oregon'], the only acceptable
+        # evidence token is "oregon" — NOT "region".
+        value_tokens: set[str] = set()
+        # Label tokens are a fallback used only when predicate has no
+        # values (manual-only constraint).
+        label_tokens: set[str] = set()
+
+        def _add(target: set[str], s: str) -> None:
+            for m in _re_local.findall(r"[a-z0-9]{3,}", s.lower()):
+                if m in _GENERIC_EVIDENCE_STOPWORDS:
+                    continue
+                target.add(m)
+
+        # Walk predicate looking ONLY at string values, skipping the
+        # `manual` boolean and predicate-key strings (they're metadata,
+        # not values).
+        def _walk_values(obj: object) -> None:
+            if isinstance(obj, str):
+                _add(value_tokens, obj)
+            elif isinstance(obj, bool):
+                return  # `manual: True` etc.
+            elif isinstance(obj, (list, tuple, set)):
+                for x in obj:
+                    _walk_values(x)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _walk_values(v)
+        _walk_values(constraint.predicate or {})
+        _add(label_tokens, constraint.label)
+        # Filter label tokens that are ALSO in the stop-word list
+        # (already done by _add) AND drop common category words even
+        # when not in the global stopword list — these appear in
+        # multiple constraints' labels and aren't discriminating.
+        # ("region" in "Oregon region" is the category, "oregon" is
+        # the discriminating part.)
+        label_category_words: set[str] = {
+            "region", "country", "state", "color", "size", "brand",
+            "year", "rating", "score", "stars", "review", "reviewed",
+            "price", "type", "kind", "variety", "varietal", "style",
+            "pairing", "pairings", "pairs", "wines", "wine",
+        }
+        label_tokens -= label_category_words
+
+        # Choose the active token set.
+        if value_tokens:
+            tokens = value_tokens
+        elif label_tokens:
+            tokens = label_tokens
+        else:
+            # No discriminating tokens available — skip validation.
+            # Constraint is unverifiable from evidence text alone.
+            return ""
+
+        # Tokenize evidence and match.
+        ev_tokens = set(_re_local.findall(r"[a-z0-9]{3,}", ev_lower))
+        # Don't credit the same generic category words on the evidence
+        # side either — "region" in evidence shouldn't satisfy a
+        # "region"-categorized constraint.
+        ev_tokens -= label_category_words
+        if tokens & ev_tokens:
+            return ""
+        # No overlap. Build a hint with the expected tokens.
+        expected = ", ".join(sorted(tokens)[:8])
+        return f"evidence_doesnt_reference_predicate (expected one of: {expected})"
 
     # --------------------------------------------------------- reconciliation
 
@@ -132,6 +269,33 @@ class TaskBrief:
             return False
         flipped = False
         url_l = url.lower()
+        # Phase O: detect search-query paths. URLs like
+        # `/store/search/<query>/` have the user's query as a path
+        # segment — that is NOT a filter being applied. The brain on
+        # wineaccess marked "Oregon region" as done because the search
+        # URL `/store/search/white wine Oregon/` contained "oregon" via
+        # url_contains predicate. Build a "search-stripped" URL that
+        # excludes the search path so the substring match doesn't
+        # auto-flip on text-search.
+        try:
+            from urllib.parse import urlparse, urlunparse
+            _parsed = urlparse(url)
+            _path = _parsed.path or ""
+            # Common search-path patterns: /search/<query>, /store/search/
+            # <query>, /results/<query>. The query is everything AFTER
+            # the search marker — strip it out for url_contains matching.
+            import re as _re_search
+            _search_strip_re = _re_search.compile(
+                r"/(?:store/)?(?:search|results|find)/[^?#]*",
+                _re_search.IGNORECASE,
+            )
+            _stripped_path = _search_strip_re.sub("/", _path)
+            url_no_search_l = urlunparse((
+                _parsed.scheme, _parsed.netloc, _stripped_path,
+                _parsed.params, _parsed.query, "",
+            )).lower()
+        except Exception:
+            url_no_search_l = url_l
         # Lazily parse the query string only if any predicate needs it.
         params: Optional[dict[str, list[str]]] = None
         for c in self.constraints:
@@ -141,8 +305,16 @@ class TaskBrief:
             if pred.get("manual"):
                 continue
             # url_contains: any substring match flips the item.
+            # For `filter` constraints, match against the search-stripped
+            # URL — text-search containing a value isn't the same as a
+            # filter being applied. For `navigation` constraints,
+            # original URL is fine (the brain navigating to a search
+            # results page IS the goal of a navigation step).
+            _haystack = (
+                url_no_search_l if c.kind == "filter" else url_l
+            )
             for sub in _str_list(pred.get("url_contains")):
-                if sub.lower() in url_l:
+                if sub.lower() in _haystack:
                     c.status = "done"
                     c.evidence = f"url~={sub}"
                     flipped = True

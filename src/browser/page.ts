@@ -653,148 +653,345 @@ export class PageWrapper {
    */
   async clickInBbox(
     bbox: { x0: number; y0: number; x1: number; y1: number },
-    options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
-  ): Promise<{ x: number; y: number; snapped: boolean; target?: string }> {
-    // Trust the bbox: vision said "click here", we click here. Scroll the
-    // bbox into view if its centre is off-screen, then dispatch a CDP
-    // click at the centre. No snap hunt, no grid scan, no off-screen
-    // hard-fallback — those layers silently turned mis-targeted bboxes
-    // into clicks at empty pixels.
-    const cx = Math.round((bbox.x0 + bbox.x1) / 2);
-    const cy = Math.round((bbox.y0 + bbox.y1) / 2);
-
-    const { resolvedX, resolvedY, target } = await this.page.evaluate(
+    options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number; expectedLabel?: string },
+  ): Promise<{ x: number; y: number; snapped: boolean; target?: string; drift?: boolean; driftReason?: string; method?: 'pinpoint' | 'grid_scan' | 'raw_centre'; edgePick?: boolean }> {
+    // Phase 2: restored from v2 verbatim.
+    // 1. Pinpoint: click the bbox centre. If ANY element renders at the
+    //    centre — even a wrapping <div> — trust the bbox.
+    // 2. 5×5 grid scan fallback for loose bboxes: pick the interactive
+    //    element whose rect overlaps the bbox most.
+    // 3. Hard fallback: click raw centre with snapped=false (amber UI).
+    //
+    // Phase A1: between snap-resolution and CDP click dispatch, layout
+    // can shift (lazy-loaded images, font swaps, animation completion,
+    // framework re-renders). The wineaccess.com trace showed three V2
+    // clicks that silently no-op'd because the resolved coords no
+    // longer pointed at the original target by the time CDP fired.
+    // Solution: run a SECOND elementsFromPoint just before dispatch
+    // and abort if the element at (snap.x, snap.y) materially differs
+    // from the snap-time target. Adds <10ms; saves silent-miss loops.
+    const snap = await this.page.evaluate(
       (b: { x0: number; y0: number; x1: number; y1: number }) => {
-        const cx0 = Math.round((b.x0 + b.x1) / 2);
-        const cy0 = Math.round((b.y0 + b.y1) / 2);
-        // Scroll-into-view rule: scroll if ANY part of the bbox is
-        // within MARGIN of the viewport edge OR off-screen entirely.
-        const MARGIN = 100;
-        const vh = window.innerHeight;
-        const vw = window.innerWidth;
-        let scrolledY = 0;
-        let scrolledX = 0;
-        const needsVScroll = b.y0 < MARGIN || b.y1 > vh - MARGIN;
-        if (needsVScroll) {
-          const targetTop = Math.max(0, Math.round(cy0 - vh / 2));
-          const before = window.scrollY;
-          window.scrollTo({ left: window.scrollX, top: targetTop, behavior: 'instant' as ScrollBehavior });
-          scrolledY = window.scrollY - before;
-        }
-        const needsHScroll = b.x0 < MARGIN || b.x1 > vw - MARGIN;
-        if (needsHScroll) {
-          const targetLeft = Math.max(0, Math.round(cx0 - vw / 2));
-          const before = window.scrollX;
-          window.scrollTo({ left: targetLeft, top: window.scrollY, behavior: 'instant' as ScrollBehavior });
-          scrolledX = window.scrollX - before;
-        }
-        // Convert bbox + center to post-scroll viewport coords.
-        const cx = cx0 - scrolledX;
-        const cy = cy0 - scrolledY;
-        const sb = {
-          x0: b.x0 - scrolledX, y0: b.y0 - scrolledY,
-          x1: b.x1 - scrolledX, y1: b.y1 - scrolledY,
-        };
-        // Intra-bbox snap-to-interactive: when vision points at a
-        // wrapper / label / icon and the actual click handler is on a
-        // child or sibling inside the same bbox, the geometric centre
-        // hits a non-interactive parent. The CDP click fires but no
-        // listener responds — the silent-miss path that produced
-        // [click_at(V3)] x2 with no effect in the wineaccess trace.
-        // Two-step recovery, all inside the bbox:
-        //   1. centre elementFromPoint → walk to closest interactive
-        //      ancestor whose rect overlaps the bbox.
-        //   2. 3×3 grid scan → pick the interactive element with the
-        //      largest bbox-rect intersection.
-        // If both fail, fall back to raw centre (vision-trust).
         const SEL = 'a,button,input,select,textarea,'
           + '[role="button"],[role="link"],[role="checkbox"],'
-          + '[role="tab"],[role="menuitem"],[role="option"],'
-          + '[role="radio"],[onclick],[tabindex]';
-        const overlaps = (r: DOMRect): boolean => {
-          return !(r.right <= sb.x0 || r.left >= sb.x1
-                || r.bottom <= sb.y0 || r.top >= sb.y1);
-        };
+          + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+        const cx = Math.round((b.x0 + b.x1) / 2);
+        const cy = Math.round((b.y0 + b.y1) / 2);
         const describe = (el: Element): string => {
           const tag = el.tagName.toLowerCase();
           const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
+          const cls = (el as HTMLElement).className && typeof (el as HTMLElement).className === 'string'
+            ? `.${(el as HTMLElement).className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
+            : '';
           const txt = (el.textContent || '').trim().slice(0, 30);
-          return `${tag}${id}${txt ? `[${txt}]` : ''}`;
+          return `${tag}${id}${cls}${txt ? `[${txt}]` : ''}`;
         };
-        let snapEl: Element | null = null;
-        try {
-          const centerEl = document.elementFromPoint(cx, cy);
-          if (centerEl) {
-            const interactive = (centerEl as Element).closest(SEL);
-            if (interactive && overlaps(interactive.getBoundingClientRect())) {
-              snapEl = interactive;
-            } else if (
-              centerEl.tagName !== 'HTML'
-              && centerEl.tagName !== 'BODY'
-            ) {
-              // Center hit a non-interactive element inside the bbox —
-              // accept centre coords as-is so vision-trust is preserved.
-              snapEl = centerEl;
+        // Anchor data to compare against the pre-dispatch re-check.
+        // We capture the snap target's identity here so the re-check
+        // can detect drift WITHOUT re-running the full snap algorithm.
+        const anchorOf = (el: Element | null) => {
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return {
+            tag: el.tagName.toLowerCase(),
+            id: (el as HTMLElement).id || '',
+            text: ((el.textContent || '').trim().slice(0, 60)),
+            rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+          };
+        };
+        // 1. Pinpoint: click the bbox centre. Sanity-check that SOMETHING
+        //    is rendered there (not transparent padding, not off-page).
+        //    If the centre hits any element at all — even a wrapping
+        //    <div> — we trust Gemini's bbox and fire at (cx, cy).
+        let centreStack: Element[] = [];
+        try { centreStack = document.elementsFromPoint(cx, cy); } catch { centreStack = []; }
+        const centreEl = centreStack.find(
+          (el) => el !== document.documentElement && el !== document.body,
+        );
+        if (centreEl) {
+          // Look for an interactive ancestor ONLY to label the target
+          // nicely in the UI overlay. The click coordinates stay at the
+          // bbox centre — we don't move them.
+          const interactive = (centreEl as Element).closest(SEL) || centreEl;
+          return {
+            x: cx,
+            y: cy,
+            snapped: true,
+            target: describe(interactive),
+            anchor: anchorOf(interactive),
+            method: 'pinpoint',
+          };
+        }
+        // 2. Centre fell on empty space — bbox is probably loose or
+        //    off-page. Grid-scan fallback: collect ALL candidate
+        //    interactive elements and pick by Phase G3 tiebreaker.
+        //
+        // Phase G3 — instead of "max overlap wins" (which always
+        // selects the largest element, usually the row's label area
+        // over the chevron), score candidates by a composite:
+        //   * primary: bbox-rect intersection AREA
+        //   * tiebreaker (when 2+ candidates have ≥ 25% of best area):
+        //     prefer (a) [aria-expanded] disclosure controls, then
+        //     (b) elements containing chevron text ▸▾▼▶◀▲►◄+−×⨯⌃⌄,
+        //     then (c) elements with aria-label matching expand/
+        //     toggle/collapse, then (d) the SMALLEST candidate
+        //     (chevrons are small; row wrappers are wide).
+        const CHEVRON_RE = /[▸▾▼▶◀▲►◄⌃⌄＋＋\+\-−×⨯]/;
+        const EXPAND_LABEL_RE = /\b(expand|toggle|collapse|open|close)\b/i;
+        type Cand = {
+          el: Element;
+          area: number;
+          rectArea: number;
+          hasAriaExpanded: boolean;
+          hasChevronText: boolean;
+          hasExpandLabel: boolean;
+        };
+        const cands: Cand[] = [];
+        const seen = new Set<Element>();
+        for (let i = 1; i < 5; i++) {
+          for (let j = 1; j < 5; j++) {
+            const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
+            const py = b.y0 + ((b.y1 - b.y0) * j) / 5;
+            let stack: Element[] = [];
+            try { stack = document.elementsFromPoint(px, py); } catch { stack = []; }
+            for (const el of stack) {
+              const hit = (el as Element).closest(SEL);
+              if (!hit || seen.has(hit)) continue;
+              seen.add(hit);
+              const r = hit.getBoundingClientRect();
+              const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
+              const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
+              const area = ix * iy;
+              if (area === 0) continue;
+              const text = ((hit.textContent || '').trim().slice(0, 80));
+              const aria = hit.getAttribute('aria-label') || '';
+              const ariaExp = hit.hasAttribute('aria-expanded')
+                || (hit.closest('[aria-expanded]') !== null);
+              cands.push({
+                el: hit,
+                area,
+                rectArea: Math.max(1, r.width * r.height),
+                hasAriaExpanded: ariaExp,
+                hasChevronText: CHEVRON_RE.test(text),
+                hasExpandLabel: EXPAND_LABEL_RE.test(text) || EXPAND_LABEL_RE.test(aria),
+              });
             }
           }
-        } catch { /* fall through */ }
-        // Step 2: 3×3 grid scan if step 1 didn't find an interactive el.
-        if (!snapEl || !((snapEl as Element).matches?.(SEL))) {
-          let best: Element | null = null;
-          let bestArea = 0;
-          for (let i = 1; i < 4; i++) {
-            for (let j = 1; j < 4; j++) {
-              const px = sb.x0 + ((sb.x1 - sb.x0) * i) / 4;
-              const py = sb.y0 + ((sb.y1 - sb.y0) * j) / 4;
-              let stack: Element[] = [];
-              try { stack = document.elementsFromPoint(px, py); } catch { /* */ }
-              for (const el of stack) {
-                const hit = (el as Element).closest(SEL);
-                if (!hit) continue;
-                const r = hit.getBoundingClientRect();
-                if (!overlaps(r)) continue;
-                const ix = Math.max(0, Math.min(r.right, sb.x1) - Math.max(r.left, sb.x0));
-                const iy = Math.max(0, Math.min(r.bottom, sb.y1) - Math.max(r.top, sb.y0));
-                const area = ix * iy;
-                if (area > bestArea) { bestArea = area; best = hit; }
-              }
-            }
-          }
-          if (best) snapEl = best;
         }
-        let fx = cx;
-        let fy = cy;
-        let label = '';
-        if (snapEl) {
-          // If we found an interactive element, click its rect centre
-          // (clamped inside the bbox) so the listener actually fires.
-          if ((snapEl as Element).matches?.(SEL)) {
-            const r = snapEl.getBoundingClientRect();
-            fx = Math.round(Math.max(sb.x0, Math.min(sb.x1, r.left + r.width / 2)));
-            fy = Math.round(Math.max(sb.y0, Math.min(sb.y1, r.top + r.height / 2)));
+        let best: Element | null = null;
+        if (cands.length > 0) {
+          cands.sort((a, b) => b.area - a.area);
+          const topArea = cands[0].area;
+          // Co-leading candidates within 75% of the top area get
+          // the chevron-preference tiebreaker. The 25% slack stops
+          // a half-overlapping label from displacing a clearly-
+          // dominant single element.
+          const tied = cands.filter((c) => c.area >= topArea * 0.75);
+          if (tied.length === 1) {
+            best = tied[0].el;
+          } else {
+            // Score: chevron signals + smallness. Smaller wins
+            // because chevrons are small icons at row edges.
+            const scored = tied.map((c) => ({
+              c,
+              score:
+                (c.hasAriaExpanded ? 4 : 0)
+                + (c.hasChevronText ? 3 : 0)
+                + (c.hasExpandLabel ? 2 : 0)
+                // Smallness: smaller rect → higher score; capped
+                // contribution so it can't dominate the signals
+                // above on its own.
+                + Math.min(2, 1 / Math.log10(Math.max(10, c.rectArea / 100))),
+            }));
+            scored.sort((a, b) => b.score - a.score);
+            best = scored[0].c.el;
           }
-          label = describe(snapEl);
         }
-        return { resolvedX: fx, resolvedY: fy, target: label };
+        if (best) {
+          const r = best.getBoundingClientRect();
+          // Phase J3: edge_pick flag — best element's centre is far
+          // from the bbox centre, suggesting the bbox was loose and
+          // the snap chose an off-axis interactive child. Brain
+          // surfaces this for follow-up "consider re-screenshotting"
+          // hints.
+          const elCx = r.left + r.width / 2;
+          const elCy = r.top + r.height / 2;
+          const distance = Math.hypot(elCx - cx, elCy - cy);
+          const halfDiag = Math.hypot(
+            (b.x1 - b.x0) / 2,
+            (b.y1 - b.y0) / 2,
+          );
+          const edgePick = halfDiag > 0
+            ? distance / halfDiag > 0.75
+            : false;
+          return {
+            x: Math.round(elCx),
+            y: Math.round(elCy),
+            snapped: true,
+            target: describe(best),
+            anchor: anchorOf(best),
+            method: 'grid_scan',
+            edge_pick: edgePick,
+          };
+        }
+        // 3. Hard fallback: click the raw centre anyway. snapped=false
+        //    so the UI crosshair shows amber — operator can see we had
+        //    no visual confirmation.
+        return {
+          x: cx,
+          y: cy,
+          snapped: false,
+          anchor: null,
+          method: 'raw_centre',
+        };
       },
       bbox,
     );
 
+    // Phase A1: drift detection. Re-read elementsFromPoint at the
+    // resolved coordinates and compare against the snap-time anchor.
+    // Skip drift detection when:
+    //   * snap fell back to raw centre (no anchor to compare against)
+    //   * env disabled it explicitly
+    //
+    // Material drift = different tag, OR rect shifted by >10px on any
+    // edge, OR text content no longer overlaps. Any of these means
+    // the visual target the brain saw is gone — we abort the dispatch
+    // and signal `drift: true` so the Python layer can force a
+    // re-screenshot before the brain reaches for the same V_n again.
+    const driftEnv = (typeof process !== 'undefined' && process.env?.CLICK_DRIFT_DETECTION) || '1';
+    const driftEnabled = driftEnv !== '0' && driftEnv !== 'false';
+    if (driftEnabled && snap.snapped && snap.anchor) {
+      const drift = await this.page.evaluate(
+        (args: { x: number; y: number; anchor: { tag: string; id: string; text: string; rect: { x: number; y: number; w: number; h: number } } }) => {
+          const SEL = 'a,button,input,select,textarea,'
+            + '[role="button"],[role="link"],[role="checkbox"],'
+            + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+          let stack: Element[] = [];
+          try { stack = document.elementsFromPoint(args.x, args.y); } catch { stack = []; }
+          const cur = stack.find(
+            (el) => el !== document.documentElement && el !== document.body,
+          );
+          if (!cur) {
+            return { drifted: true, reason: 'element_vanished' };
+          }
+          const interactive = (cur as Element).closest(SEL) || cur;
+          const r = interactive.getBoundingClientRect();
+          const tag = interactive.tagName.toLowerCase();
+          const id = (interactive as HTMLElement).id || '';
+          const text = ((interactive.textContent || '').trim().slice(0, 60));
+          // Tag drift = clearly a different element class.
+          if (tag !== args.anchor.tag) {
+            return { drifted: true, reason: `tag_changed:${args.anchor.tag}->${tag}` };
+          }
+          // ID drift (when both have IDs) = different element entirely.
+          if (args.anchor.id && id && id !== args.anchor.id) {
+            return { drifted: true, reason: `id_changed:${args.anchor.id}->${id}` };
+          }
+          // Rect drift = layout shifted under us. >10px on any edge is
+          // material; smaller shifts (subpixel rendering, anti-alias)
+          // are noise.
+          const dx = Math.abs(Math.round(r.left) - args.anchor.rect.x);
+          const dy = Math.abs(Math.round(r.top) - args.anchor.rect.y);
+          const dw = Math.abs(Math.round(r.width) - args.anchor.rect.w);
+          const dh = Math.abs(Math.round(r.height) - args.anchor.rect.h);
+          if (dx > 10 || dy > 10 || dw > 10 || dh > 10) {
+            return { drifted: true, reason: `rect_shifted:dx=${dx},dy=${dy},dw=${dw},dh=${dh}` };
+          }
+          // Text drift = label changed (different content rendered at
+          // same coords). Use Jaccard on tokens — tolerates whitespace
+          // changes but catches "Submit" → "Loading...".
+          const oldTokens = new Set((args.anchor.text.toLowerCase().match(/\w+/g) || []));
+          const newTokens = new Set((text.toLowerCase().match(/\w+/g) || []));
+          if (oldTokens.size > 0 && newTokens.size > 0) {
+            let overlap = 0;
+            oldTokens.forEach((t) => { if (newTokens.has(t)) overlap++; });
+            const jaccard = overlap / (oldTokens.size + newTokens.size - overlap);
+            if (jaccard < 0.34) {
+              return { drifted: true, reason: `text_changed:${args.anchor.text.slice(0, 30)}->${text.slice(0, 30)}` };
+            }
+          }
+          return { drifted: false, reason: '' };
+        },
+        { x: snap.x, y: snap.y, anchor: snap.anchor },
+      );
+      if (drift.drifted) {
+        return {
+          x: snap.x,
+          y: snap.y,
+          snapped: snap.snapped,
+          target: snap.target,
+          drift: true,
+          driftReason: drift.reason,
+          method: (snap as { method?: 'pinpoint' | 'grid_scan' | 'raw_centre' }).method,
+          edgePick: (snap as { edge_pick?: boolean }).edge_pick,
+        };
+      }
+    }
+
+    // Phase J2: stricter drift verification on grid_scan path.
+    // Pinpoint trusts the bbox centre — if vision was right, the
+    // element at the centre is the right element by construction.
+    // Grid_scan picks an off-centre interactive element by overlap;
+    // it's MORE likely to be wrong when bbox is loose. Compare the
+    // resolved element's text to the expected_label (the vision
+    // label we sent in the click payload). If they share no content
+    // tokens, treat it like a drift event and force re-screenshot.
+    if (
+      (snap as { method?: string }).method === 'grid_scan'
+      && options?.expectedLabel
+      && snap.target
+    ) {
+      const labelMismatch = await this.page.evaluate(
+        (cfg: { expected: string; actual: string }) => {
+          const tokens = (s: string) => new Set((s.toLowerCase().match(/\w+/g) || []).filter((t) => t.length >= 3));
+          const a = tokens(cfg.expected);
+          const b = tokens(cfg.actual);
+          if (a.size === 0 || b.size === 0) return false;
+          let overlap = 0;
+          a.forEach((t) => { if (b.has(t)) overlap++; });
+          return overlap === 0;
+        },
+        { expected: options.expectedLabel, actual: snap.target },
+      );
+      if (labelMismatch) {
+        return {
+          x: snap.x,
+          y: snap.y,
+          snapped: snap.snapped,
+          target: snap.target,
+          drift: true,
+          driftReason: `grid_scan_label_mismatch:expected=${options.expectedLabel.slice(0, 30)}|got=${snap.target.slice(0, 30)}`,
+          method: 'grid_scan',
+          edgePick: (snap as { edge_pick?: boolean }).edge_pick,
+        };
+      }
+    }
+
+    // Broadcast resolved target to live viewers BEFORE the click so the
+    // crosshair appears in the same frame the click lands.
     if (this.sessionId) {
       inputEventBus.emitClickTarget(
         this.sessionId,
-        resolvedX,
-        resolvedY,
-        true,
+        snap.x,
+        snap.y,
+        snap.snapped,
         bbox,
-        target || undefined,
+        snap.target,
       );
     }
 
     const client = await this.getCDPSession();
-    await dispatchClick(client, resolvedX, resolvedY, { ...options, sessionId: this.sessionId });
+    await dispatchClick(client, snap.x, snap.y, { ...options, sessionId: this.sessionId });
     await this.waitForIdle(1000).catch(() => {});
-    return { x: resolvedX, y: resolvedY, snapped: true, target: target || undefined };
+    return {
+      x: snap.x,
+      y: snap.y,
+      snapped: snap.snapped,
+      target: snap.target,
+      method: (snap as { method?: 'pinpoint' | 'grid_scan' | 'raw_centre' }).method,
+      edgePick: (snap as { edge_pick?: boolean }).edge_pick,
+    };
   }
 
   /** Hover over an element (from BrowserOS hover). */
@@ -2212,6 +2409,318 @@ export class PageWrapper {
       finalScrollY: finalInfo[0],
       scrolledPx: finalInfo[0] - startY,
       reason: 'max_iterations',
+    };
+  }
+
+  /**
+   * Phase B1: find a target across viewport boundaries.
+   *
+   * Locates DOM elements matching `label` (substring or regex), reports
+   * each candidate's viewport-relative position and any collapsed-
+   * accordion ancestor that hides it from vision, and optionally scrolls
+   * the best candidate into mid-viewport.
+   *
+   * Exists because vision sees only the viewport while markdown sees
+   * the full DOM text — so the brain often "knows" a target exists
+   * without any V_n bbox to point at. The wineaccess.com trace had
+   * "Oregon" in markdown but no V_n labelled it (collapsed Region
+   * accordion); the brain fell through to fabricated URL hacks. This
+   * method bridges the gap.
+   */
+  async findTarget(opts: {
+    label: string;
+    section?: string;
+    role?: string;
+    autoScroll?: boolean;
+    maxCandidates?: number;
+  }): Promise<{
+    found: boolean;
+    candidates: Array<{
+      tag: string;
+      role: string;
+      text: string;
+      rect: { x: number; y: number; w: number; h: number };
+      visible: boolean;
+      viewportPosition: 'visible' | 'above_fold' | 'below_fold' | 'in_collapsed_section';
+      yOffsetFromViewportTop: number;
+      sectionPath: string[];
+      collapsedAncestor: { selector: string; text: string } | null;
+      requiresExpand: boolean;
+      cssSelectorHint: string;
+    }>;
+    scrolledTo: number | null;
+    scrolledFrom: number;
+    pageHeight: number;
+    viewportHeight: number;
+  }> {
+    const result = await this.page.evaluate(
+      (cfg: { label: string; section?: string; role?: string; maxCandidates: number }) => {
+        const labelLower = cfg.label.toLowerCase().trim();
+        const labelTokens = labelLower.match(/\w+/g) || [];
+        const interactiveSel =
+          'a,button,input,select,textarea,'
+          + '[role="button"],[role="link"],[role="checkbox"],'
+          + '[role="tab"],[role="menuitem"],[role="option"],'
+          + '[role="radio"],[onclick],[tabindex],label';
+        const visibleNow = (rect: DOMRect): boolean => {
+          const vh = window.innerHeight;
+          return rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < window.innerWidth;
+        };
+        const isElementVisible = (el: Element): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return false;
+          const cs = window.getComputedStyle(el);
+          if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') return false;
+          return true;
+        };
+        // Walk to nearest collapsed-accordion ancestor. Heuristics:
+        //   * `[aria-expanded="false"]` on any ancestor
+        //   * `[aria-controls]` ancestor pointing at an element with
+        //      hidden/collapsed class or display:none
+        //   * `details:not([open])` ancestor
+        const collapsedAncestor = (el: Element | null): { selector: string; text: string } | null => {
+          let cur: Element | null = el;
+          let depth = 0;
+          while (cur && cur !== document.body && depth < 12) {
+            const ariaExp = cur.getAttribute('aria-expanded');
+            if (ariaExp === 'false') {
+              return {
+                selector: cur.tagName.toLowerCase()
+                  + (cur.id ? `#${cur.id}` : '')
+                  + (cur.getAttribute('aria-controls') ? `[aria-controls="${cur.getAttribute('aria-controls')}"]` : ''),
+                text: ((cur.textContent || '').trim().slice(0, 60)),
+              };
+            }
+            if (cur.tagName.toLowerCase() === 'details' && !cur.hasAttribute('open')) {
+              return {
+                selector: 'details',
+                text: ((cur.textContent || '').trim().slice(0, 60)),
+              };
+            }
+            cur = cur.parentElement;
+            depth++;
+          }
+          return null;
+        };
+        // Walk ancestors collecting headings / aria-labelledby / section
+        // landmarks to build a "section path" the brain can use.
+        const sectionPath = (el: Element | null): string[] => {
+          const path: string[] = [];
+          let cur: Element | null = el;
+          let depth = 0;
+          while (cur && cur !== document.body && depth < 16) {
+            const tag = cur.tagName.toLowerCase();
+            const role = cur.getAttribute('role') || '';
+            if (
+              tag === 'section'
+              || tag === 'aside'
+              || tag === 'nav'
+              || tag === 'fieldset'
+              || tag === 'details'
+              || role === 'region'
+              || role === 'group'
+              || role === 'tablist'
+              || role === 'tabpanel'
+              || role === 'navigation'
+              || (cur.classList && (cur.classList.contains('filter') || cur.classList.contains('accordion') || cur.classList.contains('sidebar')))
+            ) {
+              // Find a heading or aria-labelledby for this section.
+              const labelledby = cur.getAttribute('aria-labelledby');
+              if (labelledby) {
+                const labelEl = document.getElementById(labelledby);
+                if (labelEl) {
+                  path.unshift(((labelEl.textContent || '').trim().slice(0, 50)));
+                  cur = cur.parentElement;
+                  depth++;
+                  continue;
+                }
+              }
+              const heading = cur.querySelector('h1,h2,h3,h4,h5,h6,legend,summary,[role="heading"]');
+              if (heading) {
+                path.unshift(((heading.textContent || '').trim().slice(0, 50)));
+              } else {
+                const aria = cur.getAttribute('aria-label');
+                if (aria) path.unshift(aria.slice(0, 50));
+              }
+            }
+            cur = cur.parentElement;
+            depth++;
+          }
+          return path.filter(Boolean);
+        };
+        // Build CSS selector hint: prefer id, then a stable attribute.
+        const selectorHintOf = (el: Element): string => {
+          if ((el as HTMLElement).id) return `#${(el as HTMLElement).id}`;
+          const dataTest = el.getAttribute('data-test-id') || el.getAttribute('data-testid') || el.getAttribute('data-test');
+          if (dataTest) return `[data-test-id="${dataTest}"]`;
+          const name = el.getAttribute('name');
+          if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
+          const aria = el.getAttribute('aria-label');
+          if (aria) return `${el.tagName.toLowerCase()}[aria-label="${aria}"]`;
+          // No stable hook — return tag + visible text fragment.
+          const txt = ((el.textContent || '').trim().slice(0, 30)).replace(/"/g, '\\"');
+          return txt ? `${el.tagName.toLowerCase()}:has-text("${txt}")` : el.tagName.toLowerCase();
+        };
+        // Find candidates: elements whose own text or aria-label or
+        // value matches `labelLower` (token overlap >= 50%). Limit to
+        // interactive elements and labels — searching every <div>
+        // would return hundreds of false positives.
+        const all = Array.from(document.querySelectorAll(interactiveSel));
+        const scored: Array<{ el: Element; score: number; matchedText: string }> = [];
+        for (const el of all) {
+          const visText = ((el as HTMLElement).innerText || el.textContent || '').toLowerCase().trim();
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+          const value = ((el as HTMLInputElement).value || '').toLowerCase();
+          const candidateText = [visText, aria, placeholder, value].filter(Boolean).join(' | ');
+          if (!candidateText) continue;
+          // Exact substring → score 1.0
+          if (candidateText.includes(labelLower)) {
+            const exactness = labelLower.length / Math.max(candidateText.length, 1);
+            scored.push({ el, score: 0.6 + 0.4 * exactness, matchedText: candidateText.slice(0, 80) });
+            continue;
+          }
+          // Token-overlap fallback (Jaccard).
+          if (labelTokens.length > 0) {
+            const candTokens = candidateText.match(/\w+/g) || [];
+            if (candTokens.length === 0) continue;
+            const candSet = new Set(candTokens);
+            let overlap = 0;
+            for (const t of labelTokens) if (candSet.has(t)) overlap++;
+            const jaccard = overlap / (labelTokens.length + candTokens.length - overlap);
+            if (jaccard >= 0.5) {
+              scored.push({ el, score: jaccard, matchedText: candidateText.slice(0, 80) });
+            }
+          }
+        }
+        scored.sort((a, b) => b.score - a.score);
+        // Optional section filter: keep only candidates whose section
+        // path contains the requested section (substring match).
+        const sectionLower = (cfg.section || '').toLowerCase();
+        const roleLower = (cfg.role || '').toLowerCase();
+        const filtered = scored.filter((s) => {
+          if (sectionLower) {
+            const path = sectionPath(s.el).map((p) => p.toLowerCase());
+            if (!path.some((p) => p.includes(sectionLower))) return false;
+          }
+          if (roleLower) {
+            const r = (s.el.getAttribute('role') || s.el.tagName).toLowerCase();
+            if (!r.includes(roleLower)) return false;
+          }
+          return true;
+        }).slice(0, cfg.maxCandidates);
+
+        const candidates = filtered.map((s) => {
+          const r = s.el.getBoundingClientRect();
+          const collapsed = collapsedAncestor(s.el);
+          const visible = isElementVisible(s.el) && visibleNow(r);
+          let viewportPosition: 'visible' | 'above_fold' | 'below_fold' | 'in_collapsed_section';
+          if (collapsed) {
+            viewportPosition = 'in_collapsed_section';
+          } else if (visible) {
+            viewportPosition = 'visible';
+          } else if (r.bottom < 0) {
+            viewportPosition = 'above_fold';
+          } else {
+            viewportPosition = 'below_fold';
+          }
+          return {
+            tag: s.el.tagName.toLowerCase(),
+            role: s.el.getAttribute('role') || '',
+            text: ((s.el.textContent || '').trim().slice(0, 80)),
+            rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+            visible,
+            viewportPosition,
+            yOffsetFromViewportTop: Math.round(r.top),
+            sectionPath: sectionPath(s.el),
+            collapsedAncestor: collapsed,
+            requiresExpand: !!collapsed,
+            cssSelectorHint: selectorHintOf(s.el),
+          };
+        });
+
+        return {
+          candidates,
+          pageHeight: Math.max(
+            document.body.scrollHeight,
+            document.documentElement.scrollHeight,
+          ),
+          viewportHeight: window.innerHeight,
+          scrollY: window.scrollY,
+        };
+      },
+      {
+        label: opts.label,
+        section: opts.section,
+        role: opts.role,
+        maxCandidates: Math.max(1, Math.min(opts.maxCandidates ?? 5, 10)),
+      },
+    );
+
+    const startScrollY = result.scrollY;
+    let scrolledTo: number | null = null;
+
+    // Auto-scroll best candidate into mid-viewport when:
+    //   * autoScroll is enabled,
+    //   * we have a non-collapsed candidate that's NOT currently
+    //     visible (above_fold or below_fold).
+    // Collapsed candidates need an explicit click-to-expand by the
+    // brain — we can't expand here without overstepping the contract.
+    if (opts.autoScroll !== false && result.candidates.length > 0) {
+      const best = result.candidates[0];
+      if (
+        !best.requiresExpand
+        && (best.viewportPosition === 'above_fold' || best.viewportPosition === 'below_fold')
+      ) {
+        // Compute target scroll position so the candidate sits roughly
+        // 1/3 from the viewport top (good for filter-sidebar items).
+        const targetScrollY = Math.max(
+          0,
+          Math.min(
+            startScrollY + best.rect.y - Math.floor(result.viewportHeight / 3),
+            result.pageHeight - result.viewportHeight,
+          ),
+        );
+        await this.page.evaluate(
+          (y: number) => window.scrollTo({ left: 0, top: y, behavior: 'instant' as ScrollBehavior }),
+          targetScrollY,
+        );
+        scrolledTo = targetScrollY;
+        // Re-read rect after scroll so the returned candidate reflects
+        // the new viewport position.
+        const updated = await this.page.evaluate(
+          (sel: string) => {
+            try {
+              const els = Array.from(document.querySelectorAll(sel));
+              if (els.length === 0) return null;
+              const r = els[0].getBoundingClientRect();
+              return {
+                rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+                visible: r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.bottom > 0,
+                scrollY: window.scrollY,
+              };
+            } catch {
+              return null;
+            }
+          },
+          best.cssSelectorHint.startsWith('#') ? best.cssSelectorHint : '',
+        );
+        if (updated) {
+          best.rect = updated.rect;
+          best.yOffsetFromViewportTop = updated.rect.y;
+          best.visible = updated.visible;
+          best.viewportPosition = updated.visible ? 'visible' : best.viewportPosition;
+        }
+      }
+    }
+
+    return {
+      found: result.candidates.length > 0,
+      candidates: result.candidates,
+      scrolledTo,
+      scrolledFrom: startScrollY,
+      pageHeight: result.pageHeight,
+      viewportHeight: result.viewportHeight,
     };
   }
 
