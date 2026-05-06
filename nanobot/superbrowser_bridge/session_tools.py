@@ -4512,14 +4512,42 @@ class BrowserKeysTool(Tool):
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
-        direction=StringSchema("Scroll direction: up or down", nullable=True),
-        percent=NumberSchema(description="Scroll to exact percentage 0-100", nullable=True),
+        direction=StringSchema(
+            "Scroll direction: 'up' or 'down'. Required when using `pixels`.",
+            nullable=True,
+        ),
+        percent=NumberSchema(
+            description=(
+                "ABSOLUTE position 0..100 (0=top, 100=bottom). "
+                "`percent=20` JUMPS to 20% of the page from the top — it is "
+                "NOT 'scroll down by 20%'. Use `pixels` for incremental "
+                "motion or `browser_scroll_until` to find a specific control."
+            ),
+            nullable=True,
+        ),
+        pixels=IntegerSchema(
+            description=(
+                "Incremental scroll distance in pixels (positive). "
+                "Pair with `direction` for sign. Use this for fine nudges "
+                "below a control just past the fold."
+            ),
+            nullable=True,
+        ),
         required=["session_id"],
     )
 )
 class BrowserScrollTool(Tool):
     name = "browser_scroll"
-    description = "Scroll the page up or down, or to a specific percentage."
+    description = (
+        "Scroll the page. Three modes: (a) `direction='up'|'down'` — "
+        "one viewport-ish step; (b) `pixels=N` (with `direction`) — "
+        "explicit incremental scroll, RECOMMENDED for fine motion; "
+        "(c) `percent=N` — ABSOLUTE position (0=top, 100=bottom). "
+        "`percent=20` is NOT 'scroll a bit', it teleports to 20% of the "
+        "page. To FIND a specific control, use `browser_scroll_until` "
+        "instead — it walks the page in small steps and tells you what "
+        "labels it passed."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
@@ -4528,13 +4556,32 @@ class BrowserScrollTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, direction: str | None = None, percent: float | None = None, **kw: Any) -> Any:
-        print(f"\n>> browser_scroll({direction or f'{percent}%'})")
+    async def execute(
+        self,
+        session_id: str,
+        direction: str | None = None,
+        percent: float | None = None,
+        pixels: int | None = None,
+        **kw: Any,
+    ) -> Any:
+        if pixels is not None:
+            label = f"{direction or 'down'} {int(pixels)}px"
+        elif percent is not None:
+            label = f"{percent}%"
+        else:
+            label = direction or "down"
+        print(f"\n>> browser_scroll({label})")
         gate = await _feedback_gate("browser_scroll")
         if gate:
             return gate
         payload: dict[str, Any] = {}
-        if percent is not None:
+        # `pixels` (incremental) wins over `percent` (absolute) when both
+        # are passed — keeps the explicit unit primary and avoids the
+        # confusion that a "small percent" was trying to fix.
+        if pixels is not None and pixels > 0:
+            payload["pixels"] = int(pixels)
+            payload["direction"] = direction or "down"
+        elif percent is not None:
             payload["percent"] = percent
         else:
             payload["direction"] = direction or "down"
@@ -4551,7 +4598,47 @@ class BrowserScrollTool(Tool):
             elements = await _fetch_elements(session_id, self.s)
             if elements:
                 data["elements"] = elements
-        action = f"Scrolled to {percent}%" if percent is not None else f"Scrolled {direction or 'down'}"
+        # Pre/post scroll geometry comes from the server in one round-
+        # trip — lets us detect silent no-op scrolls without an extra
+        # GET. Brain needs this to differentiate "scroll worked but
+        # didn't help" from "scroll surface mismatch / locked body".
+        pre_geo = data.get("prevScrollInfo") or {}
+        pre_y: int | None = (
+            int(pre_geo.get("scrollY") or 0)
+            if isinstance(pre_geo, dict) and pre_geo.get("scrollY") is not None
+            else None
+        )
+        post_geo = data.get("scrollInfo") or {}
+        post_y = int(post_geo.get("scrollY") or 0) if isinstance(post_geo, dict) else 0
+
+        if pixels is not None and pixels > 0:
+            base = f"Scrolled {direction or 'down'} {int(pixels)}px requested"
+        elif percent is not None:
+            base = f"Scrolled to {percent}% (absolute) requested"
+        else:
+            base = f"Scrolled {direction or 'down'} requested"
+
+        if pre_y is not None:
+            actual = post_y - pre_y
+            base += f" → moved {actual:+d}px (Y {pre_y}→{post_y})"
+            # Flag silent no-op scrolls. Without this caption the LLM
+            # often retries the same scroll, looping forever on locked-
+            # body SPAs. With Bug-1 fix in place this should be rare,
+            # but the diagnostic is essential for the cases it misses.
+            if (pixels is not None and pixels > 0) or (percent is None and direction):
+                if abs(actual) < 5:
+                    base += (
+                        ". WARNING: page did not move. The real scroll "
+                        "container may be a non-document element. Try "
+                        "`browser_scroll_within` if a popup/modal is "
+                        "open, or `browser_get_markdown` to inspect."
+                    )
+        action = base
+        _update_scroll_telemetry(
+            self.s,
+            data.get("scrollInfo"),
+            direction or ("down" if pixels and pixels > 0 else None),
+        )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
@@ -4686,6 +4773,10 @@ class BrowserSelectOptionTool(Tool):
         verified = bool(data.get("verified"))
         reason = data.get("reason")
         candidates = data.get("candidates") or []
+        tried = data.get("tried") or []
+        dom_changed = bool(data.get("dom_changed"))
+        new_classes = data.get("new_classes") or []
+        trigger_score = data.get("trigger_score")
 
         # Cursor strategy ledger — counts as a real cursor attempt for the
         # cursor-first lockout in browser_run_script.
@@ -4725,7 +4816,41 @@ class BrowserSelectOptionTool(Tool):
                 "you passed — call browser_screenshot to read actual labels, "
                 "then retry with the exact text."
             )
-        if candidates:
+        elif reason == "trigger_navigated":
+            # The trigger turned out to be a link / nav action, not a
+            # dropdown opener. Best Buy trade-in 'Brand' picker is the
+            # canonical case — each brand is a clickable card that
+            # navigates to the next step. Tell the brain to switch
+            # tools, don't keep retrying select_option.
+            nav_to = ""
+            for c in candidates:
+                if isinstance(c, str) and c.startswith("navigated_to="):
+                    nav_to = c.split("=", 1)[1]
+                    break
+            msg_parts.append(
+                f"The trigger NAVIGATED ({label!r} click changed the "
+                f"page to: {nav_to or '?'}). This isn't a dropdown — "
+                f"it's a link or card-grid item. STOP retrying "
+                f"select_option/form_plan for this label. The page "
+                f"is now on a new step. Take a fresh screenshot, "
+                f"then click the next target with `browser_click_at` "
+                f"(by V_n) or `browser_click_selector` (by CSS). For "
+                f"card-grid pickers (Brand → Model → ...), each step "
+                f"is a navigation, not a dropdown — `browser_click_at` "
+                f"on the visible card is the right tool."
+            )
+        elif reason == "no_popup_detected":
+            msg_parts.append(
+                f"Click on {label!r} did NOT open any popup/listbox/menu "
+                f"(no [role=listbox|menu|dialog] or [aria-expanded=true] "
+                f"appeared). The trigger is probably not a dropdown — "
+                f"it might be a nav button, a card, or a label without "
+                f"an interactive child. Try: (a) `browser_click_at` on "
+                f"the visible target, (b) `browser_get_markdown` to "
+                f"inspect the page shape, or (c) re-screenshot — the "
+                f"page may have transitioned to a different stage."
+            )
+        if candidates and reason not in ("trigger_navigated",):
             shown = ", ".join(repr(c) for c in candidates[:15])
             msg_parts.append(f"candidates: {shown}")
             msg_parts.append(
@@ -4733,11 +4858,54 @@ class BrowserSelectOptionTool(Tool):
                 "Do NOT fall back to raw clicking — DOM indices change after "
                 "each pick; this tool re-anchors on the label."
             )
-        elif reason and reason != "trigger_not_found":
+        elif (
+            reason
+            and reason not in ("trigger_not_found", "trigger_navigated", "no_popup_detected")
+        ):
             msg_parts.append(
                 "No options were collected. The listbox may use a non-ARIA "
                 "pattern — retry with a more specific label, or pass "
                 "extra_option_selectors=[...] (e.g. ['li.option', '.dropdown-item'])."
+            )
+
+        # Phase D diagnostics — append on EVERY failure path so the
+        # brain can pick a different tool instead of looping. Includes
+        # which open-strategies were tried and what the DOM did.
+        if tried:
+            msg_parts.append(f"open_strategies_tried: {', '.join(str(t) for t in tried)}")
+        if reason in ("options_did_not_render", "no_popup_detected"):
+            if dom_changed and new_classes:
+                # Page DID change — but not into a dropdown. Show top
+                # new classes so the LLM can recognize "oh that's a
+                # card grid / a wizard step / a modal".
+                msg_parts.append(
+                    "dom_changed=true. New visible classes (top-5): "
+                    + ", ".join(str(c) for c in new_classes[:5])
+                )
+                msg_parts.append(
+                    "→ The trigger likely opened/navigated to a "
+                    "non-dropdown UI. Re-screenshot and use "
+                    "`browser_click_at` on the visible target instead "
+                    "of `browser_select_option`."
+                )
+            elif not dom_changed:
+                msg_parts.append(
+                    "dom_changed=false — the trigger click did NOTHING. "
+                    "Either the picked element wasn't actually the "
+                    "dropdown trigger (label-text matched a heading or "
+                    "wrapper near the real trigger), OR the trigger is "
+                    "disabled. Re-screenshot, then use `browser_click_at` "
+                    "on the visible dropdown chevron / control."
+                )
+        if trigger_score is not None and float(trigger_score) <= 0:
+            # Low-confidence trigger pick — flag it. With a 4-phase
+            # picker scoring positive on real dropdowns, a non-positive
+            # score is itself a smell.
+            msg_parts.append(
+                f"trigger_score={trigger_score} (low) — the picked "
+                "element may not be a real dropdown trigger. Pass a "
+                "more specific label (e.g. 'Processor Brand' instead "
+                "of 'Brand') or use `browser_click_at` directly."
             )
         self.s.log_activity(f"select_option({label}, FAIL)", (reason or "")[:60])
         self.s.record_step("browser_select_option", f"{label}={value}", f"FAIL:{reason or '?'}")
@@ -7344,12 +7512,53 @@ class BrowserEscalateTool(Tool):
             nullable=True,
         ),
         max_iterations=IntegerSchema(
-            "Safety cap on scroll steps. Default 10, max 40.",
+            "Safety cap on scroll steps per direction. Default 10, max 40. "
+            "When auto_reverse fires, the second leg gets its own budget.",
+            nullable=True,
+        ),
+        cadence=StringSchema(
+            description=(
+                "Step size preset. 'fine' (~30%% viewport, default when "
+                "target_text is set) for precise scanning, 'medium' "
+                "(~55%%) for general navigation, 'coarse' (~85%%, legacy "
+                "behaviour) for fast traversal. `step_ratio` overrides."
+            ),
             nullable=True,
         ),
         step_ratio=NumberSchema(
-            description="Fraction of viewport to scroll per step (0.1–1.0). Default 0.8.",
+            description=(
+                "Explicit fraction of viewport per step (0.1–1.0). "
+                "Overrides `cadence` when set."
+            ),
             nullable=True,
+        ),
+        auto_reverse=BooleanSchema(
+            description=(
+                "When the initial direction hits page_end / page_start "
+                "without finding the target, automatically scan the "
+                "OPPOSITE direction. Default true — eliminates the 'I "
+                "scrolled down, didn't find it, gave up' failure mode. "
+                "Returns reason='reversed_no_match' if both legs miss."
+            ),
+            default=True,
+        ),
+        container_selector=StringSchema(
+            description=(
+                "Optional CSS selector to scroll INSIDE this element "
+                "(rather than the page). For dropdown popups / modal "
+                "lists with internal overflow. Usually you want "
+                "`browser_scroll_within` instead — it auto-detects the "
+                "open popup."
+            ),
+            nullable=True,
+        ),
+        emit_trace=BooleanSchema(
+            description=(
+                "Include a per-step narrative of labels that entered "
+                "the viewport. Default true. Set false on huge scans "
+                "to keep prompt size down."
+            ),
+            default=True,
         ),
         required=["session_id"],
     )
@@ -7357,17 +7566,18 @@ class BrowserEscalateTool(Tool):
 class BrowserScrollUntilTool(Tool):
     name = "browser_scroll_until"
     description = (
-        "Closed-loop scroll. Walks the page in `direction` until an "
-        "element matching `target_text` (substring or regex) and/or "
-        "`target_role` becomes visible, the page can't scroll further, "
-        "or `max_iterations` elapses. Cheap — uses interactive-element "
-        "polling between steps, no screenshot per iteration. Returns a "
-        "structured outcome with `reason` ('matched' | 'page_end' | "
-        "'page_start' | 'max_iterations') so the brain knows whether "
-        "to act, retreat, or give up. Prefer this over browser_scroll "
-        "when you know what you're scrolling toward — it stops at the "
-        "right place AND tells you when content runs out, instead of "
-        "blindly scrolling and re-screenshotting."
+        "Closed-loop scan. Walks the page in small steps toward "
+        "`target_text` (substring or regex) / `target_role`, returning "
+        "a TRACE of every interactive label that entered the viewport "
+        "along the way. Auto-reverses by default if the first direction "
+        "hits the page boundary without a match — so the brain doesn't "
+        "have to remember to scroll back. Prefer this over "
+        "`browser_scroll` whenever you know what you're looking for: "
+        "the trace IS the ground truth — if it doesn't list your "
+        "target after a `reversed_no_match`, the label is not on this "
+        "page (try a synonym or `browser_get_markdown`). Cheap (DOM "
+        "polling, no screenshot per step). Defaults: cadence='fine' "
+        "when target_text is set, auto_reverse=true, emit_trace=true."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -7385,6 +7595,10 @@ class BrowserScrollUntilTool(Tool):
         direction: str | None = None,
         max_iterations: int | None = None,
         step_ratio: float | None = None,
+        cadence: str | None = None,
+        auto_reverse: bool | None = None,
+        container_selector: str | None = None,
+        emit_trace: bool | None = None,
         **kw: Any,
     ) -> Any:
         gate = await _feedback_gate("browser_scroll_until")
@@ -7409,10 +7623,22 @@ class BrowserScrollUntilTool(Tool):
             payload["maxIterations"] = int(max_iterations)
         if step_ratio is not None:
             payload["stepRatio"] = float(step_ratio)
+        if cadence in ("fine", "medium", "coarse"):
+            payload["cadence"] = cadence
+        # Auto-reverse defaults to true server-side; only forward an
+        # explicit override.
+        if auto_reverse is not None:
+            payload["autoReverse"] = bool(auto_reverse)
+        if container_selector and container_selector.strip():
+            payload["containerSelector"] = container_selector.strip()
+        if emit_trace is not None:
+            payload["emitTrace"] = bool(emit_trace)
 
         target_disp = target_text or f"role={target_role}"
         print(
-            f"\n>> browser_scroll_until({target_disp!r}, dir={payload['direction']})"
+            f"\n>> browser_scroll_until({target_disp!r}, dir={payload['direction']}"
+            f"{', cadence=' + cadence if cadence else ''}"
+            f"{', auto_reverse=' + str(auto_reverse) if auto_reverse is not None else ''})"
         )
 
         try:
@@ -7420,7 +7646,10 @@ class BrowserScrollUntilTool(Tool):
                 "POST",
                 f"{SUPERBROWSER_URL}/session/{session_id}/scroll-until",
                 json=payload,
-                timeout=30.0,  # closed-loop can take 10 iterations × ~300ms
+                # Two-phase scan (auto-reverse) with up to 40 iterations
+                # per leg at ~300ms each can run ~25s in the worst case.
+                # Bump from 30s → 60s to cover doubled budget cleanly.
+                timeout=60.0,
             )
         except Exception as exc:
             return f"[scroll_until_failed] request error: {exc}"
@@ -7437,6 +7666,9 @@ class BrowserScrollUntilTool(Tool):
         reason = str(outcome.get("reason") or "unknown")
         iters = int(outcome.get("iterations") or 0)
         scrolled = int(outcome.get("scrolledPx") or 0)
+        reversed_flag = bool(outcome.get("reversed") or False)
+        start_y = int(outcome.get("startScrollY") or 0)
+        final_y = int(outcome.get("finalScrollY") or 0)
 
         # Update scroll telemetry so the next vision pass sees a fresh
         # [SCROLL_STATE …] line including reached_bottom/reached_top hints
@@ -7447,8 +7679,13 @@ class BrowserScrollUntilTool(Tool):
             payload["direction"],
             extra={
                 "last_scroll_reason": reason,
-                "reached_bottom": reason == "page_end",
-                "reached_top": reason == "page_start",
+                "reached_bottom": reason == "page_end" or (
+                    reason == "reversed_no_match" and payload["direction"] == "down"
+                ),
+                "reached_top": reason == "page_start" or (
+                    reason == "reversed_no_match" and payload["direction"] == "up"
+                ),
+                "reversed": reversed_flag,
             },
         )
 
@@ -7457,30 +7694,61 @@ class BrowserScrollUntilTool(Tool):
         # loop-detection and task-graph signal evaluation.
         self.s.record_step(
             "browser_scroll_until",
-            f"{target_disp!r} → {reason} in {iters} iters ({scrolled}px)",
+            f"{target_disp!r} → {reason} in {iters} iters ({scrolled}px)"
+            + (" [reversed]" if reversed_flag else ""),
             data.get("url", ""),
         )
 
         lines: list[str] = []
+        # Detect "vision will look identical" cases up-front so the
+        # caption can explicitly tell the brain to trust the trace
+        # rather than the post-call vision summary.
+        ended_near_start = abs(final_y - start_y) < 50
+        no_movement = scrolled == 0 and iters > 0
         if outcome.get("found"):
             matched = outcome.get("matchedText") or ""
             sel = outcome.get("matchedSelector") or ""
-            lines.append(
-                f"FOUND {target_disp!r} after {iters} iter(s), "
-                f"scrolled {scrolled}px. matched={matched[:80]!r} "
-                f"selector={sel}"
-            )
+            if iters == 0:
+                # Found in the initial viewport — no scroll happened.
+                # Make this LOUD: the brain may have thought it was
+                # navigating to find the target, but actually the target
+                # was always visible. Vision will be a cache HIT (same
+                # dom_hash) — that's not a tool failure.
+                lines.append(
+                    f"ALREADY VISIBLE: {target_disp!r} was on screen at "
+                    f"scrollY={start_y} before any scroll. NO scroll "
+                    f"happened (iters=0, scrolled=0px). matched="
+                    f"{matched[:80]!r} selector={sel}. Vision cache "
+                    f"may HIT — that's correct, not a bug."
+                )
+            else:
+                lines.append(
+                    f"FOUND {target_disp!r} after {iters} iter(s), "
+                    f"scrolled {scrolled}px ({start_y}→{final_y}"
+                    + (", reversed" if reversed_flag else "")
+                    + f"). matched={matched[:80]!r} selector={sel}"
+                )
         else:
-            tag = (
-                "page_end" if reason == "page_end"
-                else "page_start" if reason == "page_start"
-                else reason
-            )
+            tag = reason
             lines.append(
                 f"[scroll_until_failed:{tag}] target {target_disp!r} not "
-                f"found after {iters} iter(s) ({scrolled}px). "
-                f"reason={reason}."
+                f"found after {iters} iter(s) ({scrolled}px, "
+                f"{start_y}→{final_y}). reason={reason}."
             )
+            if no_movement:
+                # Scroll never actually moved — the page may use an
+                # inner scroll container the page-level fallback didn't
+                # catch, or the page genuinely isn't scrollable.
+                lines.append(
+                    "  WARNING: scrolledPx=0 across all iterations — "
+                    "the page didn't move. The scroll surface may be a "
+                    "non-document container we couldn't detect. Try: "
+                    "(a) `browser_scroll_within(target_text=...)` if a "
+                    "popup/modal is open; (b) `browser_get_markdown` to "
+                    "verify what's actually on the page; (c) the "
+                    "target may already be present off-viewport — "
+                    "check the [N] elements listing below."
+                )
             if reason == "page_end":
                 lines.append(
                     "  Page can't scroll further down. The target may be "
@@ -7492,12 +7760,76 @@ class BrowserScrollUntilTool(Tool):
                     "  Already at top of page. Try direction='down' or "
                     "verify the target text/role is correct."
                 )
+            elif reason == "reversed_no_match":
+                lines.append(
+                    f"  Walked from Y={start_y} to the page boundary AND "
+                    f"back the other way without finding the target. The "
+                    f"label is not on this page. Stop scrolling — try a "
+                    f"synonym, `browser_get_markdown` to inspect the "
+                    f"actual text, or accept that the control isn't here."
+                )
+                if ended_near_start:
+                    # Auto-reverse landed back near the start — the
+                    # post-call vision pass will produce the same
+                    # dom_hash and HIT cache. Without this hint the
+                    # brain assumes the tool did nothing.
+                    lines.append(
+                        "  Note: scroll position returned to ~start "
+                        f"(Δ={final_y - start_y}px). Vision will be a "
+                        "cache HIT showing the SAME page as before — "
+                        "trust the trace above, not the vision repeat."
+                    )
+                if (
+                    target_text
+                    and any(
+                        kw in target_text.lower()
+                        for kw in ("intel", "amd", "ryzen", "core i", "gen ", "generation")
+                    )
+                ):
+                    # Common smell: the brain is looking for a CPU/spec
+                    # option that lives inside a CLOSED dropdown.
+                    # scroll_until on the page can never find it.
+                    lines.append(
+                        "  HINT: this looks like a CPU/spec option that "
+                        "typically lives inside a closed dropdown. "
+                        "scroll_until on the PAGE can't find it. Open "
+                        "the relevant dropdown first (e.g. "
+                        "`browser_select_option(label='Processor', "
+                        "value=...)`), or use `browser_form_plan` for "
+                        "cascading filter forms."
+                    )
             elif reason == "max_iterations":
                 lines.append(
                     "  Hit iteration cap. If you believe the target exists "
                     "further on, raise max_iterations (cap is 40) or "
                     "use a more specific target_text."
                 )
+
+        # Per-step narrative — what entered the viewport at each step.
+        # This is the load-bearing anti-hallucination signal: the brain
+        # sees a complete log of labels we passed, so it can't claim
+        # 'the target was off-screen but I missed it' if the trace
+        # didn't contain the target.
+        trace = outcome.get("trace") or []
+        if trace:
+            trace_bits: list[str] = []
+            char_budget = 600
+            for step in trace:
+                try:
+                    i = int(step.get("i") or 0)
+                    passed = step.get("passed") or []
+                    if not isinstance(passed, list):
+                        continue
+                    short = ",".join(str(p) for p in passed[:5])
+                    chunk = f"[{i}]+{short}"
+                    if sum(len(b) for b in trace_bits) + len(chunk) + 2 > char_budget:
+                        trace_bits.append(f"…(+{len(trace) - len(trace_bits)} more)")
+                        break
+                    trace_bits.append(chunk)
+                except Exception:
+                    continue
+            if trace_bits:
+                lines.append("  trace: " + " ".join(trace_bits))
 
         if data.get("elements"):
             lines.append(str(data["elements"]))
@@ -7554,6 +7886,217 @@ def _update_scroll_telemetry(
     except Exception:
         # Telemetry is best-effort — never let it block the scroll tool.
         pass
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        target_text=StringSchema(
+            description=(
+                "Text the option/item should match. When set, walks the "
+                "container in fine steps until the option enters view "
+                "(or the container can't scroll further). Substring or "
+                "regex."
+            ),
+            nullable=True,
+        ),
+        container_selector=StringSchema(
+            description=(
+                "CSS selector for the scroll container. Optional — if "
+                "omitted, auto-detects the most recently opened popup "
+                "(role=listbox/menu/dialog, headlessui-state=open) and "
+                "walks up its ancestor chain to find the smallest "
+                "scrollable host."
+            ),
+            nullable=True,
+        ),
+        direction=StringSchema(
+            "'down' (default) or 'up'.",
+            nullable=True,
+        ),
+        amount=StringSchema(
+            description=(
+                "Step amount when target_text is NOT set: 'page' "
+                "(~85%% of container, default), 'half' (~50%%), or pass "
+                "a numeric pixel count. Ignored when target_text is set."
+            ),
+            nullable=True,
+        ),
+        max_iterations=IntegerSchema(
+            description="Max scroll steps (default 12, max 40). Used with target_text.",
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
+)
+class BrowserScrollWithinTool(Tool):
+    name = "browser_scroll_within"
+    description = (
+        "Scroll INSIDE a popup/listbox/menu/modal — NOT the page. Use "
+        "this when a dropdown is open and the option you want sits "
+        "below the visible portion of its menu (long option list, "
+        "scrollable popup). Page-level scroll won't move a popup's "
+        "internal scroll. With `target_text`, walks the container in "
+        "fine steps until that option enters view. Without "
+        "`container_selector`, auto-detects the most recently opened "
+        "popup. Note: `browser_select_option` already does this "
+        "internally — only reach for this tool when you're driving the "
+        "dropdown manually with `browser_click_at`."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        target_text: str | None = None,
+        container_selector: str | None = None,
+        direction: str | None = None,
+        amount: str | int | None = None,
+        max_iterations: int | None = None,
+        **kw: Any,
+    ) -> Any:
+        gate = await _feedback_gate("browser_scroll_within")
+        if gate:
+            return gate
+
+        payload: dict[str, Any] = {
+            "direction": direction or "down",
+        }
+        if target_text and target_text.strip():
+            payload["targetText"] = target_text.strip()
+        if container_selector and container_selector.strip():
+            payload["containerSelector"] = container_selector.strip()
+        if amount is not None:
+            # Accept "page" / "half" or an integer pixel count.
+            if isinstance(amount, str) and amount in ("page", "half"):
+                payload["amount"] = amount
+            else:
+                try:
+                    payload["amount"] = int(amount)
+                except (TypeError, ValueError):
+                    pass
+        if max_iterations is not None:
+            payload["maxIterations"] = int(max_iterations)
+
+        target_disp = target_text or f"container={container_selector or '<auto>'}"
+        print(
+            f"\n>> browser_scroll_within({target_disp!r}, dir={payload['direction']})"
+        )
+
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/scroll-within",
+                json=payload,
+                timeout=45.0,
+            )
+        except Exception as exc:
+            return f"[scroll_within_failed] request error: {exc}"
+
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[scroll_within_failed] HTTP {r.status_code}: {err}"
+
+        data = r.json()
+        outcome = data.get("outcome") or {}
+        reason = str(outcome.get("reason") or "unknown")
+        iters = int(outcome.get("iterations") or 0)
+        scrolled = int(outcome.get("scrolledPx") or 0)
+        resolved = str(outcome.get("resolvedContainer") or outcome.get("containerSelector") or "")
+        reversed_flag = bool(outcome.get("reversed") or False)
+
+        # Track in step history for downstream loop-detection / planning.
+        self.s.record_step(
+            "browser_scroll_within",
+            f"{target_disp!r} → {reason} in {iters} iter(s) ({scrolled}px) "
+            f"in {resolved or '<no_container>'}"
+            + (" [reversed]" if reversed_flag else ""),
+            data.get("url", ""),
+        )
+
+        lines: list[str] = []
+        if reason == "no_container":
+            lines.append(
+                "[scroll_within_failed:no_container] No scrollable popup "
+                "found. Either no dropdown/menu/modal is currently open, "
+                "or the open popup doesn't have internal overflow. "
+                "Open the dropdown first (browser_click_at on its "
+                "trigger), or pass an explicit container_selector."
+            )
+        elif outcome.get("found"):
+            matched = outcome.get("matchedText") or ""
+            sel = outcome.get("matchedSelector") or ""
+            lines.append(
+                f"FOUND {target_disp!r} inside {resolved} after {iters} "
+                f"iter(s), scrolled {scrolled}px"
+                + (" (reversed)" if reversed_flag else "")
+                + f". matched={matched[:80]!r} selector={sel}. "
+                "Now click it with `browser_click_selector` or, easier, "
+                "use `browser_select_option(label=..., value=...)` which "
+                "handles the click for you."
+            )
+        else:
+            lines.append(
+                f"[scroll_within:{reason}] inside {resolved}, after "
+                f"{iters} iter(s), scrolled {scrolled}px"
+                + (" (reversed)" if reversed_flag else "")
+                + f". reason={reason}."
+            )
+            if reason == "reversed_no_match":
+                lines.append(
+                    "  Walked the popup top-to-bottom-and-back without "
+                    "finding the target. The option text is not in this "
+                    "menu. Try a synonym, or close+re-open the dropdown."
+                )
+            elif reason in ("page_end", "page_start"):
+                lines.append(
+                    "  Reached the boundary of the popup. Target wasn't "
+                    "in this menu — try the opposite direction or check "
+                    "if you've opened the right dropdown."
+                )
+
+        # Per-step trace narrative (same shape as scroll_until).
+        trace = outcome.get("trace") or []
+        if trace:
+            trace_bits: list[str] = []
+            char_budget = 600
+            for step in trace:
+                try:
+                    i = int(step.get("i") or 0)
+                    passed = step.get("passed") or []
+                    if not isinstance(passed, list):
+                        continue
+                    short = ",".join(str(p) for p in passed[:5])
+                    chunk = f"[{i}]+{short}"
+                    if sum(len(b) for b in trace_bits) + len(chunk) + 2 > char_budget:
+                        trace_bits.append(f"…(+{len(trace) - len(trace_bits)} more)")
+                        break
+                    trace_bits.append(chunk)
+                except Exception:
+                    continue
+            if trace_bits:
+                lines.append("  trace: " + " ".join(trace_bits))
+
+        # No telemetry update — this is in-container scroll, not page
+        # scroll, so reached_bottom / reached_top would be misleading.
+        if data.get("elements"):
+            lines.append(str(data["elements"]))
+
+        self.s.advance_observation_token("scroll_within")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task, "\n".join(lines),
+            state=self.s,
+        )
 
 
 @tool_parameters(
@@ -9158,6 +9701,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserKeysTool(state),
         BrowserScrollTool(state),
         BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
+        BrowserScrollWithinTool(state),    # in-popup/listbox scroll
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
         BrowserFormPlanTool(state),

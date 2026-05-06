@@ -1913,58 +1913,196 @@ export class PageWrapper {
 
   // --- Scrolling ---
 
+  // Robust window-scroll. `window.scrollBy` is a no-op on pages that lock
+  // body overflow and use an inner div as the real scroll surface (a
+  // pattern common to single-page wizards and full-bleed app shells).
+  // Cascade: window → document.scrollingElement → largest scrollable
+  // descendant. Returns {before, after, fallback} so the caller can
+  // surface diagnostics when scroll silently fails.
+  private async _windowScrollByWithFallback(
+    delta: number,
+  ): Promise<{ before: number; after: number; fallback: 'window' | 'scrollingElement' | 'largest_container' | 'none' }> {
+    if (!Number.isFinite(delta) || delta === 0) {
+      const y = (await this.getScrollInfo())[0];
+      return { before: y, after: y, fallback: 'none' };
+    }
+    return (await this.page.evaluate((d: number) => {
+      const before = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
+      window.scrollBy(0, d);
+      let after = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
+      if (after === before) {
+        const se = document.scrollingElement as HTMLElement | null;
+        if (se) {
+          se.scrollBy(0, d);
+          after = Math.round(window.scrollY || se.scrollTop || 0);
+        }
+      }
+      if (after === before) {
+        // Find the largest non-trivial scrollable descendant. We prefer
+        // big main-app containers over small overflow regions (a 200px
+        // sidebar isn't where the brain wants to scroll). Anything <
+        // 200px clientHeight is ignored.
+        let target: HTMLElement | null = null;
+        let bestScore = 0;
+        const all = document.querySelectorAll<HTMLElement>('*');
+        for (let i = 0; i < all.length; i++) {
+          const el = all[i];
+          if (el.clientHeight < 200) continue;
+          if (el.scrollHeight <= el.clientHeight + 4) continue;
+          const cs = window.getComputedStyle(el);
+          if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue;
+          // Skip elements whose ancestor we already considered better.
+          const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
+          if (score > bestScore) {
+            bestScore = score;
+            target = el;
+          }
+        }
+        if (target) {
+          const tBefore = target.scrollTop;
+          target.scrollBy(0, d);
+          const moved = target.scrollTop !== tBefore;
+          // Tag for stable reuse — subsequent scrolls hit the same host.
+          if (moved) {
+            target.setAttribute('data-sb-doc-scroll-host', '1');
+            return { before, after: target.scrollTop, fallback: 'largest_container' as const };
+          }
+        }
+        return { before, after, fallback: 'none' as const };
+      }
+      // Determine which path moved us.
+      // (Heuristic: if document.scrollingElement was used, window.scrollY
+      // would still update. We can't easily distinguish; report 'window'.)
+      return { before, after, fallback: 'window' as const };
+    }, delta)) as { before: number; after: number; fallback: 'window' | 'scrollingElement' | 'largest_container' | 'none' };
+  }
+
   async scrollPage(direction: 'up' | 'down'): Promise<void> {
     const viewportHeight = this.config.viewport.height;
     const distance = direction === 'down' ? viewportHeight - 100 : -(viewportHeight - 100);
-    await this.page.evaluate((d: number) => {
-      window.scrollBy(0, d);
-    }, distance);
+    await this._windowScrollByWithFallback(distance);
     await new Promise((r) => setTimeout(r, 500));
   }
 
   async scrollToPercent(percent: number): Promise<void> {
     await this.page.evaluate((pct: number) => {
+      const setPos = (target: number) => {
+        // Try window first.
+        const before = window.scrollY;
+        window.scrollTo(0, Math.round(target));
+        if (Math.round(window.scrollY) !== before) return;
+        // scrollingElement fallback.
+        const se = document.scrollingElement as HTMLElement | null;
+        if (se) {
+          const seBefore = se.scrollTop;
+          se.scrollTop = Math.round(target);
+          if (se.scrollTop !== seBefore) return;
+        }
+        // Largest-container fallback.
+        let host: HTMLElement | null = null;
+        let best = 0;
+        const all = document.querySelectorAll<HTMLElement>('*');
+        for (let i = 0; i < all.length; i++) {
+          const el = all[i];
+          if (el.clientHeight < 200) continue;
+          if (el.scrollHeight <= el.clientHeight + 4) continue;
+          const cs = window.getComputedStyle(el);
+          if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue;
+          const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
+          if (score > best) { best = score; host = el; }
+        }
+        if (host) host.scrollTop = Math.round(target * (host.scrollHeight - host.clientHeight) / Math.max(1, document.documentElement.scrollHeight - window.innerHeight));
+      };
       const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
-      window.scrollTo(0, Math.round(maxScroll * pct / 100));
+      setPos(maxScroll * pct / 100);
     }, percent);
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  async getScrollInfo(): Promise<[number, number, number]> {
-    return this.page.evaluate(() => [
-      Math.round(window.scrollY),
-      Math.round(window.innerHeight),
-      Math.round(document.documentElement.scrollHeight),
-    ]) as Promise<[number, number, number]>;
+  // Incremental scroll by an explicit pixel distance — avoids the percent-vs-
+  // viewport-vs-pixel confusion the LLM keeps tripping on. Returns the
+  // actual delta moved so the caller can detect & report no-op scrolls.
+  async scrollByPixels(direction: 'up' | 'down', pixels: number): Promise<{
+    before: number;
+    after: number;
+    scrolledPx: number;
+    fallback: 'window' | 'scrollingElement' | 'largest_container' | 'none';
+  }> {
+    const px = Math.max(1, Math.round(Math.abs(pixels)));
+    const signed = direction === 'down' ? px : -px;
+    const result = await this._windowScrollByWithFallback(signed);
+    await new Promise((r) => setTimeout(r, 500));
+    return {
+      before: result.before,
+      after: result.after,
+      scrolledPx: result.after - result.before,
+      fallback: result.fallback,
+    };
   }
 
-  // Closed-loop scroll: walks the page in `direction` one viewport-fraction
-  // at a time, polling DOM after each step for an element matching
-  // `targetText` (case-insensitive substring or regex) and/or `targetRole`.
-  // Stops on match, on a scrollY plateau (page end / page start signal),
-  // or after `maxIterations`. The plateau detection is the load-bearing
-  // bit: it tells the brain "no more content this way" so it doesn't
-  // ask for more scrolling forever.
+  async getScrollInfo(): Promise<[number, number, number]> {
+    // Prefer the tagged document-scroll host (set by
+    // `_windowScrollByWithFallback` when window.scrollBy turned out to
+    // be a no-op). This keeps scrollUntil's plateau detection honest
+    // on pages where the real scroll surface is an inner div.
+    return this.page.evaluate(() => {
+      const host = document.querySelector('[data-sb-doc-scroll-host]') as HTMLElement | null;
+      if (host) {
+        return [
+          Math.round(host.scrollTop),
+          Math.round(host.clientHeight),
+          Math.round(host.scrollHeight),
+        ];
+      }
+      return [
+        Math.round(window.scrollY),
+        Math.round(window.innerHeight),
+        Math.round(document.documentElement.scrollHeight),
+      ];
+    }) as Promise<[number, number, number]>;
+  }
+
+  // Closed-loop scroll: walks the page (or a chosen container) toward a
+  // target by small steps, narrating what just entered view via a trace.
+  // The trace is the load-bearing bit for hallucination control: instead
+  // of one big scroll + a stale screenshot, the brain gets every label
+  // we passed. If the trace doesn't include the target text, it isn't
+  // on this page — no need to invent coordinates and click.
+  //
+  // `cadence` resolves to a stepRatio when stepRatio is omitted: fine
+  // (0.30) for "I'm looking for X" workflows, medium (0.55) for plain
+  // navigation, coarse (0.85) preserves the legacy default.
+  //
+  // `autoReverse` (default true) closes the other failure mode: when a
+  // down-scan hits page_end without a match, we turn around and walk
+  // back up to page_start before returning. The brain no longer needs
+  // to remember to scroll back.
   async scrollUntil(opts: {
     targetText?: string;
     targetRole?: string;
     direction?: 'up' | 'down';
     maxIterations?: number;
     stepRatio?: number;
+    cadence?: 'fine' | 'medium' | 'coarse';
+    autoReverse?: boolean;
+    containerSelector?: string;
+    emitTrace?: boolean;
   }): Promise<{
     found: boolean;
     iterations: number;
     finalScrollY: number;
     scrolledPx: number;
-    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target';
+    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match';
     matchedSelector?: string;
     matchedText?: string;
+    trace: { i: number; scrollY: number; passed: string[] }[];
+    reversed?: boolean;
+    startScrollY: number;
+    containerSelector?: string;
   }> {
-    const direction = opts.direction === 'up' ? 'up' : 'down';
-    const maxIter = Math.max(1, Math.min(40, opts.maxIterations ?? 10));
-    const stepRatio = Math.max(0.1, Math.min(1.0, opts.stepRatio ?? 0.8));
     const targetText = (opts.targetText ?? '').trim();
     const targetRole = (opts.targetRole ?? '').trim();
+    const containerSelector = (opts.containerSelector ?? '').trim() || undefined;
 
     if (!targetText && !targetRole) {
       const info = await this.getScrollInfo();
@@ -1974,17 +2112,30 @@ export class PageWrapper {
         finalScrollY: info[0],
         scrolledPx: 0,
         reason: 'no_target',
+        trace: [],
+        startScrollY: info[0],
       };
     }
 
-    // Compile the regex once (caller-side) — regex literal first, fall
-    // back to a substring search inside the page if it's not a valid
-    // regex. Mirrors the BrowserDragSliderUntilTool label_pattern path.
+    // Resolve cadence → stepRatio. Explicit stepRatio wins. When neither
+    // is given, default cadence depends on whether we have a target:
+    // tighter cadence when the brain is actively hunting a label.
+    const cadenceMap = { fine: 0.30, medium: 0.55, coarse: 0.85 } as const;
+    const explicitStep = typeof opts.stepRatio === 'number';
+    const resolvedRatio = explicitStep
+      ? Math.max(0.1, Math.min(1.0, opts.stepRatio as number))
+      : cadenceMap[opts.cadence ?? (targetText ? 'fine' : 'medium')];
+
+    const maxIter = Math.max(1, Math.min(40, opts.maxIterations ?? 10));
+    const autoReverse = opts.autoReverse !== false;
+    const emitTrace = opts.emitTrace !== false;
+    const startDirection = opts.direction === 'up' ? 'up' : 'down';
+
+    // Regex compile once. Caller passes a substring or a regex source.
     let regexSrc = '';
     let isRegex = false;
     if (targetText) {
       try {
-        // Anchor-free regex: caller provides the pattern, we just compile it.
         new RegExp(targetText, 'i');
         regexSrc = targetText;
         isRegex = true;
@@ -1994,23 +2145,61 @@ export class PageWrapper {
       }
     }
 
-    const startInfo = await this.getScrollInfo();
-    const startY = startInfo[0];
-    const viewportH = startInfo[1];
-    const stepDelta = Math.round(viewportH * stepRatio);
+    // Reset the per-scan "already passed" tag so the trace reports
+    // arrivals fresh for THIS scan (not bleed-over from a prior call).
+    await this.page.evaluate((sel: string | undefined) => {
+      const root = sel
+        ? (document.querySelector(sel) as HTMLElement | null)
+        : document.body;
+      const scope = root || document.body;
+      try {
+        scope.querySelectorAll('[data-sb-passed]').forEach((el) => {
+          el.removeAttribute('data-sb-passed');
+        });
+      } catch { /* ignore */ }
+    }, containerSelector);
 
-    let lastY = startY;
-    let plateauHits = 0;
-    let iterations = 0;
-    let matchedSelector: string | undefined;
-    let matchedText: string | undefined;
+    const getGeometry = async (): Promise<{ y: number; vp: number; total: number }> => {
+      if (containerSelector) {
+        const r = await this.page.evaluate((sel: string) => {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (!el) return null;
+          return {
+            y: Math.round(el.scrollTop),
+            vp: Math.round(el.clientHeight),
+            total: Math.round(el.scrollHeight),
+          };
+        }, containerSelector) as { y: number; vp: number; total: number } | null;
+        return r ?? { y: 0, vp: 0, total: 0 };
+      }
+      const [y, vp, total] = await this.getScrollInfo();
+      return { y, vp, total };
+    };
 
-    // Polling helper — runs in the page context to find a visible element
-    // matching the target. Returns { selector, text } or null.
+    const scrollByDelta = async (delta: number): Promise<void> => {
+      if (containerSelector) {
+        await this.page.evaluate(
+          (args: { sel: string; d: number }) => {
+            const el = document.querySelector(args.sel) as HTMLElement | null;
+            if (el) el.scrollBy(0, args.d);
+          },
+          { sel: containerSelector, d: delta },
+        );
+      } else {
+        // Use the robust window-scroll cascade so scroll_until works on
+        // pages where body has overflow:hidden (wizard-style SPAs, full-
+        // bleed apps). Without this, every iteration is a silent no-op
+        // and scroll_until walks 10 iters reporting 0 scrolledPx.
+        await this._windowScrollByWithFallback(delta);
+      }
+    };
+
+    // Find a visible match within scope (page or container). Returns
+    // the matched selector + text or null.
     const findMatch = async (): Promise<{ selector: string; text: string } | null> => {
       return await this.page.evaluate(
-        (args: { regexSrc: string; isRegex: boolean; role: string }) => {
-          const { regexSrc: rs, isRegex: ir, role } = args;
+        (args: { regexSrc: string; isRegex: boolean; role: string; container?: string }) => {
+          const { regexSrc: rs, isRegex: ir, role, container } = args;
           const matchText = (txt: string): boolean => {
             if (!rs) return true;
             if (ir) {
@@ -2022,25 +2211,31 @@ export class PageWrapper {
             }
             return txt.toLowerCase().includes(rs.toLowerCase());
           };
+          const root: ParentNode = container
+            ? (document.querySelector(container) as HTMLElement | null) ?? document
+            : document;
+          const containerEl = container ? (root as HTMLElement) : null;
           const isVisible = (el: Element): boolean => {
             const r = (el as HTMLElement).getBoundingClientRect();
             if (r.width <= 0 || r.height <= 0) return false;
-            const vpH = window.innerHeight;
-            const vpW = window.innerWidth;
-            // Must be at least partially in viewport.
-            if (r.bottom < 0 || r.top > vpH) return false;
-            if (r.right < 0 || r.left > vpW) return false;
+            if (containerEl) {
+              const cr = containerEl.getBoundingClientRect();
+              if (r.bottom < cr.top || r.top > cr.bottom) return false;
+              if (r.right < cr.left || r.left > cr.right) return false;
+            } else {
+              const vpH = window.innerHeight;
+              const vpW = window.innerWidth;
+              if (r.bottom < 0 || r.top > vpH) return false;
+              if (r.right < 0 || r.left > vpW) return false;
+            }
             const cs = window.getComputedStyle(el as HTMLElement);
             if (cs.visibility === 'hidden' || cs.display === 'none') return false;
             return true;
           };
-          // Candidate set — bias toward labelled / interactive elements
-          // since those are what users typically scroll *to*. Falls back
-          // to all text-bearing elements when nothing matches.
-          const interactive = Array.from(document.querySelectorAll(
+          const interactive = Array.from(root.querySelectorAll(
             'a, button, input, select, textarea, label, summary, ' +
             '[role], [aria-label], [data-testid], h1, h2, h3, h4, h5, ' +
-            'li, td, th, span, div'
+            'li, td, th, span, div',
           ));
           for (const el of interactive) {
             if (!isVisible(el)) continue;
@@ -2066,82 +2261,407 @@ export class PageWrapper {
           }
           return null;
         },
-        { regexSrc, isRegex, role: targetRole },
+        { regexSrc, isRegex, role: targetRole, container: containerSelector },
       ) as { selector: string; text: string } | null;
     };
 
-    // Check before any scroll — target may already be visible.
+    // Per-step "what entered view" diff. Tags newcomers with
+    // data-sb-passed so we only narrate each label once. Returns up to
+    // 5 short labels — enough for the brain to recognize the page
+    // shape, capped to keep the trace prompt-budget under control.
+    const collectArrivals = async (): Promise<string[]> => {
+      if (!emitTrace) return [];
+      return await this.page.evaluate((container?: string) => {
+        const root: ParentNode = container
+          ? (document.querySelector(container) as HTMLElement | null) ?? document
+          : document;
+        const containerEl = container ? (root as HTMLElement) : null;
+        const inViewport = (el: Element): boolean => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          if (containerEl) {
+            const cr = containerEl.getBoundingClientRect();
+            if (r.bottom < cr.top || r.top > cr.bottom) return false;
+          } else {
+            if (r.bottom < 0 || r.top > window.innerHeight) return false;
+          }
+          const cs = window.getComputedStyle(el as HTMLElement);
+          if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+          return true;
+        };
+        const shorten = (s: string): string => {
+          const norm = s.replace(/\s+/g, ' ').trim();
+          if (!norm) return '';
+          return norm.length > 28 ? `${norm.slice(0, 26)}…` : norm;
+        };
+        const arrivals: string[] = [];
+        const interactive = Array.from(root.querySelectorAll(
+          'a, button, input, select, textarea, label, summary, ' +
+          '[role], [aria-label], [data-testid], h1, h2, h3, h4',
+        )) as HTMLElement[];
+        for (const el of interactive) {
+          if (arrivals.length >= 5) break;
+          if (el.hasAttribute('data-sb-passed')) continue;
+          if (!inViewport(el)) continue;
+          el.setAttribute('data-sb-passed', '1');
+          const aria = el.getAttribute('aria-label') || '';
+          const txt = el.innerText || el.textContent || '';
+          const placeholder = el.getAttribute('placeholder') || '';
+          const label = shorten(aria || txt || placeholder);
+          if (label) arrivals.push(label);
+        }
+        return arrivals;
+      }, containerSelector) as string[];
+    };
+
+    // Initial geometry + freebie check (target may already be on screen).
+    const startInfo = await getGeometry();
+    const startY = startInfo.y;
+    const stepDelta = Math.max(80, Math.round(startInfo.vp * resolvedRatio));
+    const trace: { i: number; scrollY: number; passed: string[] }[] = [];
+
+    // Seed trace with what's already in view at iter 0 — gives the brain
+    // a complete narrative even if the match is found before scrolling.
+    if (emitTrace) {
+      const seed = await collectArrivals();
+      if (seed.length) {
+        trace.push({ i: 0, scrollY: startY, passed: seed });
+      }
+    }
+
     const initialMatch = await findMatch();
     if (initialMatch) {
-      const info = await this.getScrollInfo();
+      const info = await getGeometry();
       return {
         found: true,
         iterations: 0,
-        finalScrollY: info[0],
+        finalScrollY: info.y,
         scrolledPx: 0,
         reason: 'matched',
         matchedSelector: initialMatch.selector,
         matchedText: initialMatch.text,
+        trace,
+        startScrollY: startY,
+        containerSelector,
       };
     }
 
-    while (iterations < maxIter) {
-      iterations += 1;
-      // Step. We re-use scrollPage's behavior (window.scrollBy with a
-      // ~viewport-100px chunk) but parametric on stepRatio so callers
-      // can take smaller steps on dense pages.
-      const delta = direction === 'down' ? stepDelta : -stepDelta;
-      await this.page.evaluate((d: number) => {
-        window.scrollBy(0, d);
-      }, delta);
-      // Brief settle for lazy-loaded content. 300ms balances against the
-      // need to make ~10 iterations finish under 5 seconds.
-      await new Promise((r) => setTimeout(r, 300));
+    // Run a single direction scan. Returns the outcome OR null if the
+    // caller should auto-reverse and try the other way.
+    const scanOnce = async (
+      direction: 'up' | 'down',
+      iterStart: number,
+    ): Promise<{
+      done: true;
+      result: {
+        found: boolean;
+        iterations: number;
+        finalScrollY: number;
+        scrolledPx: number;
+        reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations';
+        matchedSelector?: string;
+        matchedText?: string;
+      };
+    } | { done: false; reason: 'page_end' | 'page_start'; iterations: number; finalScrollY: number }> => {
+      let iterations = iterStart;
+      let lastY = (await getGeometry()).y;
+      let plateauHits = 0;
+      while (iterations < iterStart + maxIter) {
+        iterations += 1;
+        const delta = direction === 'down' ? stepDelta : -stepDelta;
+        await scrollByDelta(delta);
+        await new Promise((r) => setTimeout(r, 300));
+        const info = await getGeometry();
+        const y = info.y;
 
-      const info = await this.getScrollInfo();
-      const y = info[0];
+        if (emitTrace) {
+          const passed = await collectArrivals();
+          if (passed.length) {
+            trace.push({ i: iterations, scrollY: y, passed });
+          }
+        }
 
-      // Plateau detection — same scrollY twice in a row means the page
-      // can't scroll further this direction.
-      if (Math.abs(y - lastY) < 2) {
-        plateauHits += 1;
-        if (plateauHits >= 2) {
+        if (Math.abs(y - lastY) < 2) {
+          plateauHits += 1;
+          if (plateauHits >= 2) {
+            return {
+              done: false,
+              reason: direction === 'down' ? 'page_end' : 'page_start',
+              iterations,
+              finalScrollY: y,
+            };
+          }
+        } else {
+          plateauHits = 0;
+        }
+        lastY = y;
+
+        const m = await findMatch();
+        if (m) {
           return {
-            found: false,
-            iterations,
-            finalScrollY: y,
-            scrolledPx: y - startY,
-            reason: direction === 'down' ? 'page_end' : 'page_start',
+            done: true,
+            result: {
+              found: true,
+              iterations,
+              finalScrollY: y,
+              scrolledPx: y - startY,
+              reason: 'matched',
+              matchedSelector: m.selector,
+              matchedText: m.text,
+            },
           };
         }
-      } else {
-        plateauHits = 0;
       }
-      lastY = y;
-
-      const m = await findMatch();
-      if (m) {
-        matchedSelector = m.selector;
-        matchedText = m.text;
-        return {
-          found: true,
+      const finalInfo = await getGeometry();
+      return {
+        done: true,
+        result: {
+          found: false,
           iterations,
-          finalScrollY: y,
-          scrolledPx: y - startY,
-          reason: 'matched',
-          matchedSelector,
-          matchedText,
-        };
-      }
+          finalScrollY: finalInfo.y,
+          scrolledPx: finalInfo.y - startY,
+          reason: 'max_iterations',
+        },
+      };
+    };
+
+    // Phase 1.
+    const phase1 = await scanOnce(startDirection, 0);
+    if (phase1.done) {
+      return { ...phase1.result, trace, startScrollY: startY, containerSelector };
     }
 
-    const finalInfo = await this.getScrollInfo();
+    // Phase 2 (auto-reverse). Only fires if the first leg hit a real
+    // page boundary (not max_iterations) and reversal is enabled.
+    if (!autoReverse) {
+      return {
+        found: false,
+        iterations: phase1.iterations,
+        finalScrollY: phase1.finalScrollY,
+        scrolledPx: phase1.finalScrollY - startY,
+        reason: phase1.reason,
+        trace,
+        startScrollY: startY,
+        containerSelector,
+      };
+    }
+
+    const reverseDir: 'up' | 'down' = startDirection === 'down' ? 'up' : 'down';
+    const phase2 = await scanOnce(reverseDir, phase1.iterations);
+    if (phase2.done && phase2.result.found) {
+      return {
+        ...phase2.result,
+        reversed: true,
+        trace,
+        startScrollY: startY,
+        containerSelector,
+      };
+    }
+
+    const finalY = phase2.done ? phase2.result.finalScrollY : phase2.finalScrollY;
+    const finalIters = phase2.done ? phase2.result.iterations : phase2.iterations;
     return {
       found: false,
-      iterations,
-      finalScrollY: finalInfo[0],
-      scrolledPx: finalInfo[0] - startY,
-      reason: 'max_iterations',
+      iterations: finalIters,
+      finalScrollY: finalY,
+      scrolledPx: finalY - startY,
+      reason: 'reversed_no_match',
+      reversed: true,
+      trace,
+      startScrollY: startY,
+      containerSelector,
+    };
+  }
+
+  // In-container scroll for open dropdowns / listboxes / menus / modal
+  // lists. When `containerSelector` isn't given, auto-detects the most
+  // recently opened popup (role=listbox|menu, headlessui-state=open,
+  // data-state=open) and walks UP its ancestor chain to find the
+  // smallest scrollable host. Falls back to the focused element's
+  // scrollable ancestor.
+  async scrollWithin(opts: {
+    containerSelector?: string;
+    direction?: 'up' | 'down';
+    amount?: 'page' | 'half' | number;
+    targetText?: string;
+    maxIterations?: number;
+  }): Promise<{
+    found: boolean;
+    iterations: number;
+    finalScrollY: number;
+    scrolledPx: number;
+    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match' | 'no_container';
+    matchedSelector?: string;
+    matchedText?: string;
+    trace: { i: number; scrollY: number; passed: string[] }[];
+    reversed?: boolean;
+    startScrollY: number;
+    containerSelector?: string;
+    resolvedContainer: string;
+  }> {
+    // 1. Resolve the container selector. If the caller supplied one, use it.
+    //    Otherwise auto-detect.
+    let resolved = (opts.containerSelector ?? '').trim();
+    if (!resolved) {
+      resolved = await this.page.evaluate(() => {
+        // Heuristic: the most recently opened popup is usually the one we
+        // want. Look for visible listbox/menu/dialog/headlessui-open
+        // candidates and pick the one with the largest z-index (top of
+        // the stack), preferring those whose scrollable ancestor has
+        // overflowable content.
+        const popupSelectors = [
+          '[role="listbox"]:not([aria-hidden="true"])',
+          '[role="menu"]:not([aria-hidden="true"])',
+          '[role="dialog"]:not([aria-hidden="true"])',
+          '[data-headlessui-state="open"]',
+          '[data-state="open"]',
+        ];
+        const findScrollHost = (start: HTMLElement | null): HTMLElement | null => {
+          let cur: HTMLElement | null = start;
+          while (cur && cur !== document.body) {
+            const cs = window.getComputedStyle(cur);
+            const oy = cs.overflowY;
+            if ((oy === 'auto' || oy === 'scroll') && cur.scrollHeight > cur.clientHeight + 4) {
+              return cur;
+            }
+            cur = cur.parentElement;
+          }
+          return null;
+        };
+        const isVisible = (el: HTMLElement): boolean => {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const cs = window.getComputedStyle(el);
+          if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+          return true;
+        };
+        type Candidate = { host: HTMLElement; z: number };
+        const candidates: Candidate[] = [];
+        for (const sel of popupSelectors) {
+          for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+            if (!isVisible(el)) continue;
+            // The popup itself may scroll, OR its scrollable ancestor may.
+            let host: HTMLElement | null = null;
+            const cs = window.getComputedStyle(el);
+            if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                && el.scrollHeight > el.clientHeight + 4) {
+              host = el;
+            } else {
+              host = findScrollHost(el);
+            }
+            if (!host) continue;
+            const z = parseInt(window.getComputedStyle(host).zIndex || '0', 10);
+            candidates.push({ host, z: isNaN(z) ? 0 : z });
+          }
+        }
+        // Fallback: scrollable ancestor of focused element.
+        if (candidates.length === 0 && document.activeElement
+            && document.activeElement !== document.body) {
+          const host = findScrollHost(document.activeElement as HTMLElement);
+          if (host) candidates.push({ host, z: 0 });
+        }
+        if (candidates.length === 0) return '';
+        // Pick smallest scroll-host that contains a [role=option] if any do
+        // (more likely to be the actual menu); otherwise fall back to z-index.
+        const withOptions = candidates.filter(
+          (c) => c.host.querySelector('[role="option"], [role="menuitem"]'),
+        );
+        const pool = withOptions.length ? withOptions : candidates;
+        pool.sort((a, b) => {
+          if (b.z !== a.z) return b.z - a.z;
+          return a.host.scrollHeight - b.host.scrollHeight;
+        });
+        const winner = pool[0].host;
+        // Tag for stable reuse this turn.
+        const id = `sb-scroll-host-${Math.random().toString(36).slice(2, 10)}`;
+        winner.setAttribute('data-sb-scroll-host', id);
+        return `[data-sb-scroll-host="${id}"]`;
+      }) as string;
+    }
+
+    if (!resolved) {
+      const startInfo = await this.getScrollInfo();
+      return {
+        found: false,
+        iterations: 0,
+        finalScrollY: startInfo[0],
+        scrolledPx: 0,
+        reason: 'no_container',
+        trace: [],
+        startScrollY: startInfo[0],
+        resolvedContainer: '',
+      };
+    }
+
+    // 2. With target_text → delegate to scrollUntil scoped to container.
+    if ((opts.targetText ?? '').trim()) {
+      const result = await this.scrollUntil({
+        targetText: opts.targetText,
+        direction: opts.direction,
+        maxIterations: opts.maxIterations ?? 12,
+        containerSelector: resolved,
+        cadence: 'fine',
+        autoReverse: true,
+        emitTrace: true,
+      });
+      return { ...result, resolvedContainer: resolved };
+    }
+
+    // 3. Without target → one-shot scroll by amount.
+    const direction = opts.direction === 'up' ? 'up' : 'down';
+    const geo = await this.page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) return null;
+      return {
+        y: Math.round(el.scrollTop),
+        vp: Math.round(el.clientHeight),
+        total: Math.round(el.scrollHeight),
+      };
+    }, resolved) as { y: number; vp: number; total: number } | null;
+
+    if (!geo) {
+      return {
+        found: false,
+        iterations: 0,
+        finalScrollY: 0,
+        scrolledPx: 0,
+        reason: 'no_container',
+        trace: [],
+        startScrollY: 0,
+        resolvedContainer: resolved,
+      };
+    }
+    const startY = geo.y;
+    const amount = opts.amount;
+    let pxDelta: number;
+    if (typeof amount === 'number') pxDelta = Math.max(1, Math.round(Math.abs(amount)));
+    else if (amount === 'half') pxDelta = Math.max(40, Math.round(geo.vp * 0.5));
+    else pxDelta = Math.max(60, Math.round(geo.vp * 0.85));
+    const signed = direction === 'down' ? pxDelta : -pxDelta;
+    await this.page.evaluate(
+      (args: { sel: string; d: number }) => {
+        const el = document.querySelector(args.sel) as HTMLElement | null;
+        if (el) el.scrollBy(0, args.d);
+      },
+      { sel: resolved, d: signed },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await this.page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      return el ? Math.round(el.scrollTop) : 0;
+    }, resolved) as number;
+    const moved = after - startY;
+    const reachedEnd = direction === 'down' ? Math.abs(moved) < 2 : after <= 4;
+    return {
+      found: false,
+      iterations: 1,
+      finalScrollY: after,
+      scrolledPx: moved,
+      reason: reachedEnd ? (direction === 'down' ? 'page_end' : 'page_start') : 'max_iterations',
+      trace: [],
+      startScrollY: startY,
+      resolvedContainer: resolved,
+      containerSelector: resolved,
     };
   }
 

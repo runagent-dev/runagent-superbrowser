@@ -992,14 +992,24 @@ export function createHttpServer(
     }
   });
 
-  /** Scroll the page. Returns updated state. */
+  /** Scroll the page. Returns updated state, plus pre/post scroll Y so
+   * the caller can detect silent no-op scrolls (locked-body SPAs that
+   * neither window nor scrollingElement nor the largest container can
+   * scroll — rare but real, and otherwise invisible to the LLM).
+   */
   app.post('/session/:id/scroll', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { direction, percent } = req.body;
-      if (percent !== undefined) {
+      const { direction, percent, pixels } = req.body;
+      const [preY] = await page.getScrollInfo();
+      // `pixels` (when set) wins — explicit incremental motion that
+      // sidesteps the percent-vs-viewport ambiguity. Falls through to
+      // legacy direction/percent paths otherwise.
+      if (typeof pixels === 'number' && pixels > 0) {
+        await page.scrollByPixels(direction === 'up' ? 'up' : 'down', pixels);
+      } else if (percent !== undefined) {
         await page.scrollToPercent(percent);
       } else {
         await page.scrollPage(direction || 'down');
@@ -1009,6 +1019,7 @@ export function createHttpServer(
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
+        prevScrollInfo: { scrollY: preY },
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
       });
     } catch (err) {
@@ -1030,7 +1041,10 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { targetText, targetRole, direction, maxIterations, stepRatio } = req.body ?? {};
+      const {
+        targetText, targetRole, direction, maxIterations, stepRatio,
+        cadence, autoReverse, containerSelector, emitTrace,
+      } = req.body ?? {};
       if (
         (typeof targetText !== 'string' || !targetText.trim())
         && (typeof targetRole !== 'string' || !targetRole.trim())
@@ -1038,17 +1052,73 @@ export function createHttpServer(
         res.status(400).json({ error: 'targetText or targetRole required' });
         return;
       }
+      const cad = (cadence === 'fine' || cadence === 'medium' || cadence === 'coarse')
+        ? cadence
+        : undefined;
       const outcome = await page.scrollUntil({
         targetText: typeof targetText === 'string' ? targetText : undefined,
         targetRole: typeof targetRole === 'string' ? targetRole : undefined,
         direction: direction === 'up' ? 'up' : 'down',
         maxIterations: typeof maxIterations === 'number' ? maxIterations : 10,
-        stepRatio: typeof stepRatio === 'number' ? stepRatio : 0.8,
+        // Only forward stepRatio when the caller explicitly set it —
+        // otherwise let cadence drive the default. Avoids overriding
+        // the new fine/medium semantics with an old hardcoded 0.8.
+        ...(typeof stepRatio === 'number' ? { stepRatio } : {}),
+        cadence: cad,
+        autoReverse: typeof autoReverse === 'boolean' ? autoReverse : true,
+        containerSelector: typeof containerSelector === 'string' && containerSelector.trim()
+          ? containerSelector
+          : undefined,
+        emitTrace: typeof emitTrace === 'boolean' ? emitTrace : true,
       });
 
       const newState = await page.getState({ useVision: false });
       res.json({
         success: outcome.found,
+        outcome,
+        url: newState.url,
+        elements: newState.elementTree.clickableElementsToString(),
+        scrollInfo: {
+          scrollY: newState.scrollY,
+          scrollHeight: newState.scrollHeight,
+          viewportHeight: newState.viewportHeight,
+        },
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Scroll inside a popup/listbox/menu/modal. Page-level scroll won't
+   * move a popup's internal scroll, so dropdowns whose options extend
+   * below the visible menu need this. Auto-detects the most recently
+   * opened scrollable popup when `containerSelector` is omitted.
+   */
+  app.post('/session/:id/scroll-within', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const {
+        containerSelector, direction, amount, targetText, maxIterations,
+      } = req.body ?? {};
+      const amt = (amount === 'page' || amount === 'half' || typeof amount === 'number')
+        ? amount
+        : undefined;
+      const outcome = await page.scrollWithin({
+        containerSelector: typeof containerSelector === 'string' && containerSelector.trim()
+          ? containerSelector
+          : undefined,
+        direction: direction === 'up' ? 'up' : 'down',
+        amount: amt,
+        targetText: typeof targetText === 'string' && targetText.trim() ? targetText : undefined,
+        maxIterations: typeof maxIterations === 'number' ? maxIterations : undefined,
+      });
+
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: outcome.found || outcome.reason !== 'no_container',
         outcome,
         url: newState.url,
         elements: newState.elementTree.clickableElementsToString(),

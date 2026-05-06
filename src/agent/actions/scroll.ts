@@ -51,9 +51,15 @@ export const scrollUpAction = new Action({
 
 export const scrollToPercentAction = new Action({
   name: 'scroll_to_percent',
-  description: 'Scroll to a specific percentage of the page (0=top, 100=bottom)',
+  description:
+    'Jump to an ABSOLUTE position on the page (0=top, 100=bottom). '
+    + '`percent: 20` jumps to 20% of the page from the top — it is '
+    + 'NOT "scroll down by 20% from current position". For incremental '
+    + 'motion use scroll_pixels or scroll_down.',
   schema: z.object({
-    percent: z.number().min(0).max(100).describe('Scroll position as percentage'),
+    percent: z.number().min(0).max(100).describe(
+      'ABSOLUTE position 0..100 (0=top, 100=bottom). NOT incremental.',
+    ),
   }),
   handler: async (input, page) => {
     const { percent } = input as { percent: number };
@@ -61,6 +67,90 @@ export const scrollToPercentAction = new Action({
     return {
       success: true,
       extractedContent: `Scrolled to ${percent}% of page`,
+      includeInMemory: true,
+    };
+  },
+});
+
+/** Incremental pixel scroll — explicit unit, no percent confusion. */
+export const scrollPixelsAction = new Action({
+  name: 'scroll_pixels',
+  description:
+    'Incremental scroll by an explicit pixel distance. Use this for '
+    + 'fine nudges below a control that is just past the fold.',
+  schema: z.object({
+    direction: z.enum(['up', 'down']).describe('Direction to scroll'),
+    pixels: z.number().int().positive().describe(
+      'Pixels to scroll (positive). Combine with `direction` for sign.',
+    ),
+  }),
+  handler: async (input, page) => {
+    const { direction, pixels } = input as { direction: 'up' | 'down'; pixels: number };
+    await page.scrollByPixels(direction, pixels);
+    return {
+      success: true,
+      extractedContent: `Scrolled ${direction} ${pixels}px`,
+      includeInMemory: true,
+    };
+  },
+});
+
+/**
+ * Scroll INSIDE an open popup/listbox/menu/modal — page-level scroll
+ * does not move a popup's internal scroll, so dropdowns whose options
+ * extend below the visible menu need this. Auto-detects the most
+ * recently opened scrollable popup when container_selector is absent.
+ */
+export const scrollWithinAction = new Action({
+  name: 'scroll_within',
+  description:
+    'Scroll inside an open popup/listbox/menu/modal (NOT the page). '
+    + 'Use when a dropdown\'s options extend below its visible menu '
+    + 'area. Auto-detects the most recently opened popup when no '
+    + 'container_selector is given.',
+  schema: z.object({
+    container_selector: z.string().optional().describe(
+      'CSS selector for the scroll container; auto-detect if omitted.',
+    ),
+    target_text: z.string().optional().describe(
+      'If set, walks the container until this text appears.',
+    ),
+    direction: z.enum(['up', 'down']).optional(),
+    amount: z.union([z.literal('page'), z.literal('half'), z.number()]).optional().describe(
+      "'page' (default), 'half', or explicit pixels. Ignored when target_text is set.",
+    ),
+    max_iterations: z.number().int().positive().max(40).optional(),
+  }),
+  handler: async (input, page) => {
+    const opts = input as {
+      container_selector?: string;
+      target_text?: string;
+      direction?: 'up' | 'down';
+      amount?: 'page' | 'half' | number;
+      max_iterations?: number;
+    };
+    const result = await page.scrollWithin({
+      containerSelector: opts.container_selector,
+      targetText: opts.target_text,
+      direction: opts.direction,
+      amount: opts.amount,
+      maxIterations: opts.max_iterations,
+    });
+    if (result.reason === 'no_container') {
+      return {
+        success: false,
+        error:
+          'No scrollable popup found. Make sure a dropdown/menu/modal '
+          + 'is open, or pass an explicit container_selector.',
+      };
+    }
+    const summary = result.found
+      ? `Scrolled within ${result.resolvedContainer} → matched "${result.matchedText ?? ''}"`
+      : `Scrolled within ${result.resolvedContainer}: ${result.reason} `
+        + `(scrolled ${result.scrolledPx}px)`;
+    return {
+      success: true,
+      extractedContent: summary,
       includeInMemory: true,
     };
   },
