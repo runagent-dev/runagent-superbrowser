@@ -103,25 +103,63 @@ class BrowserScreenshotTool(Tool):
                 elements=data.get("elements"),
                 elements_with_bounds=overlay_elements,
                 device_pixel_ratio=dpr,
+                # v2-C: full selectorEntries (with attributes + text)
+                # so vision_pipeline can detect chevrons that vision
+                # merged into a parent row bbox and inject the missing
+                # sub-bbox.
+                selector_entries=entries,
             )
         return caption
 
 
 @tool_parameters(
-    tool_parameters_schema(session_id=StringSchema("Session ID"), required=["session_id"])
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        include_anchors=BooleanSchema(
+            description=(
+                "When true, each heading is annotated inline with "
+                "[@y=N] (its absolute scroll-Y in pixels) and a trailing "
+                "[OUTLINE scrollY=N scrollHeight=H vp=V] line is "
+                "appended. Use this when you need to approximate-scroll "
+                "to a NAMED section (e.g. 'Brand', 'Price'): read the "
+                "[@y=N] for that heading, compute pixels = y - scrollY, "
+                "then browser_scroll(direction='down', pixels=…). "
+                "Vision will finish the fine targeting once you land "
+                "in the right neighborhood. Default false (back-compat)."
+            ),
+            nullable=True,
+        ),
+        required=["session_id"],
+    )
 )
 class BrowserGetMarkdownTool(Tool):
     name = "browser_get_markdown"
-    description = "Extract page content as markdown. FREE — no screenshot cost."
+    description = (
+        "Extract page content as markdown. FREE — no screenshot cost. "
+        "Pass include_anchors=true to also get [@y=N] heading anchors "
+        "+ a trailing [OUTLINE …] line for DOM-aware approximate "
+        "scrolling: read anchor_y, compute pixels = anchor_y - "
+        "scrollY, then browser_scroll(pixels=…). Lets vision finish "
+        "the fine targeting after you land near the right section."
+    )
 
     @property
     def read_only(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, **kw: Any) -> str:
+    async def execute(
+        self,
+        session_id: str,
+        include_anchors: bool | None = None,
+        **kw: Any,
+    ) -> str:
+        params: dict[str, Any] = {}
+        if include_anchors:
+            params["include_anchors"] = "true"
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
+            params=params,
             timeout=15.0,
         )
         r.raise_for_status()

@@ -174,6 +174,26 @@ Page-type coverage rules (CRITICAL for dense filter/booking UIs):
   the others. Do NOT merge a slider_handle bbox into the slider_widget
   rectangle — they must be separate so the tool can compute the drag
   target along the track.
+- COMPOUND ROWS — single rows that combine a primary control with a
+  secondary trigger. When a row contains BOTH a primary control (checkbox,
+  radio, label, primary button) AND a secondary trigger that opens nested
+  content (chevron ▼ ▶, expand arrow, kebab ⋮, "+" next to a label, small
+  disclosure indicator on the right edge of the row), emit them as TWO
+  bboxes — NEVER one:
+    1. The primary control — tight around the checkbox/radio/label area;
+       role='checkbox'|'button'; label = visible text (e.g. "United States").
+    2. The secondary trigger — tight around the chevron/expand glyph
+       ITSELF (not the whole row); role='button'; label NAMING the action
+       (e.g. "Expand United States", "United States ▶"). Set
+       intent_relevant=true if the user task references a sub-region this
+       trigger would expose (e.g. task says "California" and the row is a
+       US-states group whose chevron opens state-level options).
+  Example: a row `[ ☐ ] United States [▼]` → emit V_a (the checkbox+label
+  area, role='checkbox', label='United States') AND V_b (the chevron only,
+  role='button', label='Expand United States').
+  Same rule for: state/region pickers with sub-trees, accordion section
+  headers (e.g. "More filters ▼"), "Edit" pencils next to a value,
+  "Remove" × on filter chips, info "ⓘ" badges on field labels.
 - `suggested_actions` is REQUIRED. Always include at least one action
   based on the stated intent. If blocking overlays exist (cookie banners,
   modals, captchas), suggest dismissing them first (priority=1).

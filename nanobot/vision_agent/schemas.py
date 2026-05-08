@@ -107,6 +107,73 @@ class BBox(BaseModel):
         description="ID of the SceneLayer this bbox belongs to. None when scene is absent.",
     )
 
+    # ---- DOM-derived enrichment fields (populated post-vision) -----
+    # These are filled by `_enrich_bboxes_with_dom_metadata` in
+    # `superbrowser_bridge.session_tools.vision_pipeline` after the
+    # vision agent returns. Vision (Gemini) never sets them. Optional
+    # so legacy producers / fixtures stay valid.
+    dom_index: Optional[int] = Field(
+        default=None,
+        description=(
+            "DOM-side [N] for browser_click(index=N) fallback when "
+            "vision-bbox click drifts. Resolved by IoU+label match "
+            "against the TS server's selectorEntries."
+        ),
+    )
+    aria_expanded: Optional[str] = Field(
+        default=None,
+        description=(
+            "Current expansion state from the DOM: 'true' | 'false' | "
+            "'mixed'. None when the underlying element doesn't carry "
+            "the attribute. Used by the precondition gate so the brain "
+            "doesn't try to click a child of a collapsed group."
+        ),
+    )
+    aria_controls_v: Optional[int] = Field(
+        default=None,
+        description=(
+            "V_n (1-based, same response) of the bbox this control "
+            "EXPANDS. Resolved by mapping aria-controls element-id "
+            "back to its bbox. None when no resolvable match."
+        ),
+    )
+    parent_expand_v: Optional[int] = Field(
+        default=None,
+        description=(
+            "V_n of an ancestor expand-button this bbox is a child "
+            "of (e.g. 'California' -> the 'Expand United States' "
+            "chevron). When the parent's aria_expanded='false', the "
+            "click_at gate refuses with [click_at_blocked:expand_"
+            "parent_first V_n]."
+        ),
+    )
+    group_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Group context derived from aria-labelledby resolution or "
+            "<fieldset><legend> ancestor. Tells the brain 'this "
+            "checkbox belongs to <group>' without forcing a parent "
+            "click. None when no group context found."
+        ),
+    )
+    is_disabled: bool = Field(
+        default=False,
+        description=(
+            "True when the underlying DOM element is disabled "
+            "(disabled attribute or aria-disabled='true'). Click "
+            "tools surface this as a soft warning."
+        ),
+    )
+    is_active: bool = Field(
+        default=False,
+        description=(
+            "True when the underlying DOM element advertises an "
+            "active state via aria-checked / aria-pressed / aria-"
+            "selected / aria-current. Lets the brain see 'this filter "
+            "is already ON' without clicking to test."
+        ),
+    )
+
     @field_validator("box_2d", mode="before")
     @classmethod
     def _coerce_box(cls, v: object) -> list[int]:
@@ -859,6 +926,14 @@ class VisionResponse(BaseModel):
             )
 
         ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
+        # Build identity → V_n map BEFORE rendering so DOM-enriched
+        # cross-bbox refs (parent_expand_v, aria_controls_v) can be
+        # resolved against the just-computed ordering. The enrichment
+        # helper writes V_n indices using the same `_rank` logic,
+        # making this map a faithful round-trip.
+        v_by_identity: dict[int, int] = {
+            id(bb): i for i, bb in enumerate(ordered, start=1)
+        }
         elements_lines: list[str] = []
         iw, ih = self._image_width, self._image_height
         for i, b in enumerate(ordered, start=1):
@@ -876,12 +951,41 @@ class VisionResponse(BaseModel):
             else:
                 ymin, xmin, ymax, xmax = b.box_2d
                 coord_text = f"(box_2d=[{ymin},{xmin},{ymax},{xmax}])"
-            elements_lines.append(
+            # DOM-derived enrichment fields. Render only when present
+            # to keep the line short on simple pages and grow only as
+            # needed on complex filter UIs. Rendered on a continuation
+            # line so the primary [V_n] line stays scannable.
+            extras: list[str] = []
+            pe = getattr(b, "parent_expand_v", None)
+            if isinstance(pe, int) and pe > 0:
+                extras.append(f"child_of=V{pe}")
+            ac = getattr(b, "aria_controls_v", None)
+            if isinstance(ac, int) and ac > 0:
+                extras.append(f"controls=V{ac}")
+            ae = getattr(b, "aria_expanded", None)
+            if ae in ("true", "false", "mixed"):
+                extras.append(f"expanded={ae}")
+            grp = getattr(b, "group_label", None)
+            if grp:
+                extras.append(f"group={grp!r}")
+            if getattr(b, "is_active", False):
+                extras.append("active=true")
+            if getattr(b, "is_disabled", False):
+                extras.append("disabled=true")
+            di = getattr(b, "dom_index", None)
+            if isinstance(di, int) and di >= 0:
+                extras.append(f"dom_idx={di}")
+            primary = (
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "
                 f"{coord_text}"
                 f"{role_tag}"
             )
+            if extras:
+                # Two-space indent under the V_n line keeps it visually
+                # subordinate. Caps at ~80 chars to avoid wrapping.
+                primary += f"\n         {'  '.join(extras)}"
+            elements_lines.append(primary)
         truncated = (
             f"  … {len(self.bboxes) - max_bboxes} more bboxes truncated"
             if len(self.bboxes) > max_bboxes

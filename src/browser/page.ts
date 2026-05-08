@@ -468,6 +468,85 @@ export class PageWrapper {
           // Fall through to tier 2; sometimes the overlay is intentional and the
           // real target dispatches on the wrapper.
         } else {
+          // A1: pre-dispatch element-at-coords sanity check. After
+          // probe + scroll-into-view, verify that the topmost element
+          // at (coords.x, coords.y) is the expected element OR a
+          // descendant of it. Catches cases where a transient overlay
+          // (toast, tooltip, lazy-loaded modal) appeared between
+          // probe and dispatch — without this, the click silently
+          // lands on the overlay instead of the intended element.
+          // Env-flag escape: SUPERBROWSER_PRECLICK_VALIDATE=0.
+          const preclickEnabled = process.env.SUPERBROWSER_PRECLICK_VALIDATE !== '0';
+          if (preclickEnabled) {
+            const validation = await this.page.evaluate(
+              (args: { sel: string; cx: number; cy: number }) => {
+                const expected = document.querySelector(args.sel) as HTMLElement | null;
+                if (!expected) return { ok: true, reason: 'no_expected' as const };
+                let stack: Element[] = [];
+                try {
+                  stack = document.elementsFromPoint(args.cx, args.cy);
+                } catch {
+                  stack = [];
+                }
+                if (stack.length === 0) {
+                  return { ok: true, reason: 'empty_stack' as const };
+                }
+                // Topmost element. If it's the expected one OR a
+                // descendant OR an ancestor (parent wrapping the
+                // child), accept.
+                const top = stack[0] as HTMLElement;
+                if (
+                  top === expected
+                  || expected.contains(top)
+                  || top.contains(expected)
+                ) {
+                  return { ok: true, reason: 'match' as const };
+                }
+                // Iframe heuristic: clicking would hit the iframe
+                // host instead of inner content.
+                if (top.tagName.toLowerCase() === 'iframe') {
+                  return {
+                    ok: false,
+                    reason: 'target_in_iframe' as const,
+                    overlay: 'iframe',
+                    overlayText: '',
+                  };
+                }
+                // Overlay covers the expected element.
+                const overlayTag = top.tagName.toLowerCase();
+                const overlayId = top.id ? `#${top.id}` : '';
+                const overlayClass = top.className && typeof top.className === 'string'
+                  ? `.${top.className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
+                  : '';
+                const overlayText = (top.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+                return {
+                  ok: false,
+                  reason: 'covered_by_overlay' as const,
+                  overlay: `${overlayTag}${overlayId}${overlayClass}`,
+                  overlayText,
+                };
+              },
+              { sel: selector, cx: coords.x, cy: coords.y },
+            );
+            if (!validation.ok) {
+              return {
+                success: false,
+                reason: validation.reason === 'target_in_iframe'
+                  ? 'element_covered'
+                  : 'element_covered',
+                tried,
+                error:
+                  validation.reason === 'target_in_iframe'
+                    ? `Click target is inside an <iframe>; CDP coords land on the iframe host, not the inner element. Switch to selectors scoped to the iframe document, or browser_click_at(vision_index=V_n) which snaps inside.`
+                    : `Element is covered by ${validation.overlay}${validation.overlayText ? ` ("${validation.overlayText}")` : ''}. The click would land on the overlay instead of the intended element. Dismiss the overlay first or wait for it to dissolve.`,
+                alternatives: [
+                  'Dismiss the covering overlay (close button, Escape key)',
+                  'browser_wait_for the overlay to disappear, then retry',
+                  'Re-screenshot to confirm the current page state',
+                ],
+              };
+            }
+          }
           tried.push('cdp');
           // Crosshair on the live view BEFORE the click so it lands in
           // the same screencast frame the user sees the page change in.
@@ -631,7 +710,17 @@ export class PageWrapper {
   async clickInBbox(
     bbox: { x0: number; y0: number; x1: number; y1: number },
     options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
-  ): Promise<{ x: number; y: number; snapped: boolean; target?: string }> {
+  ): Promise<{
+    x: number;
+    y: number;
+    snapped: boolean;
+    target?: string;
+    /** A2: advisory flag when the snapped element is inside an iframe
+     *  ('target_in_iframe') or has a pointer-events:none ancestor
+     *  ('pointer_events_none_ancestor'). The click still dispatches —
+     *  the bridge surfaces this so the brain can react. */
+    warning?: string;
+  }> {
     const snap = await this.page.evaluate(
       (b: { x0: number; y0: number; x1: number; y1: number }) => {
         const SEL = 'a,button,input,select,textarea,'
@@ -662,18 +751,66 @@ export class PageWrapper {
           // nicely in the UI overlay. The click coordinates stay at the
           // bbox centre — we don't move them.
           const interactive = (centreEl as Element).closest(SEL) || centreEl;
+          // A2: surface warning when the click would land on an
+          // iframe host (inner content unreachable via outer-doc CDP)
+          // or when an ancestor has pointer-events:none (click would
+          // pass through to whatever sits behind). These are advisory
+          // — the click still dispatches, but the bridge surfaces
+          // them so the brain can react.
+          let warning: string | undefined;
+          if (interactive.tagName.toLowerCase() === 'iframe') {
+            warning = 'target_in_iframe';
+          } else {
+            // Walk up to body looking for pointer-events:none on
+            // ancestors. A leaf with pointer-events:none doesn't
+            // intercept clicks but its ancestor with pe:none means
+            // the dispatch coords would pass through this layer and
+            // land on whatever's behind.
+            let walker: Element | null = interactive;
+            let depth = 0;
+            while (walker && walker !== document.body && depth < 8) {
+              const pe = window.getComputedStyle(walker as HTMLElement).pointerEvents;
+              if (pe === 'none') {
+                warning = 'pointer_events_none_ancestor';
+                break;
+              }
+              walker = walker.parentElement;
+              depth += 1;
+            }
+          }
           return {
             x: cx,
             y: cy,
             snapped: true,
             target: describe(interactive),
+            warning,
           };
         }
         // 2. Centre fell on empty space — bbox is probably loose or
         //    off-page. Grid-scan fallback: pick the interactive element
         //    whose rect overlaps the bbox most, click its own centre.
+        //    Chevron tiebreaker: when two grid hits have similar area
+        //    (within 30%) and one carries expand/collapse semantics
+        //    (aria-expanded, aria-haspopup, single chevron char,
+        //    aria-label matching expand/collapse/toggle/more), bias
+        //    toward the chevron. Only fires on row-shaped bboxes
+        //    (≥60×24) — for a small bbox the bbox itself IS the
+        //    chevron, no bias needed.
+        const isRowBbox = (b.x1 - b.x0) >= 60 && (b.y1 - b.y0) >= 24;
+        const CHEVRON_CHARS = '▼▶◀▲►◄⌃⌄⋮+−×⨯›';
+        const chevronScoreOf = (el: Element): number => {
+          const h = el as HTMLElement;
+          if (h.getAttribute('aria-expanded') !== null) return 3;
+          if (h.getAttribute('aria-haspopup')) return 2;
+          const t = (h.textContent || '').trim();
+          if (t.length === 1 && CHEVRON_CHARS.includes(t)) return 2;
+          const al = (h.getAttribute('aria-label') || '').toLowerCase();
+          if (/(expand|collapse|toggle|more)/.test(al)) return 1;
+          return 0;
+        };
         let best: Element | null = null;
         let bestArea = 0;
+        let bestComposite = 0;
         for (let i = 1; i < 5; i++) {
           for (let j = 1; j < 5; j++) {
             const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
@@ -687,7 +824,21 @@ export class PageWrapper {
               const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
               const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
               const area = ix * iy;
-              if (area > bestArea) { bestArea = area; best = hit; }
+              if (area <= 0) continue;
+              const cs = isRowBbox ? chevronScoreOf(hit) : 0;
+              // Composite scoring: area dominates, chevron only nudges
+              // when this candidate is within 30% of the current best.
+              // For a clean single winner the existing largest-area
+              // logic is unchanged.
+              const within30 = bestArea > 0 && area > bestArea * 0.7;
+              const composite = cs > 0 && within30
+                ? area + bestArea * 0.5 * cs
+                : area;
+              if (composite > bestComposite) {
+                bestComposite = composite;
+                bestArea = area;
+                best = hit;
+              }
             }
           }
         }
@@ -1979,31 +2130,69 @@ export class PageWrapper {
 
   async scrollPage(direction: 'up' | 'down'): Promise<void> {
     const viewportHeight = this.config.viewport.height;
-    const distance = direction === 'down' ? viewportHeight - 100 : -(viewportHeight - 100);
+    // Smaller step than viewport-100. Below-fold filter sections that
+    // sit mid-page are routinely overshot by a near-viewport scroll —
+    // the brain ends up at the bottom of a 5000px page and re-runs
+    // vision with no filter in sight. Default ratio 0.4 keeps each
+    // scroll inside ~440px on the standard 1100px viewport, so a
+    // partial-fold filter section enters view in 1–2 steps. Override
+    // via `SCROLL_STEP_RATIO` (clamped to [0.2, 0.95]); set to 0.91
+    // to recover the legacy ~viewport step.
+    const ratioRaw = process.env.SCROLL_STEP_RATIO;
+    const parsed = ratioRaw ? parseFloat(ratioRaw) : NaN;
+    const ratio = Number.isFinite(parsed)
+      ? Math.max(0.2, Math.min(0.95, parsed))
+      : 0.4;
+    const step = Math.max(80, Math.round(viewportHeight * ratio));
+    const distance = direction === 'down' ? step : -step;
     await this._windowScrollByWithFallback(distance);
     await new Promise((r) => setTimeout(r, 500));
   }
 
   async scrollToPercent(percent: number): Promise<void> {
-    await this.page.evaluate((pct: number) => {
-      const setPos = (target: number) => {
-        // Try window first.
+    // Smooth-animate over N steps. Two reasons:
+    //   1. The brain often misuses `percent` as "scroll a bit" when it
+    //      really means "teleport to N% of total". Animating gives the
+    //      page time to lazy-load AND lets vision capture intermediate
+    //      states if the brain re-screenshots mid-scroll.
+    //   2. The legacy single-step path had a math bug in the largest-
+    //      container fallback (multiplied + divided by document range,
+    //      which collapsed to nonsense on locked-body SPAs where
+    //      document range and host range disagree). Per-step targeting
+    //      against each surface's OWN range is stable on all layouts.
+    const pct = Math.max(0, Math.min(100, percent));
+    const STEPS = 4;
+    for (let i = 1; i <= STEPS; i++) {
+      const stepPct = (pct * i) / STEPS;
+      await this.page.evaluate((p: number) => {
+        // Try window first against the document's own range.
+        const docMax = Math.max(
+          0,
+          document.documentElement.scrollHeight - window.innerHeight,
+        );
+        const docTarget = Math.round(docMax * p / 100);
         const before = window.scrollY;
-        window.scrollTo(0, Math.round(target));
+        window.scrollTo(0, docTarget);
         if (Math.round(window.scrollY) !== before) return;
-        // scrollingElement fallback.
+        // scrollingElement against its own range.
         const se = document.scrollingElement as HTMLElement | null;
         if (se) {
+          const seMax = Math.max(0, se.scrollHeight - se.clientHeight);
           const seBefore = se.scrollTop;
-          se.scrollTop = Math.round(target);
+          se.scrollTop = Math.round(seMax * p / 100);
           if (se.scrollTop !== seBefore) return;
         }
-        // Largest-container fallback.
+        // Largest-container fallback — compute target against THIS
+        // host's own range, NOT the document's. Bug fix: previous code
+        // multiplied a document-range target by host-range and divided
+        // by document-range, which yields wrong scrollTop on locked-
+        // body SPAs where the two ranges disagree (often jumping the
+        // host to its end). Use percent directly against host range.
         let host: HTMLElement | null = null;
         let best = 0;
         const all = document.querySelectorAll<HTMLElement>('*');
-        for (let i = 0; i < all.length; i++) {
-          const el = all[i];
+        for (let k = 0; k < all.length; k++) {
+          const el = all[k];
           if (el.clientHeight < 200) continue;
           if (el.scrollHeight <= el.clientHeight + 4) continue;
           const cs = window.getComputedStyle(el);
@@ -2011,12 +2200,16 @@ export class PageWrapper {
           const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
           if (score > best) { best = score; host = el; }
         }
-        if (host) host.scrollTop = Math.round(target * (host.scrollHeight - host.clientHeight) / Math.max(1, document.documentElement.scrollHeight - window.innerHeight));
-      };
-      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
-      setPos(maxScroll * pct / 100);
-    }, percent);
-    await new Promise((r) => setTimeout(r, 500));
+        if (host) {
+          const hostMax = Math.max(0, host.scrollHeight - host.clientHeight);
+          host.scrollTop = Math.round(hostMax * p / 100);
+          host.setAttribute('data-sb-doc-scroll-host', '1');
+        }
+      }, stepPct);
+      // Per-step wait so vision/lazy-load has time to settle. Last
+      // step gets a longer pause so the final landing is stable.
+      await new Promise((r) => setTimeout(r, i === STEPS ? 500 : 100));
+    }
   }
 
   // Incremental scroll by an explicit pixel distance — avoids the percent-vs-
@@ -2849,8 +3042,30 @@ export class PageWrapper {
 
   // --- FROM BROWSEROS: Content extraction to markdown ---
 
-  async getMarkdownContent(): Promise<string> {
-    return this.page.evaluate(() => {
+  async getMarkdownContent(opts?: { includeAnchors?: boolean }): Promise<string> {
+    const includeAnchors = !!(opts && opts.includeAnchors);
+    return this.page.evaluate((withAnchors: boolean) => {
+      // Capture LIVE heading positions BEFORE cloning. The clone is
+      // detached from layout so getBoundingClientRect on cloned nodes
+      // returns zeros. Pair by (level, text, occurrence index) when
+      // emitting in the clone.
+      type LiveHead = { level: number; text: string; y: number; consumed: boolean };
+      const liveHeads: LiveHead[] = [];
+      if (withAnchors) {
+        for (let lvl = 1; lvl <= 6; lvl++) {
+          document.querySelectorAll(`h${lvl}`).forEach((h) => {
+            const text = (h.textContent || '').trim();
+            if (!text) return;
+            const rect = (h as HTMLElement).getBoundingClientRect();
+            // Skip headings whose ancestor is display:none / hidden;
+            // a zero-rect heading isn't useful as a scroll anchor.
+            if (rect.width <= 0 && rect.height <= 0) return;
+            const y = Math.round(rect.top + window.scrollY);
+            liveHeads.push({ level: lvl, text, y, consumed: false });
+          });
+        }
+      }
+
       // Simple markdown extraction from the page
       const clone = document.body.cloneNode(true) as HTMLElement;
 
@@ -2867,13 +3082,23 @@ export class PageWrapper {
         }
       });
 
-      // Convert headings
+      // Convert headings (with optional inline @y anchor)
       for (let i = 1; i <= 6; i++) {
         clone.querySelectorAll(`h${i}`).forEach((h) => {
           const text = h.textContent?.trim() || '';
-          if (text) {
-            h.textContent = '\n' + '#'.repeat(i) + ' ' + text + '\n';
+          if (!text) return;
+          let suffix = '';
+          if (withAnchors) {
+            // First unconsumed live heading at the same level + text.
+            const match = liveHeads.find(
+              (lh) => !lh.consumed && lh.level === i && lh.text === text,
+            );
+            if (match) {
+              match.consumed = true;
+              suffix = ` [@y=${match.y}]`;
+            }
           }
+          h.textContent = '\n' + '#'.repeat(i) + ' ' + text + suffix + '\n';
         });
       }
 
@@ -2889,8 +3114,20 @@ export class PageWrapper {
       let text = clone.innerText || clone.textContent || '';
       text = text.replace(/[ \t]+/g, ' ');
       text = text.replace(/\n{3,}/g, '\n\n');
-      return text.trim().substring(0, 50000);
-    });
+      let out = text.trim().substring(0, 50000);
+
+      if (withAnchors) {
+        // Trailing OUTLINE line — gives the brain the page envelope so
+        // it can compute pixels = (anchor_y - current_scrollY) for
+        // browser_scroll(direction='down', pixels=…) without a second
+        // tool call.
+        const sy = Math.round(window.scrollY);
+        const sh = Math.round(document.documentElement.scrollHeight);
+        const vp = Math.round(window.innerHeight);
+        out += `\n\n[OUTLINE scrollY=${sy} scrollHeight=${sh} vp=${vp}]`;
+      }
+      return out;
+    }, includeAnchors);
   }
 
   // --- FROM BROWSEROS: DOM search ---

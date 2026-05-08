@@ -409,6 +409,52 @@ class BrowserClickAtTool(Tool):
                     "vision, then retry with a higher-confidence target."
                     + (f"\n{alts}" if alts else "")
                 )
+            # B5: precondition gate. When this bbox has a parent
+            # expand-button (resolved via aria-controls during DOM
+            # enrichment) AND that parent is currently collapsed
+            # (aria_expanded='false'), refuse — clicking the child
+            # would land on something not yet rendered or already
+            # selected at group-level. Brain has to expand first.
+            if os.environ.get(
+                "BBOX_PRECONDITION_GATE", "1"
+            ) not in ("0", "false", "no"):
+                parent_v = getattr(bbox, "parent_expand_v", None)
+                if isinstance(parent_v, int) and parent_v > 0:
+                    parent_bbox = resp.get_bbox(parent_v)
+                    parent_expanded = (
+                        getattr(parent_bbox, "aria_expanded", None)
+                        if parent_bbox is not None
+                        else None
+                    )
+                    if parent_expanded == "false":
+                        parent_label = (
+                            getattr(parent_bbox, "label", "")
+                            if parent_bbox is not None
+                            else ""
+                        )
+                        my_label = (
+                            getattr(bbox, "label", "") or ""
+                        ).strip()
+                        self.s.record_cursor_failure(
+                            strategy="click_at",
+                            target=f"V{vision_index}",
+                            reason=(
+                                f"expand_parent_first V{parent_v} "
+                                f"(parent={parent_label!r})"
+                            ),
+                        )
+                        return (
+                            f"[click_at_blocked:expand_parent_first "
+                            f"V{parent_v}] V{vision_index} "
+                            f"({my_label!r}) is a child of a "
+                            f"COLLAPSED group {parent_label!r} "
+                            f"(V{parent_v}, aria_expanded=false). "
+                            f"Clicking V{vision_index} now would land "
+                            f"on a hidden / not-yet-rendered element. "
+                            f"Click V{parent_v} FIRST to expand the "
+                            f"group, then re-screenshot and retry "
+                            f"V{vision_index}."
+                        )
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return (
@@ -482,12 +528,31 @@ class BrowserClickAtTool(Tool):
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
-        snap = data.get("snap")  # {x, y, snapped: bool, target?: str}
+        snap = data.get("snap")  # {x, y, snapped: bool, target?: str, warning?: str}
         if snap:
             snap_note = (
                 f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
                 if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
             )
+            # A2: surface clickInBbox warnings so the brain can react.
+            # The click still dispatched; this is advisory — but on
+            # 'target_in_iframe' the click reliably hits the iframe
+            # host instead of inner content, so the brain should
+            # plan around it (e.g., switch to selector inside the
+            # iframe document).
+            warn = snap.get("warning")
+            if warn == "target_in_iframe":
+                snap_note += (
+                    " [WARN:target_in_iframe — click landed on the "
+                    "<iframe> host, NOT inner content. Inner-doc "
+                    "selectors require iframe-scoped tooling.]"
+                )
+            elif warn == "pointer_events_none_ancestor":
+                snap_note += (
+                    " [WARN:pointer_events_none_ancestor — an "
+                    "ancestor has pointer-events:none, the click may "
+                    "have passed through to a layer behind.]"
+                )
         else:
             snap_note = ""
 

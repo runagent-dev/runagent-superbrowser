@@ -51,6 +51,13 @@ export function getBuildDomTreeScript(): string {
     // separate probe before picking a value to pass browser_set_slider.
     'min', 'max', 'step',
     'aria-valuenow', 'aria-valuemin', 'aria-valuemax', 'aria-orientation',
+    // Relationship attrs — let the brain see parent/child/precondition
+    // semantics. aria-controls in particular tells us "this expand
+    // button opens that sub-tree", which is the load-bearing signal
+    // for compound rows like a country picker with a chevron, where
+    // clicking a sub-region first requires expanding its parent.
+    'aria-controls', 'aria-labelledby', 'aria-describedby', 'aria-owns',
+    'aria-haspopup', 'aria-current', 'aria-pressed', 'disabled',
   ];
   // Heuristic: class/id substrings that strongly imply interactivity.
   // Used as a tiebreaker when other signals are absent — e.g., a <div> with

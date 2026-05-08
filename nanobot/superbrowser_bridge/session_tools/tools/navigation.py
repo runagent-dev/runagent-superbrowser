@@ -686,13 +686,19 @@ class BrowserScrollTool(Tool):
     name = "browser_scroll"
     description = (
         "Scroll the page. Three modes: (a) `direction='up'|'down'` — "
-        "one viewport-ish step; (b) `pixels=N` (with `direction`) — "
-        "explicit incremental scroll, RECOMMENDED for fine motion; "
-        "(c) `percent=N` — ABSOLUTE position (0=top, 100=bottom). "
-        "`percent=20` is NOT 'scroll a bit', it teleports to 20% of the "
-        "page. To FIND a specific control, use `browser_scroll_until` "
-        "instead — it walks the page in small steps and tells you what "
-        "labels it passed."
+        "small viewport step (~40% of viewport, ~440px on default "
+        "viewport); use this for 'show me a bit more'; "
+        "(b) `pixels=N` (with `direction`) — explicit incremental, "
+        "RECOMMENDED for fine motion; (c) `percent=N` — ABSOLUTE "
+        "position (0=top, 100=bottom) — `percent=20` TELEPORTS to 20% "
+        "of the page, NOT 'scroll a bit'. "
+        "To FIND a NAMED below-fold control (e.g. 'Price filter', "
+        "'Brand filter', 'Apply'): DO NOT call this tool. Call "
+        "`browser_scroll_until(target_text='Price')` — it walks the "
+        "page in fine steps, narrates labels passed at each step, "
+        "auto-reverses if it overshot, and tells you whether the label "
+        "exists on this page (look for `reversed_no_match` in the "
+        "response — that means it doesn't)."
     )
 
     def __init__(self, state: BrowserSessionState):

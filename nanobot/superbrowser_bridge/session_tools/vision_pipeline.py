@@ -15,12 +15,495 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 import time
 from typing import Any
 
 import httpx
 
 from .http_client import SUPERBROWSER_URL, _request_with_backoff
+
+
+# Compound-row split helpers (v2-C). The vision prompt instructs Gemini
+# to emit chevron/expand triggers as separate bboxes, but in practice
+# Gemini occasionally merges them. The DOM-side selectorEntries tell us
+# WHERE chevrons live; we use them as a safety net to inject the
+# missing sub-bbox after vision returns.
+_COMPOUND_CHEVRON_CHARS = "▼▶◀▲►◄⌃⌄⋮"
+_COMPOUND_TASK_STOPWORDS = frozenset({
+    "this", "that", "with", "from", "into", "open", "click", "find",
+    "select", "filter", "show", "tell", "what", "which", "where",
+    "when", "page", "site", "link", "button", "search", "result",
+    "results", "item", "items", "list", "menu", "option", "options",
+})
+
+
+def _is_chevron_entry(attrs: dict[str, Any], text: str) -> bool:
+    """Decide if a DOM selectorEntry looks like an expand/collapse trigger."""
+    if not isinstance(attrs, dict):
+        return False
+    if "aria-expanded" in attrs:
+        return True
+    if attrs.get("aria-haspopup"):
+        return True
+    t = (text or "").strip()
+    if len(t) == 1 and t in _COMPOUND_CHEVRON_CHARS:
+        return True
+    al = (attrs.get("aria-label") or "").lower()
+    if al and re.search(r"expand|toggle|collapse|more", al):
+        return True
+    return False
+
+
+def _entry_pixel_rect(entry: dict) -> tuple[float, float, float, float] | None:
+    """Return (x0, y0, x1, y1) in CSS-pixel space, or None when missing."""
+    bounds = entry.get("bounds") or {}
+    if not bounds:
+        return None
+    try:
+        x0 = float(bounds.get("x") or 0.0)
+        y0 = float(bounds.get("y") or 0.0)
+        w = float(bounds.get("width") or 0.0)
+        h = float(bounds.get("height") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (x0, y0, x0 + w, y0 + h)
+
+
+def _rect_iou(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    """Standard IoU on two rectangles."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0 = max(ax0, bx0); iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1); iy1 = min(ay1, by1)
+    iw = max(0.0, ix1 - ix0); ih = max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    a_area = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+    b_area = max(1.0, (bx1 - bx0) * (by1 - by0))
+    return inter / (a_area + b_area - inter)
+
+
+def _resolve_aria_idref(
+    target_id: str,
+    selector_entries: list[dict],
+) -> dict | None:
+    """Find the selectorEntry whose attributes['id'] == target_id."""
+    if not target_id:
+        return None
+    for entry in selector_entries:
+        attrs = entry.get("attributes") or {}
+        if (attrs.get("id") or "") == target_id:
+            return entry
+    return None
+
+
+def _bbox_index_containing_entry(
+    bboxes_rects: list[tuple[int, int, int, int, float]],
+    entry_rect: tuple[float, float, float, float],
+) -> int:
+    """Return the index of a bbox whose rect contains entry_rect's centre.
+
+    Picks the SMALLEST containing bbox (most specific). -1 when no
+    containing bbox exists.
+    """
+    cx = (entry_rect[0] + entry_rect[2]) / 2.0
+    cy = (entry_rect[1] + entry_rect[3]) / 2.0
+    best = -1
+    best_area = float("inf")
+    for idx, (bx0, by0, bx1, by1, area) in enumerate(bboxes_rects):
+        if bx0 <= cx <= bx1 and by0 <= cy <= by1 and area < best_area:
+            best = idx
+            best_area = area
+    return best
+
+
+def _enrich_bboxes_with_dom_metadata(
+    resp: Any,
+    selector_entries: list[dict] | None,
+    image_w: int,
+    image_h: int,
+    dpr: float,
+    task_instruction: str | None,
+) -> int:
+    """Populate DOM-derived fields on each bbox from selectorEntries.
+
+    Mutates ``resp.bboxes`` in place. Returns count of bboxes touched.
+    Run AFTER `_apply_compound_row_split` so chevron sub-bboxes
+    injected by that helper are included in the enrichment pass.
+
+    Fields populated when an underlying selectorEntry can be matched:
+      * ``dom_index``        — selectorEntry's index for fallback clicks.
+      * ``aria_expanded``    — current 'true'/'false'/'mixed' state.
+      * ``is_disabled``      — disabled or aria-disabled.
+      * ``is_active``        — aria-checked/pressed/selected/current.
+      * ``group_label``      — aria-labelledby resolved text, when
+                               not already in the bbox label.
+      * ``aria_controls_v``  — V_n of the bbox this entry's
+                               aria-controls points to.
+      * ``parent_expand_v``  — V_n of an expand control whose
+                               aria-controls points back at this bbox.
+
+    Match policy: best-IoU between bbox pixel rect and selectorEntry
+    pixel rect, with a label-similarity tie-break. IoU floor 0.10 to
+    avoid spurious matches on dense pages.
+    """
+    if os.environ.get("BBOX_DOM_ENRICHMENT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or not getattr(resp, "bboxes", None):
+        return 0
+    if not selector_entries:
+        return 0
+    if image_w <= 0 or image_h <= 0:
+        return 0
+
+    dpr_eff = dpr if dpr and dpr > 0 else 1.0
+
+    # Build the bbox pixel-rect cache once.
+    bboxes = resp.bboxes
+    bbox_pixel_rects: list[tuple[int, int, int, int, float] | None] = []
+    for b in bboxes:
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_w, image_h, dpr=dpr_eff)
+        except Exception:
+            bbox_pixel_rects.append(None)
+            continue
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        bbox_pixel_rects.append((x0, y0, x1, y1, area))
+
+    # Build entry pixel-rect cache + entry-by-id lookup.
+    entry_rects: list[tuple[float, float, float, float] | None] = []
+    for entry in selector_entries:
+        entry_rects.append(_entry_pixel_rect(entry))
+
+    # Match each bbox to its best selectorEntry (best IoU).
+    bbox_to_entry: dict[int, int] = {}
+    used_entries: set[int] = set()
+    for bi, brect in enumerate(bbox_pixel_rects):
+        if brect is None:
+            continue
+        bb = (brect[0], brect[1], brect[2], brect[3])
+        bbox_label = (getattr(bboxes[bi], "label", "") or "").strip().lower()
+        best_ei = -1
+        best_score = 0.0
+        for ei, erect in enumerate(entry_rects):
+            if erect is None or ei in used_entries:
+                continue
+            iou = _rect_iou(bb, erect)
+            if iou < 0.10:
+                continue
+            # Light label tie-breaker: when labels overlap, bias up.
+            entry_text = (selector_entries[ei].get("text") or "").strip().lower()
+            entry_aria = ((selector_entries[ei].get("attributes") or {}).get("aria-label") or "").strip().lower()
+            label_bonus = 0.0
+            if bbox_label:
+                if bbox_label == entry_text or bbox_label == entry_aria:
+                    label_bonus = 0.15
+                elif bbox_label in entry_text or entry_text in bbox_label:
+                    label_bonus = 0.08
+            score = iou + label_bonus
+            if score > best_score:
+                best_score = score
+                best_ei = ei
+        if best_ei >= 0:
+            bbox_to_entry[bi] = best_ei
+            used_entries.add(best_ei)
+
+    # First pass — populate per-bbox attributes from the matched entry.
+    touched = 0
+    for bi, ei in bbox_to_entry.items():
+        bbox = bboxes[bi]
+        entry = selector_entries[ei]
+        attrs = entry.get("attributes") or {}
+        try:
+            bbox.dom_index = entry.get("index")
+            ae = attrs.get("aria-expanded")
+            if ae in ("true", "false", "mixed"):
+                bbox.aria_expanded = ae
+            disabled_attr = attrs.get("disabled")
+            adis = (attrs.get("aria-disabled") or "").lower() == "true"
+            bbox.is_disabled = bool(
+                (disabled_attr is not None and disabled_attr != "false")
+                or adis
+            )
+            active_signals = []
+            for k in ("aria-checked", "aria-pressed", "aria-selected"):
+                v = (attrs.get(k) or "").lower()
+                if v == "true":
+                    active_signals.append(k)
+            ac = (attrs.get("aria-current") or "").lower()
+            if ac and ac != "false":
+                active_signals.append("aria-current")
+            bbox.is_active = bool(active_signals)
+            # Group label via aria-labelledby — resolve to the
+            # referenced element's text. Only attach when it adds
+            # info (not already in the bbox label itself).
+            labelled_by = attrs.get("aria-labelledby") or ""
+            if labelled_by:
+                ref = _resolve_aria_idref(labelled_by.split()[0], selector_entries)
+                if ref:
+                    grp = (ref.get("text") or "").strip()
+                    if grp and grp.lower() not in (bbox.label or "").lower():
+                        bbox.group_label = grp[:80]
+            touched += 1
+        except Exception:
+            continue
+
+    # Second pass — wire aria_controls_v and parent_expand_v.
+    # aria-controls points an expand button at the element it controls.
+    # Convert that to V_n by:
+    #   1. find the controlled selectorEntry (by id)
+    #   2. find the bbox that bbox-contains the controlled entry
+    # The reverse direction (parent_expand_v on the controlled bbox)
+    # falls out of the same pair: the expander's bbox V_n is the parent.
+    # V_n is 1-based and uses the rendering rank, NOT the raw bbox order.
+    try:
+        ranked = sorted(bboxes, key=_replicate_rank_for_enrichment)
+        # Map bbox identity -> V_n.
+        identity_to_v: dict[int, int] = {
+            id(b): i for i, b in enumerate(ranked, 1)
+        }
+    except Exception:
+        identity_to_v = {id(b): i for i, b in enumerate(bboxes, 1)}
+
+    for bi, ei in bbox_to_entry.items():
+        bbox = bboxes[bi]
+        attrs = selector_entries[ei].get("attributes") or {}
+        controls_id = (attrs.get("aria-controls") or "").strip()
+        if not controls_id:
+            continue
+        # First ID in a space-separated list is the controlled element.
+        target_id = controls_id.split()[0]
+        target_entry = _resolve_aria_idref(target_id, selector_entries)
+        if target_entry is None:
+            continue
+        target_rect = _entry_pixel_rect(target_entry)
+        if target_rect is None:
+            continue
+        # Find the bbox whose rect contains the target's centre.
+        valid_rects = [
+            r for r in bbox_pixel_rects if r is not None
+        ]
+        # Build a parallel index map (skip Nones).
+        idx_map = [
+            i for i, r in enumerate(bbox_pixel_rects) if r is not None
+        ]
+        target_local_idx = _bbox_index_containing_entry(
+            valid_rects, target_rect,
+        )
+        if target_local_idx < 0:
+            continue
+        controlled_bi = idx_map[target_local_idx]
+        if controlled_bi == bi:
+            # The expand control and the controlled element matched
+            # the same bbox — no-op (vision merged them; the compound
+            # split helper handles that case separately).
+            continue
+        # Wire both directions.
+        try:
+            bbox.aria_controls_v = identity_to_v.get(id(bboxes[controlled_bi]))
+            bboxes[controlled_bi].parent_expand_v = identity_to_v.get(id(bbox))
+        except Exception:
+            pass
+
+    return touched
+
+
+def _replicate_rank_for_enrichment(b: Any) -> tuple[int, int, int, float]:
+    """Mirror VisionResponse._rank used by as_brain_text/get_bbox.
+
+    Kept inline so we don't import a private helper out of schemas.
+    """
+    role_in_scene = getattr(b, "role_in_scene", "") or ""
+    if role_in_scene == "blocker":
+        role_rank = 0
+    elif role_in_scene == "target":
+        role_rank = 1
+    else:
+        role_rank = 2
+    try:
+        confidence = float(getattr(b, "confidence", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return (
+        role_rank,
+        0 if getattr(b, "intent_relevant", False) else 1,
+        0 if getattr(b, "clickable", False) else 1,
+        -confidence,
+    )
+
+
+def _apply_compound_row_split(
+    resp: Any,
+    selector_entries: list[dict] | None,
+    image_w: int,
+    image_h: int,
+    dpr: float,
+    task_instruction: str | None,
+) -> int:
+    """Inject chevron sub-bboxes when vision merged a compound row.
+
+    Mutates ``resp.bboxes`` in place. Returns the count of bboxes added.
+    Safe no-op when:
+      * the env flag ``BBOX_COMPOUND_ROW_SPLIT`` is disabled,
+      * the response carries no bboxes or no usable image dims,
+      * ``selector_entries`` is empty/missing,
+      * no chevron-shaped DOM entry is enclosed by a row-shaped vision
+        bbox that doesn't already have a sibling targeting just the
+        chevron.
+    """
+    if os.environ.get("BBOX_COMPOUND_ROW_SPLIT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or not getattr(resp, "bboxes", None):
+        return 0
+    if not selector_entries:
+        return 0
+    if image_w <= 0 or image_h <= 0:
+        return 0
+    try:
+        from vision_agent.schemas import BBox  # type: ignore[import-not-found]
+    except ImportError:
+        return 0
+
+    dpr_eff = dpr if dpr and dpr > 0 else 1.0
+
+    # Pre-compute pixel rects for each existing bbox so we don't pay
+    # to_pixels() per chevron candidate.
+    bbox_rects: list[tuple[int, int, int, int, float]] = []
+    for b in resp.bboxes:
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_w, image_h, dpr=dpr_eff)
+        except Exception:
+            continue
+        area = max(1, (x1 - x0) * (y1 - y0))
+        bbox_rects.append((x0, y0, x1, y1, area))
+
+    task_lc = (task_instruction or "").lower()
+    task_tokens: list[str] = []
+    if task_lc:
+        task_tokens = [
+            t for t in re.findall(r"\b[a-z]{4,}\b", task_lc)
+            if t not in _COMPOUND_TASK_STOPWORDS
+        ]
+
+    added = 0
+    for entry in selector_entries:
+        attrs = entry.get("attributes") or {}
+        text = entry.get("text") or ""
+        bounds = entry.get("bounds") or {}
+        if not bounds:
+            continue
+        try:
+            cx0 = float(bounds.get("x") or 0.0)
+            cy0 = float(bounds.get("y") or 0.0)
+            cw = float(bounds.get("width") or 0.0)
+            ch = float(bounds.get("height") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if cw <= 0 or ch <= 0:
+            continue
+        if not _is_chevron_entry(attrs, text):
+            continue
+        cx1 = cx0 + cw
+        cy1 = cy0 + ch
+        chev_area = max(1.0, cw * ch)
+        ccx = (cx0 + cx1) / 2.0
+        ccy = (cy0 + cy1) / 2.0
+
+        # Find a row-shaped parent bbox that contains this chevron.
+        parent_idx = -1
+        for idx, (bx0, by0, bx1, by1, area) in enumerate(bbox_rects):
+            if not (bx0 <= ccx <= bx1 and by0 <= ccy <= by1):
+                continue
+            # Row shape: wide-ish, not too tall, and a few× larger than
+            # the chevron itself (so we don't try to "split" a bbox
+            # that's already targeting just the chevron).
+            if (bx1 - bx0) < 60 or (by1 - by0) < 24 or (by1 - by0) > 120:
+                continue
+            if area < chev_area * 3:
+                continue
+            parent_idx = idx
+            break
+        if parent_idx < 0:
+            continue
+
+        # Skip when another existing bbox already covers ONLY the
+        # chevron (vision did its job for this row already).
+        already_split = False
+        for idx, (bx0, by0, bx1, by1, area) in enumerate(bbox_rects):
+            if idx == parent_idx:
+                continue
+            if (bx0 <= cx0 + 2 and by0 <= cy0 + 2
+                    and bx1 + 2 >= cx1 and by1 + 2 >= cy1
+                    and area < chev_area * 4):
+                already_split = True
+                break
+        if already_split:
+            continue
+
+        parent_bbox = resp.bboxes[parent_idx]
+        parent_label = (getattr(parent_bbox, "label", "") or "").strip()
+        chev_label_attr = (attrs.get("aria-label") or "").strip()
+        if chev_label_attr:
+            new_label = chev_label_attr
+        elif parent_label:
+            new_label = f"Expand {parent_label}"
+        else:
+            new_label = "Expand row"
+
+        # Convert CSS-px bounds back to box_2d normalized [0, 1000].
+        # to_pixels does: scale = image_dim / dpr; px = norm/1000 * scale.
+        # Inverse: norm = px * dpr / image_dim * 1000.
+        def _norm_y(py: float) -> int:
+            return max(0, min(1000, int(round(py * dpr_eff / image_h * 1000))))
+
+        def _norm_x(px: float) -> int:
+            return max(0, min(1000, int(round(px * dpr_eff / image_w * 1000))))
+
+        ymin = _norm_y(cy0)
+        ymax = _norm_y(cy1)
+        xmin = _norm_x(cx0)
+        xmax = _norm_x(cx1)
+        if ymax <= ymin:
+            ymax = min(1000, ymin + 1)
+        if xmax <= xmin:
+            xmax = min(1000, xmin + 1)
+
+        # Mark as intent-relevant when the task names something the
+        # parent label doesn't cover — strong signal the chevron's
+        # sub-tree is what the user actually wants.
+        intent_rel = False
+        if task_tokens:
+            parent_tokens = set(re.findall(r"\b[a-z]{4,}\b", parent_label.lower()))
+            if any(t not in parent_tokens for t in task_tokens):
+                intent_rel = True
+
+        try:
+            new_bbox = BBox(
+                label=new_label[:120],
+                box_2d=[ymin, xmin, ymax, xmax],
+                clickable=True,
+                role="button",
+                confidence=0.7,
+                intent_relevant=intent_rel,
+                role_in_scene=getattr(parent_bbox, "role_in_scene", "unknown"),
+                layer_id=getattr(parent_bbox, "layer_id", None),
+            )
+        except Exception:
+            continue
+        resp.bboxes.append(new_bbox)
+        # Also extend the local rect cache so subsequent iterations of
+        # the chevron loop see the just-added bbox and don't double-split.
+        bbox_rects.append((int(cx0), int(cy0), int(cx1), int(cy1), chev_area))
+        added += 1
+
+    return added
 
 
 def _read_image_dims(b64: str) -> tuple[int, int]:
@@ -248,6 +731,39 @@ def _schedule_vision_prefetch(
                 task_instruction=state.task_instruction or None,
             )
             resp.with_image_dims(img_w, img_h, dpr=dpr_val)
+            # v2-C: post-vision DOM enrichment. When vision merged a
+            # compound row (parent control + chevron in one bbox), the
+            # selectorEntries from the same /state response give us the
+            # chevron's exact bounds — inject a sub-bbox so the brain
+            # has a V_n it can target directly. No-op when vision did
+            # the split itself.
+            sel_entries_pref = data.get("selectorEntries") or []
+            try:
+                _apply_compound_row_split(
+                    resp,
+                    sel_entries_pref,
+                    img_w,
+                    img_h,
+                    dpr_val,
+                    state.task_instruction,
+                )
+            except Exception as exc:
+                print(f"  [compound_row_split prefetch failed: {exc}]")
+            # Then attach DOM-derived metadata (parent_expand_v,
+            # aria_expanded, dom_index, group_label, ...). Runs AFTER
+            # the compound split so injected chevron sub-bboxes also
+            # get enriched.
+            try:
+                _enrich_bboxes_with_dom_metadata(
+                    resp,
+                    sel_entries_pref,
+                    img_w,
+                    img_h,
+                    dpr_val,
+                    state.task_instruction,
+                )
+            except Exception as exc:
+                print(f"  [dom_enrichment prefetch failed: {exc}]")
             state._last_vision_response = resp
             state._last_vision_summary = resp.summary
             state._last_vision_ts = time.time()

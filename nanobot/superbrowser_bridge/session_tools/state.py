@@ -855,6 +855,7 @@ class BrowserSessionState:
         elements: str | None = None,
         elements_with_bounds: list[dict] | None = None,
         device_pixel_ratio: float = 1.0,
+        selector_entries: list[dict] | None = None,
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -922,6 +923,40 @@ class BrowserSessionState:
                     image_height=img_h,
                     task_instruction=self.task_instruction or None,
                 )
+                # v2-C: compound-row sub-bbox split. Safety net for when
+                # vision merged a parent control + chevron into one
+                # bbox — the selectorEntries from the screenshot tool
+                # know where the chevron sits, so we can inject a
+                # dedicated V_n. No-op when vision split it itself.
+                try:
+                    from .vision_pipeline import _apply_compound_row_split
+                    _apply_compound_row_split(
+                        resp,
+                        selector_entries or [],
+                        img_w,
+                        img_h,
+                        device_pixel_ratio,
+                        self.task_instruction,
+                    )
+                except Exception as exc:
+                    print(f"  [compound_row_split build_blocks failed: {exc}]")
+                # B3: attach DOM-derived metadata to each bbox so the
+                # brain sees parent/child/expanded-state/disabled/active
+                # context (the "California is under United States" chain).
+                try:
+                    from .vision_pipeline import (
+                        _enrich_bboxes_with_dom_metadata,
+                    )
+                    _enrich_bboxes_with_dom_metadata(
+                        resp,
+                        selector_entries or [],
+                        img_w,
+                        img_h,
+                        device_pixel_ratio,
+                        self.task_instruction,
+                    )
+                except Exception as exc:
+                    print(f"  [dom_enrichment build_blocks failed: {exc}]")
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
                 self._last_vision_ts = time.time()
@@ -1063,6 +1098,30 @@ class BrowserSessionState:
             result += f"\nConsole errors: {data['consoleErrors']}"
         if data.get("pendingDialogs"):
             result += f"\nPending dialogs: {data['pendingDialogs']}"
+        # Surface scroll geometry the TS bridge reported on this action
+        # response. Wires up the [SCROLL_STATE …] contract the vision
+        # system prompt already references — vision can suggest a
+        # `scroll` action with target text when reached_bottom=false,
+        # and the worker_hook scroll-stagnation guard reads the same
+        # signal. Best-effort; never fails the result string.
+        try:
+            tel = getattr(self, "scroll_telemetry", None) or {}
+            if tel:
+                pos = int(tel.get("scrollY", 0) or 0)
+                h = int(tel.get("scrollHeight", 0) or 0)
+                vp = int(tel.get("viewportHeight", 0) or 0)
+                flags: list[str] = []
+                if tel.get("reached_top"):
+                    flags.append("reached_top=true")
+                if tel.get("reached_bottom"):
+                    flags.append("reached_bottom=true")
+                hist = list(tel.get("direction_history") or [])[-3:]
+                if hist:
+                    flags.append("last_dirs=" + ",".join(hist))
+                tail = (" " + " ".join(flags)) if flags else ""
+                result += f"\n[SCROLL_STATE pos={pos}/{h} vp={vp}{tail}]"
+        except Exception:
+            pass
         # Piggyback cached vision if it's still fresh — gives the brain
         # up-to-date bboxes after a mutating tool WITHOUT a screenshot
         # round trip + Gemini call. "Fresh" = same URL as the action's

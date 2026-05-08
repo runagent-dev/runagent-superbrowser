@@ -11,10 +11,48 @@ preserving the assistant/tool message alternation expected by LLM APIs.
 
 from __future__ import annotations
 
+import os
+import re
+
 from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
 from superbrowser_bridge.loop_detector import LoopDetector
+
+# Phase 3.3 helpers for chevron-focus guidance.
+_CHEVRON_CHARS_SET = set("▼▶◀▲►◄⌃⌄⋮")
+_CHEVRON_EXPAND_PATTERN = re.compile(r"^expand\s+(.+?)$", re.IGNORECASE)
+_CHEVRON_TASK_STOPWORDS = frozenset({
+    "this", "that", "with", "from", "into", "open", "click", "find",
+    "select", "filter", "show", "tell", "what", "which", "where",
+    "when", "page", "site", "link", "button", "search", "result",
+    "results", "item", "items", "list", "menu", "option", "options",
+})
+
+
+def _replicate_bbox_rank(bbox: object) -> tuple[int, int, int, float]:
+    """Mirror VisionResponse._rank used by as_brain_text + get_bbox.
+
+    Kept inline so we don't reach into a private function on the
+    schemas module. If the upstream ranking changes, update both.
+    """
+    role_in_scene = getattr(bbox, "role_in_scene", "") or ""
+    if role_in_scene == "blocker":
+        role_rank = 0
+    elif role_in_scene == "target":
+        role_rank = 1
+    else:
+        role_rank = 2
+    try:
+        confidence = float(getattr(bbox, "confidence", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return (
+        role_rank,
+        0 if getattr(bbox, "intent_relevant", False) else 1,
+        0 if getattr(bbox, "clickable", False) else 1,
+        -confidence,
+    )
 
 
 class BrowserWorkerHook(AgentHook):
@@ -258,6 +296,206 @@ class BrowserWorkerHook(AgentHook):
                     if needs:
                         pieces.append(needs)
                     guidance_parts.append("\n".join(pieces))
+            except Exception:
+                pass
+
+        # --- Phase 3.2: scroll-stagnation hint --------------------------
+        # Below-fold target hallucination guard. Fires before any cursor
+        # failure has been logged — catches the brain that re-screenshots
+        # the same viewport hunting V_n indices that don't exist (because
+        # the target sits below the fold) and is about to escalate to
+        # browser_run_script. Steers it into browser_scroll_until.
+        try:
+            tel = getattr(self.state, "scroll_telemetry", None) or {}
+            scroll_h = int(tel.get("scrollHeight", 0) or 0)
+            vp_h = int(tel.get("viewportHeight", 0) or 0)
+            has_capacity = scroll_h > vp_h + 200
+            reached_bottom = bool(tel.get("reached_bottom"))
+            recent = self.state.step_history[-3:] if self.state.step_history else []
+            recent_tools = [s.get("tool", "") for s in recent]
+            tried_scroll = any(t.startswith("browser_scroll") for t in recent_tools)
+            only_screenshots = (
+                len(recent_tools) >= 2
+                and all(t == "browser_screenshot" for t in recent_tools)
+            )
+            if (
+                has_capacity
+                and not reached_bottom
+                and not tried_scroll
+                and only_screenshots
+            ):
+                sid = self.state.session_id or "<session_id>"
+                guidance_parts.append(
+                    f"[SCROLL_HINT pos={int(tel.get('scrollY', 0) or 0)}/"
+                    f"{scroll_h} vp={vp_h}]\n"
+                    "The page has below-fold content and no scroll has "
+                    "happened in the last 3 turns — only re-screenshots. "
+                    "If your target (filter, button, named control) is "
+                    "plausibly off-screen, call:\n"
+                    f"  browser_scroll_until(session_id='{sid}', "
+                    "target_text='<label>')\n"
+                    "It walks the page in fine steps, narrates labels "
+                    "passed at each step, and tells you whether the "
+                    "label exists on this page (look for "
+                    "`reversed_no_match` — that means it doesn't). Do "
+                    "NOT keep screenshotting the same viewport, and do "
+                    "NOT reach for browser_run_script(mutates=true) — "
+                    "the run_script gate will refuse it until you have "
+                    "scrolled."
+                )
+        except Exception:
+            pass
+
+        # --- Phase 3.3: chevron-focus hint ------------------------------
+        # Compound-row sub-tree picker. When vision has emitted both a
+        # parent row bbox AND a sibling chevron/expand bbox, AND the
+        # task names something specific that the parent label doesn't
+        # cover (e.g. task says "California" but the row is "United
+        # States"), nudge the brain at the chevron — clicking the
+        # parent row would select the WHOLE group and miss the sub-
+        # selection the task requires.
+        if os.environ.get("WORKER_CHEVRON_FOCUS", "1") not in ("0", "false", "no"):
+            try:
+                last_resp = getattr(self.state, "_last_vision_response", None)
+                bboxes = getattr(last_resp, "bboxes", None) if last_resp else None
+                task_text = (getattr(self.state, "task_instruction", "") or "").lower()
+                if bboxes and task_text:
+                    # Match the brain's V_n indexing — same rank fn as
+                    # as_brain_text + get_bbox. Cap at 50 like the renderer.
+                    try:
+                        ranked = sorted(bboxes, key=_replicate_bbox_rank)[:50]
+                    except Exception:
+                        ranked = list(bboxes)[:50]
+                    # Build a label → V_n lookup over the ranked window.
+                    label_to_v: dict[str, int] = {}
+                    for idx, b in enumerate(ranked, 1):
+                        lbl = (getattr(b, "label", "") or "").strip().lower()
+                        if lbl and lbl not in label_to_v:
+                            label_to_v[lbl] = idx
+                    # Pre-extract task tokens once (length>=4, lowercase).
+                    task_tokens = [
+                        t for t in re.findall(r"\b[a-z]{4,}\b", task_text)
+                        if t not in _CHEVRON_TASK_STOPWORDS
+                    ]
+                    # Avoid firing the hint twice if brain already
+                    # clicked the chevron. Check last 5 click_at
+                    # attempts for the candidate V_n.
+                    recent_click_args = [
+                        str(s.get("args", ""))
+                        for s in (self.state.step_history or [])[-5:]
+                        if (s.get("tool") or "").startswith("browser_click")
+                    ]
+                    fired = False
+                    for chev_idx, b in enumerate(ranked, 1):
+                        if fired:
+                            break
+                        lbl = (getattr(b, "label", "") or "").strip()
+                        if not lbl:
+                            continue
+                        # Detect "Expand X" or single-chevron-character labels.
+                        m = _CHEVRON_EXPAND_PATTERN.match(lbl)
+                        is_chevron_glyph = (
+                            len(lbl) <= 4
+                            and any(c in _CHEVRON_CHARS_SET for c in lbl)
+                        )
+                        if not (m or is_chevron_glyph):
+                            continue
+                        parent_label = m.group(1).strip() if m else ""
+                        if not parent_label:
+                            # Glyph-only label can't tell us the parent.
+                            continue
+                        parent_v = label_to_v.get(parent_label.lower())
+                        if parent_v is None or parent_v == chev_idx:
+                            continue
+                        # Task must mention something the parent doesn't.
+                        parent_tokens = set(
+                            re.findall(r"\b[a-z]{4,}\b", parent_label.lower())
+                        )
+                        interesting = [
+                            t for t in task_tokens if t not in parent_tokens
+                        ]
+                        if not interesting:
+                            continue
+                        # Skip if brain already clicked V{chev_idx} recently.
+                        v_marker = f"V{chev_idx}"
+                        if any(v_marker in arg for arg in recent_click_args):
+                            continue
+                        sample = interesting[0]
+                        guidance_parts.append(
+                            f"[CHEVRON_FOCUS V{chev_idx}]\n"
+                            f"Task mentions '{sample}'. Row {parent_label!r} "
+                            f"(V{parent_v}) is a GROUP label — clicking "
+                            f"V{parent_v} selects the WHOLE group and skips "
+                            f"the sub-tree where '{sample}' lives. The "
+                            f"sibling chevron 'Expand {parent_label}' "
+                            f"(V{chev_idx}) opens that sub-tree. Click "
+                            f"V{chev_idx}, NOT V{parent_v}."
+                        )
+                        fired = True
+            except Exception:
+                pass
+
+        # --- Phase 3.4: precondition reminder ---------------------------
+        # When an intent-relevant bbox has a collapsed parent
+        # expand-button, surface a [PRECONDITION] block so the brain
+        # explicitly sees "click V_n to expand BEFORE clicking V_m".
+        # Complements the click_at gate (B5) which catches the wrong
+        # click after the fact — this fires before the brain even
+        # tries.
+        if os.environ.get("WORKER_PRECONDITION_HINT", "1") not in ("0", "false", "no"):
+            try:
+                last_resp = getattr(self.state, "_last_vision_response", None)
+                bboxes = getattr(last_resp, "bboxes", None) if last_resp else None
+                if bboxes:
+                    try:
+                        ranked = sorted(bboxes, key=_replicate_bbox_rank)[:50]
+                    except Exception:
+                        ranked = list(bboxes)[:50]
+                    parent_v_to_label: dict[int, str] = {}
+                    candidates: list[tuple[int, int, str, str]] = []
+                    # First pass: collect ranked-V_n for every bbox by
+                    # identity, plus collect (child_v, parent_v, child_label).
+                    v_by_id = {id(b): i for i, b in enumerate(ranked, 1)}
+                    for child_idx, b in enumerate(ranked, 1):
+                        parent_v = getattr(b, "parent_expand_v", None)
+                        if not isinstance(parent_v, int) or parent_v <= 0:
+                            continue
+                        # Only fire on intent-relevant children — too
+                        # noisy otherwise on dense filter pages.
+                        if not getattr(b, "intent_relevant", False):
+                            continue
+                        # Resolve parent bbox to read its expansion state.
+                        try:
+                            parent_bbox = last_resp.get_bbox(parent_v)
+                        except Exception:
+                            parent_bbox = None
+                        if parent_bbox is None:
+                            continue
+                        if getattr(parent_bbox, "aria_expanded", None) != "false":
+                            continue
+                        child_label = (getattr(b, "label", "") or "").strip()
+                        parent_label = (getattr(parent_bbox, "label", "") or "").strip()
+                        if not parent_label:
+                            continue
+                        # De-dup by parent_v so we don't repeat the same
+                        # 'expand X first' message for every child.
+                        if parent_v in parent_v_to_label:
+                            continue
+                        parent_v_to_label[parent_v] = parent_label
+                        candidates.append((child_idx, parent_v, child_label, parent_label))
+                    if candidates:
+                        # Cap at 2 distinct preconditions per turn — beyond
+                        # that the message gets too long.
+                        msg_lines: list[str] = ["[PRECONDITION]"]
+                        for child_v, parent_v, child_lbl, parent_lbl in candidates[:2]:
+                            msg_lines.append(
+                                f"  V{child_v} ({child_lbl!r}) is hidden "
+                                f"under collapsed group {parent_lbl!r} "
+                                f"(V{parent_v}, aria_expanded=false). "
+                                f"Click V{parent_v} FIRST to expand, then "
+                                f"re-screenshot and target V{child_v}."
+                            )
+                        guidance_parts.append("\n".join(msg_lines))
             except Exception:
                 pass
 

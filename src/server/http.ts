@@ -1577,13 +1577,23 @@ export function createHttpServer(
     }
   });
 
-  /** Extract page content as markdown. */
+  /** Extract page content as markdown.
+   *
+   * Optional `?include_anchors=true` annotates each heading with
+   * `[@y=N]` (its absolute scroll-Y position) and appends a trailing
+   * `[OUTLINE scrollY=N scrollHeight=H vp=V]` line. Used by the brain
+   * to scroll approximately to a named section: read anchors, compute
+   * `pixels = anchor_y - scrollY`, call `browser_scroll(pixels=…)`,
+   * then let vision finish the fine targeting.
+   */
   app.get('/session/:id/markdown', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const markdown = await page.getMarkdownContent();
+      const includeAnchors =
+        req.query.include_anchors === 'true' || req.query.include_anchors === '1';
+      const markdown = await page.getMarkdownContent({ includeAnchors });
       res.json({ content: markdown });
     } catch (err) {
       handleError(res, err);

@@ -104,6 +104,57 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Scroll-first gate. A page with scroll capacity remaining where
+        # the brain hasn't called any scroll-class tool in the recent
+        # window is the classic "hallucinated V_n on a below-fold target"
+        # cascade — the brain is escalating to JS before even trying to
+        # bring the target into view. Refuse and steer at scroll_until.
+        # Runs BEFORE the cursor-first lockout so the more specific
+        # message wins when both apply.
+        if (
+            bool(mutates)
+            and os.environ.get("RUN_SCRIPT_REQUIRE_SCROLL_FIRST", "1")
+                not in ("0", "false", "no")
+        ):
+            tel = getattr(self.s, "scroll_telemetry", None) or {}
+            scroll_h = int(tel.get("scrollHeight", 0) or 0)
+            vp_h = int(tel.get("viewportHeight", 0) or 0)
+            has_capacity = scroll_h > vp_h + 200
+            reached_bottom = bool(tel.get("reached_bottom"))
+            reached_top = bool(tel.get("reached_top"))
+            recent_tools = [
+                s.get("tool", "")
+                for s in (self.s.step_history or [])[-5:]
+            ]
+            tried_scroll = any(
+                t in {
+                    "browser_scroll",
+                    "browser_scroll_until",
+                    "browser_scroll_within",
+                }
+                for t in recent_tools
+            )
+            if (
+                has_capacity
+                and not reached_bottom
+                and not reached_top
+                and not tried_scroll
+            ):
+                pos = int(tel.get("scrollY", 0) or 0)
+                return (
+                    "[run_script_blocked:scroll_first_required] Page has "
+                    f"scroll capacity remaining (Y={pos}/{scroll_h}, "
+                    f"vp={vp_h}) and you haven't called any scroll-class "
+                    "tool in the last 5 turns. If your target isn't "
+                    "visible in current vision, call:\n"
+                    f"  browser_scroll_until(session_id='{session_id}', "
+                    "target_text='<the label>')\n"
+                    "It walks the page in fine steps, narrates labels "
+                    "passed, and tells you whether the label exists on "
+                    "this page. Only after that scan returns "
+                    "`reversed_no_match` should you reach for "
+                    "browser_run_script."
+                )
         # Phase 3.1: cursor-first lockout. Read-only scripts always
         # allowed (data extraction). Mutating scripts require evidence
         # that the brain has tried — and failed — at least 2 distinct
