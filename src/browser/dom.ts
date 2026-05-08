@@ -179,6 +179,30 @@ export interface DOMState {
   selectorMap: Map<number, DOMElementNode>;
 }
 
+export interface SelectorEntry {
+  index: number;
+  xpath: string;
+  tagName: string;
+  attributes: Record<string, string>;
+  text: string;
+  /** Viewport-pixel bounds. `vw`/`vh` are the viewport dims at capture time —
+   *  the Python perception-fusion layer needs both to normalize bounds into
+   *  vision's 0-1000 `box_2d` space. */
+  bounds?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    vw?: number;
+    vh?: number;
+  } | null;
+  /** Nearest semantic region landmark: toolbar | sidebar | header | footer | main.
+   *  Sent as an anchor hint to the vision prompt so Gemini stops culling
+   *  sidebar/toolbar elements on heavy pages. */
+  regionTag?: string | null;
+  role?: string;
+}
+
 export interface PageState extends DOMState {
   url: string;
   title: string;
@@ -189,6 +213,11 @@ export interface PageState extends DOMState {
   accessibilityTree?: string;
   pendingDialogs?: DialogInfo[];
   consoleErrors?: string[];
+  /** Bounds + metadata per indexed interactive element (for bbox overlays). */
+  selectorEntries?: SelectorEntry[];
+  /** Present when the current page is an error page (chrome-error, 4xx/5xx with
+   *  error-body text, DNS/TLS failure). Navigator short-circuits on this. */
+  errorPage?: import('./page-readiness.js').ErrorPage;
 }
 
 export interface DialogInfo {
@@ -200,8 +229,18 @@ export interface DialogInfo {
 /**
  * Build the DOM tree from a puppeteer page.
  * Returns a structured tree with interactive elements indexed.
+ *
+ * If `priorSelectorMap` is passed, elements whose (xpath + attrs) don't
+ * appear in the prior map are marked `isNew = true` so the LLM view
+ * renders them as `*[n]<tag/>` — browser-use's signal for "this appeared
+ * after your last action". The marker resets the next time buildDomTree
+ * runs, so it represents "new since the last step" only.
  */
-export async function buildDomTree(page: Page, viewportExpansion: number = 0): Promise<DOMState & { url: string; title: string; scrollY: number; scrollHeight: number; viewportHeight: number }> {
+export async function buildDomTree(
+  page: Page,
+  viewportExpansion: number = 0,
+  priorSelectorMap?: Map<number, DOMElementNode> | null,
+): Promise<DOMState & { url: string; title: string; scrollY: number; scrollHeight: number; viewportHeight: number; selectorEntries: RawDomResult['selectorEntries']; detectorStats?: RawDomResult['detectorStats'] }> {
   const script = getBuildDomTreeScript();
   const raw = await page.evaluate(`(${script})(${viewportExpansion})`) as RawDomResult;
 
@@ -214,6 +253,20 @@ export async function buildDomTree(page: Page, viewportExpansion: number = 0): P
   const selectorMap = new Map<number, DOMElementNode>();
   buildSelectorMap(tree, selectorMap);
 
+  // Mark new elements: hash prior map by (xpath + attrs) and flag any
+  // current element whose hash isn't in the prior set.
+  if (priorSelectorMap && priorSelectorMap.size > 0) {
+    const priorHashes = new Set<string>();
+    for (const el of priorSelectorMap.values()) {
+      priorHashes.add(identityKey(el));
+    }
+    for (const el of selectorMap.values()) {
+      if (!priorHashes.has(identityKey(el))) {
+        el.isNew = true;
+      }
+    }
+  }
+
   return {
     elementTree: tree,
     selectorMap,
@@ -222,7 +275,18 @@ export async function buildDomTree(page: Page, viewportExpansion: number = 0): P
     scrollY: raw.scrollY,
     scrollHeight: raw.scrollHeight,
     viewportHeight: raw.viewportHeight,
+    selectorEntries: raw.selectorEntries,
+    detectorStats: raw.detectorStats,
   };
+}
+
+/** Stable identity key: xpath + canonical attrs. Used for new-element diff. */
+function identityKey(el: DOMElementNode): string {
+  const attrs = Object.keys(el.attributes || {})
+    .sort()
+    .map((k) => `${k}=${el.attributes[k]}`)
+    .join('&');
+  return `${el.xpath}|${attrs}`;
 }
 
 // --- Internal helpers ---
@@ -235,12 +299,28 @@ interface RawDomResult {
     tagName: string;
     attributes: Record<string, string>;
     text: string;
+    bounds?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      vw?: number;
+      vh?: number;
+    } | null;
+    regionTag?: string | null;
+    role?: string;
   }>;
   url: string;
   title: string;
   scrollY: number;
   scrollHeight: number;
   viewportHeight: number;
+  detectorStats?: {
+    candidates: number;
+    occluded: number;
+    shadowed: number;
+    indexed: number;
+  };
 }
 
 interface RawNode {

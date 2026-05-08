@@ -16,13 +16,28 @@ export const clickElementAction = new Action({
     const { index } = input as { index: number };
     const element = state.selectorMap.get(index);
     if (!element) {
-      return { success: false, error: `Element [${index}] not found in current page` };
+      return {
+        success: false,
+        reason: 'element_not_found',
+        error: `Element [${index}] not found in current page`,
+        alternatives: ['Re-read the interactive elements list — indices may have shifted'],
+      };
     }
-    await page.clickElement(element);
+    const result = await page.clickElement(element);
+    if (!result.success) {
+      return {
+        success: false,
+        reason: result.reason,
+        tried: result.tried,
+        alternatives: result.alternatives,
+        error: `Click [${index}] failed (${result.reason ?? 'unknown'}): ${result.error ?? ''}`,
+      };
+    }
     const text = element.getAllTextTillNextClickableElement(2);
     return {
       success: true,
       extractedContent: `Clicked [${index}] "${text.substring(0, 50)}"`,
+      tried: result.tried,
       includeInMemory: true,
     };
   },
@@ -40,12 +55,27 @@ export const inputTextAction = new Action({
     const { index, text } = input as { index: number; text: string };
     const element = state.selectorMap.get(index);
     if (!element) {
-      return { success: false, error: `Element [${index}] not found` };
+      return {
+        success: false,
+        reason: 'element_not_found',
+        error: `Element [${index}] not found`,
+        alternatives: ['Re-read interactive elements list — index may be stale'],
+      };
     }
-    await page.typeText(element, text);
+    const result = await page.typeText(element, text);
+    if (!result.success) {
+      return {
+        success: false,
+        reason: result.reason,
+        tried: result.tried,
+        alternatives: result.alternatives,
+        error: `Type into [${index}] failed (${result.reason ?? 'unknown'}): ${result.error ?? ''}`,
+      };
+    }
     return {
       success: true,
       extractedContent: `Typed "${text}" into [${index}]`,
+      tried: result.tried,
       includeInMemory: true,
     };
   },

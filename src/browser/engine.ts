@@ -18,7 +18,22 @@ import { PageWrapper } from './page.js';
 puppeteer.use(StealthPlugin() as any);
 
 export interface BrowserConfig {
+  /**
+   * Legacy boolean headless flag. When `true`, old-style headless is used
+   * UNLESS `headlessMode` is also set — prefer `headlessMode` in new code.
+   * Retained for backward compatibility with callers that pass `{headless: false}`.
+   */
   headless: boolean;
+  /**
+   * Controls Chromium's headless mode:
+   *   'new'   — Puppeteer's --headless=new. Runtime matches headful closely;
+   *             fewer detectable signatures than old headless. Default.
+   *   'old'   — Legacy --headless. More detectable; kept for environments
+   *             where 'new' crashes (rare).
+   *   false   — Headful. Requires an X display; use only when running under
+   *             Xvfb or a real desktop session.
+   */
+  headlessMode?: 'new' | 'old' | false;
   viewport: { width: number; height: number };
   userAgent?: string;
   proxy?: string;
@@ -26,25 +41,51 @@ export interface BrowserConfig {
   blockAds: boolean;
   stealth: boolean;
   executablePath?: string;
+  /**
+   * Disable the GPU via --disable-gpu. Default false (GPU enabled). Setting
+   * this to true forces SwiftShader, whose WebGL vendor string is a known
+   * bot signature. Only enable for environments where GPU crashes.
+   */
+  disableGpu?: boolean;
 }
 
 const DEFAULT_CONFIG: BrowserConfig = {
   headless: true,
+  headlessMode: 'new',
   viewport: { width: 1280, height: 1100 },
   downloadDir: '/tmp/superbrowser/downloads',
   blockAds: true,
   stealth: true,
+  disableGpu: false,
 };
 
-/** Chrome launch flags for headless automation with enhanced stealth. */
+/** Chrome build identity for stealth — must stay in sync with stealth.ts. */
+const CHROME_VERSION = '130.0.6723.91';
+const CHROME_MAJOR = CHROME_VERSION.split('.')[0];
+const DEFAULT_UA =
+  `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ` +
+  `(KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36`;
+const DEFAULT_PLATFORM: 'macOS' | 'Windows' | 'Linux' = 'macOS';
+
+/**
+ * Chrome launch flags for headless automation with enhanced stealth.
+ *
+ * GPU: `--disable-gpu` is deliberately OMITTED. Disabling GPU forces
+ * Chromium to render via SwiftShader, whose WebGL UNMASKED_VENDOR is
+ * `"Google Inc. (Google)"` / renderer `"ANGLE (...) SwiftShader ..."` —
+ * a canonical bot-signature string pattern. Real desktop users rarely
+ * run with GPU disabled. For headless environments where GPU must be
+ * off (rare), set `disableGpu: true` on BrowserConfig explicitly.
+ *
+ * `--disable-accelerated-2d-canvas` is likewise OMITTED — it's closely
+ * coupled with `--disable-gpu` in fingerprint impact.
+ */
 const CHROME_FLAGS = [
   '--disable-blink-features=AutomationControlled',
   '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
   '--disable-setuid-sandbox',
   '--no-sandbox',
   '--disable-dev-shm-usage',
-  '--disable-accelerated-2d-canvas',
-  '--disable-gpu',
   '--no-first-run',
   '--no-zygote',
   '--disable-extensions',
@@ -56,6 +97,18 @@ const CHROME_FLAGS = [
   '--mute-audio',
   '--no-default-browser-check',
   '--enable-features=NetworkService,NetworkServiceInProcess',
+  // Additional anti-detection flags (from browser-use patterns)
+  '--disable-infobars',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-hang-monitor',
+  '--disable-ipc-flooding-protection',
+  '--disable-component-update',
+  '--disable-domain-reliability',
+  // Locale consistency — matches navigator.languages in stealth.ts.
+  '--lang=en-US',
+  '--accept-lang=en-US,en;q=0.9',
 ];
 
 /** Auto-detect Chrome/Chromium binary path. */
@@ -98,8 +151,28 @@ export class BrowserEngine extends EventEmitter {
       args.push(`--proxy-server=${this.config.proxy}`);
     }
 
+    // Opt-in GPU-disable for environments where Chromium can't use a GPU.
+    // Defaults to enabled — disabling GPU forces SwiftShader, a known
+    // bot-signature renderer string.
+    if (this.config.disableGpu) {
+      args.push('--disable-gpu');
+      args.push('--disable-accelerated-2d-canvas');
+    }
+
+    // Resolve headless mode. `headlessMode` takes precedence when set; the
+    // legacy `headless` boolean is honored for callers that still use it.
+    // Puppeteer accepts `true | false | 'new'` (and historically 'chrome').
+    // We map 'old' to `true` (legacy headless), 'new' to the string 'new',
+    // and false to headful.
+    const mode = this.config.headlessMode;
+    let headlessOpt: boolean | 'new';
+    if (mode === 'new') headlessOpt = 'new';
+    else if (mode === 'old') headlessOpt = true;
+    else if (mode === false) headlessOpt = false;
+    else headlessOpt = this.config.headless ? 'new' : false;
+
     const launchOptions: Record<string, unknown> = {
-      headless: this.config.headless,
+      headless: headlessOpt,
       args,
       defaultViewport: this.config.viewport,
       ignoreHTTPSErrors: true,
@@ -135,18 +208,85 @@ export class BrowserEngine extends EventEmitter {
 
     const page = await this.browser.newPage();
 
+    // Per-session seed so canvas/audio fingerprint noise is stable within
+    // a session but differs across sessions.
+    const sessionSeed = Math.floor(Math.random() * 2147483647);
+
     // Inject stealth scripts before any page script
     if (this.config.stealth) {
-      await page.evaluateOnNewDocument(getStealthScript());
+      await page.evaluateOnNewDocument(
+        getStealthScript({
+          sessionSeed,
+          chromeVersion: CHROME_VERSION,
+          platform: DEFAULT_PLATFORM,
+        }),
+      );
       await page.evaluateOnNewDocument(getPlatformOverrideScript());
     }
+
+    // Mutation counter: installs window.__nb_mutation_counter and a
+    // MutationObserver that bumps it on any childList/attribute change.
+    // Used by post-action effect verification — the HTTP mutation
+    // handlers read this before + after an action and surface the
+    // delta so the Python side can tell "Puppeteer dispatched" apart
+    // from "the page actually changed." characterData is deliberately
+    // excluded (fires on every text tick in chat apps, would tank CPU
+    // on Slack/Notion); childList+subtree+attributes is sufficient for
+    // React re-renders and DOM-level autocomplete state changes.
+    // Shim `__name` so arrow functions compiled by tsx/esbuild (which
+    // wraps every function in `__name(fn, 'name')` for name
+    // preservation) don't hit `ReferenceError: __name is not defined`
+    // when Puppeteer serializes them into the browser context. This
+    // manifested as HTTP 500s on /session/:id/click — semantic_click
+    // couldn't dismiss any popup. Keep it before the mutation observer
+    // install so that instrumentation itself doesn't trip the shim
+    // load order. `fn => fn` preserves behaviour — the `__name` helper
+    // is a decorator-style identity wrapper in practice.
+    await page.evaluateOnNewDocument(`
+      (function () {
+        try {
+          if (typeof window === 'undefined') return;
+          if (typeof window.__name !== 'function') {
+            Object.defineProperty(window, '__name', {
+              value: function (fn) { return fn; },
+              configurable: true, writable: true,
+            });
+          }
+        } catch (_) { /* silent */ }
+      })();
+    `);
+
+    await page.evaluateOnNewDocument(`
+      (function () {
+        try {
+          if (typeof window === 'undefined') return;
+          if (window.__nb_mutation_counter_installed) return;
+          window.__nb_mutation_counter_installed = true;
+          window.__nb_mutation_counter = 0;
+          var obs = new MutationObserver(function () {
+            window.__nb_mutation_counter = (window.__nb_mutation_counter || 0) + 1;
+          });
+          var start = function () {
+            if (document.documentElement) {
+              obs.observe(document.documentElement, {
+                childList: true, subtree: true, attributes: true,
+              });
+            }
+          };
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', start, { once: true });
+          } else {
+            start();
+          }
+        } catch (e) { /* never let instrumentation break the page */ }
+      })();
+    `);
 
     // Set viewport
     await page.setViewport(this.config.viewport);
 
-    // Set user agent — use configured value or a realistic default matching stealth script (Chrome 130)
-    const ua = this.config.userAgent
-      || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+    // Set user agent — derived from CHROME_VERSION so stealth UA hints stay in sync.
+    const ua = this.config.userAgent || DEFAULT_UA;
     await page.setUserAgent(ua);
 
     // Setup CDP session for download behavior

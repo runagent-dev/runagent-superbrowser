@@ -17,6 +17,7 @@ import {
 import {
   scrollDownAction, scrollUpAction, scrollToPercentAction,
   scrollToTopAction, scrollToBottomAction, scrollToTextAction,
+  scrollPixelsAction, scrollWithinAction,
 } from './actions/scroll.js';
 
 // Tabs
@@ -68,6 +69,8 @@ export function buildDefaultActionRegistry(humanInput?: HumanInputManager): Acti
   registry.register(scrollToTopAction);
   registry.register(scrollToBottomAction);
   registry.register(scrollToTextAction);
+  registry.register(scrollPixelsAction);
+  registry.register(scrollWithinAction);
   registry.register(openTabAction);
   registry.register(switchTabAction);
   registry.register(closeTabAction);

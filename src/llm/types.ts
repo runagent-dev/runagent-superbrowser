@@ -23,6 +23,12 @@ export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
   model?: string;
+  /**
+   * Force structured JSON output when supported by the provider.
+   * 'json_object': generic JSON (OpenAI JSON mode).
+   * Ignored by providers that don't support it (falls through to raw text).
+   */
+  responseFormat?: 'json_object';
 }
 
 export interface TokenUsage {

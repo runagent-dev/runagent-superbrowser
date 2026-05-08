@@ -12,8 +12,14 @@
 
 import type { Page, Frame } from 'puppeteer-core';
 import type { LLMProvider } from '../llm/provider.js';
+import { clampToRect, parseTilesStrict, captchaRectHash, type Rect } from './captcha/validation.js';
+import { sanitizeImageBuffer } from './image-safety.js';
+import { VisionMemory } from './captcha/vision-memory.js';
+import { tileIndexFromCoord } from './captcha/grid-geometry.js';
+import { getDomainStats, hostKey } from './captcha/domain-stats.js';
+import { buildObservation, coordBand, type StepOutcome as RewardOutcome, type VisibleChange } from '../agent/step-observation.js';
 
-export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'unknown';
+export type CaptchaType = 'recaptcha' | 'hcaptcha' | 'turnstile' | 'image' | 'text' | 'slider' | 'visual_puzzle' | 'unknown';
 
 export interface CaptchaInfo {
   type: CaptchaType;
@@ -39,6 +45,40 @@ export interface CaptchaSolverConfig {
  */
 export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
   return page.evaluate(() => {
+    // --- Cloudflare detection FIRST (Cloudflare pages often embed reCAPTCHA as fallback) ---
+
+    // Cloudflare managed challenge — check page title/body first
+    const pageTitle = document.title.toLowerCase();
+    const isCfPage = pageTitle.includes('just a moment')
+      || pageTitle.includes('checking your browser')
+      || pageTitle.includes('attention required');
+    if (isCfPage) {
+      return { type: 'turnstile' as const, solved: false };
+    }
+
+    // Cloudflare Turnstile widget
+    const turnstileIframe = document.querySelector(
+      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
+    ) as HTMLIFrameElement | null;
+    if (turnstileIframe) {
+      return {
+        type: 'turnstile' as const,
+        iframeSrc: turnstileIframe.src,
+        solved: false,
+      };
+    }
+
+    const turnstileDiv = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]') as HTMLElement | null;
+    if (turnstileDiv) {
+      return {
+        type: 'turnstile' as const,
+        siteKey: turnstileDiv.getAttribute('data-turnstile-sitekey') || turnstileDiv.getAttribute('data-sitekey') || undefined,
+        solved: false,
+      };
+    }
+
+    // --- Standard CAPTCHA detection ---
+
     // reCAPTCHA v2 (checkbox or invisible)
     const recaptchaIframe = document.querySelector(
       'iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]',
@@ -85,28 +125,45 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       };
     }
 
-    // Cloudflare Turnstile
-    const turnstileIframe = document.querySelector(
-      'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]',
-    ) as HTMLIFrameElement | null;
-    if (turnstileIframe) {
-      return {
-        type: 'turnstile' as const,
-        iframeSrc: turnstileIframe.src,
-        solved: false,
-      };
+    // Slider CAPTCHA detection (Temu, GeeTest, custom slider puzzles)
+    const sliderSelectors = [
+      '[class*="slider" i][class*="captcha" i]',
+      '[class*="slider" i][class*="verify" i]',
+      '[class*="slide-verify" i]',
+      '[class*="slide_verify" i]',
+      '[class*="puzzle" i][class*="slider" i]',
+      '[class*="captcha-slider" i]',
+      '[class*="geetest" i]',
+      '[id*="slider" i][id*="captcha" i]',
+      '[class*="drag" i][class*="verify" i]',
+    ];
+    for (const sel of sliderSelectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        return { type: 'slider' as const, solved: false };
+      }
     }
 
-    const turnstileDiv = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]') as HTMLElement | null;
-    if (turnstileDiv) {
-      return {
-        type: 'turnstile' as const,
-        siteKey: turnstileDiv.getAttribute('data-turnstile-sitekey') || turnstileDiv.getAttribute('data-sitekey') || undefined,
-        solved: false,
-      };
+    // Visual puzzle detection (image selection, rotation, jigsaw)
+    const puzzleSelectors = [
+      '[class*="verify-wrap" i]',
+      '[class*="verification-wrap" i]',
+      '[class*="puzzle-image" i]',
+      '[class*="captcha-image" i]',
+      '[class*="verify-img" i]',
+      '[class*="image-captcha" i]',
+    ];
+    for (const sel of puzzleSelectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        return { type: 'visual_puzzle' as const, solved: false };
+      }
     }
 
-    // Generic captcha detection (image captcha, text captcha)
+    // Generic captcha detection (image captcha, text captcha).
+    // Requires BOTH a keyword hit AND a DOM anchor for an actual captcha widget —
+    // keyword-only matches produce false positives on pages with legitimate copy
+    // like "verify your email" or security policy footers.
     const captchaKeywords = ['captcha', 'verify you are human', 'prove you are not a robot',
       'security check', 'are you a robot', 'bot verification'];
     const bodyText = (document.body.innerText || '').toLowerCase();
@@ -115,10 +172,18 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
         const captchaImg = document.querySelector(
           'img[src*="captcha"], img[alt*="captcha"], img[id*="captcha"]',
         );
-        return {
-          type: captchaImg ? 'image' as const : 'text' as const,
-          solved: false,
-        };
+        if (captchaImg) {
+          return { type: 'image' as const, solved: false };
+        }
+
+        const imgGrid = document.querySelectorAll(
+          '[class*="verify" i] img, [class*="captcha" i] img',
+        );
+        if (imgGrid.length >= 4) {
+          return { type: 'visual_puzzle' as const, solved: false };
+        }
+
+        return null;
       }
     }
 
@@ -409,11 +474,12 @@ export async function screenshotCaptchaArea(
 
   if (!rect) return null;
 
-  const screenshot = await page.screenshot({
+  const raw = await page.screenshot({
     type: 'jpeg',
     quality: 90,
     clip: rect,
   }) as Buffer;
+  const screenshot = (await sanitizeImageBuffer(raw)).buffer;
 
   return { screenshot, description: 'Captcha area screenshot for solving' };
 }
@@ -435,6 +501,62 @@ export interface CaptchaSolveResult {
   method: string;
   attempts: number;
   error?: string;
+}
+
+/**
+ * Click the reCAPTCHA "I'm not a robot" checkbox.
+ * This must be done before the challenge grid appears.
+ * Returns true if the checkbox was found and clicked, or if reCAPTCHA auto-resolved.
+ */
+export async function clickRecaptchaCheckbox(page: Page): Promise<boolean> {
+  // Find the reCAPTCHA anchor iframe (the one with the checkbox)
+  const frames = page.frames();
+  for (const frame of frames) {
+    const url = frame.url();
+    if (url.includes('recaptcha') && (url.includes('anchor') || url.includes('api2/anchor'))) {
+      try {
+        // Click the checkbox inside the anchor frame
+        const checkbox = await frame.$('.recaptcha-checkbox-border, #recaptcha-anchor');
+        if (checkbox) {
+          await checkbox.click();
+          console.log('[captcha] Clicked reCAPTCHA checkbox');
+          // Wait to see if it auto-resolves (good stealth = auto-pass)
+          await new Promise((r) => setTimeout(r, 3000));
+
+          // Check if the checkbox got a checkmark (solved without challenge)
+          const checked = await frame.evaluate(() => {
+            const anchor = document.querySelector('#recaptcha-anchor');
+            return anchor?.getAttribute('aria-checked') === 'true';
+          }).catch(() => false);
+
+          if (checked) {
+            console.log('[captcha] reCAPTCHA auto-resolved after checkbox click');
+            return true;
+          }
+          // Not auto-resolved — challenge grid should now be visible
+          return true;
+        }
+      } catch (err) {
+        console.error('[captcha] Error clicking checkbox:', err);
+      }
+    }
+  }
+
+  // Fallback: try clicking by coordinates on the main page
+  // The reCAPTCHA iframe is usually around 300x78 pixels, checkbox near left
+  const recaptchaIframe = await page.$('iframe[src*="recaptcha"][src*="anchor"]');
+  if (recaptchaIframe) {
+    const box = await recaptchaIframe.boundingBox();
+    if (box) {
+      // Checkbox is at roughly (28, 28) inside the iframe
+      await page.mouse.click(box.x + 28, box.y + 28);
+      console.log('[captcha] Clicked reCAPTCHA checkbox via coordinates');
+      await new Promise((r) => setTimeout(r, 3000));
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -556,11 +678,12 @@ export async function screenshotChallengeGrid(page: Page): Promise<ChallengeGrid
       height: gridInfo.bounds.height,
     };
 
-    const screenshot = await page.screenshot({
+    const rawGridShot = await page.screenshot({
       type: 'jpeg',
       quality: 90,
       clip: clipRect,
     }) as Buffer;
+    const screenshot = (await sanitizeImageBuffer(rawGridShot)).buffer;
 
     return {
       screenshot,
@@ -668,112 +791,6 @@ async function hasNewImages(frame: Frame): Promise<boolean> {
   }
 }
 
-/**
- * Solve captcha using AI vision (multimodal LLM).
- */
-export async function solveWithAIVision(
-  page: Page,
-  captcha: CaptchaInfo,
-  llmProvider: LLMProvider,
-  maxRounds: number = 3,
-): Promise<CaptchaSolveResult> {
-  let totalAttempts = 0;
-
-  for (let round = 0; round < maxRounds; round++) {
-    totalAttempts++;
-    const grid = await screenshotChallengeGrid(page);
-    if (!grid) {
-      return { solved: false, method: 'ai_vision', attempts: totalAttempts, error: 'Could not screenshot challenge grid' };
-    }
-
-    const b64Image = grid.screenshot.toString('base64');
-    const totalTiles = grid.rows * grid.cols;
-
-    try {
-      const response = await llmProvider.chat([
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: { url: `data:image/jpeg;base64,${b64Image}` },
-            },
-            {
-              type: 'text',
-              text: `This is a ${grid.rows}x${grid.cols} CAPTCHA image grid. The instruction says: "${grid.instruction}"
-
-Tiles are numbered 1 to ${totalTiles}, left-to-right, top-to-bottom:
-${Array.from({ length: grid.rows }, (_, r) =>
-  Array.from({ length: grid.cols }, (_, c) => r * grid.cols + c + 1).join(' | ')
-).join('\n')}
-
-Which tiles contain the target described in the instruction? Return ONLY a JSON array of tile numbers. Example: [1, 4, 7]
-If no tiles match, return an empty array: []`,
-            },
-          ],
-        },
-      ], { temperature: 0.1 });
-
-      // Parse the LLM response to extract tile indices
-      const tiles = parseTileIndices(response.content, totalTiles);
-      if (tiles.length === 0) {
-        // No matching tiles — might be wrong, try clicking verify anyway
-        await clickVerifyButton(page);
-      } else {
-        await clickChallengeTiles(page, tiles, grid);
-
-        // Check if new images appeared (dynamic reCAPTCHA)
-        if (await hasNewImages(grid.frame)) {
-          // Continue to next round to handle new images
-          continue;
-        }
-
-        await clickVerifyButton(page);
-      }
-
-      // Check if solved
-      const solved = await waitForCaptchaSolution(page, captcha, 5000, 1000);
-      if (solved) {
-        return { solved: true, method: 'ai_vision', attempts: totalAttempts };
-      }
-
-      // Not solved yet — might need another round
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`AI vision captcha attempt ${totalAttempts} failed:`, msg);
-      return { solved: false, method: 'ai_vision', attempts: totalAttempts, error: msg };
-    }
-  }
-
-  return { solved: false, method: 'ai_vision', attempts: totalAttempts, error: 'Max rounds exceeded' };
-}
-
-/**
- * Parse tile indices from LLM response text.
- * Handles various formats: [1,4,7], "1, 4, 7", "tiles 1, 4, and 7", etc.
- */
-function parseTileIndices(text: string, maxTile: number): number[] {
-  // Try JSON array first
-  const jsonMatch = text.match(/\[[\d\s,]*\]/);
-  if (jsonMatch) {
-    try {
-      const arr = JSON.parse(jsonMatch[0]) as number[];
-      return arr.filter((n) => typeof n === 'number' && n >= 1 && n <= maxTile);
-    } catch {
-      // Fall through to regex
-    }
-  }
-
-  // Extract all numbers from the text
-  const numbers = text.match(/\d+/g);
-  if (numbers) {
-    return numbers
-      .map(Number)
-      .filter((n) => n >= 1 && n <= maxTile);
-  }
-
-  return [];
-}
 
 /**
  * Solve captcha using 2captcha grid method (send screenshot, get tile indices).
@@ -883,9 +900,14 @@ function parseGridApiResult(result: string, maxTile: number): number[] {
     .filter((n) => !isNaN(n) && n >= 1 && n <= maxTile);
 }
 
+
 /**
  * Full captcha solver orchestrator.
- * Tries methods in order: token → AI vision → 2captcha grid.
+ * Tries methods in order: token → AI vision → vision generic → 2captcha grid.
+ *
+ * `options` are passed through to the registry-backed 'auto' path so the
+ * human-handoff strategy can reach the session's HumanInputManager and
+ * build a view URL.
  */
 export async function solveCaptchaFull(
   page: Page,
@@ -893,6 +915,12 @@ export async function solveCaptchaFull(
   config: CaptchaSolverConfig,
   llmProvider?: LLMProvider | null,
   method: string = 'auto',
+  options?: {
+    sessionId?: string;
+    humanInput?: import('../agent/human-input.js').HumanInputManager;
+    humanHandoffBudget?: number;
+    publicBaseUrl?: string;
+  },
 ): Promise<CaptchaSolveResult> {
   console.log(`Solving captcha (type: ${captcha.type}, method: ${method})`);
 
@@ -905,20 +933,37 @@ export async function solveCaptchaFull(
     return { solved: false, method: 'token', attempts: 0, error: 'No captcha provider configured' };
   }
 
-  // Method: AI vision only
-  if (method === 'ai_vision') {
-    if (!llmProvider) {
-      return { solved: false, method: 'ai_vision', attempts: 0, error: 'No LLM provider configured for AI vision' };
-    }
-    return solveWithAIVision(page, captcha, llmProvider);
-  }
+  // Method 'ai_vision' and 'vision_generic' were retired. Python's
+  // dedicated vision agent now handles all screenshot-driven captcha
+  // solves via browser_solve_captcha(method='vision').
 
   // Method: grid API only
   if (method === 'grid') {
     return solveWithGridApi(page, captcha, config);
   }
 
-  // Method: auto — try all strategies
+
+  // Method: auto — delegate to the strategy registry (Phase 3.1).
+  // The registry picks per-type specialized solvers (turnstile_explicit,
+  // slider_drag_feedback, recaptcha_checkbox, etc.) in priority+cost order
+  // and returns a RichSolveResult with method/subMethod/trace/timing so
+  // callers can learn which approach worked per-domain.
+  if (method === 'auto') {
+    const { solveCaptchaViaRegistry } = await import('./captcha/orchestrator.js');
+    const rich = await solveCaptchaViaRegistry(page, captcha, config, llmProvider, {
+      sessionId: options?.sessionId,
+      humanInput: options?.humanInput,
+      humanHandoffBudget: options?.humanHandoffBudget,
+      publicBaseUrl: options?.publicBaseUrl,
+    });
+    if (rich.solved || rich.method !== 'all_strategies_failed') {
+      return rich;
+    }
+    // Only fall through if the registry produced no candidate at all —
+    // preserve the legacy waterfall for unknown captcha types.
+  }
+
+  // Legacy auto waterfall (fallback when the registry has no candidate).
   // 1. Token method (fast, works 95% of the time)
   if (config.provider && config.apiKey && captcha.siteKey) {
     console.log('  Trying token method...');
@@ -929,15 +974,28 @@ export async function solveCaptchaFull(
     console.log('  Token method failed or rejected');
   }
 
-  // 2. AI vision (if LLM available)
-  if (llmProvider) {
-    console.log('  Trying AI vision method...');
-    const aiResult = await solveWithAIVision(page, captcha, llmProvider);
-    if (aiResult.solved) return aiResult;
-    console.log(`  AI vision failed: ${aiResult.error}`);
+  // 1.5. For reCAPTCHA: click the checkbox first (required before grid appears)
+  if (captcha.type === 'recaptcha') {
+    console.log('  Clicking reCAPTCHA checkbox...');
+    const clicked = await clickRecaptchaCheckbox(page);
+    if (clicked) {
+      // Re-check if captcha is still present (might have auto-resolved)
+      const recheckCaptcha = await detectCaptcha(page);
+      if (!recheckCaptcha) {
+        console.log('  reCAPTCHA auto-resolved after checkbox click');
+        return { solved: true, method: 'checkbox_autopass', attempts: 1 };
+      }
+      // Check if the token was populated (solved via checkbox)
+      const tokenFilled = await waitForCaptchaSolution(page, captcha, 3000, 500);
+      if (tokenFilled) {
+        console.log('  reCAPTCHA solved via checkbox click');
+        return { solved: true, method: 'checkbox', attempts: 1 };
+      }
+    }
   }
 
-  // 3. 2captcha grid method
+
+  // 2. 2captcha grid method
   if (config.provider === '2captcha' && config.apiKey) {
     console.log('  Trying 2captcha grid method...');
     const gridResult = await solveWithGridApi(page, captcha, config);
@@ -945,7 +1003,8 @@ export async function solveCaptchaFull(
     console.log(`  Grid method failed: ${gridResult.error}`);
   }
 
-  // 4. Wait for manual solution as last resort
+
+  // 3. Wait for manual solution as last resort
   if (!config.provider) {
     console.log('  Waiting for manual solution...');
     const solved = await waitForCaptchaSolution(page, captcha, config.timeout || 60000);

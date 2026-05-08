@@ -35,10 +35,13 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server as HttpServer } from 'http';
 import type { PageWrapper } from '../browser/page.js';
-import type { HumanInputManager, HumanInputRequest } from '../agent/human-input.js';
+import type { HumanInputManager } from '../agent/human-input.js';
 import { validateUrl } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { detectCaptcha, solveCaptchaFull } from '../browser/captcha.js';
+import { feedbackBus, type FeedbackEvent } from '../agent/feedback-bus.js';
+import { ScreencastManager } from '../browser/screencast.js';
+import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent, type ClickTargetEvent, type VisionBboxesEvent, type VisionPendingEvent } from '../browser/input-events.js';
 
 interface SessionBinding {
   page: PageWrapper;
@@ -46,14 +49,22 @@ interface SessionBinding {
   ws: WebSocket;
 }
 
+// Track WebSocket connections per session at module scope so
+// `broadcastToSession` (exported for the HTTP layer) can look up the
+// right client without iterating every open socket.
+const bindings = new Map<string, Set<SessionBinding>>();
+
+// --- Screencast streaming ---
+const screencasts = new Map<string, ScreencastManager>();
+/** Per-session throttle for cursor_move broadcasts (30 FPS = 33ms). */
+const lastCursorBroadcast = new Map<string, number>();
+const CURSOR_THROTTLE_MS = 33;
+
 export function attachWebSocketServer(
   httpServer: HttpServer,
   getSessions: () => Map<string, { page: PageWrapper; createdAt: number; lastAccessed: number }>,
 ): WebSocketServer {
   const wss = new WebSocketServer({ noServer: true });
-
-  // Track WebSocket connections per session
-  const bindings = new Map<string, SessionBinding>();
 
   // Handle HTTP upgrade to WebSocket
   httpServer.on('upgrade', (req, socket, head) => {
@@ -65,15 +76,27 @@ export function attachWebSocketServer(
       return;
     }
 
-    // Token auth on upgrade
+    // Token auth on upgrade. Loopback callers bypass — same exemption as
+    // tokenAuth in auth.ts; without it the local live-viewer can't open
+    // the screencast WebSocket once TOKEN is set, so the page renders
+    // but never streams cursor / typing frames.
     const token = process.env.TOKEN;
     if (token) {
-      const authHeader = req.headers.authorization;
-      const queryToken = url.searchParams.get('token');
-      if (authHeader !== `Bearer ${token}` && queryToken !== token) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
+      const remote = (req.socket.remoteAddress || '') as string;
+      const isLoopback =
+        process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false' &&
+        (remote === '127.0.0.1' ||
+          remote === '::1' ||
+          remote === '::ffff:127.0.0.1' ||
+          remote.startsWith('127.'));
+      if (!isLoopback) {
+        const authHeader = req.headers.authorization;
+        const queryToken = url.searchParams.get('token');
+        if (authHeader !== `Bearer ${token}` && queryToken !== token) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
       }
     }
 
@@ -96,12 +119,59 @@ export function attachWebSocketServer(
     }
 
     const binding: SessionBinding = { page: session.page, ws };
-    bindings.set(sessionId, binding);
+    const sessionSet = bindings.get(sessionId) ?? new Set<SessionBinding>();
+    sessionSet.add(binding);
+    bindings.set(sessionId, sessionSet);
 
     // Touch session
     session.lastAccessed = Date.now();
 
     sendEvent(ws, 'connected', { sessionId });
+
+    // --- Start screencast for this viewer ---
+    const bindingId = `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    let screencastMgr = screencasts.get(sessionId);
+    if (!screencastMgr) {
+      screencastMgr = new ScreencastManager(
+        () => session.page.getCDPSession(),
+        (data, ts) => {
+          broadcastToSession(wss, sessionId, 'screencast_frame', { data, ts });
+        },
+      );
+      screencasts.set(sessionId, screencastMgr);
+    }
+    screencastMgr.addViewer(bindingId).catch((err) => {
+      console.error(`[ws] screencast addViewer failed: ${(err as Error).message}`);
+    });
+
+    // Replay current feedback state on connect so a late subscriber (e.g.
+    // a WhatsApp bot reconnecting mid-handoff) catches up on in-flight
+    // captcha / error / awaiting_human state.
+    const snap = feedbackBus.getState();
+    if (snap.captchaActive) {
+      sendEvent(ws, 'feedback', {
+        kind: 'captcha_active',
+        host: '(snapshot)',
+        strategy: snap.captchaStrategy ?? 'unknown',
+      });
+    }
+    if (snap.awaitingHuman) {
+      sendEvent(ws, 'feedback', {
+        kind: 'awaiting_human',
+        detail: snap.awaitingHuman,
+      });
+    }
+    if (snap.errorPage) {
+      sendEvent(ws, 'feedback', { kind: 'error_page', detail: snap.errorPage });
+    }
+
+    // Subscribe this WS to the process-wide feedback bus. Every event
+    // becomes a `feedback` WS message — the Python bridge mirrors state
+    // into a local dict it consults before dispatching tools.
+    const onFeedback = (event: FeedbackEvent) => {
+      sendEvent(ws, 'feedback', event);
+    };
+    feedbackBus.on('event', onFeedback);
 
     // Handle incoming commands
     ws.on('message', async (raw) => {
@@ -115,12 +185,76 @@ export function attachWebSocketServer(
       }
     });
 
-    ws.on('close', () => {
-      bindings.delete(sessionId);
-    });
+    const cleanup = () => {
+      const set = bindings.get(sessionId);
+      if (set) {
+        set.delete(binding);
+        if (set.size === 0) bindings.delete(sessionId);
+      }
+      feedbackBus.off('event', onFeedback);
+      // Remove this viewer from screencast — stops CDP stream if last viewer.
+      const mgr = screencasts.get(sessionId);
+      if (mgr) {
+        mgr.removeViewer(bindingId).catch(() => {});
+        if (mgr.viewerCount === 0) {
+          screencasts.delete(sessionId);
+        }
+      }
+    };
+    ws.on('close', cleanup);
+    ws.on('error', cleanup);
+  });
 
-    ws.on('error', () => {
-      bindings.delete(sessionId);
+  // --- Input event forwarding (mouse + keyboard) -------------------------
+  // Subscribe once globally. Each event carries a sessionId, so we route
+  // to the correct session's viewers via broadcastToSession.
+  inputEventBus.on('mouse_move', (evt: MouseMoveEvent) => {
+    // Throttle to ~30 FPS per session to avoid overwhelming WS clients.
+    const last = lastCursorBroadcast.get(evt.sessionId) ?? 0;
+    if (evt.ts - last < CURSOR_THROTTLE_MS) return;
+    lastCursorBroadcast.set(evt.sessionId, evt.ts);
+    broadcastToSession(wss, evt.sessionId, 'cursor_move', { x: evt.x, y: evt.y });
+  });
+
+  inputEventBus.on('keystroke', (evt: KeystrokeEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'keystroke', { key: evt.key, type: evt.type });
+  });
+
+  // Click-target events fire once per click after the snap-to-element
+  // resolution. The viewer renders a transient crosshair so a missed
+  // click is visible without diff-ing successive screenshots.
+  inputEventBus.on('click_target', (evt: ClickTargetEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'cursor_target', {
+      x: evt.x,
+      y: evt.y,
+      snapped: evt.snapped,
+      bbox: evt.bbox,
+      target: evt.target,
+    });
+  });
+
+  // Fires after each vision pass — the viewer flashes the full set of
+  // detected bboxes on the live frame. Lets the user see what Gemini
+  // "saw" so misses can be attributed to vision vs snap. Now carries
+  // url/freshness/latencyMs so the UI can gate display by URL match
+  // and dim stale/uncertain frames instead of hiding bboxes on a timer.
+  inputEventBus.on('vision_bboxes', (evt: VisionBboxesEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'vision_bboxes', {
+      bboxes: evt.bboxes,
+      imageWidth: evt.imageWidth,
+      imageHeight: evt.imageHeight,
+      url: evt.url,
+      freshness: evt.freshness,
+      latencyMs: evt.latencyMs,
+    });
+  });
+
+  // Fires when a vision call is dispatched, BEFORE the model returns.
+  // Lets the UI show a transient "vision updating…" indicator so the
+  // user knows an overlay refresh is in flight.
+  inputEventBus.on('vision_pending', (evt: VisionPendingEvent) => {
+    broadcastToSession(wss, evt.sessionId, 'vision_pending', {
+      dispatchedAt: evt.dispatchedAt,
     });
   });
 
@@ -128,20 +262,19 @@ export function attachWebSocketServer(
 }
 
 /**
- * Broadcast an event to the WebSocket client connected to a session.
- * Called by the executor/event system when something happens.
+ * Broadcast an event to every WebSocket client subscribed to a session.
+ * Uses the module-scoped `bindings` map so the lookup is O(1) and no other
+ * session's clients see the message.
  */
 export function broadcastToSession(
-  wss: WebSocketServer,
+  _wss: WebSocketServer,
   sessionId: string,
   event: string,
   data: unknown,
 ): void {
-  // Find the binding for this session
-  for (const client of wss.clients) {
-    // We need to match by session — use the bindings approach
-    // This is handled internally via the bindings map
-  }
+  const set = bindings.get(sessionId);
+  if (!set) return;
+  for (const b of set) sendEvent(b.ws, event, data);
 }
 
 // --- Internal helpers ---
@@ -197,7 +330,16 @@ async function handleCommand(
         const state = await page.getState({ useVision: false });
         const element = state.selectorMap.get(data.index as number);
         if (!element) { sendEvent(ws, 'error', { message: `Element [${data.index}] not found` }); return; }
-        await page.clickElement(element);
+        const r = await page.clickElement(element);
+        if (!r.success) {
+          sendEvent(ws, 'error', {
+            message: r.error ?? 'click failed',
+            reason: r.reason,
+            tried: r.tried,
+            alternatives: r.alternatives,
+          });
+          return;
+        }
       } else {
         sendEvent(ws, 'error', { message: 'index or x,y required' });
         return;
@@ -213,7 +355,16 @@ async function handleCommand(
       const state = await page.getState({ useVision: false });
       const element = state.selectorMap.get(index);
       if (!element) { sendEvent(ws, 'error', { message: `Element [${index}] not found` }); return; }
-      await page.typeText(element, text, data.clear !== false);
+      const r = await page.typeText(element, text, data.clear !== false);
+      if (!r.success) {
+        sendEvent(ws, 'error', {
+          message: r.error ?? 'type failed',
+          reason: r.reason,
+          tried: r.tried,
+          alternatives: r.alternatives,
+        });
+        return;
+      }
       await sendStateEvent(ws, page);
       break;
     }
@@ -269,6 +420,7 @@ async function handleCommand(
         code,
         data.context as Record<string, unknown> | undefined,
         data.timeout as number | undefined,
+        { mutates: Boolean(data.mutates) },
       );
       sendEvent(ws, 'script_result', scriptResult);
       break;
@@ -341,34 +493,21 @@ async function handleCommand(
       break;
     }
 
+    // --- Screencast pause/resume (sent by view page on visibilitychange) ---
+    case 'screencast_pause': {
+      const mgr = screencasts.get(sessionId);
+      // We don't have bindingId here, so use a generic pause
+      if (mgr) mgr.removeViewer(`pause-${sessionId}`).catch(() => {});
+      break;
+    }
+    case 'screencast_resume': {
+      const mgr = screencasts.get(sessionId);
+      if (mgr) mgr.addViewer(`pause-${sessionId}`).catch(() => {});
+      break;
+    }
+
     default:
       sendEvent(ws, 'error', { message: `Unknown action: ${msg.action}` });
   }
 }
 
-/**
- * Create a function that pushes human input requests over WebSocket.
- * Wire this to the HumanInputManager so gateway clients get notified instantly.
- */
-export function createHumanInputBridge(
-  wss: WebSocketServer,
-  sessionId: string,
-  humanInput: HumanInputManager,
-): void {
-  // Poll for pending requests and broadcast
-  // (The HumanInputManager uses a blocking promise pattern,
-  //  so we intercept by checking after requestInput is called)
-  const checkInterval = setInterval(() => {
-    const pending = humanInput.getPendingRequest();
-    if (pending) {
-      for (const client of wss.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          sendEvent(client, 'human_input', pending);
-        }
-      }
-    }
-  }, 500);
-
-  // Cleanup when no longer needed
-  wss.on('close', () => clearInterval(checkInterval));
-}

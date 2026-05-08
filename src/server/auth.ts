@@ -11,12 +11,31 @@ import type { Request, Response, NextFunction } from 'express';
  * Bearer token authentication middleware.
  * If TOKEN env var is set, all requests must include it.
  * If TOKEN is not set, auth is disabled (development mode).
+ *
+ * Loopback callers (127.0.0.1, ::1) are bypassed so the local live-viewer
+ * UI and the same-host nanobot bridge work without smuggling tokens into
+ * every <img>/<script>/WebSocket fetch. This mirrors the loopback bypass
+ * already in `RateLimiter.isLoopback`. Set
+ * `TOKEN_AUTH_LOOPBACK_BYPASS=false` to enforce auth for local traffic too.
  */
 export function tokenAuth(req: Request, res: Response, next: NextFunction): void {
   const token = process.env.TOKEN;
   if (!token) {
     next();
     return;
+  }
+
+  if (process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false') {
+    const ip = req.ip || req.socket.remoteAddress || '';
+    if (
+      ip === '127.0.0.1' ||
+      ip === '::1' ||
+      ip === '::ffff:127.0.0.1' ||
+      ip.startsWith('127.')
+    ) {
+      next();
+      return;
+    }
   }
 
   const authHeader = req.headers.authorization;
@@ -104,15 +123,24 @@ export function isValidSessionId(id: string): boolean {
 
 /**
  * Simple in-memory per-IP rate limiter.
+ *
+ * Loopback callers (127.0.0.1, ::1) are exempted by default — the whole
+ * nanobot bridge + WebSocket client traffic comes from the same local IP
+ * as the server, and one agent run easily does 200+ requests per minute
+ * (state fetches, element list refreshes, feedback polls, click/type
+ * rounds). Counting them against the bucket caused hard-to-diagnose 429s
+ * mid-run. Set RATE_LIMIT_LOOPBACK_BYPASS=false to re-enable enforcement.
  */
 export class RateLimiter {
   private requests = new Map<string, { count: number; resetAt: number }>();
   private maxRequests: number;
   private windowMs: number;
+  private loopbackBypass: boolean;
 
   constructor(maxRequests: number = 100, windowMs: number = 60000) {
     this.maxRequests = maxRequests;
     this.windowMs = windowMs;
+    this.loopbackBypass = process.env.RATE_LIMIT_LOOPBACK_BYPASS !== 'false';
 
     // Cleanup old entries periodically
     setInterval(() => {
@@ -123,7 +151,18 @@ export class RateLimiter {
     }, windowMs);
   }
 
+  private isLoopback(ip: string): boolean {
+    return (
+      ip === '127.0.0.1' ||
+      ip === '::1' ||
+      ip === '::ffff:127.0.0.1' ||
+      ip.startsWith('127.') ||
+      ip === 'unknown' // fallback when req.ip/remoteAddress both failed
+    );
+  }
+
   check(ip: string): boolean {
+    if (this.loopbackBypass && this.isLoopback(ip)) return true;
     const now = Date.now();
     const entry = this.requests.get(ip);
 
@@ -142,7 +181,14 @@ export class RateLimiter {
       if (this.check(ip)) {
         next();
       } else {
-        res.status(429).json({ error: 'Too many requests — try again later' });
+        // Include Retry-After so well-behaved clients back off without
+        // the LLM having to reason about the delay.
+        res.setHeader('Retry-After', '30');
+        res.status(429).json({
+          error: 'Too many requests — try again later',
+          retry_after_seconds: 30,
+          transient: true,
+        });
       }
     };
   }

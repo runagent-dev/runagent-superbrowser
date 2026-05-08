@@ -20,6 +20,18 @@ from pathlib import Path
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Load the project-root .env BEFORE any module reads os.environ. The TS
+# server picks these up via node dotenv; Python was previously missing
+# the same step, which meant VISION_ENABLED / VISION_API_KEY / etc. never
+# reached the Python vision preprocessor. Result: every browser tool call
+# fell through to the legacy image-blocks path and nanobot's brain paid
+# image tokens on every screenshot.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass  # dotenv optional; env can still be set in the shell.
+
 
 async def main():
     from nanobot import Nanobot
