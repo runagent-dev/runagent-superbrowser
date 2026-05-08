@@ -228,6 +228,68 @@ async def _t3_dispatch_from_http(
             )
             return _T3Response(data)
 
+        if verb == "back":
+            # Surgical undo support on T3. Patchright doesn't expose a
+            # rich goBack with effect snapshotting, so we approximate
+            # via JS history.back() + a short settle. The Python
+            # recovery tool re-fetches state to confirm URL drift after
+            # each step, so a missing effect block here is acceptable.
+            try:
+                await mgr.evaluate(sid, "history.back()")
+                await asyncio.sleep(0.6)
+                state_data = await mgr.state(sid, use_vision=False)
+                return _T3Response({
+                    "success": True,
+                    "url": state_data.get("url", ""),
+                    "title": state_data.get("title", ""),
+                    "elements": state_data.get("elementsText", ""),
+                    "effect": {
+                        "url_changed": True,
+                        "mutation_delta": 0,
+                        "focused_changed": False,
+                    },
+                })
+            except Exception as exc:
+                return _T3Response(
+                    {"success": False, "error": f"t3 back failed: {exc}"},
+                    status_code=500,
+                )
+
+        if verb == "probe-aria" or verb == "probe_aria":
+            sel = body.get("selector", "")
+            if not isinstance(sel, str) or not sel:
+                return _T3Response(
+                    {"error": "selector is required"}, status_code=400,
+                )
+            try:
+                probe_js = (
+                    "(sel) => {"
+                    " const el = document.querySelector(sel);"
+                    " if (!el) return null;"
+                    " const ac = el.getAttribute('aria-checked');"
+                    " const ap = el.getAttribute('aria-pressed');"
+                    " const as_ = el.getAttribute('aria-selected');"
+                    " const acu = el.getAttribute('aria-current');"
+                    " const truthy = (v) => v != null && v !== 'false' && v !== '';"
+                    " const noneSet = (ac == null && ap == null && as_ == null && acu == null);"
+                    " return {"
+                    "  ariaChecked: ac, ariaPressed: ap,"
+                    "  ariaSelected: as_, ariaCurrent: acu,"
+                    "  isActive: noneSet ? null :"
+                    "    (truthy(ac) || truthy(ap) || truthy(as_) || truthy(acu))"
+                    " };"
+                    "}"
+                )
+                result = await mgr.evaluate(sid, probe_js, arg=sel)
+                if result is None:
+                    return _T3Response({"success": False, "found": False})
+                return _T3Response({"success": True, "found": True, **result})
+            except Exception as exc:
+                return _T3Response(
+                    {"success": False, "error": f"t3 probe-aria failed: {exc}"},
+                    status_code=500,
+                )
+
         # Captcha verbs — map URL shapes like /captcha/detect, /captcha/solve,
         # /captcha/screenshot to the antibot.captcha module.
         if verb == "captcha":

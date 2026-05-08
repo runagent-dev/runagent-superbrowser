@@ -173,6 +173,19 @@ class BBox(BaseModel):
             "is already ON' without clicking to test."
         ),
     )
+    just_toggled: Optional[Literal["on", "off"]] = Field(
+        default=None,
+        description=(
+            "Set by the vision pipeline AFTER a click action when this "
+            "bbox's is_active flipped relative to the previous vision "
+            "epoch. 'on' = false→true (filter just applied), 'off' = "
+            "true→false (filter just removed). The bridge surfaces "
+            "this so the brain can recognize an unintentional toggle "
+            "and re-click the SAME V_n to undo it without navigating "
+            "away. Vision (Gemini) never sets this; only the post-"
+            "click comparison fills it."
+        ),
+    )
 
     @field_validator("box_2d", mode="before")
     @classmethod
@@ -970,6 +983,12 @@ class VisionResponse(BaseModel):
                 extras.append(f"group={grp!r}")
             if getattr(b, "is_active", False):
                 extras.append("active=true")
+            jt = getattr(b, "just_toggled", None)
+            if jt in ("on", "off"):
+                # 'on' = was false, now true (filter just applied);
+                # 'off' = was true, now false (filter just removed).
+                # Brain reads this and knows: re-click V_n undoes it.
+                extras.append(f"just_toggled={jt}")
             if getattr(b, "is_disabled", False):
                 extras.append("disabled=true")
             di = getattr(b, "dom_index", None)

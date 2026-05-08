@@ -12,6 +12,13 @@ import type { CDPSession, Page } from 'puppeteer-core';
 export interface ElementCoords {
   x: number;
   y: number;
+  /** v6 H1: true when the source CSS selector matched 2+ elements
+   *  and only the FIRST match's coords were returned. Click validation
+   *  (A1) tightens to require exact-element match in this case to
+   *  avoid clicking the wrong matching element. */
+  ambiguous?: boolean;
+  /** v6 H1: actual count of matching elements (>=1 when ambiguous=true). */
+  matchCount?: number;
 }
 
 /**
@@ -108,12 +115,15 @@ export async function getElementCenterBySelector(
 ): Promise<ElementCoords | null> {
   try {
     const result = await page.evaluate((sel: string) => {
-      const el = document.querySelector(sel);
-      if (!el) return null;
+      const matches = document.querySelectorAll(sel);
+      if (matches.length === 0) return null;
+      const el = matches[0];
       const rect = el.getBoundingClientRect();
       return {
         x: Math.round(rect.left + rect.width / 2),
         y: Math.round(rect.top + rect.height / 2),
+        ambiguous: matches.length > 1,
+        matchCount: matches.length,
       };
     }, selector);
     return result;
@@ -233,6 +243,19 @@ export async function domSearchCDP(
 }
 
 /**
+ * Diagnostic shape for an ambiguous trigger candidate, surfaced when
+ * the picker can't confidently pick one trigger over another.
+ */
+export interface TriggerCandidate {
+  selector: string;
+  score: number;
+  currentText: string;
+  role: string;
+  ariaPopup: string;
+  tag: string;
+}
+
+/**
  * Result of selectOptionByLabel.
  */
 export interface SelectOptionByLabelResult {
@@ -250,6 +273,104 @@ export interface SelectOptionByLabelResult {
   dom_changed?: boolean;   // did anything new become visible after open?
   new_classes?: string[];  // top sample of newly-visible class names
   trigger_score?: number;  // how confident the trigger picker was (Phase C)
+  // Hardening additions:
+  ambiguous_trigger?: { candidates: TriggerCandidate[] };
+  ambiguous_option?: { candidates: string[] };
+  navigated_to?: { url: string; path: string; hash: string; titleChanged: boolean };
+  verified_focus_target?: string;
+  selected_index?: number;
+}
+
+/**
+ * Frozen snapshot of page state used to detect navigation between two
+ * points in time — strictly more sensitive than the historical URL+title
+ * pair: also flags pushState SPA route changes (different pathname/hash
+ * with same URL string), pushState-with-same-URL (history grew), and
+ * full-content swaps where the URL stays identical but the visible
+ * `<main>` body changed substantially.
+ */
+export interface NavFingerprint {
+  url: string;
+  pathname: string;
+  hash: string;
+  title: string;
+  historyLength: number;
+  contentHash: string;
+}
+
+/**
+ * Capture a single navigation fingerprint for the page. One round trip.
+ * Failure-tolerant: any throw returns an all-zero fingerprint that
+ * compares unequal so we conservatively flag "navigation" rather than
+ * miss it.
+ */
+export async function navFingerprint(page: Page): Promise<NavFingerprint> {
+  try {
+    return await page.evaluate(() => {
+      const main = (document.querySelector('main')
+        || document.body) as HTMLElement | null;
+      const head = main
+        ? (main.innerText || main.textContent || '').slice(0, 2048)
+        : '';
+      let h = 5381 >>> 0;
+      for (let i = 0; i < head.length; i++) {
+        h = (((h << 5) + h) ^ head.charCodeAt(i)) >>> 0;
+      }
+      return {
+        url: location.href,
+        pathname: location.pathname,
+        hash: location.hash,
+        title: document.title,
+        historyLength: history.length,
+        contentHash: h.toString(16),
+      };
+    });
+  } catch {
+    return {
+      url: '', pathname: '', hash: '',
+      title: '', historyLength: 0, contentHash: '',
+    };
+  }
+}
+
+/**
+ * Decide whether two NavFingerprints represent a navigation event.
+ * Conservative: any of pathname / hash / title (with no popup) /
+ * historyLength + same URL / 1KB+ content delta counts as navigated.
+ */
+function navFingerprintChanged(
+  pre: NavFingerprint,
+  post: NavFingerprint,
+  popupAppeared: boolean,
+): { changed: boolean; kind: string } {
+  if (!pre.url && !post.url) return { changed: false, kind: '' };
+  if (pre.pathname !== post.pathname) return { changed: true, kind: 'pathname' };
+  if (pre.hash !== post.hash) return { changed: true, kind: 'hash' };
+  if (
+    pre.title !== post.title
+    && !popupAppeared
+    && pre.title !== ''
+  ) {
+    return { changed: true, kind: 'title' };
+  }
+  // pushState with identical URL bumps historyLength.
+  if (
+    pre.url === post.url
+    && post.historyLength > pre.historyLength
+  ) {
+    return { changed: true, kind: 'historyLength' };
+  }
+  // Full content swap with no URL change. Require both contentHashes
+  // to be non-empty (zero hash means we failed to capture).
+  if (
+    pre.contentHash
+    && post.contentHash
+    && pre.contentHash !== post.contentHash
+    && !popupAppeared
+  ) {
+    return { changed: true, kind: 'content' };
+  }
+  return { changed: false, kind: '' };
 }
 
 /**
@@ -270,6 +391,14 @@ export async function selectOptionByLabel(
     timeout?: number;
     extraOpenSelectors?: string[];
     extraOptionSelectors?: string[];
+    /**
+     * When provided, skip the label-based trigger picker entirely and
+     * use this selector as the trigger. The element MUST already be
+     * tagged (e.g. with a `data-sb-trigger` attribute) so the rest of
+     * the function's `data-sb-trigger` lookups still work. Used by
+     * `selectOptionByVisionBbox` to bypass DOM-text ambiguity.
+     */
+    triggerSelector?: string;
   },
 ): Promise<SelectOptionByLabelResult> {
   const start = Date.now();
@@ -282,20 +411,77 @@ export async function selectOptionByLabel(
   const timeout = Math.max(500, Math.min(20000, opts.timeout ?? 6000));
   const extraOptionSelectors = opts.extraOptionSelectors ?? [];
 
-  // 1. Locate trigger by label. SCORED picker (Phase C): when multiple
-  //    candidates contain the label text, prefer ones with explicit
-  //    dropdown semantics. Skips heading-shaped elements (full-width,
-  //    short height) which often steal the match on retail SPAs.
-  const trigger = await page.evaluate((lbl: string) => {
+  // 1. Locate trigger by label. SCORED picker with affordance gate +
+  //    tiered match priority + ambiguity detection.
+  //
+  //    Affordance gate: a candidate must show real popup affordance
+  //    (native <select>, role=combobox/listbox/menu, aria-haspopup,
+  //    aria-expanded, datalist input, or chevron-shaped button) — not
+  //    just text-contains the label. Eliminates the "heading-shaped
+  //    <a> titled Region" silent misfire where a navigation card
+  //    shaped like a card stole the click.
+  //
+  //    Tiered priority: exactAria > exactText > exactPlaceholder >
+  //    startsWithAria > startsWithText > containsAria > containsText
+  //    (with word boundaries on the contains tier). "Region Settings"
+  //    no longer outranks "Region" via plain substring contains.
+  //
+  //    Ambiguity: when top-1 vs top-2 gap is < 4 AND top-2 score >= 0,
+  //    return ambiguous_trigger with candidate list. Brain narrows the
+  //    label or passes vision_index instead of guessing.
+  // Fast path: trigger already resolved by caller (e.g.
+  // selectOptionByVisionBbox snapped to a bbox). Skip the label
+  // picker; just read metadata.
+  let preResolvedTrigger:
+    | {
+        kind: 'pick';
+        trigger: {
+          selector: string;
+          isNativeSelect: boolean;
+          currentText: string;
+          role: string;
+          ariaExpanded: string;
+          score: number;
+        };
+      }
+    | { kind: 'none' }
+    | null = null;
+  if (opts.triggerSelector) {
+    const meta = await page.evaluate((sel: string) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) return null;
+      return {
+        isNativeSelect: el.tagName.toLowerCase() === 'select',
+        currentText: ((el.textContent || '').replace(/\s+/g, ' ').trim()).slice(0, 200),
+        role: el.getAttribute('role') || '',
+        ariaExpanded: el.getAttribute('aria-expanded') || '',
+      };
+    }, opts.triggerSelector);
+    if (meta) {
+      preResolvedTrigger = {
+        kind: 'pick',
+        trigger: {
+          selector: opts.triggerSelector,
+          isNativeSelect: meta.isNativeSelect,
+          currentText: meta.currentText,
+          role: meta.role,
+          ariaExpanded: meta.ariaExpanded,
+          score: 100,  // synthetic — caller asserted this is the right element
+        },
+      };
+    } else {
+      preResolvedTrigger = { kind: 'none' };
+    }
+  }
+
+  const triggerResult = preResolvedTrigger ?? await page.evaluate((lbl: string) => {
     const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
     const lower = (s: string) => norm(s).toLowerCase();
     const target = lower(lbl);
-    if (!target) return null;
+    if (!target) return { kind: 'none' as const };
 
     const isVisuallyHeading = (el: HTMLElement): boolean => {
       const r = el.getBoundingClientRect();
-      // Heading-shaped: takes the full content width and is short.
-      // These are usually section labels, not dropdown triggers.
       if (r.width > window.innerWidth * 0.7 && r.height < 40) return true;
       const tag = el.tagName.toLowerCase();
       if (tag === 'h1' || tag === 'h2' || tag === 'h3') return true;
@@ -303,8 +489,6 @@ export async function selectOptionByLabel(
     };
 
     const isVisible = (el: HTMLElement): boolean => {
-      // <select> elements often have offsetParent null even when usable;
-      // treat them as visible for compatibility with the existing path.
       if (el.tagName === 'SELECT') return true;
       if (el.offsetParent === null) return false;
       const cs = window.getComputedStyle(el);
@@ -312,100 +496,336 @@ export async function selectOptionByLabel(
       return true;
     };
 
-    const scoreCandidate = (el: HTMLElement): number => {
+    /**
+     * Affordance gate — is this candidate plausibly a dropdown trigger?
+     * Returns the affordance score component (>0) or 0 if it fails the
+     * gate. Candidates returning 0 are skipped from scoring.
+     */
+    const affordance = (el: HTMLElement): number => {
       const role = (el.getAttribute('role') || '').toLowerCase();
       const ariaPopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
       const tag = el.tagName.toLowerCase();
       let score = 0;
-      // Strong signals — explicit dropdown semantics.
-      if (ariaPopup === 'listbox' || ariaPopup === 'menu' || ariaPopup === 'true' || ariaPopup === 'dialog') score += 12;
-      if (role === 'combobox') score += 10;
-      if (role === 'listbox') score += 8;
-      if (tag === 'select') score += 9;
-      if (el.hasAttribute('aria-expanded')) score += 4;
-      // Mid signals — class hint on element or wrapping parent.
-      const cls = ((typeof el.className === 'string' ? el.className : '') || '').toLowerCase();
-      if (/\b(select|dropdown|combobox|picker|chooser)\b/.test(cls)) score += 5;
+      let gateOpen = false;
+      if (tag === 'select') { score += 14; gateOpen = true; }
+      if (
+        ariaPopup === 'listbox' || ariaPopup === 'menu'
+        || ariaPopup === 'true' || ariaPopup === 'dialog'
+        || ariaPopup === 'tree' || ariaPopup === 'grid'
+      ) { score += 14; gateOpen = true; }
+      if (role === 'combobox') { score += 12; gateOpen = true; }
+      if (role === 'listbox') { score += 10; gateOpen = true; }
+      if (role === 'menu') { score += 8; gateOpen = true; }
+      if (el.hasAttribute('aria-expanded')) { score += 4; gateOpen = true; }
+      if (
+        tag === 'input' && el.hasAttribute('list')
+        && document.getElementById(el.getAttribute('list') || '')
+      ) { score += 8; gateOpen = true; }
+      // Chevron descendant on a button-like host.
+      const isChevronHost = (
+        (tag === 'button' || (tag === 'div' && role === 'button'))
+        && el.querySelector(
+          '[class*="chevron"], [class*="caret"], [class*="arrow-down"], '
+          + 'svg[class*="chevron"], svg[class*="caret"]',
+        ) != null
+      );
+      if (isChevronHost) { score += 6; gateOpen = true; }
+      // Wrapping picker/dropdown class — only when this el is the sole
+      // interactive child of that wrapper.
       const parent = el.parentElement;
-      const pcls = (parent && typeof parent.className === 'string' ? parent.className : '').toLowerCase();
-      if (/\b(select|dropdown|combobox|picker|chooser|form-field|field-group)\b/.test(pcls)) score += 3;
-      // Penalty — heading-shaped elements steal matches.
-      if (isVisuallyHeading(el)) score -= 6;
-      // Tiny preference for smaller area (fragmented page layouts).
-      const r = el.getBoundingClientRect();
-      const area = Math.max(1, r.width * r.height);
-      score += Math.max(0, 3 - Math.log10(area));
-      return score;
+      const pcls = (parent && typeof parent.className === 'string'
+        ? parent.className : '').toLowerCase();
+      if (
+        /\b(picker|chooser|select|dropdown|combobox)\b/.test(pcls)
+        && parent
+      ) {
+        const interactives = parent.querySelectorAll(
+          'button, select, input, a[href], [role="button"], '
+          + '[role="combobox"], [role="listbox"], [tabindex]:not([tabindex="-1"])',
+        );
+        if (interactives.length === 1 && interactives[0] === el) {
+          score += 4;
+          gateOpen = true;
+        }
+      }
+      // Mid signals — class hint on element itself.
+      const cls = ((typeof el.className === 'string' ? el.className : '')
+        || '').toLowerCase();
+      if (/\b(select|dropdown|combobox|picker|chooser)\b/.test(cls)) {
+        score += 3;
+        gateOpen = true;
+      }
+      return gateOpen ? score : 0;
     };
 
-    const tag = (el: Element, score: number) => {
+    /**
+     * Negative signals — rule out elements that look like dropdown
+     * matches but are clearly something else (real anchor links,
+     * plain buttons with no popup hint, headings).
+     */
+    const negativeSignals = (el: HTMLElement): number => {
+      let penalty = 0;
+      const tag = el.tagName.toLowerCase();
+      const ariaPopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+      if (tag === 'a' && el.hasAttribute('href') && !ariaPopup) {
+        const href = el.getAttribute('href') || '';
+        if (!href.startsWith('#')) penalty += 10;
+      }
+      if (
+        tag === 'button' && !ariaPopup
+        && !el.hasAttribute('aria-expanded')
+      ) {
+        const cls = ((typeof el.className === 'string' ? el.className : '')
+          || '').toLowerCase();
+        if (!/\b(picker|dropdown|combobox|select)\b/.test(cls)) {
+          penalty += 4;
+        }
+      }
+      if (isVisuallyHeading(el)) penalty += 6;
+      return penalty;
+    };
+
+    /**
+     * Word-boundary contains — Unicode-aware. "Region" inside
+     * "Region Settings" matches; "tion" inside "Selection" doesn't.
+     */
+    const wordBoundary = (s: string, frag: string): boolean => {
+      if (!frag) return false;
+      const i = s.indexOf(frag);
+      if (i < 0) return false;
+      const before = s[i - 1];
+      const after = s[i + frag.length];
+      const isWord = (c: string | undefined): boolean =>
+        c != null && /[\p{L}\p{N}_]/u.test(c);
+      return !isWord(before) && !isWord(after);
+    };
+
+    /**
+     * Tier-based match score. Returns the tier bonus (24/20/18/14/
+     * 10/6/4/0) for the first tier the candidate hits, or 0 if no
+     * label match at all (caller uses 0 to filter the candidate out).
+     * Higher tier = more confident match.
+     */
+    const tierMatch = (
+      el: HTMLElement,
+    ): { tier: number; bonus: number } => {
+      const aria = lower(el.getAttribute('aria-label') || '');
+      const txt = lower((el.innerText || el.textContent || '')).slice(0, 200);
+      const placeholder = lower(el.getAttribute('placeholder') || '');
+      // Tier 0: exact aria.
+      if (aria === target) return { tier: 0, bonus: 24 };
+      // Tier 1: exact text.
+      if (txt === target) return { tier: 1, bonus: 20 };
+      // Tier 2: exact placeholder.
+      if (placeholder === target) return { tier: 2, bonus: 18 };
+      // Tier 3: startsWith aria (with word boundary at end of frag).
+      const startsWithBoundary = (s: string): boolean => {
+        if (!s.startsWith(target)) return false;
+        const after = s[target.length];
+        return after == null || !/[\p{L}\p{N}_]/u.test(after);
+      };
+      if (startsWithBoundary(aria)) return { tier: 3, bonus: 14 };
+      if (startsWithBoundary(txt)) return { tier: 4, bonus: 10 };
+      // Tier 5: contains aria with word boundary.
+      if (wordBoundary(aria, target)) return { tier: 5, bonus: 6 };
+      if (wordBoundary(txt, target)) return { tier: 6, bonus: 4 };
+      // Tier 7: contains placeholder with word boundary.
+      if (wordBoundary(placeholder, target)) return { tier: 7, bonus: 3 };
+      return { tier: -1, bonus: 0 };
+    };
+
+    const sizePref = (el: HTMLElement): number => {
+      const r = el.getBoundingClientRect();
+      const area = Math.max(1, r.width * r.height);
+      return Math.max(0, 3 - Math.log10(area));
+    };
+
+    const tagTrigger = (
+      el: Element, score: number,
+    ): { kind: 'pick'; trigger: { selector: string; isNativeSelect: boolean; currentText: string; role: string; ariaExpanded: string; score: number } } => {
       const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
       el.setAttribute('data-sb-trigger', id);
       const isSelect = el.tagName.toLowerCase() === 'select';
       return {
-        selector: `[data-sb-trigger="${id}"]`,
-        isNativeSelect: isSelect,
-        currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
-        role: el.getAttribute('role') || '',
-        ariaExpanded: el.getAttribute('aria-expanded') || '',
-        score,
+        kind: 'pick',
+        trigger: {
+          selector: `[data-sb-trigger="${id}"]`,
+          isNativeSelect: isSelect,
+          currentText: norm((el as HTMLElement).textContent || '').slice(0, 200),
+          role: el.getAttribute('role') || '',
+          ariaExpanded: el.getAttribute('aria-expanded') || '',
+          score,
+        },
       };
     };
 
-    // A. <label for="x">Lbl</label> + #x — strongest signal, take it
-    //    immediately if found.
-    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label[for]'))) {
-      if (lower(lab.textContent || '').includes(target)) {
-        const ctrl = document.getElementById(lab.htmlFor);
-        if (ctrl) return tag(ctrl, 20);  // synthetic high score — explicit association
+    const tagAmbiguous = (
+      cands: Array<{ el: HTMLElement; score: number }>,
+    ): { kind: 'ambiguous'; candidates: Array<{ selector: string; score: number; currentText: string; role: string; ariaPopup: string; tag: string }> } => {
+      return {
+        kind: 'ambiguous',
+        candidates: cands.slice(0, 3).map((c) => {
+          const id = `sb-trigger-cand-${Math.random().toString(36).slice(2, 10)}`;
+          c.el.setAttribute('data-sb-trigger-cand', id);
+          return {
+            selector: `[data-sb-trigger-cand="${id}"]`,
+            score: c.score,
+            currentText: norm(c.el.textContent || '').slice(0, 120),
+            role: c.el.getAttribute('role') || '',
+            ariaPopup: c.el.getAttribute('aria-haspopup') || '',
+            tag: c.el.tagName.toLowerCase(),
+          };
+        }),
+      };
+    };
+
+    // A. <label for="x">Lbl</label> + #x — explicit association.
+    //    Prefer EXACT label-text match; substring fallback is lower
+    //    score so a more specific contender from C/D can win.
+    let labelForBest: { el: HTMLElement; score: number } | null = null;
+    for (const lab of Array.from(
+      document.querySelectorAll<HTMLLabelElement>('label[for]'),
+    )) {
+      const labText = lower(lab.textContent || '');
+      const ctrl = document.getElementById(lab.htmlFor);
+      if (!ctrl || !isVisible(ctrl)) continue;
+      let bonus = 0;
+      if (labText === target) bonus = 14;
+      else if (wordBoundary(labText, target)) bonus = 10;
+      else if (labText.includes(target)) bonus = 6;
+      if (bonus === 0) continue;
+      const aff = affordance(ctrl);
+      const total = (aff > 0 ? aff : 0) + bonus - negativeSignals(ctrl);
+      if (!labelForBest || total > labelForBest.score) {
+        labelForBest = { el: ctrl, score: total };
       }
     }
 
-    // B. aria-labelledby — also a strong, explicit association.
-    for (const el of Array.from(document.querySelectorAll<HTMLElement>('[aria-labelledby]'))) {
-      const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+    // B. aria-labelledby — explicit association.
+    let ariaLbBest: { el: HTMLElement; score: number } | null = null;
+    for (const el of Array.from(
+      document.querySelectorAll<HTMLElement>('[aria-labelledby]'),
+    )) {
+      if (!isVisible(el)) continue;
+      const ids = (el.getAttribute('aria-labelledby') || '')
+        .split(/\s+/).filter(Boolean);
       const labText = ids
         .map((id) => lower(document.getElementById(id)?.textContent || ''))
         .join(' ');
-      if (labText.includes(target)) return tag(el, 18);
-    }
-
-    // C+D. Score-based pick across aria-label and visible-text candidates.
-    const interactiveSelector = (
-      '[role="combobox"], [role="listbox"], [role="button"], '
-      + '[aria-haspopup], [aria-expanded], button, select, input, '
-      + '[role="textbox"], [tabindex]:not([tabindex="-1"])'
-    );
-    const interactive = Array.from(document.querySelectorAll<HTMLElement>(interactiveSelector));
-    let best: { el: HTMLElement; score: number } | null = null;
-    for (const el of interactive) {
-      if (!isVisible(el)) continue;
-      const aria = lower(el.getAttribute('aria-label') || '');
-      const txt = lower((el.innerText || el.textContent || '')).slice(0, 200);
-      const placeholder = lower(el.getAttribute('placeholder') || '');
-      const matches = aria.includes(target) || txt.includes(target) || placeholder.includes(target);
-      if (!matches) continue;
-      const s = scoreCandidate(el) + (aria.includes(target) ? 3 : 0);
-      if (!best || s > best.score) best = { el, score: s };
-    }
-    if (best && best.score > 0) return tag(best.el, best.score);
-
-    // E. Wrapping <label> — <label>Lbl <input/></label>
-    for (const lab of Array.from(document.querySelectorAll<HTMLLabelElement>('label'))) {
-      if (lower(lab.textContent || '').includes(target)) {
-        const ctrl = lab.querySelector<HTMLElement>('select, input, [role="combobox"], [role="listbox"]');
-        if (ctrl) return tag(ctrl, 15);
+      let bonus = 0;
+      if (labText === target) bonus = 16;
+      else if (wordBoundary(labText, target)) bonus = 12;
+      else if (labText.includes(target)) bonus = 8;
+      if (bonus === 0) continue;
+      const aff = affordance(el);
+      const total = (aff > 0 ? aff : 0) + bonus - negativeSignals(el);
+      if (!ariaLbBest || total > ariaLbBest.score) {
+        ariaLbBest = { el, score: total };
       }
     }
 
-    // F. Last-ditch: best low-confidence pick (negative scores allowed).
-    if (best) return tag(best.el, best.score);
-    return null;
+    // C+D. Score-based pick across affordance-gated interactive
+    //      candidates with tiered label matching. Collect ALL passing
+    //      candidates so we can detect ambiguity at the top.
+    const interactiveSelector = (
+      '[role="combobox"], [role="listbox"], [role="button"], '
+      + '[aria-haspopup], [aria-expanded], button, select, input, '
+      + '[role="textbox"], [role="menu"], [tabindex]:not([tabindex="-1"])'
+    );
+    const interactive = Array.from(
+      document.querySelectorAll<HTMLElement>(interactiveSelector),
+    );
+    const candidates: Array<{ el: HTMLElement; score: number; tier: number }> = [];
+    for (const el of interactive) {
+      if (!isVisible(el)) continue;
+      const aff = affordance(el);
+      if (aff <= 0) continue;  // affordance gate
+      const tm = tierMatch(el);
+      if (tm.tier < 0) continue;
+      const total = aff + tm.bonus + sizePref(el) - negativeSignals(el);
+      candidates.push({ el, score: total, tier: tm.tier });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+
+    // E. Wrapping <label> fallback — <label>Lbl <input/></label>.
+    let wrapLabelBest: { el: HTMLElement; score: number } | null = null;
+    for (const lab of Array.from(
+      document.querySelectorAll<HTMLLabelElement>('label'),
+    )) {
+      const ctrl = lab.querySelector<HTMLElement>(
+        'select, input, [role="combobox"], [role="listbox"]',
+      );
+      if (!ctrl || !isVisible(ctrl)) continue;
+      const labText = lower(lab.textContent || '');
+      let bonus = 0;
+      if (labText === target) bonus = 13;
+      else if (wordBoundary(labText, target)) bonus = 9;
+      else if (labText.includes(target)) bonus = 5;
+      if (bonus === 0) continue;
+      const aff = affordance(ctrl);
+      const total = (aff > 0 ? aff : 0) + bonus - negativeSignals(ctrl);
+      if (!wrapLabelBest || total > wrapLabelBest.score) {
+        wrapLabelBest = { el: ctrl, score: total };
+      }
+    }
+
+    // Pool every candidate path (A, B, C/D, E). Dedupe by element.
+    const pooled = new Map<HTMLElement, number>();
+    const consider = (
+      x: { el: HTMLElement; score: number } | null,
+    ): void => {
+      if (!x) return;
+      const cur = pooled.get(x.el);
+      if (cur == null || x.score > cur) pooled.set(x.el, x.score);
+    };
+    consider(labelForBest);
+    consider(ariaLbBest);
+    for (const c of candidates) consider({ el: c.el, score: c.score });
+    consider(wrapLabelBest);
+
+    if (pooled.size === 0) {
+      return { kind: 'none' as const };
+    }
+    const ranked = Array.from(pooled.entries())
+      .map(([el, score]) => ({ el, score }))
+      .sort((a, b) => b.score - a.score);
+
+    const top = ranked[0];
+    const second = ranked[1];
+
+    // Ambiguity: top-1 vs top-2 gap < 4 AND top-2 score >= 0.
+    if (
+      second
+      && top.score - second.score < 4
+      && second.score >= 0
+    ) {
+      return tagAmbiguous(ranked);
+    }
+
+    // Section F equivalent: only return when the best score is >= 0.
+    if (top.score < 0) {
+      return { kind: 'none' as const };
+    }
+    return tagTrigger(top.el, top.score);
   }, label);
 
-  if (!trigger) {
+  if (!triggerResult || triggerResult.kind === 'none') {
     return { ok: false, reason: 'trigger_not_found', took_ms: Date.now() - start };
   }
+
+  if (triggerResult.kind === 'ambiguous') {
+    return {
+      ok: false,
+      reason: 'ambiguous_trigger',
+      ambiguous_trigger: { candidates: triggerResult.candidates },
+      candidates: triggerResult.candidates.map(
+        (c) => `${c.tag}<${c.role || '?'}>['${c.currentText}'] score=${c.score.toFixed(1)}`,
+      ),
+      took_ms: Date.now() - start,
+    };
+  }
+
+  const trigger = triggerResult.trigger;
 
   // 2. Native <select>: dispatch a real change event via page.select().
   if (trigger.isNativeSelect) {
@@ -435,9 +855,35 @@ export async function selectOptionByLabel(
         };
       }
       await page.select(trigger.selector, optionValue);
+      // Confirm the option is now actually selected. page.select can
+      // resolve before the page acknowledges the change on slow react/
+      // vue forms; explicitly reading selectedIndex / option.selected
+      // closes that gap and avoids reporting false success.
+      const post = await page.evaluate(
+        (sel: string, val: string) => {
+          const sel_el = document.querySelector(sel) as HTMLSelectElement | null;
+          if (!sel_el) return null;
+          const idx = sel_el.selectedIndex;
+          const opt = (idx >= 0 ? sel_el.options[idx] : null) as HTMLOptionElement | null;
+          return {
+            selectedIndex: idx,
+            optionValue: opt ? opt.value : '',
+            optionText: opt ? (opt.textContent || '').trim() : '',
+            matchesRequested: opt != null && opt.value === val,
+          };
+        },
+        trigger.selector,
+        optionValue,
+      );
       return {
-        ok: true, picked_text: value,
-        trigger_selector: trigger.selector, verified: true,
+        ok: true,
+        picked_text: post?.optionText || value,
+        trigger_selector: trigger.selector,
+        verified: !!post?.matchesRequested,
+        selected_index:
+          post && typeof post.selectedIndex === 'number'
+            ? post.selectedIndex
+            : undefined,
         took_ms: Date.now() - start,
       };
     } catch (e) {
@@ -452,12 +898,12 @@ export async function selectOptionByLabel(
   //    "trigger opens a popup" from "trigger navigates a new page"
   //    (Best Buy trade-in brand picker is a grid of clickable cards
   //    labelled 'Brand' — clicking navigates, no listbox ever appears).
-  let preNavUrl = '';
-  let preNavTitle = '';
-  try {
-    preNavUrl = page.url();
-    preNavTitle = await page.title();
-  } catch { /* best-effort */ }
+  // Capture a navigation fingerprint BEFORE the first open-strategy.
+  // We re-fingerprint after each strategy and after the final option
+  // click, comparing both via navFingerprintChanged() so SPA pushState
+  // routes (different pathname/hash with same URL string) and
+  // pushState-with-content-swap also count as navigation.
+  const preNavFp: NavFingerprint = await navFingerprint(page);
   try {
     await page.$eval(trigger.selector, (el: Element) =>
       (el as HTMLElement).scrollIntoView({ block: 'center' }),
@@ -666,7 +1112,8 @@ export async function selectOptionByLabel(
 
   let rendered = false;
   let popupSeen = false;
-  let navigatedTo = '';
+  let navFp: NavFingerprint = preNavFp;
+  let navKind = '';
   // Per-strategy budget: split the total timeout across strategies, but
   // give each at least 600ms. Total can slightly exceed timeout when
   // every strategy is tried; that's acceptable.
@@ -680,45 +1127,72 @@ export async function selectOptionByLabel(
 
     const subDeadline = Date.now() + perStrategyBudget;
     while (Date.now() < subDeadline) {
-      // Fast-path: navigation kills the dropdown story entirely.
-      let curUrl = '';
-      try { curUrl = page.url(); } catch { /* page may be navigating */ }
-      if (curUrl && preNavUrl && curUrl !== preNavUrl) { navigatedTo = curUrl; break; }
-      // Tag-and-count: if anything popup-shaped exists, try collecting.
+      // Tag-and-count first so popupAppeared informs nav check.
       const popupNow = await checkPopupDetected().catch(() => false);
       if (popupNow) popupSeen = true;
       const tagged = await collectAndTagCandidates().catch(() => 0);
       if (tagged > 0) { rendered = true; break; }
+      // Nav fingerprint check — pathname/hash/title/historyLength/
+      // contentHash deltas catch SPA pushState that page.url() alone
+      // misses. Skipped when a popup just appeared (some libraries
+      // pushState when the dropdown opens; we don't want to mistake
+      // that for a real route change).
+      const post = await navFingerprint(page);
+      const change = navFingerprintChanged(preNavFp, post, popupSeen);
+      if (change.changed) {
+        navFp = post;
+        navKind = change.kind;
+        break;
+      }
       await new Promise((r) => setTimeout(r, 120));
     }
-    if (rendered || navigatedTo) break;
+    if (rendered || navKind) break;
   }
 
-  if (navigatedTo) {
+  if (navKind) {
     return {
       ok: false,
       reason: 'trigger_navigated',
       trigger_selector: trigger.selector,
-      candidates: [`navigated_to=${navigatedTo}`, `from=${preNavUrl}`],
+      candidates: [
+        `navigated_via=${navKind}`,
+        `from=${preNavFp.url}`,
+        `to=${navFp.url}`,
+      ],
       tried,
       trigger_score: trigger.score,
+      navigated_to: {
+        url: navFp.url,
+        path: navFp.pathname,
+        hash: navFp.hash,
+        titleChanged: preNavFp.title !== navFp.title,
+      },
       took_ms: Date.now() - start,
     };
   }
 
   if (!rendered) {
-    // Final post-loop title check — SPA pushState navigation that
-    // didn't change page.url() but updated the title.
-    let postTitle = '';
-    try { postTitle = await page.title(); } catch { /* nope */ }
-    if (postTitle && preNavTitle && postTitle !== preNavTitle) {
+    // Last-chance check after the open loop.
+    const finalFp = await navFingerprint(page);
+    const finalChange = navFingerprintChanged(preNavFp, finalFp, popupSeen);
+    if (finalChange.changed) {
       return {
         ok: false,
         reason: 'trigger_navigated',
         trigger_selector: trigger.selector,
-        candidates: [`title_changed=${postTitle}`, `was=${preNavTitle}`],
+        candidates: [
+          `navigated_via=${finalChange.kind}`,
+          `from=${preNavFp.url}`,
+          `to=${finalFp.url}`,
+        ],
         tried,
         trigger_score: trigger.score,
+        navigated_to: {
+          url: finalFp.url,
+          path: finalFp.pathname,
+          hash: finalFp.hash,
+          titleChanged: preNavFp.title !== finalFp.title,
+        },
         took_ms: Date.now() - start,
       };
     }
@@ -767,12 +1241,20 @@ export async function selectOptionByLabel(
     };
   }
 
-  // 5. Pick option by exact-ci → startsWith → contains → fuzzy. The
-  //    candidate set is whatever was tagged with `data-sb-opt-candidate`
-  //    by the open-and-tag step above, which includes both standard
-  //    role-based options and DOM-diff "newly visible option-shaped"
-  //    elements. If the target isn't among them, the within-listbox
-  //    scroll loop below re-tags after each step.
+  // 5. Pick option via tiered match cascade with word-boundary contains
+  //    + raised fuzzy floor. The candidate set is whatever was tagged
+  //    with `data-sb-opt-candidate` by the open-and-tag step above.
+  //
+  //    Tier order:
+  //      1. exact-ci (lower(it.txt) === tgt) — preferred regardless of length
+  //      2. startsWith-word — startsWith AND char after frag is non-word
+  //      3. contains-word — wordBoundary contains
+  //      4. fuzzy — Levenshtein similarity >= 0.85, target length >= 4
+  //
+  //    Reject < 3-char targets at tiers 2/3 unless an exact match
+  //    exists (drops "Or" matches inside "Oregon"). When >1 candidates
+  //    pass at the SAME tier, return ambiguous_option with the
+  //    candidates so the brain narrows the value.
   const pickAttempt = (): Promise<
     | { ok: true; option_selector: string; picked_text: string }
     | { ok: false; reason: string; candidates: string[] }
@@ -790,10 +1272,111 @@ export async function selectOptionByLabel(
     if (items.length === 0) {
       return { ok: false as const, reason: 'no_options_collected', candidates: [] as string[] };
     }
-    let match = items.find((it) => lower(it.txt) === tgt);
-    if (!match) match = items.find((it) => lower(it.txt).startsWith(tgt));
-    if (!match) match = items.find((it) => lower(it.txt).includes(tgt));
-    if (!match && fz) {
+    if (!tgt) {
+      return {
+        ok: false as const,
+        reason: 'no_option_match',
+        candidates: items.slice(0, 25).map((it) => it.txt),
+      };
+    }
+
+    // Word-boundary helper.
+    const wordBoundary = (s: string, frag: string): boolean => {
+      if (!frag) return false;
+      const i = s.indexOf(frag);
+      if (i < 0) return false;
+      const before = s[i - 1];
+      const after = s[i + frag.length];
+      const isWord = (c: string | undefined): boolean =>
+        c != null && /[\p{L}\p{N}_]/u.test(c);
+      return !isWord(before) && !isWord(after);
+    };
+    const startsWithBoundary = (s: string): boolean => {
+      if (!s.startsWith(tgt)) return false;
+      const after = s[tgt.length];
+      return after == null || !/[\p{L}\p{N}_]/u.test(after);
+    };
+
+    type Item = { el: HTMLElement; txt: string };
+    const lowerItems: Array<Item & { lower: string }> = items.map(
+      (it) => ({ ...it, lower: lower(it.txt) }),
+    );
+
+    // Tier 1: exact-ci.
+    const exactHits = lowerItems.filter((it) => it.lower === tgt);
+    if (exactHits.length === 1) {
+      const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+      exactHits[0].el.setAttribute('data-sb-opt', optTag);
+      return {
+        ok: true as const,
+        option_selector: `[data-sb-opt="${optTag}"]`,
+        picked_text: exactHits[0].txt,
+      };
+    }
+    if (exactHits.length > 1) {
+      return {
+        ok: false as const,
+        reason: 'ambiguous_option',
+        candidates: exactHits.map((it) => it.txt).slice(0, 10),
+      };
+    }
+
+    // Reject 1-2 char targets beyond tier 1.
+    if (tgt.length < 3) {
+      return {
+        ok: false as const,
+        reason: 'no_option_match',
+        candidates: items.slice(0, 25).map((it) => it.txt),
+      };
+    }
+
+    // Tier 2: startsWith-word.
+    const startsHits = lowerItems.filter((it) => startsWithBoundary(it.lower));
+    if (startsHits.length >= 1) {
+      // Tiebreaker: prefer shorter text (more specific).
+      startsHits.sort((a, b) => a.txt.length - b.txt.length);
+      if (startsHits.length > 1
+          && startsHits[0].txt.length === startsHits[1].txt.length) {
+        return {
+          ok: false as const,
+          reason: 'ambiguous_option',
+          candidates: startsHits.map((it) => it.txt).slice(0, 10),
+        };
+      }
+      const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+      startsHits[0].el.setAttribute('data-sb-opt', optTag);
+      return {
+        ok: true as const,
+        option_selector: `[data-sb-opt="${optTag}"]`,
+        picked_text: startsHits[0].txt,
+      };
+    }
+
+    // Tier 3: contains-word.
+    const containsHits = lowerItems.filter(
+      (it) => wordBoundary(it.lower, tgt),
+    );
+    if (containsHits.length >= 1) {
+      containsHits.sort((a, b) => a.txt.length - b.txt.length);
+      if (containsHits.length > 1
+          && containsHits[0].txt.length === containsHits[1].txt.length) {
+        return {
+          ok: false as const,
+          reason: 'ambiguous_option',
+          candidates: containsHits.map((it) => it.txt).slice(0, 10),
+        };
+      }
+      const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+      containsHits[0].el.setAttribute('data-sb-opt', optTag);
+      return {
+        ok: true as const,
+        option_selector: `[data-sb-opt="${optTag}"]`,
+        picked_text: containsHits[0].txt,
+      };
+    }
+
+    // Tier 4: fuzzy. Raised floor to 0.85 + tgt.length >= 4.
+    if (fz && tgt.length >= 4) {
       const lev = (a: string, b: string): number => {
         if (a === b) return 0;
         const m = a.length, n = b.length;
@@ -809,31 +1392,46 @@ export async function selectOptionByLabel(
         }
         return dp[m][n];
       };
-      let best: { it: { el: HTMLElement; txt: string }; score: number } | null = null;
-      for (const it of items) {
-        const a = lower(it.txt);
+      type FuzzyHit = { it: { el: HTMLElement; txt: string }; score: number };
+      let best: FuzzyHit | null = null;
+      let runnerUp: FuzzyHit | null = null;
+      for (const it of lowerItems) {
+        const a = it.lower;
         if (!a) continue;
         const d = lev(a, tgt);
         const sim = 1 - d / Math.max(a.length, tgt.length);
-        if (sim >= 0.7 && (!best || sim > best.score)) best = { it, score: sim };
+        if (sim >= 0.85) {
+          if (!best || sim > best.score) {
+            runnerUp = best;
+            best = { it: { el: it.el, txt: it.txt }, score: sim };
+          } else if (!runnerUp || sim > runnerUp.score) {
+            runnerUp = { it: { el: it.el, txt: it.txt }, score: sim };
+          }
+        }
       }
-      if (best) match = best.it;
+      if (best) {
+        // Ambiguous if runner-up scored within 0.05 of best.
+        if (runnerUp && (best.score - runnerUp.score) < 0.05) {
+          return {
+            ok: false as const,
+            reason: 'ambiguous_option',
+            candidates: [best.it.txt, runnerUp.it.txt].slice(0, 10),
+          };
+        }
+        const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+        best.it.el.setAttribute('data-sb-opt', optTag);
+        return {
+          ok: true as const,
+          option_selector: `[data-sb-opt="${optTag}"]`,
+          picked_text: best.it.txt,
+        };
+      }
     }
 
-    if (!match) {
-      return {
-        ok: false as const,
-        reason: 'no_option_match',
-        candidates: items.slice(0, 25).map((it) => it.txt),
-      };
-    }
-
-    const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
-    match.el.setAttribute('data-sb-opt', optTag);
     return {
-      ok: true as const,
-      option_selector: `[data-sb-opt="${optTag}"]`,
-      picked_text: match.txt,
+      ok: false as const,
+      reason: 'no_option_match',
+      candidates: items.slice(0, 25).map((it) => it.txt),
     };
   }, value, fuzzy);
 
@@ -916,6 +1514,16 @@ export async function selectOptionByLabel(
   }
 
   if (!pick.ok) {
+    if (pick.reason === 'ambiguous_option') {
+      return {
+        ok: false,
+        reason: 'ambiguous_option',
+        ambiguous_option: { candidates: pick.candidates },
+        candidates: pick.candidates,
+        trigger_selector: trigger.selector,
+        took_ms: Date.now() - start,
+      };
+    }
     return {
       ok: false, reason: pick.reason, candidates: pick.candidates,
       trigger_selector: trigger.selector, took_ms: Date.now() - start,
@@ -961,26 +1569,234 @@ export async function selectOptionByLabel(
     };
   }
 
-  // 7. Settle, then verify trigger reflects the pick.
+  // 7. Settle, then verify in three layers:
+  //    a) navFingerprint after — option click that navigated should
+  //       NOT report success.
+  //    b) trigger still in DOM — re-querying via data-attr; if gone +
+  //       no nav, surface trigger_disappeared.
+  //    c) trigger text contains pick AND aria-expanded != true.
   await new Promise((r) => setTimeout(r, 250));
+
+  const postFp = await navFingerprint(page);
+  const optClickNavChange = navFingerprintChanged(preNavFp, postFp, true);
+  if (optClickNavChange.changed) {
+    return {
+      ok: false,
+      reason: 'option_navigated',
+      trigger_selector: trigger.selector,
+      option_selector: pick.option_selector,
+      candidates: [
+        `navigated_via=${optClickNavChange.kind}`,
+        `from=${preNavFp.url}`,
+        `to=${postFp.url}`,
+      ],
+      navigated_to: {
+        url: postFp.url,
+        path: postFp.pathname,
+        hash: postFp.hash,
+        titleChanged: preNavFp.title !== postFp.title,
+      },
+      took_ms: Date.now() - start,
+    };
+  }
+
   const verify = await page.evaluate((sel: string, picked: string) => {
     const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const el = document.querySelector(sel) as HTMLElement | null;
-    if (!el) return { contains_pick: false, current_text: '', closed: true };
+    if (!el) {
+      return {
+        triggerExists: false,
+        contains_pick: false,
+        current_text: '',
+        closed: true,
+        focusTag: '',
+      };
+    }
     const cur = norm(el.textContent || '');
+    const focused = (document.activeElement
+      || document.body) as HTMLElement | null;
+    const focusTag = focused
+      ? `${focused.tagName.toLowerCase()}${
+          focused.id ? '#' + focused.id : ''
+        }${
+          focused.getAttribute('role')
+            ? '[role=' + focused.getAttribute('role') + ']'
+            : ''
+        }`
+      : '';
     return {
+      triggerExists: true,
       closed: el.getAttribute('aria-expanded') !== 'true',
       contains_pick: cur.includes(norm(picked)),
       current_text: cur.slice(0, 200),
+      focusTag: focusTag.slice(0, 120),
     };
   }, trigger.selector, pick.picked_text);
+
+  if (!verify.triggerExists) {
+    return {
+      ok: false,
+      reason: 'trigger_disappeared',
+      trigger_selector: trigger.selector,
+      option_selector: pick.option_selector,
+      took_ms: Date.now() - start,
+    };
+  }
 
   return {
     ok: true,
     picked_text: pick.picked_text,
     trigger_selector: trigger.selector,
     option_selector: pick.option_selector,
-    verified: verify.contains_pick,
+    verified: verify.contains_pick && verify.closed,
+    verified_focus_target: verify.focusTag || undefined,
     took_ms: Date.now() - start,
+  };
+}
+
+/**
+ * Bbox-aware select_option entrypoint. Caller passes the dropdown
+ * trigger's bounding box (CSS pixel coords); we snap to the
+ * interactive descendant inside that bbox, gate it through the same
+ * affordance check the label-path uses, and dispatch to the shared
+ * open-strategy + pickOption + verify pipeline by tagging the
+ * resolved element and calling selectOptionByLabel with
+ * `triggerSelector` set.
+ *
+ * Returns `bbox_not_a_dropdown` when the snapped element fails the
+ * affordance gate — the brain should then use browser_click_at on
+ * the bbox instead.
+ */
+export async function selectOptionByVisionBbox(
+  page: Page,
+  opts: {
+    bbox: { x0: number; y0: number; x1: number; y1: number };
+    expectedLabel?: string;
+    value: string;
+    fuzzy?: boolean;
+    timeout?: number;
+    extraOptionSelectors?: string[];
+  },
+): Promise<SelectOptionByLabelResult> {
+  const start = Date.now();
+  const { bbox, value } = opts;
+  const cx = (bbox.x0 + bbox.x1) / 2;
+  const cy = (bbox.y0 + bbox.y1) / 2;
+
+  // Snap to the most-interactive element inside the bbox + tag it.
+  const snap = await page.evaluate(
+    (args: {
+      x0: number; y0: number; x1: number; y1: number;
+      cx: number; cy: number;
+    }) => {
+      const { x0, y0, x1, y1, cx, cy } = args;
+      const isVisible = (el: HTMLElement): boolean => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        return true;
+      };
+      const interactiveSelector = (
+        '[role="combobox"], [role="listbox"], [role="button"], '
+        + '[aria-haspopup], [aria-expanded], button, select, input, '
+        + '[role="textbox"], [role="menu"], [tabindex]:not([tabindex="-1"])'
+      );
+      // Tier 1: element at center of bbox.
+      let chosen: HTMLElement | null = null;
+      const atCenter = document.elementFromPoint(cx, cy) as HTMLElement | null;
+      if (atCenter && isVisible(atCenter)) {
+        chosen = atCenter.closest(interactiveSelector) as HTMLElement | null
+          ?? atCenter;
+      }
+      // Tier 2: best-overlap interactive descendant inside bbox.
+      if (!chosen || !chosen.matches(interactiveSelector)) {
+        let bestEl: HTMLElement | null = null;
+        let bestArea = 0;
+        const candidates = document.querySelectorAll<HTMLElement>(interactiveSelector);
+        for (const el of Array.from(candidates)) {
+          if (!isVisible(el)) continue;
+          const r = el.getBoundingClientRect();
+          // Compute overlap.
+          const ox = Math.max(0, Math.min(x1, r.right) - Math.max(x0, r.left));
+          const oy = Math.max(0, Math.min(y1, r.bottom) - Math.max(y0, r.top));
+          const overlap = ox * oy;
+          if (overlap <= 0) continue;
+          if (overlap > bestArea) {
+            bestArea = overlap;
+            bestEl = el;
+          }
+        }
+        if (bestEl) chosen = bestEl;
+      }
+      if (!chosen) return null;
+
+      // Affordance check (mirror of selectOptionByLabel's gate).
+      const role = (chosen.getAttribute('role') || '').toLowerCase();
+      const ariaPopup = (chosen.getAttribute('aria-haspopup') || '').toLowerCase();
+      const tag = chosen.tagName.toLowerCase();
+      const hasPopupAffordance = (
+        tag === 'select'
+        || role === 'combobox' || role === 'listbox' || role === 'menu'
+        || ariaPopup === 'listbox' || ariaPopup === 'menu'
+        || ariaPopup === 'true' || ariaPopup === 'dialog'
+        || ariaPopup === 'tree' || ariaPopup === 'grid'
+        || chosen.hasAttribute('aria-expanded')
+        || (
+          tag === 'input' && chosen.hasAttribute('list')
+          && document.getElementById(chosen.getAttribute('list') || '') != null
+        )
+        || (
+          (tag === 'button' || (tag === 'div' && role === 'button'))
+          && chosen.querySelector(
+            '[class*="chevron"], [class*="caret"], [class*="arrow-down"], '
+            + 'svg[class*="chevron"], svg[class*="caret"]',
+          ) != null
+        )
+      );
+      const id = `sb-trigger-${Math.random().toString(36).slice(2, 10)}`;
+      chosen.setAttribute('data-sb-trigger', id);
+      return {
+        selector: `[data-sb-trigger="${id}"]`,
+        hasPopupAffordance,
+        tag,
+        role,
+      };
+    },
+    { x0: bbox.x0, y0: bbox.y0, x1: bbox.x1, y1: bbox.y1, cx, cy },
+  );
+
+  if (!snap) {
+    return {
+      ok: false,
+      reason: 'bbox_no_interactive',
+      took_ms: Date.now() - start,
+    };
+  }
+
+  if (!snap.hasPopupAffordance) {
+    return {
+      ok: false,
+      reason: 'bbox_not_a_dropdown',
+      trigger_selector: snap.selector,
+      candidates: [`tag=${snap.tag}`, `role=${snap.role || '(none)'}`],
+      took_ms: Date.now() - start,
+    };
+  }
+
+  // Hand off to the shared label-path. label is unused on this path
+  // (triggerSelector overrides the picker) but the function still
+  // requires it; pass expectedLabel as a diagnostic.
+  const result = await selectOptionByLabel(page, {
+    label: opts.expectedLabel ?? '',
+    value,
+    fuzzy: opts.fuzzy,
+    timeout: opts.timeout,
+    extraOptionSelectors: opts.extraOptionSelectors,
+    triggerSelector: snap.selector,
+  });
+  return {
+    ...result,
+    took_ms: result.took_ms ?? (Date.now() - start),
   };
 }

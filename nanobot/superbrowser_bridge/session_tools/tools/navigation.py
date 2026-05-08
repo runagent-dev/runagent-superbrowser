@@ -340,6 +340,11 @@ class BrowserOpenTool(Tool):
         self.s.record_checkpoint(actual_url, data.get("title", ""), f"browser_open({url or 'blank'})")
         self.s.record_step("browser_open", url or "blank", f"session={data.get('sessionId', '?')}")
         self.s.consecutive_click_calls = 0
+        # v5 — flag the next vision prefetch to ask /state for visual
+        # stability (fonts swapped, above-fold images decoded, layout-
+        # shift idle). Cold first-load is the canonical case where
+        # bbox-vs-text-position drift breaks vision-driven clicks.
+        self.s._needs_visual_settle = True
 
         # If human handoff is enabled, print the view URL to stdout so the
         # user can pre-open it in their browser. The view page polls the
@@ -574,6 +579,12 @@ class BrowserNavigateTool(Tool):
         # post-nav prefetch) via `vision_for_target_resolution`, and
         # the very next `browser_screenshot` re-freezes the epoch.
         self.s._vision_epoch_response = None
+        # v5 — flag the next vision prefetch to ask /state for visual
+        # stability. browser_navigate is the same race as browser_open
+        # (cold target page, fonts/images may take 200-1500ms to
+        # settle); without this the first vision after navigate gets
+        # bboxes against pre-settled text positions.
+        self.s._needs_visual_settle = True
 
         # Set/clear the CF nav-guard based on what came back. `block_class`
         # is populated by interactive_session.py after the challenge wait
@@ -1237,6 +1248,55 @@ class BrowserScrollUntilTool(Tool):
                     "  Hit iteration cap. If you believe the target exists "
                     "further on, raise max_iterations (cap is 40) or "
                     "use a more specific target_text."
+                )
+            elif reason == "no_scroll_surface":
+                # v6 G1: scrollByDelta reported zero movement on 2
+                # consecutive iterations even after the
+                # window/scrollingElement/largest-container cascade.
+                # The page's actual scroll surface is either locked
+                # OR sits inside a container the heuristic missed.
+                lines.append(
+                    "  No scroll surface responded. The page may use a "
+                    "custom scroll container we couldn't auto-detect. "
+                    "Call `browser_get_markdown(include_anchors=true)` "
+                    "— the trailing [SCROLL_CONTAINERS …] block lists "
+                    "scrollable surfaces with their selectors. Pass "
+                    "the right one as `container_selector=` to retry. "
+                    "If no container looks like it would hold the "
+                    "target, the target probably isn't on this page."
+                )
+            elif reason == "target_in_no_scrollable_container":
+                # New diagnostic: the text exists in the DOM but isn't
+                # inside any scrollable ancestor — typically a closed
+                # <details>, an aria-hidden=true subtree, or rendered
+                # via display:none. Scrolling can't reveal it.
+                lines.append(
+                    f"  '{target_text}' is in the DOM but not inside any "
+                    "scrollable container. Likely causes: it's inside a "
+                    "collapsed <details>/accordion that needs to be "
+                    "expanded first; it's in a hidden subtree; or it's "
+                    "rendered as part of a static header/banner that "
+                    "doesn't scroll. STOP scrolling. Re-screenshot and "
+                    "check whether you need to click a "
+                    "section-expand/show-more control before targeting "
+                    "this text."
+                )
+            elif reason == "no_forward_progress":
+                # Forward leg moved <100px before bailing. Page is
+                # effectively non-scrollable for our purposes (locked
+                # body, custom scroller we couldn't drive, or
+                # smooth-scroll race that even the instant override
+                # didn't beat). Reversing back would erase what little
+                # motion happened — we skipped it.
+                lines.append(
+                    f"  Scroll never moved more than {abs(final_y - start_y)}px. "
+                    "Either the page has no responsive scroll surface, "
+                    "or its scroll-behavior is hijacked. Try (a) "
+                    "`browser_scroll(direction='down', percent=50)` for "
+                    "a pixel-locked scroll, (b) "
+                    "`browser_scroll_within(target_text=...)` if a popup "
+                    "/modal is open, or (c) accept the page can't scroll "
+                    "to this target."
                 )
 
         # Per-step narrative — what entered the viewport at each step.

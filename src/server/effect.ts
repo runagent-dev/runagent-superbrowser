@@ -18,7 +18,7 @@
  */
 
 import type { Page } from 'puppeteer-core';
-import { waitForPageReady } from '../browser/page-readiness.js';
+import { waitForPageReady, waitForVisualStable } from '../browser/page-readiness.js';
 
 export interface EffectSnapshot {
   url: string;
@@ -105,9 +105,19 @@ export function postActionSettleMs(): number {
 
 /**
  * Sleep + wait for the page to be "ready" (readyState=complete,
- * aria-busy not set). Used between an action and its `after` effect
- * snapshot so the delta reflects a settled page, not a mid-transition
- * one. Never throws — timeouts are expected on pages that never reach
+ * aria-busy not set), then briefly wait for VISUAL stability (fonts
+ * swapped, images decoded, layout-shift idle). Used between an action
+ * and its `after` effect snapshot so the delta reflects a settled
+ * page, not a mid-transition one.
+ *
+ * v5: added a short waitForVisualStable(600) so post-click vision
+ * captures bboxes against the post-render layout — catches the
+ * filter-apply re-render race where the brain would otherwise see
+ * pre-render bbox positions and click empty space. Cap is shorter
+ * than the post-navigation cap because mid-session pages have warm
+ * caches (fonts already loaded, images already in HTTP cache).
+ *
+ * Never throws — timeouts are expected on pages that never reach
  * ready (e.g., infinite loaders) and must not fail the handler.
  */
 export async function settleForEffect(page: Page): Promise<void> {
@@ -117,6 +127,15 @@ export async function settleForEffect(page: Page): Promise<void> {
   }
   try {
     await waitForPageReady(page, 2000);
+  } catch {
+    /* best-effort */
+  }
+  // v5 — short visual-stable wait. Catches mid-session reflow races
+  // (filter applied → list re-renders, autocomplete opens, modal
+  // animates in). 600ms cap because warm-cache pages settle faster
+  // than cold first-loads.
+  try {
+    await waitForVisualStable(page, 600);
   } catch {
     /* best-effort */
   }

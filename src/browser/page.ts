@@ -20,7 +20,12 @@ import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
 import type { FailureReason } from '../agent/types.js';
 import { sanitizeImageBuffer } from './image-safety.js';
-import { waitForPageReady, detectErrorPage, type ErrorPage } from './page-readiness.js';
+import {
+  waitForPageReady,
+  waitForVisualStable,
+  detectErrorPage,
+  type ErrorPage,
+} from './page-readiness.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { inputEventBus } from './input-events.js';
 
@@ -170,6 +175,16 @@ export class PageWrapper {
     // Keep the original tiny idle too — some pages commit DOM changes
     // right at 'complete' as part of their hydration tail.
     await this.waitForIdle(800).catch(() => {});
+
+    // v5 — VISUAL stability gate. DOM-ready isn't enough for screenshot-
+    // driven vision: web fonts swap 200-1200ms after DCL (FOUT), shifting
+    // text vertically; lazy hero images load late, pushing content down;
+    // hydration commits frames after first paint. Without this wait,
+    // bboxes computed against the pre-settled screenshot point at empty
+    // space ABOVE where text actually lives by click time. Hard cap at
+    // 1500ms means worst-case adds ~1500ms to a cold first navigation.
+    // VISUAL_STABLE_DISABLE=1 to bypass.
+    await waitForVisualStable(this.page).catch(() => {});
 
     // Auto-wait for Cloudflare challenge if detected
     await this.waitForCloudflare();
@@ -478,8 +493,15 @@ export class PageWrapper {
           // Env-flag escape: SUPERBROWSER_PRECLICK_VALIDATE=0.
           const preclickEnabled = process.env.SUPERBROWSER_PRECLICK_VALIDATE !== '0';
           if (preclickEnabled) {
+            // v6 H1: ambiguity flag from getElementCenterBySelector.
+            // When the selector matches multiple elements, A1 must be
+            // STRICTER — only accept exact-element match (no
+            // descendant/ancestor leniency) to ensure we hit the
+            // intended one of the matches.
+            const ambiguous = (coords as unknown as { ambiguous?: boolean })
+              .ambiguous === true;
             const validation = await this.page.evaluate(
-              (args: { sel: string; cx: number; cy: number }) => {
+              (args: { sel: string; cx: number; cy: number; ambiguous: boolean; driftPx: number }) => {
                 const expected = document.querySelector(args.sel) as HTMLElement | null;
                 if (!expected) return { ok: true, reason: 'no_expected' as const };
                 let stack: Element[] = [];
@@ -488,19 +510,56 @@ export class PageWrapper {
                 } catch {
                   stack = [];
                 }
+                // v6 H4: empty stack is now a HARD fail. Off-viewport
+                // coords or a transparent pixel mean the click won't
+                // land on anything useful. Force the brain to scroll
+                // the element into view and re-screenshot.
                 if (stack.length === 0) {
-                  return { ok: true, reason: 'empty_stack' as const };
+                  return {
+                    ok: false,
+                    reason: 'empty_stack' as const,
+                    overlay: 'transparent_or_off_viewport',
+                    overlayText: '',
+                  };
                 }
-                // Topmost element. If it's the expected one OR a
-                // descendant OR an ancestor (parent wrapping the
-                // child), accept.
+                // Topmost element. v6 H3: dropped the
+                // `top.contains(expected)` clause — it's too lenient
+                // (accepts wrong sibling under shared ancestor when
+                // page shifts). Keep:
+                //   * exact match (top === expected)
+                //   * descendant match (top is INSIDE expected — click
+                //     bubbles up correctly to expected handler)
+                // Reject ancestor case: when topmost is an ancestor of
+                // expected, the click would dispatch on the ancestor
+                // and may hit a different child entirely.
                 const top = stack[0] as HTMLElement;
-                if (
-                  top === expected
-                  || expected.contains(top)
-                  || top.contains(expected)
-                ) {
-                  return { ok: true, reason: 'match' as const };
+                if (top === expected) {
+                  // v6 F3: live-rect drift check. Even when topmost
+                  // matches, if the element's CURRENT bounds differ
+                  // significantly from the click coords (>driftPx),
+                  // the page is mid-render and we'd dispatch on a
+                  // moving target. Refuse so the brain re-screenshots.
+                  if (args.driftPx > 0) {
+                    const r = expected.getBoundingClientRect();
+                    const ncx = Math.round(r.left + r.width / 2);
+                    const ncy = Math.round(r.top + r.height / 2);
+                    const dx = ncx - args.cx;
+                    const dy = ncy - args.cy;
+                    if (Math.sqrt(dx * dx + dy * dy) > args.driftPx) {
+                      return {
+                        ok: false,
+                        reason: 'rect_shifted' as const,
+                        overlay: `shifted_by_${dx}_${dy}`,
+                        overlayText: '',
+                      };
+                    }
+                  }
+                  return { ok: true, reason: 'match_exact' as const };
+                }
+                if (!args.ambiguous && expected.contains(top)) {
+                  // top is INSIDE expected — clicking it bubbles up
+                  // to expected's handler. Safe.
+                  return { ok: true, reason: 'match_via_descendant' as const };
                 }
                 // Iframe heuristic: clicking would hit the iframe
                 // host instead of inner content.
@@ -512,7 +571,9 @@ export class PageWrapper {
                     overlayText: '',
                   };
                 }
-                // Overlay covers the expected element.
+                // Overlay covers the expected element OR ambiguous
+                // selector matched multiple elements and the topmost
+                // isn't the one we wanted.
                 const overlayTag = top.tagName.toLowerCase();
                 const overlayId = top.id ? `#${top.id}` : '';
                 const overlayClass = top.className && typeof top.className === 'string'
@@ -521,28 +582,43 @@ export class PageWrapper {
                 const overlayText = (top.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
                 return {
                   ok: false,
-                  reason: 'covered_by_overlay' as const,
+                  reason: args.ambiguous
+                    ? ('selector_ambiguous' as const)
+                    : ('covered_by_overlay' as const),
                   overlay: `${overlayTag}${overlayId}${overlayClass}`,
                   overlayText,
                 };
               },
-              { sel: selector, cx: coords.x, cy: coords.y },
+              {
+                sel: selector,
+                cx: coords.x,
+                cy: coords.y,
+                ambiguous,
+                driftPx: parseInt(
+                  process.env.SUPERBROWSER_PRECLICK_DRIFT_PX || '5', 10,
+                ) || 5,
+              },
             );
             if (!validation.ok) {
+              const reasonStr = validation.reason as string;
               return {
                 success: false,
-                reason: validation.reason === 'target_in_iframe'
-                  ? 'element_covered'
-                  : 'element_covered',
+                reason: 'element_covered',
                 tried,
                 error:
-                  validation.reason === 'target_in_iframe'
+                  reasonStr === 'target_in_iframe'
                     ? `Click target is inside an <iframe>; CDP coords land on the iframe host, not the inner element. Switch to selectors scoped to the iframe document, or browser_click_at(vision_index=V_n) which snaps inside.`
+                    : reasonStr === 'rect_shifted'
+                    ? `Element shifted between probe and dispatch (${validation.overlay}px) — page is mid-render. Re-screenshot to re-acquire fresh coords.`
+                    : reasonStr === 'empty_stack'
+                    ? `Click coords land on empty space (off-viewport or transparent pixel). Scroll the element into view and re-screenshot before retrying.`
+                    : reasonStr === 'selector_ambiguous'
+                    ? `Selector matched multiple elements; topmost at coords is "${validation.overlay}${validation.overlayText ? ` (${validation.overlayText})` : ''}", not the intended one. Re-read elements and pick a more specific [index].`
                     : `Element is covered by ${validation.overlay}${validation.overlayText ? ` ("${validation.overlayText}")` : ''}. The click would land on the overlay instead of the intended element. Dismiss the overlay first or wait for it to dissolve.`,
                 alternatives: [
-                  'Dismiss the covering overlay (close button, Escape key)',
-                  'browser_wait_for the overlay to disappear, then retry',
-                  'Re-screenshot to confirm the current page state',
+                  'Re-screenshot to refresh element state',
+                  'Dismiss any covering overlay (close button, Escape key)',
+                  'Try browser_click_at(vision_index=V_n) — snaps to interactive inside the bbox',
                 ],
               };
             }
@@ -709,7 +785,16 @@ export class PageWrapper {
    */
   async clickInBbox(
     bbox: { x0: number; y0: number; x1: number; y1: number },
-    options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
+    options?: {
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+      /** v6 F2: vision's label for this bbox. When provided, Phase 1
+       *  pinpoint validates the snapped element's text/aria-label
+       *  aligns with the vision label. On mismatch (page-shift case),
+       *  Phase 1 falls through to Phase 2 grid-scan instead of
+       *  trusting the centre element. */
+      expectedLabel?: string;
+    },
   ): Promise<{
     x: number;
     y: number;
@@ -720,9 +805,20 @@ export class PageWrapper {
      *  ('pointer_events_none_ancestor'). The click still dispatches —
      *  the bridge surfaces this so the brain can react. */
     warning?: string;
+    /** Xpath of the snapped interactive element — the /click handler
+     *  uses it to look up the corresponding selectorMap index, so the
+     *  Python bridge can record `last_click_dom_index` and the cross-
+     *  tool dead-click guard can recognize that V_n and [N] resolve
+     *  to the same DOM element. */
+    targetXpath?: string;
   }> {
+    const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
-      (b: { x0: number; y0: number; x1: number; y1: number }) => {
+      (args: {
+        b: { x0: number; y0: number; x1: number; y1: number };
+        expectedLabel: string;
+      }) => {
+        const b = args.b;
         const SEL = 'a,button,input,select,textarea,'
           + '[role="button"],[role="link"],[role="checkbox"],'
           + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
@@ -736,6 +832,25 @@ export class PageWrapper {
             : '';
           const txt = (el.textContent || '').trim().slice(0, 30);
           return `${tag}${id}${cls}${txt ? `[${txt}]` : ''}`;
+        };
+        // Compute the xpath of the snapped element so the TS-side /click
+        // handler can resolve it to a selectorMap index. Mirrors the
+        // shape buildDomTree generates: `/html[1]/body[1]/div[3]/...`.
+        const xpathOf = (el: Element): string => {
+          const parts: string[] = [];
+          let cur: Element | null = el;
+          while (cur && cur.nodeType === 1 && cur !== document.documentElement.parentElement) {
+            const tag = cur.tagName.toLowerCase();
+            let idx = 1;
+            let sib: Element | null = cur.previousElementSibling;
+            while (sib) {
+              if (sib.tagName.toLowerCase() === tag) idx += 1;
+              sib = sib.previousElementSibling;
+            }
+            parts.unshift(`${tag}[${idx}]`);
+            cur = cur.parentElement;
+          }
+          return '/' + parts.join('/');
         };
         // 1. Pinpoint: click the bbox centre. Sanity-check that SOMETHING
         //    is rendered there (not transparent padding, not off-page).
@@ -751,6 +866,36 @@ export class PageWrapper {
           // nicely in the UI overlay. The click coordinates stay at the
           // bbox centre — we don't move them.
           const interactive = (centreEl as Element).closest(SEL) || centreEl;
+          // v6 F2: label-match check. When vision provided an
+          // expectedLabel, verify the snapped element's text/aria-label
+          // aligns. After a page shift, the bbox centre may now hit a
+          // DIFFERENT interactive element — Phase 1 would happily
+          // click it. On mismatch we fall through to Phase 2 grid-
+          // scan which can find a different interactive whose rect
+          // overlaps the bbox AND whose label aligns.
+          let labelMatch = true;
+          if (args.expectedLabel.length >= 3) {
+            const snappedFull = (
+              ((interactive as HTMLElement).textContent || '') + ' '
+              + ((interactive as HTMLElement).getAttribute('aria-label') || '')
+              + ' '
+              + ((interactive as HTMLElement).getAttribute('title') || '')
+            ).toLowerCase().replace(/\s+/g, ' ').trim();
+            const expLc = args.expectedLabel.toLowerCase().trim();
+            // Substring either direction handles two real cases:
+            //   1) bbox label is a tight subset of element's full text
+            //      (e.g. label='Sony', element text='Sony 12 reviews')
+            //   2) element's text is truncated by browser-use's
+            //      80-char cap, so element-text < bbox label
+            labelMatch = (
+              !!snappedFull
+              && (
+                snappedFull.includes(expLc)
+                || expLc.includes(snappedFull.slice(0, 40))
+              )
+            );
+          }
+          if (labelMatch) {
           // A2: surface warning when the click would land on an
           // iframe host (inner content unreachable via outer-doc CDP)
           // or when an ancestor has pointer-events:none (click would
@@ -784,7 +929,15 @@ export class PageWrapper {
             snapped: true,
             target: describe(interactive),
             warning,
+            targetXpath: xpathOf(interactive),
           };
+          } /* end if (labelMatch) */
+          // labelMatch=false: fall through to Phase 2 grid-scan below.
+          // Phase 1 trusted Gemini's centre but the snapped element's
+          // label diverged from the bbox label (likely page-shift
+          // case where layout moved a different element under the
+          // bbox centre). Grid-scan can find an alternate interactive
+          // whose rect overlaps the bbox AND whose label aligns.
         }
         // 2. Centre fell on empty space — bbox is probably loose or
         //    off-page. Grid-scan fallback: pick the interactive element
@@ -849,6 +1002,7 @@ export class PageWrapper {
             y: Math.round(r.top + r.height / 2),
             snapped: true,
             target: describe(best),
+            targetXpath: xpathOf(best),
           };
         }
         // 3. Hard fallback: click the raw centre anyway. snapped=false
@@ -856,7 +1010,7 @@ export class PageWrapper {
         //    no visual confirmation.
         return { x: cx, y: cy, snapped: false };
       },
-      bbox,
+      { b: bbox, expectedLabel },
     );
 
     // Broadcast resolved target to live viewers BEFORE the click so the
@@ -2077,55 +2231,94 @@ export class PageWrapper {
       const y = (await this.getScrollInfo())[0];
       return { before: y, after: y, fallback: 'none' };
     }
-    return (await this.page.evaluate((d: number) => {
-      const before = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
-      window.scrollBy(0, d);
-      let after = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
-      if (after === before) {
-        const se = document.scrollingElement as HTMLElement | null;
-        if (se) {
-          se.scrollBy(0, d);
-          after = Math.round(window.scrollY || se.scrollTop || 0);
-        }
-      }
-      if (after === before) {
-        // Find the largest non-trivial scrollable descendant. We prefer
-        // big main-app containers over small overflow regions (a 200px
-        // sidebar isn't where the brain wants to scroll). Anything <
-        // 200px clientHeight is ignored.
-        let target: HTMLElement | null = null;
-        let bestScore = 0;
-        const all = document.querySelectorAll<HTMLElement>('*');
-        for (let i = 0; i < all.length; i++) {
-          const el = all[i];
-          if (el.clientHeight < 200) continue;
-          if (el.scrollHeight <= el.clientHeight + 4) continue;
-          const cs = window.getComputedStyle(el);
-          if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue;
-          // Skip elements whose ancestor we already considered better.
-          const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
-          if (score > bestScore) {
-            bestScore = score;
-            target = el;
+    // Force instant scroll behavior so the synchronous `before`/`after`
+    // check is reliable. Modern e-commerce frameworks routinely set
+    // `html { scroll-behavior: smooth }` for back-to-top buttons /
+    // anchor-link UX. With smooth behavior, `window.scrollBy()` is
+    // ASYNC — `scrollY` updates over the animation, not synchronously.
+    // The pre-fix code's `before === after` check fired prematurely,
+    // returning `fallback: 'none'` even though the page was scrolling
+    // smoothly behind the scenes. We override the CSS property at the
+    // <html> AND <body> level for the duration of this call, then
+    // restore it. Pages that observe style mutations see one transient
+    // change; the visible behavior is correct synchronous scroll.
+    const eager = (await this.page.evaluate((d: number) => {
+      const root = document.documentElement;
+      const body = document.body as HTMLElement | null;
+      const savedRoot = root.style.scrollBehavior;
+      const savedBody = body ? body.style.scrollBehavior : '';
+      root.style.scrollBehavior = 'auto';
+      if (body) body.style.scrollBehavior = 'auto';
+      try {
+        const before = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
+        window.scrollBy(0, d);
+        let after = Math.round(window.scrollY || (document.scrollingElement?.scrollTop ?? 0));
+        if (after === before) {
+          const se = document.scrollingElement as HTMLElement | null;
+          if (se) {
+            se.scrollBy(0, d);
+            after = Math.round(window.scrollY || se.scrollTop || 0);
           }
         }
-        if (target) {
-          const tBefore = target.scrollTop;
-          target.scrollBy(0, d);
-          const moved = target.scrollTop !== tBefore;
-          // Tag for stable reuse — subsequent scrolls hit the same host.
-          if (moved) {
-            target.setAttribute('data-sb-doc-scroll-host', '1');
-            return { before, after: target.scrollTop, fallback: 'largest_container' as const };
+        if (after === before) {
+          // v6 G2 — collect top scroll-candidate descendants and try
+          // EACH in turn until one actually moves. The previous code
+          // tried only the largest, ignoring smaller containers like
+          // filter sidebars (typically 150-180px tall). When the brain
+          // is searching for a control inside the sidebar via
+          // scrollUntil, the largest-only heuristic walked through main
+          // content forever. Lowered the threshold from 200 → 100 and
+          // try top 3.
+          const candidates: Array<{ el: HTMLElement; score: number }> = [];
+          const all = document.querySelectorAll<HTMLElement>('*');
+          for (let i = 0; i < all.length; i++) {
+            const el = all[i];
+            if (el.clientHeight < 100) continue;
+            if (el.scrollHeight <= el.clientHeight + 4) continue;
+            const cs = window.getComputedStyle(el);
+            if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue;
+            const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
+            candidates.push({ el, score });
           }
+          candidates.sort((a, b) => b.score - a.score);
+          for (const cand of candidates.slice(0, 3)) {
+            const target = cand.el;
+            const tBefore = target.scrollTop;
+            target.scrollBy(0, d);
+            if (target.scrollTop !== tBefore) {
+              target.setAttribute('data-sb-doc-scroll-host', '1');
+              return { before, after: target.scrollTop, fallback: 'largest_container' as const };
+            }
+          }
+        } else {
+          return { before, after, fallback: 'window' as const };
         }
         return { before, after, fallback: 'none' as const };
+      } finally {
+        root.style.scrollBehavior = savedRoot;
+        if (body) body.style.scrollBehavior = savedBody;
       }
-      // Determine which path moved us.
-      // (Heuristic: if document.scrollingElement was used, window.scrollY
-      // would still update. We can't easily distinguish; report 'window'.)
-      return { before, after, fallback: 'window' as const };
     }, delta)) as { before: number; after: number; fallback: 'window' | 'scrollingElement' | 'largest_container' | 'none' };
+    if (eager.fallback !== 'none') {
+      return eager;
+    }
+    // Retry-with-delay: in rare cases (frameworks that intercept scrollBy
+    // and re-dispatch async, or pages where our instant override didn't
+    // take), wait 300ms and re-read scrollY. If it moved during the
+    // wait, treat as a window scroll. Catches stragglers without
+    // disabling the fast path on simple pages.
+    const isPageScrollable = await this.page.evaluate(() => {
+      return document.documentElement.scrollHeight > window.innerHeight + 4;
+    });
+    if (!isPageScrollable) {
+      return eager;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const after = (await this.getScrollInfo())[0];
+    if (after !== eager.before) {
+      return { before: eager.before, after, fallback: 'window' };
+    }
+    return eager;
   }
 
   async scrollPage(direction: 'up' | 'down'): Promise<void> {
@@ -2285,17 +2478,34 @@ export class PageWrapper {
     iterations: number;
     finalScrollY: number;
     scrolledPx: number;
-    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match';
+    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match' | 'no_scroll_surface' | 'target_in_no_scrollable_container' | 'no_forward_progress';
     matchedSelector?: string;
     matchedText?: string;
     trace: { i: number; scrollY: number; passed: string[] }[];
     reversed?: boolean;
     startScrollY: number;
     containerSelector?: string;
+    /** Diagnostic: which surface we ended up driving. Helps the brain
+     *  reason about silent failures ("we scrolled the body but Food
+     *  Pairing is in a non-scrollable section"). */
+    chosenContainer?: {
+      selector?: string;
+      tag?: string;
+      role?: string;
+      scrollHeight?: number;
+      clientHeight?: number;
+      containedTarget?: boolean;
+    };
   }> {
     const targetText = (opts.targetText ?? '').trim();
     const targetRole = (opts.targetRole ?? '').trim();
     const containerSelector = (opts.containerSelector ?? '').trim() || undefined;
+    /** Forward leg must move at least this many pixels before
+     *  auto_reverse is allowed to rewind. If the page is non-scrollable
+     *  (target is inside a static <header> / sticky banner / collapsed
+     *  section), reversing 0 pixels of progress just hides the failure.
+     *  100px is enough to clear typical anti-aliasing jitter. */
+    const MIN_FORWARD_PROGRESS_PX = 100;
 
     if (!targetText && !targetRole) {
       const info = await this.getScrollInfo();
@@ -2369,8 +2579,14 @@ export class PageWrapper {
       return { y, vp, total };
     };
 
-    const scrollByDelta = async (delta: number): Promise<void> => {
+    // v6 G1 — return whether the scroll actually moved any surface.
+    // Previously this was a void function; the caller had no signal
+    // when window/scrollingElement/largest-container all returned no-
+    // op. Loop continued, plateau detection eventually fired, but the
+    // brain saw `page_end` with scrolledPx=0 and was confused.
+    const scrollByDelta = async (delta: number): Promise<{ moved: boolean }> => {
       if (containerSelector) {
+        const before = (await getGeometry()).y;
         await this.page.evaluate(
           (args: { sel: string; d: number }) => {
             const el = document.querySelector(args.sel) as HTMLElement | null;
@@ -2378,13 +2594,14 @@ export class PageWrapper {
           },
           { sel: containerSelector, d: delta },
         );
-      } else {
-        // Use the robust window-scroll cascade so scroll_until works on
-        // pages where body has overflow:hidden (wizard-style SPAs, full-
-        // bleed apps). Without this, every iteration is a silent no-op
-        // and scroll_until walks 10 iters reporting 0 scrolledPx.
-        await this._windowScrollByWithFallback(delta);
+        const after = (await getGeometry()).y;
+        return { moved: after !== before };
       }
+      // Use the robust window-scroll cascade so scroll_until works on
+      // pages where body has overflow:hidden (wizard-style SPAs, full-
+      // bleed apps).
+      const result = await this._windowScrollByWithFallback(delta);
+      return { moved: result.fallback !== 'none' && result.after !== result.before };
     };
 
     // Find a visible match within scope (page or container). Returns
@@ -2408,6 +2625,27 @@ export class PageWrapper {
             ? (document.querySelector(container) as HTMLElement | null) ?? document
             : document;
           const containerEl = container ? (root as HTMLElement) : null;
+          // v6 G3 — also reject elements inside collapsed accordions /
+          // <details>. Modern filter UIs use <details open> or
+          // [aria-expanded] toggles for filter sections; their text
+          // is rendered but the children are visually hidden by the
+          // closed parent. Without this check, scroll_until reports
+          // the section header as a hit when scanning for a filter
+          // value INSIDE the section.
+          const isHiddenByCollapse = (el: Element): boolean => {
+            let walker: Element | null = el.parentElement;
+            let depth = 0;
+            while (walker && walker !== document.body && depth < 12) {
+              if (
+                walker.tagName === 'DETAILS'
+                && !(walker as HTMLDetailsElement).open
+              ) return true;
+              if (walker.getAttribute('aria-expanded') === 'false') return true;
+              walker = walker.parentElement;
+              depth += 1;
+            }
+            return false;
+          };
           const isVisible = (el: Element): boolean => {
             const r = (el as HTMLElement).getBoundingClientRect();
             if (r.width <= 0 || r.height <= 0) return false;
@@ -2423,6 +2661,7 @@ export class PageWrapper {
             }
             const cs = window.getComputedStyle(el as HTMLElement);
             if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+            if (isHiddenByCollapse(el)) return false;
             return true;
           };
           const interactive = Array.from(root.querySelectorAll(
@@ -2539,6 +2778,93 @@ export class PageWrapper {
       };
     }
 
+    // Pre-walk: does the target text exist in DOM at all, and if so,
+    // is it inside a scrollable ancestor we can drive? When the answer
+    // is "exists but not in any scroll surface" (e.g., sitting in a
+    // collapsed <details>, or inside a non-overflowing static section),
+    // bail with `target_in_no_scrollable_container` instead of
+    // grinding through maxIter and reporting `page_end`. The brain
+    // reads this and adjusts strategy (expand the section, or accept
+    // the target is unreachable via scroll).
+    const containerProbe = await this.page.evaluate(
+      (args: { regexSrc: string; isRegex: boolean; container?: string }) => {
+        const { regexSrc: rs, isRegex: ir, container } = args;
+        if (!rs) return { existsInDom: false, hasScrollableAncestor: false };
+        const matches = (txt: string): boolean => {
+          if (ir) {
+            try { return new RegExp(rs, 'i').test(txt); }
+            catch { return txt.toLowerCase().includes(rs.toLowerCase()); }
+          }
+          return txt.toLowerCase().includes(rs.toLowerCase());
+        };
+        const root: ParentNode = container
+          ? (document.querySelector(container) as HTMLElement | null) ?? document
+          : document;
+        const all = Array.from(root.querySelectorAll<HTMLElement>(
+          'a, button, input, select, textarea, label, summary, '
+          + '[role], [aria-label], [data-testid], h1, h2, h3, h4, h5, '
+          + 'li, td, th, span, div',
+        ));
+        let candidate: HTMLElement | null = null;
+        for (const el of all) {
+          const txt = (el.innerText || el.textContent || '').trim();
+          const aria = el.getAttribute('aria-label') || '';
+          const placeholder = el.getAttribute('placeholder') || '';
+          const composite = `${txt}\n${aria}\n${placeholder}`.trim();
+          if (composite && matches(composite)) {
+            candidate = el;
+            break;
+          }
+        }
+        if (!candidate) return { existsInDom: false, hasScrollableAncestor: false };
+        // Walk parents looking for a scrollable ancestor. Document.body
+        // / documentElement count when their respective scrollHeight
+        // exceeds clientHeight.
+        let walker: HTMLElement | null = candidate.parentElement;
+        let depth = 0;
+        let foundScroll: HTMLElement | null = null;
+        while (walker && depth < 40) {
+          const cs = window.getComputedStyle(walker);
+          const overflowY = cs.overflowY;
+          if (
+            (overflowY === 'auto' || overflowY === 'scroll')
+            && walker.scrollHeight > walker.clientHeight + 4
+          ) {
+            foundScroll = walker;
+            break;
+          }
+          if (walker === document.body || walker === document.documentElement) break;
+          walker = walker.parentElement;
+          depth += 1;
+        }
+        // Document-level scroll counts too.
+        const docScrollable =
+          document.documentElement.scrollHeight > window.innerHeight + 4;
+        return {
+          existsInDom: true,
+          hasScrollableAncestor: !!foundScroll || docScrollable,
+        };
+      },
+      { regexSrc, isRegex, container: containerSelector },
+    );
+
+    if (
+      containerProbe.existsInDom
+      && !containerProbe.hasScrollableAncestor
+      && !containerSelector
+    ) {
+      return {
+        found: false,
+        iterations: 0,
+        finalScrollY: startY,
+        scrolledPx: 0,
+        reason: 'target_in_no_scrollable_container',
+        trace,
+        startScrollY: startY,
+        containerSelector,
+      };
+    }
+
     // Run a single direction scan. Returns the outcome OR null if the
     // caller should auto-reverse and try the other way.
     const scanOnce = async (
@@ -2551,7 +2877,7 @@ export class PageWrapper {
         iterations: number;
         finalScrollY: number;
         scrolledPx: number;
-        reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations';
+        reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_scroll_surface';
         matchedSelector?: string;
         matchedText?: string;
       };
@@ -2559,10 +2885,35 @@ export class PageWrapper {
       let iterations = iterStart;
       let lastY = (await getGeometry()).y;
       let plateauHits = 0;
+      // v6 G1 — track when scrollByDelta reports no scroll surface
+      // moved at all. Two consecutive 0-move iterations = page has no
+      // scrollable surface we can drive. Exit early with explicit
+      // reason instead of grinding through maxIter and reporting
+      // page_end (which misleads the brain into thinking it walked
+      // the whole page).
+      let noMoveStreak = 0;
       while (iterations < iterStart + maxIter) {
         iterations += 1;
         const delta = direction === 'down' ? stepDelta : -stepDelta;
-        await scrollByDelta(delta);
+        const stepResult = await scrollByDelta(delta);
+        if (!stepResult.moved) {
+          noMoveStreak += 1;
+          if (noMoveStreak >= 2 && !containerSelector) {
+            const info0 = await getGeometry();
+            return {
+              done: true,
+              result: {
+                found: false,
+                iterations,
+                finalScrollY: info0.y,
+                scrolledPx: info0.y - startY,
+                reason: 'no_scroll_surface',
+              },
+            };
+          }
+        } else {
+          noMoveStreak = 0;
+        }
         await new Promise((r) => setTimeout(r, 300));
         const info = await getGeometry();
         const y = info.y;
@@ -2639,6 +2990,25 @@ export class PageWrapper {
       };
     }
 
+    // If the forward leg made <100px of progress, reversing back is
+    // pointless (and erases what little motion did happen). Bail with
+    // a distinct `no_forward_progress` reason — brain reads it as "no
+    // scroll surface accepted my scroll" rather than "I scanned the
+    // whole page and didn't find it".
+    const forwardProgress = Math.abs(phase1.finalScrollY - startY);
+    if (forwardProgress < MIN_FORWARD_PROGRESS_PX) {
+      return {
+        found: false,
+        iterations: phase1.iterations,
+        finalScrollY: phase1.finalScrollY,
+        scrolledPx: phase1.finalScrollY - startY,
+        reason: 'no_forward_progress',
+        trace,
+        startScrollY: startY,
+        containerSelector,
+      };
+    }
+
     const reverseDir: 'up' | 'down' = startDirection === 'down' ? 'up' : 'down';
     const phase2 = await scanOnce(reverseDir, phase1.iterations);
     if (phase2.done && phase2.result.found) {
@@ -2683,7 +3053,7 @@ export class PageWrapper {
     iterations: number;
     finalScrollY: number;
     scrolledPx: number;
-    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match' | 'no_container';
+    reason: 'matched' | 'page_end' | 'page_start' | 'max_iterations' | 'no_target' | 'reversed_no_match' | 'no_container' | 'no_scroll_surface' | 'target_in_no_scrollable_container' | 'no_forward_progress';
     matchedSelector?: string;
     matchedText?: string;
     trace: { i: number; scrollY: number; passed: string[] }[];
@@ -3125,6 +3495,46 @@ export class PageWrapper {
         const sh = Math.round(document.documentElement.scrollHeight);
         const vp = Math.round(window.innerHeight);
         out += `\n\n[OUTLINE scrollY=${sy} scrollHeight=${sh} vp=${vp}]`;
+
+        // v6 G4 — list scroll containers so the brain knows where to
+        // pass `container_selector=` when browser_scroll_until returns
+        // `no_scroll_surface` or `reversed_no_match`. Top 5 by score
+        // (clientHeight × overflow). Selectors are short tag+id+class
+        // hints, not stable CSS — but enough to disambiguate.
+        const containers: Array<{ sel: string; cw: number; ch: number; sh: number; sy: number; score: number }> = [];
+        try {
+          const all = document.querySelectorAll<HTMLElement>('*');
+          for (let i = 0; i < all.length; i++) {
+            const el = all[i];
+            if (el.clientHeight < 100) continue;
+            if (el.scrollHeight <= el.clientHeight + 4) continue;
+            const cs = window.getComputedStyle(el);
+            if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue;
+            const tag = el.tagName.toLowerCase();
+            const id = el.id ? `#${el.id}` : '';
+            const cls = (el.className && typeof el.className === 'string')
+              ? `.${el.className.split(/\s+/).filter(Boolean).slice(0, 1).join('.')}`
+              : '';
+            const sel = `${tag}${id}${cls}`;
+            const score = el.clientHeight * (el.scrollHeight - el.clientHeight);
+            containers.push({
+              sel,
+              cw: Math.round(el.clientWidth),
+              ch: Math.round(el.clientHeight),
+              sh: Math.round(el.scrollHeight),
+              sy: Math.round(el.scrollTop),
+              score,
+            });
+          }
+        } catch { /* best-effort */ }
+        containers.sort((a, b) => b.score - a.score);
+        const top = containers.slice(0, 5);
+        if (top.length > 0) {
+          const lines = top.map(
+            (c) => `  - ${c.sel} (${c.cw}×${c.ch}, scrollH=${c.sh}, scrollY=${c.sy})`,
+          );
+          out += `\n[SCROLL_CONTAINERS\n${lines.join('\n')}\n]`;
+        }
       }
       return out;
     }, includeAnchors);

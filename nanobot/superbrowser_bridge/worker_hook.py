@@ -116,13 +116,52 @@ class BrowserWorkerHook(AgentHook):
                 "honestly via done(success=False).]"
             )
         elif remaining <= int(self.max_iterations * 0.4) and self._last_budget_warning_at != iteration:
-            # 40% or less remaining
+            # 40% or less remaining. v4 D2: page-type-aware guidance.
+            # On heavy pages, run_script(mutates=true) fails ~80% — Gate 3
+            # would refuse it anyway. Steer the brain toward atomic
+            # vision tools instead. On simple pages keep the old nudge.
             self._last_budget_warning_at = iteration
-            guidance_parts.append(
-                f"[GUIDANCE: {remaining} iterations left out of "
-                f"{self.max_iterations}. Switch to browser_run_script NOW "
-                "to batch all remaining work into one script call.]"
-            )
+            last_resp_pt = (
+                getattr(
+                    getattr(self.state, "_last_vision_response", None),
+                    "page_type", "",
+                ) or ""
+            ).strip()
+            current_url_lc = (self.state.current_url or "").lower()
+            is_heavy = last_resp_pt in {
+                "search_results", "product_listing",
+                "map_or_booking", "checkout_form",
+            }
+            if not is_heavy:
+                try:
+                    from superbrowser_bridge.session_tools.effects import (
+                        _HARD_DOMAINS,
+                    )
+                    is_heavy = any(
+                        d in current_url_lc for d in _HARD_DOMAINS
+                    )
+                except Exception:
+                    pass
+            if is_heavy:
+                guidance_parts.append(
+                    f"[GUIDANCE: {remaining} iterations left out of "
+                    f"{self.max_iterations}. Heavy page type "
+                    f"({last_resp_pt or 'hard-domain'}) — DO NOT use "
+                    "browser_run_script(mutates=true); it fails ~80% "
+                    "here (ambiguous selectors, isTrusted=false bot-"
+                    "detection, async re-render races). Batch the "
+                    "remaining work via ATOMIC vision tools: "
+                    "browser_click_at(V_n) + browser_type_at(V_n) + "
+                    "browser_select_option(V_n) + "
+                    "browser_scroll_until(target_text). Group results "
+                    "into a single done() call at the end.]"
+                )
+            else:
+                guidance_parts.append(
+                    f"[GUIDANCE: {remaining} iterations left out of "
+                    f"{self.max_iterations}. Switch to browser_run_script NOW "
+                    "to batch all remaining work into one script call.]"
+                )
 
         # --- Detect regression (already handled at tool level, reinforce here) ---
         if self.state.regression_count > 0 and self.state.best_checkpoint_url:
@@ -496,6 +535,167 @@ class BrowserWorkerHook(AgentHook):
                                 f"re-screenshot and target V{child_v}."
                             )
                         guidance_parts.append("\n".join(msg_lines))
+            except Exception:
+                pass
+
+        # --- Misclick advisories from the vision-pipeline detector -----
+        # `_detect_misclick_flip` populates `state._misclick_advisory`
+        # whenever the brain aimed at one bbox but a DIFFERENT one
+        # flipped active state instead. Drain up to 2 per turn — beyond
+        # that the brain has bigger problems than a misclick. Cleared
+        # after rendering so each advisory surfaces exactly once.
+        try:
+            misclick_queue = getattr(self.state, "_misclick_advisory", None)
+            if isinstance(misclick_queue, list) and misclick_queue:
+                for advisory in misclick_queue[:2]:
+                    if advisory:
+                        guidance_parts.append(advisory)
+                # Drain the queue entirely — anything >2 in one turn is
+                # noise and would re-fire next turn even if the brain
+                # already acted.
+                misclick_queue.clear()
+        except Exception:
+            pass
+
+        # --- Phase 3.5: wrong-click recovery hints ----------------------
+        # Two-axis routing:
+        #   (a) URL-change mistake — last action was a click and the new
+        #       URL is one we've visited before (regression). Recover
+        #       via existing browser_navigate or browser_rewind_to_checkpoint.
+        #   (b) Filter-toggle mistake — vision pipeline stamped
+        #       just_toggled='on' on a bbox whose label doesn't match
+        #       the task. Recover by re-clicking the same V_n. NO
+        #       navigation needed; the filter is local to this URL.
+        # The block fires AT MOST one variant per turn. URL-change
+        # case takes precedence when both could fire (page actually
+        # changed, more disruptive).
+        if os.environ.get("WORKER_WRONG_CLICK_HINT", "1") not in ("0", "false", "no"):
+            try:
+                # (a) URL-change mistake — last step was a click AND
+                #     URL changed AND that URL was previously visited
+                #     (regression). The existing regression block
+                #     above already fires for browser_navigate; this
+                #     covers the click-caused regression case.
+                steps = self.state.step_history or []
+                fired_url_branch = False
+                if steps:
+                    last = steps[-1]
+                    last_tool = last.get("tool", "")
+                    if (
+                        last_tool in {
+                            "browser_click", "browser_click_at",
+                            "browser_click_selector",
+                        }
+                        and self.state.current_url
+                        and self.state.url_visit_counts.get(
+                            self.state._normalize_url(self.state.current_url), 0
+                        ) > 1
+                    ):
+                        # Find a sensible recovery URL — second-most
+                        # recent distinct URL in step_history.
+                        recovery_url = ""
+                        seen = {self.state.current_url}
+                        for prev in reversed(steps[:-1]):
+                            u = (prev.get("url") or "").strip()
+                            if u and u not in seen:
+                                recovery_url = u
+                                break
+                        target_hint = (
+                            f"  • browser_navigate(url={recovery_url!r})"
+                            if recovery_url
+                            else "  • browser_navigate(url=<previous_url>)"
+                        )
+                        guidance_parts.append(
+                            "[WRONG_CLICK_DETECTED:url_change]\n"
+                            "Your last click landed you on a URL you "
+                            f"already visited ({self.state.current_url}). "
+                            "If this was unintentional:\n"
+                            f"{target_hint}\n"
+                            "  • browser_rewind_to_checkpoint  — back "
+                            "to last verified-good state.\n"
+                            "If the URL change was INTENTIONAL (e.g., "
+                            "you clicked a 'View details' link), ignore "
+                            "this hint and continue."
+                        )
+                        fired_url_branch = True
+                # (b) Filter-toggle mistake — only fires when (a) didn't.
+                if not fired_url_branch:
+                    last_resp = getattr(self.state, "_last_vision_response", None)
+                    bboxes = getattr(last_resp, "bboxes", None) if last_resp else None
+                    if bboxes:
+                        try:
+                            ranked = sorted(bboxes, key=_replicate_bbox_rank)[:50]
+                        except Exception:
+                            ranked = list(bboxes)[:50]
+                        task_text = (
+                            getattr(self.state, "task_instruction", "") or ""
+                        ).lower()
+                        for idx, b in enumerate(ranked, 1):
+                            jt = getattr(b, "just_toggled", None)
+                            if jt not in ("on", "off"):
+                                continue
+                            label = (getattr(b, "label", "") or "").strip()
+                            if not label:
+                                continue
+                            label_lc = label.lower()
+                            # Heuristic: if any 4+ char token from the
+                            # toggled label appears in the task, the
+                            # toggle was probably intentional. Otherwise
+                            # surface the recovery hint.
+                            label_tokens = set(
+                                re.findall(r"\b[a-z]{4,}\b", label_lc)
+                            )
+                            task_overlap = bool(
+                                task_text and any(
+                                    t in task_text for t in label_tokens
+                                )
+                            )
+                            if task_overlap:
+                                continue
+                            verb = "applied" if jt == "on" else "removed"
+                            opposite = "removed" if jt == "on" else "applied"
+                            guidance_parts.append(
+                                "[WRONG_CLICK_DETECTED:filter_toggle]\n"
+                                f"Your last click {verb} the filter "
+                                f"{label!r} (V{idx}, just_toggled={jt}). "
+                                "The task does not mention this filter — "
+                                "if the toggle was unintentional, "
+                                f"re-click V{idx} to {opposite[:-2]} it "
+                                "(this is the natural undo for filter "
+                                "chips and checkboxes — no need to "
+                                "navigate or rewind, the filter is "
+                                "local to this URL)."
+                            )
+                            break  # one filter-toggle hint per turn
+            except Exception:
+                pass
+
+        # --- Phase 3.6: run_script failure-rate redirect ----------------
+        # When the last 5 browser_run_script calls have a 3+ failure
+        # rate, redirect to vision tools regardless of page type. Catches
+        # cases where Gate 3 (heavy-page guard) didn't fire but the
+        # script still keeps failing (selector ambiguity, race
+        # conditions, sandbox refusals).
+        if os.environ.get("WORKER_RUNSCRIPT_FAIL_HINT", "1") not in ("0", "false", "no"):
+            try:
+                outcomes = list(getattr(self.state, "recent_run_script_outcomes", []) or [])
+                if len(outcomes) >= 5 and outcomes.count(False) >= 3:
+                    guidance_parts.append(
+                        "[RUN_SCRIPT_FAILING]\n"
+                        f"{outcomes.count(False)} of the last "
+                        f"{len(outcomes)} browser_run_script calls "
+                        "failed. The script approach isn't working "
+                        "on this page. STOP using browser_run_script "
+                        "and switch to ATOMIC vision tools — each "
+                        "call dispatches isTrusted=true CDP events "
+                        "and adapts to the LIVE page state:\n"
+                        "  • browser_click_at(vision_index=V_n)\n"
+                        "  • browser_type_at(vision_index=V_n, value=…)\n"
+                        "  • browser_select_option(vision_index=V_n, label=…)\n"
+                        "  • browser_scroll_until(target_text=…)\n"
+                        "  • browser_get_markdown(include_anchors=true) "
+                        "— for inspecting structure / extracting data."
+                    )
             except Exception:
                 pass
 

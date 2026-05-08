@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -89,6 +90,69 @@ class BrowserSessionState:
         self.last_click_dom_hash: str = ""
         self.consecutive_dead_clicks: int = 0
         self.MAX_CONSECUTIVE_SAME_TARGET = 3
+        # v4 — toggle-aware dead-click exemption + just_toggled
+        # detection. When the brain clicks a filter chip / checkbox to
+        # un-apply it (legitimate undo), the same V_n fires twice in a
+        # row. Without this, the dead-click guard would block the
+        # un-toggle. We record the bbox's `is_active` state at click
+        # dispatch time; if the next click on the same target sees a
+        # FLIPPED is_active, that's a successful toggle, not flailing,
+        # and the consecutive counter resets.
+        # `last_click_target_label` + `last_click_target_box_2d` give
+        # the post-click vision pipeline enough info to find the same
+        # bbox in the new response and stamp `just_toggled` on it.
+        self.last_click_target_active_state: bool | None = None
+        self.last_click_target_label: str = ""
+        self.last_click_target_box_2d: list[int] | None = None
+        # Cross-tool element identity. Resolved DOM index of the last
+        # click target — populated by every click path that knows the
+        # index (BrowserClickTool from `index` arg; BrowserClickAtTool
+        # from `data.snap.dom_index` post-response). When set, the
+        # dead-click guard catches a follow-up `browser_click(N)` on
+        # the SAME element after a `browser_click_at(V_n)` toggled it,
+        # by comparing this against the new tool's `dom_index`. Resets
+        # to None on session reset and on any explicit re-screenshot
+        # (which means the brain has re-observed and a deliberate
+        # toggle-off is permitted).
+        self.last_click_dom_index: int | None = None
+        # --- Surgical undo ring (Problem 1) -------------------------------
+        # Bounded LIFO ring of recent reversible clicks. Each entry is a
+        # dict (see begin_click_record / finalize_click_record for the
+        # shape). Filled in two phases — `begin_click_record` is called
+        # before HTTP dispatch with what we know up-front (target, label,
+        # pre_active, reversibility class); `finalize_click_record` folds
+        # in the click response (effect, snap, post_url) and pushes onto
+        # the ring. The misclick auto-detector in vision_pipeline reads
+        # the top entry to mark misclick_flag + misclick_evidence after
+        # the post-click vision lands.
+        self._undo_ring: list[dict] = []
+        self.UNDO_RING_MAX = 4
+        # The pending entry being assembled across the click → vision
+        # boundary. Set by begin_click_record, consumed by
+        # finalize_click_record. Should be None outside a click flight.
+        self._pending_undo_entry: dict | None = None
+        # One-shot advisory queue. The misclick detector appends
+        # human-readable strings here; the worker hook drains them into
+        # the next tool result (cap 2/turn) and clears the list. Plain
+        # FIFO list — the cap is enforced on render, not on insert.
+        self._misclick_advisory: list[str] = []
+        # Snapshot of the previous vision response's is_active map
+        # keyed by (label, box_centroid_bucket) so the misclick detector
+        # can identify which bbox flipped. Repopulated once per prefetch.
+        self._prev_active_map: dict[tuple[str, int, int], bool] = {}
+        # v4 D3 — failure ledger for browser_run_script. Tracks
+        # (success: bool) for the last 5 calls. Worker_hook fires a
+        # [RUN_SCRIPT_FAILING] redirect when 3+ of the last 5 failed.
+        self.recent_run_script_outcomes: list[bool] = []
+        # v5 — visual-stability gate. Set by navigation tools after a
+        # successful nav; consumed by the next vision prefetch (which
+        # passes `?settle=true` to /state, triggering the TS-side
+        # waitForVisualStable that catches font swap + image load +
+        # layout-shift before the screenshot). Without this, the
+        # FIRST vision pass after a cold navigate captures bboxes
+        # against pre-settled positions, producing the bbox-above-text
+        # offset bug.
+        self._needs_visual_settle: bool = False
         # Cross-index flail guard. consecutive_dead_clicks only catches
         # REPEATS of the same target. When the brain walks
         # [21]→[22]→[20] with every dispatch timing out, each looks like
@@ -353,6 +417,9 @@ class BrowserSessionState:
                 pass
         self._pending_vision_task = None
         self._brain_turn_counter = 0
+        # Drop cross-tool element identity tracking — a new session
+        # starts with no recorded last click.
+        self.last_click_dom_index = None
 
     def freeze_vision_epoch(self) -> None:
         """Snapshot `_last_vision_response` as the current epoch.
@@ -381,6 +448,12 @@ class BrowserSessionState:
         # zero turns elapsed since the snapshot it's reasoning on.
         self._vision_epoch_taken_at = time.time()
         self._vision_epoch_turn = self._brain_turn_counter
+        # Cross-tool same-element guard releases on any fresh vision
+        # epoch — the brain has re-observed the page, so a deliberate
+        # toggle-off via DOM-index click on the previously-bbox-clicked
+        # element is now permitted. Without this clear, the brain would
+        # be permanently blocked from re-clicking after screenshot.
+        self.last_click_dom_index = None
 
     def vision_for_target_resolution(self) -> Any:
         """Return the vision response V-index readers (click_at /
@@ -647,7 +720,12 @@ class BrowserSessionState:
             "time": datetime.now().strftime("%H:%M:%S"),
         })
 
-    def check_dead_click(self, click_target: str) -> str | None:
+    def check_dead_click(
+        self,
+        click_target: str,
+        current_active_state: bool | None = None,
+        dom_index: int | None = None,
+    ) -> str | None:
         """Pre-flight check before dispatching a click.
 
         Counts how many times this exact click target has been fired in
@@ -659,17 +737,88 @@ class BrowserSessionState:
         DOM change is detected via `_last_dom_hash` (set by every state
         fetch).
 
+        v4 C3 — toggle-aware exemption. When the bbox has `is_active`
+        flipped between the previous click and this one (was True, now
+        False, or vice versa), the prior click was a successful toggle
+        (filter applied/removed), and this click is a legitimate undo
+        — NOT flailing. Reset the counter so the brain can re-click to
+        un-toggle without being blocked. `current_active_state` is the
+        bbox's is_active right NOW (read from the most recent vision
+        response); compared against `last_click_target_active_state`
+        recorded at the previous click's dispatch.
+
+        Cross-tool same-element guard. The previous dead-click guard
+        compared `click_target` strings: `click[38]` vs `click_at(V7)`
+        differ even when both reference the SAME DOM element. So a
+        DOM-index click immediately after a bbox click on the same
+        checkbox passed silently, un-toggling the brain's correct
+        toggle. Now that bbox clicks plumb their resolved `dom_index`
+        back through `clickInBbox` and stash it in
+        `last_click_dom_index`, this method accepts the new tool's
+        dom_index and hard-blocks when:
+          - the indices match (same DOM element);
+          - the page hasn't been re-observed since (same _last_dom_hash);
+          - and the click isn't a deliberate toggle (toggle_exempt
+            releases legitimate undo-via-click cases).
+        On block, returns a `[same_element_blocked]` structured error
+        instructing the brain to call `browser_screenshot` first.
+
         Returns a structured error string when blocking, or None when
         the click is allowed to proceed.
         """
+        import os as _os
         same_target = (click_target == self.last_click_target)
         same_dom = (
             bool(self._last_dom_hash)
             and self._last_dom_hash == self.last_click_dom_hash
         )
-        if same_target and same_dom:
+        # Toggle-flip detection: only meaningful when both states are
+        # known (not None) AND they differ.
+        toggle_exempt = False
+        if (
+            _os.environ.get("BBOX_TOGGLE_DEADCLICK_EXEMPT", "1")
+                not in ("0", "false", "no")
+            and same_target
+            and self.last_click_target_active_state is not None
+            and current_active_state is not None
+            and bool(self.last_click_target_active_state)
+                != bool(current_active_state)
+        ):
+            toggle_exempt = True
+        # Cross-tool same-element check. Fires BEFORE the existing
+        # same-target/same-dom counter logic so the structured error
+        # the brain sees says "you already clicked this element, take
+        # a screenshot first" rather than "dead_click_blocked".
+        if (
+            _os.environ.get("CROSS_TOOL_SAME_ELEMENT_BLOCK", "1")
+                not in ("0", "false", "no")
+            and dom_index is not None
+            and self.last_click_dom_index is not None
+            and dom_index == self.last_click_dom_index
+            and same_dom
+            and not toggle_exempt
+            # Don't fire when the brain is targeting the same element
+            # via the same tool family (e.g., click[38] then click[38]
+            # again) — the existing same-target counter handles that.
+            and not same_target
+        ):
+            prior = self.last_click_target or "(prior click)"
+            return (
+                f"[same_element_blocked dom_index={dom_index}] You "
+                f"already clicked this element via {prior} and the "
+                f"page hasn't been re-observed since. The previous "
+                f"click toggled it; clicking again will REVERSE that "
+                f"toggle (un-applying the filter / un-checking the "
+                f"checkbox). If that's what you want, call "
+                f"browser_screenshot first to confirm the new state, "
+                f"then retry. If not, pick a different target."
+            )
+        if same_target and same_dom and not toggle_exempt:
             # Nth consecutive dead attempt at the same target.
             self.consecutive_dead_clicks += 1
+        elif toggle_exempt:
+            # Successful toggle/un-toggle — fresh strike count.
+            self.consecutive_dead_clicks = 1
         else:
             # Fresh attempt at this target (different target OR page moved).
             self.consecutive_dead_clicks = 1
@@ -693,11 +842,40 @@ class BrowserSessionState:
             )
         return None
 
-    def register_click_attempt(self, click_target: str) -> None:
+    def register_click_attempt(
+        self,
+        click_target: str,
+        *,
+        target_label: str = "",
+        target_active_state: bool | None = None,
+        target_box_2d: list[int] | None = None,
+        target_dom_index: int | None = None,
+    ) -> None:
         """Stamp the current click target + DOM hash so the next call to
-        `check_dead_click` can compare against them."""
+        `check_dead_click` can compare against them.
+
+        v4: also record the bbox's label, current is_active state, and
+        normalized box_2d. The next vision pass uses these to:
+          - detect toggle flips (C3 dead-click exemption)
+          - find the same bbox in the post-click response and stamp
+            `just_toggled='on'`/`'off'` on it (C6).
+
+        Cross-tool: also accept `target_dom_index`. DOM-index clicks
+        pass the index directly; bbox clicks pass the resolved
+        `data.snap.dom_index` from the post-click response (see
+        BrowserClickAtTool's success branch). When set, the next
+        `check_dead_click(dom_index=N)` from a different tool family
+        recognizes the same DOM element and hard-blocks.
+        """
         self.last_click_target = click_target
         self.last_click_dom_hash = self._last_dom_hash
+        self.last_click_target_label = target_label
+        self.last_click_target_active_state = target_active_state
+        self.last_click_target_box_2d = (
+            list(target_box_2d) if target_box_2d else None
+        )
+        if target_dom_index is not None:
+            self.last_click_dom_index = int(target_dom_index)
 
     def advance_observation_token(self, source: str = "") -> None:
         """No-op shim retained so kept tools (click_selector,
@@ -708,6 +886,149 @@ class BrowserSessionState:
         in-tool freshness/blocker/confidence gates in click_at do
         the same job."""
         pass
+
+    # --- Surgical undo ring (Problem 1) -------------------------------
+
+    _IRREVERSIBLE_LABEL_RE = re.compile(
+        r"^\s*(?:please\s+)?(delete|remove|cancel\s+order|submit"
+        r"|place\s+order|buy|pay|confirm|send|checkout|purchase"
+        r"|sign\s+out|log\s*out)\b",
+        re.IGNORECASE,
+    )
+
+    def begin_click_record(
+        self,
+        *,
+        tool: str,
+        target_key: str,
+        vision_index: int | None,
+        label: str,
+        box_2d: list[int] | None,
+        pre_active: bool | None,
+        expected_url_change: bool = False,
+        is_form_submit: bool = False,
+    ) -> None:
+        """Start a pending undo entry.
+
+        Called BEFORE HTTP dispatch by each click tool. Decides the
+        reversibility class up-front because by the time the click
+        response arrives, the page may already have unloaded (we'd
+        have lost the chance to label this click as e.g. nav vs
+        toggle). `finalize_click_record` later refines the class
+        when the response comes back (e.g. demotes toggle→nav when
+        the response shows url_changed=True).
+        """
+        label_clean = (label or "")[:200]
+        if is_form_submit:
+            kind = "irreversible"
+        elif expected_url_change:
+            kind = "nav"
+        elif label_clean and self._IRREVERSIBLE_LABEL_RE.match(label_clean):
+            kind = "irreversible"
+        elif pre_active is not None:
+            kind = "toggle"
+        else:
+            kind = "toggle"
+        self._pending_undo_entry = {
+            "kind": kind,
+            "tool": tool,
+            "target_key": target_key,
+            "vision_index": vision_index,
+            "label": label_clean,
+            "box_2d": list(box_2d) if box_2d else None,
+            "pre_active": pre_active,
+            "pre_url": self.current_url or "",
+            "pre_dom_hash": self._last_dom_hash or "",
+            "post_url": "",
+            "url_changed": False,
+            "mutation_delta": 0,
+            "post_active": None,
+            "session_id": self.session_id,
+            "ts": time.time(),
+            "turn": self._brain_turn_counter,
+            "misclick_flag": False,
+            "misclick_evidence": None,
+            "consumed": False,
+        }
+
+    def finalize_click_record(
+        self,
+        *,
+        response: dict | None,
+        pre_url: str = "",
+        pre_dom_hash: str = "",
+    ) -> None:
+        """Fold the click response into the pending entry and push it
+        onto the ring. Called AFTER the click response lands.
+
+        Demotes `toggle → nav` when `effect.url_changed=True` so a
+        later undo of this entry uses history.back() instead of a
+        re-click.
+        """
+        entry = self._pending_undo_entry
+        self._pending_undo_entry = None
+        if entry is None:
+            return
+        if pre_url and not entry.get("pre_url"):
+            entry["pre_url"] = pre_url
+        if pre_dom_hash and not entry.get("pre_dom_hash"):
+            entry["pre_dom_hash"] = pre_dom_hash
+        data = response or {}
+        effect = data.get("effect") if isinstance(data, dict) else None
+        if isinstance(effect, dict):
+            entry["url_changed"] = bool(effect.get("url_changed"))
+            try:
+                entry["mutation_delta"] = int(effect.get("mutation_delta") or 0)
+            except (TypeError, ValueError):
+                entry["mutation_delta"] = 0
+        entry["post_url"] = (
+            (data.get("url") if isinstance(data, dict) else None)
+            or self.current_url
+            or ""
+        )
+        # Demote toggle → nav when the click actually navigated. A nav
+        # is only undoable via history.back; re-clicking the same target
+        # on a navigated page would be wrong.
+        if entry["kind"] == "toggle" and entry.get("url_changed"):
+            entry["kind"] = "nav"
+        self._undo_ring.append(entry)
+        if len(self._undo_ring) > self.UNDO_RING_MAX:
+            # Drop the oldest entries first.
+            self._undo_ring = self._undo_ring[-self.UNDO_RING_MAX:]
+
+    def latest_undo_candidate(self) -> dict | None:
+        """Return the top unconsumed ring entry, or None if the ring
+        is empty / all entries are consumed.
+        """
+        for entry in reversed(self._undo_ring):
+            if not entry.get("consumed"):
+                return entry
+        return None
+
+    def pop_undo_candidates(self, steps: int) -> list[dict]:
+        """Pop up to N unconsumed entries from the top of the ring.
+
+        Stops at the first `irreversible` entry (which is RETURNED as
+        the first element if it sits on top — caller decides whether
+        to refuse). Otherwise returns up to `steps` entries newest-
+        first.
+        """
+        if steps <= 0:
+            return []
+        out: list[dict] = []
+        for entry in reversed(self._undo_ring):
+            if entry.get("consumed"):
+                continue
+            out.append(entry)
+            if entry.get("kind") == "irreversible":
+                break
+            if len(out) >= steps:
+                break
+        return out
+
+    def mark_undone(self, entry: dict) -> None:
+        """Mark a ring entry as consumed."""
+        entry["consumed"] = True
 
     def get_last_checkpoint(self) -> dict | None:
         """Return the most recent checkpoint."""
@@ -957,6 +1278,21 @@ class BrowserSessionState:
                     )
                 except Exception as exc:
                     print(f"  [dom_enrichment build_blocks failed: {exc}]")
+                # v4 C6 — stamp just_toggled on the bbox the brain
+                # just clicked, when is_active flipped vs. what was
+                # recorded at click dispatch. Surfaces as
+                # `active=true just_toggled=on` in brain text so the
+                # brain can re-click to un-toggle filter mistakes.
+                try:
+                    from .vision_pipeline import _apply_just_toggled_marker
+                    _apply_just_toggled_marker(resp, self)
+                except Exception as exc:
+                    print(f"  [just_toggled build_blocks failed: {exc}]")
+                try:
+                    from .vision_pipeline import _detect_misclick_flip
+                    _detect_misclick_flip(resp, self)
+                except Exception as exc:
+                    print(f"  [misclick_detect build_blocks failed: {exc}]")
                 self._last_vision_summary = resp.summary
                 self._last_vision_response = resp
                 self._last_vision_ts = time.time()

@@ -70,18 +70,20 @@ class BrowserSelectTool(Tool):
         label=StringSchema(
             "Human-readable label of the dropdown trigger (e.g. 'Brand', "
             "'Processor Brand', 'Year of Release'). Matched via accessible-name "
-            "/ <label for=> / aria-labelledby / visible text."
+            "/ <label for=> / aria-labelledby / visible text. Optional when "
+            "vision_index is provided — the bbox replaces label-based picking."
         ),
         value=StringSchema(
             "Visible text or value of the option to pick (e.g. 'Dell', 'Intel', "
-            "'2017'). Matching is exact-ci → startsWith → contains → fuzzy."
+            "'2017'). Matching priority: exact-ci → startsWith-with-word-boundary "
+            "→ contains-with-word-boundary → fuzzy ≥0.85."
         ),
         fuzzy=BooleanSchema(
-            description="Allow fuzzy match (Levenshtein ≥0.7). Default true.",
+            description="Allow fuzzy match (Levenshtein ≥0.85). Default true.",
             default=True,
         ),
         timeout=IntegerSchema(
-            description="Max ms to wait for listbox/options to render (default 4000).",
+            description="Max ms to wait for listbox/options to render (default 6000).",
             nullable=True,
         ),
         extra_option_selectors=ArraySchema(
@@ -92,7 +94,17 @@ class BrowserSelectTool(Tool):
             items=StringSchema(""),
             nullable=True,
         ),
-        required=["session_id", "label", "value"],
+        vision_index=IntegerSchema(
+            description=(
+                "Optional 1-based vision bbox index (V_n). When set, the "
+                "dropdown trigger is resolved by bbox geometry instead of "
+                "label-text matching — use this when label resolution returns "
+                "ambiguous_trigger. Honors the same vision-freshness / "
+                "epoch-age / blocker gates as browser_click_at."
+            ),
+            nullable=True,
+        ),
+        required=["session_id", "value"],
     )
 )
 class BrowserSelectOptionTool(Tool):
@@ -125,19 +137,120 @@ class BrowserSelectOptionTool(Tool):
     async def execute(
         self,
         session_id: str,
-        label: str,
         value: str,
+        label: str = "",
         fuzzy: bool = True,
         timeout: int | None = None,
         extra_option_selectors: list[str] | None = None,
+        vision_index: int | None = None,
         **kw: Any,
     ) -> str:
-        print(f"\n>> browser_select_option(label={label!r}, value={value!r})")
-        payload: dict[str, Any] = {"label": label, "value": value, "fuzzy": bool(fuzzy)}
+        if vision_index is not None:
+            print(
+                f"\n>> browser_select_option(V{vision_index}, "
+                f"value={value!r}, label={label!r})"
+            )
+        else:
+            print(
+                f"\n>> browser_select_option(label={label!r}, "
+                f"value={value!r})"
+            )
+        payload: dict[str, Any] = {
+            "label": label or "",
+            "value": value,
+            "fuzzy": bool(fuzzy),
+        }
         if timeout is not None:
             payload["timeout"] = int(timeout)
         if extra_option_selectors:
             payload["extra_option_selectors"] = list(extra_option_selectors)
+
+        # Vision-bbox path. Resolve V_n against the frozen vision epoch
+        # (same path browser_click_at uses), apply the same freshness +
+        # age + blocker gates, and pass `bbox` + `expected_label` to the
+        # TS server. Sidesteps DOM-text ambiguity entirely.
+        if vision_index is not None:
+            resp = self.s.vision_for_target_resolution()
+            if resp is None:
+                return (
+                    "[select_option_failed:no_vision] No recent vision "
+                    "response to resolve vision_index against. Take a "
+                    "browser_screenshot first, then retry. Or omit "
+                    "vision_index and pass `label` for label-based picking."
+                )
+            bbox = resp.get_bbox(int(vision_index))
+            if bbox is None:
+                return (
+                    f"[select_option_failed:bad_vision_index] V{vision_index} "
+                    f"is out of range (only {len(resp.bboxes)} bboxes in "
+                    f"the last vision response). Re-screenshot before retry."
+                )
+            freshness = getattr(resp, "screenshot_freshness", "fresh")
+            if freshness != "fresh":
+                return (
+                    f"[select_option_failed:stale_vision freshness="
+                    f"{freshness}] Vision flagged the last screenshot as "
+                    f"not fresh. Call browser_screenshot to refresh and "
+                    f"retry."
+                )
+            try:
+                max_age_turns = int(
+                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
+                )
+            except ValueError:
+                max_age_turns = 1
+            if max_age_turns > 0:
+                age_turns = max(
+                    0,
+                    self.s._brain_turn_counter - self.s._vision_epoch_turn,
+                )
+                if age_turns > max_age_turns:
+                    return (
+                        f"[select_option_failed:epoch_too_old "
+                        f"age_turns={age_turns} max={max_age_turns}] "
+                        f"V{vision_index} resolves against a vision "
+                        f"snapshot older than the safe age window. "
+                        f"browser_screenshot, then retry."
+                    )
+            # Blocker gate.
+            scene = getattr(resp, "scene", None)
+            active_blocker = (
+                getattr(scene, "active_blocker_layer_id", None)
+                if scene is not None else None
+            )
+            if active_blocker:
+                bbox_layer = getattr(bbox, "layer_id", None)
+                if bbox_layer and bbox_layer != active_blocker:
+                    return (
+                        f"[select_option_failed:blocker_active "
+                        f"layer={active_blocker}] A blocker layer is on "
+                        f"top of content; dismiss it before targeting "
+                        f"V{vision_index}."
+                    )
+            iw, ih = resp.image_width, resp.image_height
+            if iw <= 0 or ih <= 0:
+                return (
+                    "[select_option_failed:no_image_dims] Vision "
+                    "response has no image dimensions; cannot "
+                    "denormalize bbox. Re-screenshot."
+                )
+            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+            payload["bbox"] = {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+            bbox_label = (getattr(bbox, "label", "") or "").strip()
+            if bbox_label:
+                payload["expected_label"] = bbox_label[:120]
+                # Backfill `label` when caller omitted it — useful for
+                # diagnostics.
+                if not payload["label"]:
+                    payload["label"] = bbox_label[:120]
+
+        if not payload["label"] and "bbox" not in payload:
+            return (
+                "[select_option_failed:bad_args] Provide either `label` "
+                "or `vision_index`."
+            )
+
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/select_option",
@@ -150,6 +263,15 @@ class BrowserSelectOptionTool(Tool):
             self.s.record_step("browser_select_option", f"{label}={value}", f"HTTP error: {e}")
             return f"[select_option_http_error] {e}"
         data = r.json() or {}
+        # Auto-refresh element_fingerprints from the response. select_option
+        # often mutates the DOM (filter applied, listbox re-rendered),
+        # invalidating the Python-side cache. Without this, a follow-up
+        # DOM-index click sends a stale fingerprint that may collide. (B6)
+        _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(_fp_map, dict):
+            self.s.element_fingerprints = {
+                int(k): v for k, v in _fp_map.items() if isinstance(v, str)
+            }
         ok = bool(data.get("ok"))
         picked = data.get("picked_text") or value
         verified = bool(data.get("verified"))
@@ -186,7 +308,55 @@ class BrowserSelectOptionTool(Tool):
         print(f"   [select_option] FAIL reason={reason or '?'}{cand_preview}")
 
         msg_parts = [f"[select_option_failed] reason={reason or 'unknown'} label={label!r} value={value!r}"]
-        if reason == "trigger_not_found":
+        if reason == "ambiguous_trigger":
+            # Multiple candidates with similar scores. The TS picker
+            # surfaces them as `candidates` (shape: tag<role>['text']
+            # score=N). Brain narrows the label or passes vision_index.
+            msg_parts.append(
+                "Multiple candidates matched the label with similar "
+                "scores — refusing to guess. Either (a) pass a more "
+                "specific `label` (e.g. 'Sort by' instead of 'Sort'), "
+                "or (b) take a fresh browser_screenshot and call "
+                f"browser_select_option(vision_index=V_n, value={value!r}) "
+                "with the V_n of the dropdown trigger you actually want."
+            )
+        elif reason == "ambiguous_option":
+            shown = ", ".join(repr(c) for c in candidates[:5])
+            msg_parts.append(
+                f"Multiple options match {value!r} at the same tier. "
+                f"Use a more specific value. Top candidates: {shown}"
+            )
+        elif reason == "popup_on_navigated_page":
+            msg_parts.append(
+                "The trigger opened a listbox but the page also "
+                "navigated underneath it — the option click would be "
+                "applied on the navigated page, not the original one. "
+                "Re-screenshot and continue from the new page state, "
+                "or use browser_rewind_to_checkpoint to back out."
+            )
+        elif reason == "bbox_not_a_dropdown":
+            msg_parts.append(
+                "The bbox you passed via vision_index is not a dropdown "
+                "trigger (no aria-haspopup, role=combobox/listbox, "
+                "<select>, datalist, or chevron-styled button). Use "
+                "browser_click_at(vision_index=V_n) on this bbox "
+                "instead, or pass the V_n of a real dropdown trigger."
+            )
+        elif reason == "option_navigated":
+            msg_parts.append(
+                "The option click navigated the page. The selection "
+                "was NOT applied to the original page state. "
+                "Re-screenshot to inspect the new page, or "
+                "browser_rewind_to_checkpoint if this was unintentional."
+            )
+        elif reason == "trigger_disappeared":
+            msg_parts.append(
+                "The trigger element vanished after the option click "
+                "without a navigation event. The page may have "
+                "re-rendered with a different layout. Re-screenshot "
+                "and re-target."
+            )
+        elif reason == "trigger_not_found":
             msg_parts.append(
                 "The label was not found on this page. Two common causes:\n"
                 "  (a) the cascading dropdown stage is over and the page "
@@ -196,7 +366,8 @@ class BrowserSelectOptionTool(Tool):
                 "then browser_click on the matching item.\n"
                 "  (b) the label text in the page is different from what "
                 "you passed — call browser_screenshot to read actual labels, "
-                "then retry with the exact text."
+                "then retry with the exact text. Or pass vision_index=V_n "
+                "to bypass label resolution entirely."
             )
         elif reason == "trigger_navigated":
             # The trigger turned out to be a link / nav action, not a

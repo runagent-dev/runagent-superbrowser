@@ -39,6 +39,7 @@ from .tools import (
     BrowserRequestHelpTool,
     BrowserRewindToCheckpointTool,
     BrowserRunScriptTool,
+    BrowserUndoLastClickTool,
     BrowserScreenshotTool,
     BrowserScrollTool,
     BrowserScrollUntilTool,
@@ -113,6 +114,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserFormStatusTool(state),
         BrowserFormCommitTool(state),
         BrowserRewindToCheckpointTool(state),  # kept: session-memory escape hatch
+        BrowserUndoLastClickTool(state),       # surgical in-page misclick undo
         BrowserCloseTool(state),
     ]
     for tool in tools:

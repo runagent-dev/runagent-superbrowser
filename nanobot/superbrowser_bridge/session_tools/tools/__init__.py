@@ -55,6 +55,9 @@ from .puzzle import (
     BrowserImageRegionTool,
     BrowserSolvePuzzleTool,
 )
+from .recovery import (
+    BrowserUndoLastClickTool,
+)
 from .screenshot import (
     BrowserDialogTool,
     BrowserGetMarkdownTool,

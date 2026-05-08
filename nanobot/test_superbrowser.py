@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """must go to this site https://www.wineaccess.com/ .Find all highest critic-scored white wines, from oregon , priced under $40, that pairs well with either fish or dessert. use browser tools."""
+        """must go to this site https://www.bestbuy.com/ .Search for 33 to 49inch Qled gaming monitor with a 240hz refresh rate that is within $1000 to $2000. use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

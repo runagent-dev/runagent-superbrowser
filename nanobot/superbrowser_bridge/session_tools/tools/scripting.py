@@ -196,6 +196,71 @@ class BrowserRunScriptTool(Tool):
                     "rejected by Cloudflare / Akamai."
                     + (f"\nRecent cursor failures:\n{ledger}" if ledger else "")
                 )
+        # v4 D1 — Gate 3: heavy-page guard. Mutating scripts on
+        # search results / product listings / maps / checkout forms /
+        # known-hard domains fail ~80% because:
+        #   (a) selectors are ambiguous (50 'Add to cart' buttons),
+        #   (b) synthetic JS clicks are isTrusted=false → bot-detected,
+        #   (c) async re-renders race against the script's verify step.
+        # Refuse and redirect the brain to atomic vision tools, which
+        # dispatch isTrusted=true CDP events and adapt to live state.
+        # Read-only scripts (mutates=False) are ALWAYS allowed — data
+        # extraction never fails for these reasons.
+        if (
+            bool(mutates)
+            and os.environ.get("RUN_SCRIPT_HEAVY_PAGE_GUARD", "1")
+                not in ("0", "false", "no")
+        ):
+            last_resp = getattr(self.s, "_last_vision_response", None)
+            page_type = (
+                getattr(last_resp, "page_type", "") or ""
+            ).strip()
+            current_url = (self.s.current_url or "").lower()
+            try:
+                from ..effects import _HARD_DOMAINS
+            except Exception:
+                _HARD_DOMAINS = ()
+            is_hard_domain = any(d in current_url for d in _HARD_DOMAINS)
+            heavy_page_types = {
+                "search_results", "product_listing",
+                "map_or_booking", "checkout_form",
+            }
+            if page_type in heavy_page_types or is_hard_domain:
+                pt_label = page_type or "complex/high-value"
+                domain_note = (
+                    f" (domain={current_url.split('/')[2] if '://' in current_url else current_url[:40]} flagged as hard)"
+                    if is_hard_domain and page_type not in heavy_page_types
+                    else ""
+                )
+                return (
+                    "[run_script_blocked:heavy_page_use_vision] "
+                    f"This is a {pt_label} page{domain_note}. Mutating "
+                    "scripts on such pages fail ~80% of the time:\n"
+                    "  (a) selectors are ambiguous (multiple 'Add to "
+                    "cart' / 'Apply' / 'Submit' on a single page),\n"
+                    "  (b) synthetic JS clicks (el.click(), "
+                    "dispatchEvent) are isTrusted=false and routinely "
+                    "rejected by Cloudflare / Akamai bot-detection,\n"
+                    "  (c) async re-renders (React/Vue) race against "
+                    "your script's verify step.\n\n"
+                    "Use ATOMIC vision tools instead — each call "
+                    "dispatches isTrusted=true CDP events and adapts "
+                    "to the LIVE page state on every call:\n"
+                    "  • browser_click_at(vision_index=V_n)        — "
+                    "one click per call\n"
+                    "  • browser_type_at(vision_index=V_n, value=…) — "
+                    "one input per call\n"
+                    "  • browser_select_option(vision_index=V_n, "
+                    "label=…) — for dropdowns\n"
+                    "  • browser_scroll_until(target_text=…) — to "
+                    "find below-fold controls\n"
+                    "  • browser_get_markdown(include_anchors=true) "
+                    "— inspect page structure\n\n"
+                    "Group results into a single done() report at the "
+                    "end. For pure DATA EXTRACTION you may still call "
+                    "browser_run_script with mutates=false — read-only "
+                    "scripts always pass this gate."
+                )
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
         payload: dict[str, Any] = {"code": script, "mutates": bool(mutates)}
         if context:
@@ -215,6 +280,16 @@ class BrowserRunScriptTool(Tool):
 
         self.s.actions_since_screenshot += 1
 
+        # v4 D3 — record outcome in the run_script ledger so worker_hook
+        # can detect 3-of-5 failures and inject the redirect-to-vision
+        # hint regardless of page type. Caps at 5 entries (rotates).
+        try:
+            outcomes = self.s.recent_run_script_outcomes
+            outcomes.append(bool(data.get("success")))
+            if len(outcomes) > 5:
+                del outcomes[0:len(outcomes) - 5]
+        except Exception:
+            pass
         if not data.get("success"):
             error = data.get("error", "Unknown error")
             self.s.log_activity("run_script(FAILED)", error[:100])

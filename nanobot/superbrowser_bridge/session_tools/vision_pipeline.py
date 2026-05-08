@@ -315,6 +315,309 @@ def _enrich_bboxes_with_dom_metadata(
     return touched
 
 
+def _apply_just_toggled_marker(
+    resp: Any,
+    state: Any,
+) -> int:
+    """Stamp `just_toggled` on the bbox the brain just clicked, when
+    the click flipped its is_active state.
+
+    Reads `state.last_click_target_label` / `last_click_target_box_2d`
+    / `last_click_target_active_state` (set by `register_click_attempt`
+    just BEFORE the dispatch) and finds the same bbox in the new
+    response by label match + box_2d proximity. When the new bbox's
+    `is_active` differs from the recorded one, mark `just_toggled='on'`
+    or `'off'`.
+
+    The brain reads this in `as_brain_text` as e.g.
+    `[V5] checkbox 'Samsung' (...) active=true just_toggled=on`,
+    enabling the worker_hook's filter-toggle recovery hint and
+    teaching the brain that re-clicking the same V_n undoes the
+    accidental filter.
+
+    Returns the count of bboxes touched (0 or 1).
+    Safe no-op when:
+      * `BBOX_JUST_TOGGLED_DETECT` env flag is disabled,
+      * `state` has no recorded last-click target,
+      * the new bbox's is_active didn't flip (legitimate fresh click),
+      * no bbox in the new response matches the prior target.
+    """
+    if os.environ.get("BBOX_JUST_TOGGLED_DETECT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or not getattr(resp, "bboxes", None):
+        return 0
+    prior_label = (getattr(state, "last_click_target_label", "") or "").strip()
+    prior_box = getattr(state, "last_click_target_box_2d", None)
+    prior_active = getattr(state, "last_click_target_active_state", None)
+    # We need at least the prior label OR the prior box to match by.
+    # Prior active_state must be known for a flip to be meaningful.
+    if prior_active is None:
+        return 0
+    if not prior_label and not prior_box:
+        return 0
+
+    prior_label_lc = prior_label.lower()
+    # Find the closest matching bbox in the new response.
+    # Strategy: label-exact wins (when label present); fallback to
+    # the bbox whose box_2d centre is closest to the prior centre.
+    best_idx = -1
+    best_score = -1.0
+    for idx, b in enumerate(resp.bboxes):
+        b_label = (getattr(b, "label", "") or "").strip().lower()
+        # Hard label match — most reliable.
+        label_score = 0.0
+        if prior_label_lc and b_label:
+            if b_label == prior_label_lc:
+                label_score = 1.0
+            elif prior_label_lc in b_label or b_label in prior_label_lc:
+                label_score = 0.5
+        # Box-centre proximity (normalized space, max distance ~1414).
+        box_score = 0.0
+        if prior_box and len(prior_box) == 4:
+            try:
+                py0, px0, py1, px1 = prior_box
+                pcx = (px0 + px1) / 2.0
+                pcy = (py0 + py1) / 2.0
+                ny0, nx0, ny1, nx1 = b.box_2d
+                ncx = (nx0 + nx1) / 2.0
+                ncy = (ny0 + ny1) / 2.0
+                dist = ((ncx - pcx) ** 2 + (ncy - pcy) ** 2) ** 0.5
+                # Closer = higher score; cap at 100 norm units (~10% viewport).
+                if dist < 100:
+                    box_score = max(0.0, 1.0 - dist / 100.0) * 0.5
+            except (TypeError, ValueError):
+                pass
+        score = label_score + box_score
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    # Require a non-trivial match: either hard label hit or close box.
+    if best_idx < 0 or best_score < 0.5:
+        return 0
+    target = resp.bboxes[best_idx]
+    new_active = bool(getattr(target, "is_active", False))
+    if bool(prior_active) == new_active:
+        # No flip — either click missed or click on a non-toggle
+        # element. Don't stamp.
+        return 0
+    target.just_toggled = "on" if new_active else "off"
+    return 1
+
+
+def _detect_misclick_flip(resp: Any, state: Any) -> int:
+    """Surface a misclick advisory when the brain aimed at one bbox but
+    a *different* bbox flipped active state instead.
+
+    Complements `_apply_just_toggled_marker`: the marker stamps the
+    expected-target bbox when its `is_active` flipped (good toggle).
+    This detector handles the inverse — expected target did NOT flip,
+    but some OTHER bbox did. That's the dropdown / checkbox misclick
+    fingerprint we need to surface to the brain (and to flag the
+    pending undo entry with `misclick_evidence` so a later
+    `browser_undo_last_click` can target the actually-flipped bbox).
+
+    Reads `state._prev_active_map` (populated by this same fn on each
+    prior call) to know what each bbox's is_active was BEFORE this
+    response. Cheap O(N+M) over the bbox lists.
+
+    Returns the count of advisories appended (0 or 1; >1 flips collapse
+    to a single `[MISCLICK_AMBIGUOUS]` advisory).
+
+    Safe no-op when:
+      * `BBOX_MISCLICK_DETECT` env flag is disabled,
+      * no prior active map is available (first vision pass),
+      * no click target was registered (state.last_click_target_label
+        is empty — typically a non-click action),
+      * prior_active is None (DOM/index/selector click without bbox),
+      * the expected target's is_active flipped (not a misclick).
+    """
+    if os.environ.get("BBOX_MISCLICK_DETECT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or not getattr(resp, "bboxes", None):
+        # Refresh prev_active_map even on empty response so a future
+        # call doesn't read stale data — but use empty map.
+        try:
+            state._prev_active_map = {}
+        except Exception:
+            pass
+        return 0
+
+    prev_map: dict[tuple[str, int, int], bool] = (
+        getattr(state, "_prev_active_map", None) or {}
+    )
+    prior_label = (getattr(state, "last_click_target_label", "") or "").strip()
+    prior_box = getattr(state, "last_click_target_box_2d", None)
+    prior_active = getattr(state, "last_click_target_active_state", None)
+
+    def _key(label: str, box_2d: Any) -> tuple[str, int, int]:
+        # Bucket box centroid into 50-norm-unit cells (~5% viewport).
+        try:
+            ny0, nx0, ny1, nx1 = box_2d
+            cx = int(((nx0 + nx1) / 2.0) // 50)
+            cy = int(((ny0 + ny1) / 2.0) // 50)
+        except Exception:
+            cx = cy = -1
+        return ((label or "").strip().lower(), cx, cy)
+
+    # Build NEW active map and compute flips against prev_map.
+    new_map: dict[tuple[str, int, int], bool] = {}
+    flipped: list[tuple[int, Any, bool, bool]] = []  # (idx, bbox, prev, new)
+    for idx, b in enumerate(resp.bboxes):
+        active = bool(getattr(b, "is_active", False))
+        k = _key(getattr(b, "label", "") or "", getattr(b, "box_2d", None))
+        new_map[k] = active
+        prev = prev_map.get(k) if prev_map else None
+        if prev is not None and prev != active:
+            flipped.append((idx, b, prev, active))
+
+    # Stash for the next call.
+    try:
+        state._prev_active_map = new_map
+    except Exception:
+        pass
+
+    # No prior map (first vision pass) → nothing to compare.
+    if not prev_map:
+        return 0
+    # No click target registered → not a click outcome — nothing to flag.
+    if not prior_label and not prior_box:
+        return 0
+    if prior_active is None:
+        # The click was DOM-index / selector / raw-coords with no
+        # is_active recorded. Without a baseline we can't say which
+        # flip is "intended" vs "unintended". Skip — the brain reads
+        # just_toggled as the primary signal.
+        return 0
+
+    # Identify the expected target in the new response (same proximity
+    # match _apply_just_toggled_marker uses).
+    expected_idx = -1
+    expected_score = -1.0
+    prior_label_lc = prior_label.lower()
+    for idx, b in enumerate(resp.bboxes):
+        b_label = (getattr(b, "label", "") or "").strip().lower()
+        label_score = 0.0
+        if prior_label_lc and b_label:
+            if b_label == prior_label_lc:
+                label_score = 1.0
+            elif prior_label_lc in b_label or b_label in prior_label_lc:
+                label_score = 0.5
+        box_score = 0.0
+        if prior_box and len(prior_box) == 4:
+            try:
+                py0, px0, py1, px1 = prior_box
+                pcx = (px0 + px1) / 2.0
+                pcy = (py0 + py1) / 2.0
+                ny0, nx0, ny1, nx1 = b.box_2d
+                ncx = (nx0 + nx1) / 2.0
+                ncy = (ny0 + ny1) / 2.0
+                dist = ((ncx - pcx) ** 2 + (ncy - pcy) ** 2) ** 0.5
+                if dist < 100:
+                    box_score = max(0.0, 1.0 - dist / 100.0) * 0.5
+            except (TypeError, ValueError):
+                pass
+        score = label_score + box_score
+        if score > expected_score:
+            expected_score = score
+            expected_idx = idx
+
+    expected_flipped = False
+    if expected_idx >= 0:
+        exp_b = resp.bboxes[expected_idx]
+        exp_active = bool(getattr(exp_b, "is_active", False))
+        if bool(prior_active) != exp_active:
+            expected_flipped = True
+
+    # Filter flips to OTHER bboxes (i.e., not the expected target).
+    other_flips = [
+        f for f in flipped
+        if f[0] != expected_idx
+    ]
+
+    if expected_flipped:
+        # Intended toggle. Even if other bboxes flipped (rare on dense
+        # pages with concurrent state changes), the expected target
+        # responded — leave the marker logic to handle it.
+        return 0
+
+    if not other_flips:
+        # Expected didn't flip and nothing else did either. Click was
+        # a no-op or hit a non-toggle target. Not our concern here.
+        return 0
+
+    advisories = getattr(state, "_misclick_advisory", None)
+    if advisories is None:
+        return 0
+
+    # Compute 1-based V_n indices using the same bbox ordering the
+    # brain sees. The bboxes list IS already in display order on the
+    # vision response (bbox V1 == resp.bboxes[0], etc.).
+    def _v_for(idx: int) -> int:
+        return idx + 1
+
+    expected_v = _v_for(expected_idx) if expected_idx >= 0 else None
+    expected_label = (
+        getattr(resp.bboxes[expected_idx], "label", "")
+        if expected_idx >= 0 else prior_label
+    ) or "?"
+
+    if len(other_flips) == 1:
+        flip_idx, flip_b, _, _ = other_flips[0]
+        flip_v = _v_for(flip_idx)
+        flip_label = (getattr(flip_b, "label", "") or "?")[:80]
+        advisories.append(
+            f"[MISCLICK_DETECTED] Aimed at "
+            f"{('V' + str(expected_v)) if expected_v else 'target'} "
+            f"({expected_label!r}) but V{flip_v} "
+            f"({flip_label!r}) flipped active. Undo with "
+            f"browser_undo_last_click."
+        )
+        # Mark the pending undo entry (if any) with misclick evidence
+        # so the recovery tool can target the actually-flipped bbox.
+        pending = getattr(state, "_pending_undo_entry", None)
+        if isinstance(pending, dict):
+            pending["misclick_flag"] = True
+            pending["misclick_evidence"] = {
+                "expected_v": expected_v,
+                "flipped_v": flip_v,
+                "flipped_label": flip_label,
+                "flipped_box_2d": list(
+                    getattr(flip_b, "box_2d", []) or []
+                ) or None,
+            }
+        # If finalize already ran, also tag the top of the ring.
+        ring = getattr(state, "_undo_ring", None)
+        if isinstance(ring, list) and ring:
+            top = ring[-1]
+            if isinstance(top, dict) and not top.get("misclick_flag"):
+                top["misclick_flag"] = True
+                top["misclick_evidence"] = {
+                    "expected_v": expected_v,
+                    "flipped_v": flip_v,
+                    "flipped_label": flip_label,
+                    "flipped_box_2d": list(
+                        getattr(flip_b, "box_2d", []) or []
+                    ) or None,
+                }
+        return 1
+    else:
+        # Multiple flips. Don't pre-mark any single one — let the brain
+        # inspect.
+        names = ", ".join(
+            f"V{_v_for(f[0])} ({(getattr(f[1], 'label', '') or '?')[:30]!r})"
+            for f in other_flips[:3]
+        )
+        advisories.append(
+            f"[MISCLICK_AMBIGUOUS] Aimed at "
+            f"{('V' + str(expected_v)) if expected_v else 'target'} "
+            f"({expected_label!r}); multiple bboxes flipped active "
+            f"unexpectedly: {names}. Inspect the new state before "
+            f"calling browser_undo_last_click."
+        )
+        return 1
+
+
 def _replicate_rank_for_enrichment(b: Any) -> tuple[int, int, int, float]:
     """Mirror VisionResponse._rank used by as_brain_text/get_bbox.
 
@@ -682,11 +985,28 @@ def _schedule_vision_prefetch(
 
     async def _run() -> "Any":
         try:
+            # v5 — when the most recent action was a navigation, ask
+            # the TS server to wait for VISUAL stability (fonts /
+            # images / layout-shift idle) before capturing the
+            # screenshot. Avoids the cold-page bbox-above-text race.
+            # State flag is one-shot: consume it here so subsequent
+            # mid-session prefetches don't re-pay the cost.
+            params: dict[str, str] = {"vision": "true", "bounds": "true"}
+            if getattr(state, "_needs_visual_settle", False):
+                params["settle"] = "true"
+                try:
+                    state._needs_visual_settle = False
+                except Exception:
+                    pass
+            # Bump prefetch timeout when settle is active — the TS
+            # waitForVisualStable can spend up to VISUAL_STABLE_MAX_MS
+            # (default 1500ms) before /state returns.
+            timeout_s = 18.0 if params.get("settle") else 15.0
             r = await _request_with_backoff(
                 "GET",
                 f"{SUPERBROWSER_URL}/session/{session_id}/state",
-                params={"vision": "true", "bounds": "true"},
-                timeout=15.0,
+                params=params,
+                timeout=timeout_s,
             )
             if r.status_code != 200:
                 return None
@@ -764,6 +1084,19 @@ def _schedule_vision_prefetch(
                 )
             except Exception as exc:
                 print(f"  [dom_enrichment prefetch failed: {exc}]")
+            # v4 C6 — stamp `just_toggled` on the bbox the brain just
+            # clicked, when its is_active flipped relative to what was
+            # recorded at click dispatch. Brain then sees e.g.
+            # `active=true just_toggled=on` and knows re-clicking the
+            # same V_n will UN-toggle.
+            try:
+                _apply_just_toggled_marker(resp, state)
+            except Exception as exc:
+                print(f"  [just_toggled prefetch failed: {exc}]")
+            try:
+                _detect_misclick_flip(resp, state)
+            except Exception as exc:
+                print(f"  [misclick_detect prefetch failed: {exc}]")
             state._last_vision_response = resp
             state._last_vision_summary = resp.summary
             state._last_vision_ts = time.time()

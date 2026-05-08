@@ -21,7 +21,7 @@ import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
-import { selectOptionByLabel } from '../browser/elements.js';
+import { selectOptionByLabel, selectOptionByVisionBbox } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
 import { renderCaptchaViewHtml } from './captcha-ui-html.js';
@@ -650,13 +650,17 @@ export function createHttpServer(
       const useVision = req.query.vision !== 'false';
       const includeBounds = req.query.bounds === 'true' || req.query.highlight === 'true';
       // Optional settle gate — Python-side prefetch sends `settle=true`
-      // so the screenshot reflects a post-React-commit page instead of
-      // a mid-transition one. Bounded at 2s so a broken page doesn't
-      // hang the whole state request.
+      // after navigation so the screenshot reflects a post-render page
+      // instead of a mid-transition one. v5: now waits for VISUAL
+      // stability (fonts loaded, above-fold images decoded, layout-
+      // shift idle), not just DOM-ready. DOM-ready was already done
+      // by navigate(); rerunning it was a no-op. Bounded at the
+      // helper's own maxMs (default 1500ms / VISUAL_STABLE_MAX_MS) so
+      // a broken page can't hang the whole state request.
       if (req.query.settle === 'true') {
         try {
-          const { waitForPageReady } = await import('../browser/page-readiness.js');
-          await waitForPageReady(page.getRawPage(), 2000);
+          const { waitForVisualStable } = await import('../browser/page-readiness.js');
+          await waitForVisualStable(page.getRawPage());
         } catch {
           /* best-effort — never block /state on a settle failure */
         }
@@ -695,7 +699,10 @@ export function createHttpServer(
         // Per-index identity fingerprint. Used by the Python bridge to
         // catch stale-index clicks when the DOM re-renders between
         // state-fetch and click. Small payload (~16 hex chars × N).
-        fingerprints: fingerprintMap(state.selectorMap),
+        // Pass selectorEntries so the bounds bucket is included — drops
+        // collision rate on repeating sibling lists (filter checkboxes
+        // with identical aria-labels at different on-screen positions).
+        fingerprints: fingerprintMap(state.selectorMap, state.selectorEntries),
       });
     } catch (err) {
       handleError(res, err);
@@ -709,7 +716,7 @@ export function createHttpServer(
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const { index, x, y, bbox, button, clickCount, expected_fingerprint } = req.body as {
+      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label } = req.body as {
         index?: number;
         x?: number;
         y?: number;
@@ -724,6 +731,11 @@ export function createHttpServer(
          *  has a different fingerprint — prevents clicking a different
          *  element than the LLM intended after a DOM re-render. */
         expected_fingerprint?: string;
+        /** v6 F2: vision's label for this bbox. clickInBbox uses it
+         *  to validate that the snapped element's text/aria-label
+         *  aligns — catches page-shift cases where the bbox centre
+         *  now lies on a different element. */
+        expected_label?: string;
       };
 
       if (bbox !== undefined) {
@@ -731,10 +743,30 @@ export function createHttpServer(
         // click at the snapped centre, return the resolved point so
         // the bridge can log/trace which element actually received
         // the input.
-        const snap = await page.clickInBbox(bbox, { button, clickCount });
+        const snap = await page.clickInBbox(bbox, {
+          button,
+          clickCount,
+          expectedLabel: expected_label,
+        });
         await settleForEffect(page.getRawPage());
         const effectAfter = await captureEffect(page.getRawPage());
         const newState = await page.getState({ useVision: false, includeConsole: true });
+        // Resolve the snapped element to its DOM index so the Python
+        // bridge can record `last_click_dom_index`. Cross-tool dead-
+        // click guard then catches a follow-up `browser_click(N)` on
+        // the SAME element after a `browser_click_at(V_n)` toggled it.
+        let domIndex: number | undefined;
+        if (snap.targetXpath) {
+          for (const [idx, el] of newState.selectorMap) {
+            if (el.xpath === snap.targetXpath) {
+              domIndex = idx;
+              break;
+            }
+          }
+        }
+        const snapWithIndex = domIndex !== undefined
+          ? { ...snap, dom_index: domIndex }
+          : snap;
         res.json({
           success: true,
           url: newState.url,
@@ -742,8 +774,9 @@ export function createHttpServer(
           elements: newState.elementTree.clickableElementsToString(),
           consoleErrors: newState.consoleErrors,
           pendingDialogs: newState.pendingDialogs,
-          snap,
+          snap: snapWithIndex,
           effect: diffEffect(effectBefore, effectAfter),
+          fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
         });
         return;
       }
@@ -788,9 +821,13 @@ export function createHttpServer(
         // different element. Compare fingerprints and reject with a
         // structured hint naming the new index of the intended element.
         if (expected_fingerprint) {
-          const currentFp = fingerprintElement(element);
+          const entryByIdx = new Map<number, import('../browser/dom.js').SelectorEntry>();
+          for (const e of state.selectorEntries ?? []) {
+            if (typeof e.index === 'number') entryByIdx.set(e.index, e);
+          }
+          const currentFp = fingerprintElement(element, entryByIdx.get(index) ?? null);
           if (currentFp !== expected_fingerprint) {
-            const currentFpMap = fingerprintMap(state.selectorMap);
+            const currentFpMap = fingerprintMap(state.selectorMap, state.selectorEntries);
             const suggestedIndex = invertFingerprintMap(currentFpMap)[expected_fingerprint];
             res.status(409).json({
               error: `Element [${index}] has shifted since last state — the element you intended is ${suggestedIndex !== undefined ? `now at [${suggestedIndex}]` : 'no longer on the page'}.`,
@@ -803,6 +840,106 @@ export function createHttpServer(
             });
             return;
           }
+        }
+
+        // Route the DOM-index click through the same bbox-snap pipeline
+        // that V_n clicks use. We compute LIVE bounds at click time
+        // (via xpath → getBoundingClientRect) so any drift between the
+        // brain's mental model of [N] and the page's current state is
+        // caught by clickInBbox's Phase 1 label-match guard. Brain's
+        // tool surface is unchanged; the protections are now invisible
+        // to it.
+        //
+        // Fallback to legacy clickElement when:
+        //   - DOM_CLICK_VIA_BBOX=0 (env-flag opt-out for prod rollback);
+        //   - bounds aren't readable (element removed or zero-size);
+        //   - clickInBbox failed to dispatch (then snap.snapped=false
+        //     AND we surface a hard error rather than the silent
+        //     fallback the legacy path used).
+        const viaBboxEnabled = process.env.DOM_CLICK_VIA_BBOX !== '0';
+        let snapWithIndex: Record<string, unknown> | null = null;
+
+        if (viaBboxEnabled) {
+          const live = await page.getRawPage().evaluate((xp: string) => {
+            try {
+              const node = document.evaluate(
+                xp, document, null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE, null,
+              ).singleNodeValue;
+              if (!node || !(node instanceof HTMLElement)) return null;
+              // Scroll into view first so off-screen targets get a real
+              // viewport rect — clickInBbox needs viewport coords.
+              try {
+                node.scrollIntoView({ block: 'center', behavior: 'instant' });
+              } catch { /* ignore — older engines */ }
+              const r = node.getBoundingClientRect();
+              return {
+                x: r.left, y: r.top, w: r.width, h: r.height,
+                tag: node.tagName.toLowerCase(),
+              };
+            } catch {
+              return null;
+            }
+          }, element.xpath) as
+            | { x: number; y: number; w: number; h: number; tag: string }
+            | null;
+
+          if (live && live.w > 0 && live.h > 0) {
+            const expectedLabel = (
+              element.attributes['aria-label']
+              || element.attributes['placeholder']
+              || element.attributes['title']
+              || element.getAllTextTillNextClickableElement(2)
+              || ''
+            ).slice(0, 80).trim();
+
+            const snap = await page.clickInBbox(
+              {
+                x0: live.x, y0: live.y,
+                x1: live.x + live.w, y1: live.y + live.h,
+              },
+              { button, clickCount, expectedLabel: expectedLabel || undefined },
+            );
+
+            await settleForEffect(page.getRawPage());
+            const effectAfter = await captureEffect(page.getRawPage());
+            const newState = await page.getState({
+              useVision: false, includeConsole: true,
+            });
+            // Resolve the snapped element to its DOM index in the
+            // post-click state. Falls back to the brain's [N] when the
+            // snap targeted a different element (rare — usually means
+            // grid-scan picked a sibling because the centre-element
+            // didn't label-match). Either way the brain learns the
+            // identity.
+            let domIndex: number | undefined;
+            if (snap.targetXpath) {
+              for (const [idx, el] of newState.selectorMap) {
+                if (el.xpath === snap.targetXpath) {
+                  domIndex = idx;
+                  break;
+                }
+              }
+            }
+            if (domIndex === undefined) domIndex = index;
+            snapWithIndex = { ...snap, dom_index: domIndex };
+
+            res.json({
+              success: true,
+              url: newState.url,
+              title: newState.title,
+              elements: newState.elementTree.clickableElementsToString(),
+              consoleErrors: newState.consoleErrors,
+              pendingDialogs: newState.pendingDialogs,
+              snap: snapWithIndex,
+              effect: diffEffect(effectBefore, effectAfter),
+              fingerprints: fingerprintMap(
+                newState.selectorMap, newState.selectorEntries,
+              ),
+            });
+            return;
+          }
+          // bounds unreadable — fall through to legacy path.
         }
 
         const r = await page.clickElement(element, { button, clickCount });
@@ -832,6 +969,12 @@ export function createHttpServer(
         consoleErrors: newState.consoleErrors,
         pendingDialogs: newState.pendingDialogs,
         effect: diffEffect(effectBefore, effectAfter),
+        // Fresh per-index fingerprints so the Python bridge's
+        // element_fingerprints cache stays in sync after every click.
+        // Without this, a follow-up DOM-index click on a re-rendered
+        // page sends a STALE expected_fingerprint that may collide with
+        // the new occupant of [N], silently misclicking.
+        fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
       });
     } catch (err) {
       handleError(res, err);
@@ -931,9 +1074,13 @@ export function createHttpServer(
       if (!element) { res.status(400).json({ error: `Element [${index}] not found` }); return; }
 
       if (expected_fingerprint) {
-        const currentFp = fingerprintElement(element);
+        const entryByIdx = new Map<number, import('../browser/dom.js').SelectorEntry>();
+        for (const e of state.selectorEntries ?? []) {
+          if (typeof e.index === 'number') entryByIdx.set(e.index, e);
+        }
+        const currentFp = fingerprintElement(element, entryByIdx.get(index) ?? null);
         if (currentFp !== expected_fingerprint) {
-          const currentFpMap = fingerprintMap(state.selectorMap);
+          const currentFpMap = fingerprintMap(state.selectorMap, state.selectorEntries);
           const suggestedIndex = invertFingerprintMap(currentFpMap)[expected_fingerprint];
           res.status(409).json({
             error: `Element [${index}] has shifted since last state — retarget to ${suggestedIndex !== undefined ? `[${suggestedIndex}]` : 'a different index'}.`,
@@ -1202,7 +1349,91 @@ export function createHttpServer(
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
+        // Fresh per-index fingerprints — keeps the Python bridge's
+        // cache in sync without a follow-up /state round-trip.
+        fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
       });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Surgical undo support — single history.back() step with effect
+   * diff. The Python recovery tool decides how far to go and calls us
+   * repeatedly. Mirrors /click's effect-snapshot envelope so the
+   * response shape is familiar to the brain.
+   */
+  app.post('/session/:id/back', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      await page.goBack();
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false });
+      res.json({
+        success: true,
+        url: newState.url,
+        title: newState.title,
+        elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
+        // Fresh fingerprints for the post-back DOM.
+        fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Surgical undo support — read aria toggle state of a single
+   * element by CSS selector. Returns null fields when missing /
+   * absent. Used by browser_click_selector to capture pre_active
+   * before dispatch so a later browser_undo_last_click on a toggle-
+   * shaped target can verify the flip.
+   */
+  app.post('/session/:id/probe-aria', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const { selector } = req.body ?? {};
+      if (typeof selector !== 'string' || !selector) {
+        res.status(400).json({ error: 'selector is required' });
+        return;
+      }
+      const probe = await page.getRawPage().evaluate((sel: string) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const ariaCheckedRaw = el.getAttribute('aria-checked');
+        const ariaPressedRaw = el.getAttribute('aria-pressed');
+        const ariaSelectedRaw = el.getAttribute('aria-selected');
+        const ariaCurrentRaw = el.getAttribute('aria-current');
+        const truthy = (v: string | null) => v != null && v !== 'false' && v !== '';
+        return {
+          ariaChecked: ariaCheckedRaw,
+          ariaPressed: ariaPressedRaw,
+          ariaSelected: ariaSelectedRaw,
+          ariaCurrent: ariaCurrentRaw,
+          // Single normalized "is_active" — true if any toggle attribute
+          // is truthy. None if no toggle attributes present at all.
+          isActive: (
+            ariaCheckedRaw == null
+            && ariaPressedRaw == null
+            && ariaSelectedRaw == null
+            && ariaCurrentRaw == null
+          )
+            ? null
+            : (truthy(ariaCheckedRaw) || truthy(ariaPressedRaw) || truthy(ariaSelectedRaw) || truthy(ariaCurrentRaw)),
+        };
+      }, selector);
+      if (probe == null) {
+        res.json({ success: false, found: false });
+        return;
+      }
+      res.json({ success: true, found: true, ...probe });
     } catch (err) {
       handleError(res, err);
     }
@@ -1545,9 +1776,21 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
-    const { label, value, fuzzy, timeout, extra_option_selectors } = req.body || {};
-    if (typeof label !== 'string' || !label.trim()) {
-      res.status(400).json({ error: 'label (string) is required' });
+    const {
+      label, value, fuzzy, timeout,
+      extra_option_selectors,
+      bbox, expected_label,
+    } = req.body || {};
+    // Either label OR bbox must be supplied. When bbox is present we
+    // dispatch to the vision-bbox path which sidesteps DOM-text
+    // ambiguity entirely.
+    const hasBbox = (
+      bbox != null && typeof bbox === 'object'
+      && typeof bbox.x0 === 'number' && typeof bbox.y0 === 'number'
+      && typeof bbox.x1 === 'number' && typeof bbox.y1 === 'number'
+    );
+    if (!hasBbox && (typeof label !== 'string' || !label.trim())) {
+      res.status(400).json({ error: 'label (string) or bbox is required' });
       return;
     }
     if (typeof value !== 'string' || !value.trim()) {
@@ -1557,13 +1800,25 @@ export function createHttpServer(
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const result = await selectOptionByLabel(page.getRawPage(), {
-        label,
-        value,
-        fuzzy: fuzzy !== false,
-        timeout: typeof timeout === 'number' ? timeout : undefined,
-        extraOptionSelectors: Array.isArray(extra_option_selectors) ? extra_option_selectors : undefined,
-      });
+      const result = hasBbox
+        ? await selectOptionByVisionBbox(page.getRawPage(), {
+            bbox: {
+              x0: Number(bbox.x0), y0: Number(bbox.y0),
+              x1: Number(bbox.x1), y1: Number(bbox.y1),
+            },
+            expectedLabel: typeof expected_label === 'string' ? expected_label : undefined,
+            value,
+            fuzzy: fuzzy !== false,
+            timeout: typeof timeout === 'number' ? timeout : undefined,
+            extraOptionSelectors: Array.isArray(extra_option_selectors) ? extra_option_selectors : undefined,
+          })
+        : await selectOptionByLabel(page.getRawPage(), {
+            label,
+            value,
+            fuzzy: fuzzy !== false,
+            timeout: typeof timeout === 'number' ? timeout : undefined,
+            extraOptionSelectors: Array.isArray(extra_option_selectors) ? extra_option_selectors : undefined,
+          });
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false }).catch(() => null);
@@ -1571,6 +1826,12 @@ export function createHttpServer(
         ...result,
         elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
         effect: diffEffect(effectBefore, effectAfter),
+        // Fresh fingerprints — Python's element_fingerprints cache stays
+        // in sync after select_option mutates the DOM (filter applied,
+        // listbox re-rendered, etc.).
+        fingerprints: newState
+          ? fingerprintMap(newState.selectorMap, newState.selectorEntries)
+          : undefined,
       });
     } catch (err) {
       handleError(res, err);

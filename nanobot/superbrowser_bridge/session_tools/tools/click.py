@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import httpx
@@ -78,11 +79,32 @@ class BrowserClickTool(Tool):
                 + (f"\n{alts}" if alts else "")
             )
         target_key = f"click[{index}]"
-        dead = self.s.check_dead_click(target_key)
+        # Cross-tool same-element guard: if the previous click (via any
+        # tool) resolved to DOM index `index`, refuse this click unless
+        # the page has been re-observed (fresh screenshot clears
+        # last_click_dom_index). Catches the bbox-then-DOM cascade where
+        # browser_click_at(V_n) toggled a checkbox ON and the brain
+        # then clicks [N] (the same checkbox by index) and un-toggles it.
+        dead = self.s.check_dead_click(target_key, dom_index=int(index))
         if dead:
             self.s.log_activity(f"click([{index}])(DEAD_CLICK_BLOCKED)", "")
             return dead
-        self.s.register_click_attempt(target_key)
+        self.s.register_click_attempt(target_key, target_dom_index=int(index))
+        # Surgical undo: open a pending entry. We don't know pre_active
+        # for DOM-index clicks (the dead-click guard's bbox path is the
+        # only place is_active is read at click time). The label safety
+        # net + url_changed demotion in finalize_click_record will still
+        # classify it correctly.
+        self.s.begin_click_record(
+            tool="browser_click",
+            target_key=target_key,
+            vision_index=None,
+            label=f"index={index}",
+            box_2d=None,
+            pre_active=None,
+            expected_url_change=False,
+            is_form_submit=False,
+        )
         self.s.consecutive_click_calls += 1
         payload: dict[str, Any] = {"index": index}
         if button:
@@ -189,6 +211,42 @@ class BrowserClickTool(Tool):
         # Successful HTTP response — clear the timeout counter so the
         # flail guard doesn't trip on a future unrelated hiccup.
         self.s.consecutive_click_timeouts = 0
+        # Surgical undo: finalize the pending entry with the response.
+        # `pre_url` / `pre_dom_hash` were already captured at
+        # begin_click_record time, so finalize doesn't need them passed
+        # in. Demotes toggle→nav when effect.url_changed is true.
+        self.s.finalize_click_record(response=data)
+        # Auto-refresh element_fingerprints so the next click ships a
+        # current expected_fingerprint for any [N] in the cache. (B6)
+        _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(_fp_map, dict):
+            self.s.element_fingerprints = {
+                int(k): v for k, v in _fp_map.items() if isinstance(v, str)
+            }
+        # v6 F1 — invalidate the frozen vision epoch when this click
+        # produced a significant DOM mutation. The brain's V_n indices
+        # captured before this click point at PRE-shift coords; if we
+        # let the next click_at resolve against the frozen epoch it
+        # will land on the wrong element. Forcing the next click to
+        # require a fresh screenshot (or letting the in-flight
+        # prefetch settle) catches the page-shift misclick cascade.
+        try:
+            effect = (data or {}).get("effect") or {}
+            mutation_delta = int(effect.get("mutation_delta") or 0)
+            try:
+                threshold = int(
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                )
+            except ValueError:
+                threshold = 8
+            if mutation_delta > threshold:
+                self.s._vision_epoch_response = None
+                self.s.log_activity(
+                    f"click([{index}])(EPOCH_DIRTY)",
+                    f"mutation_delta={mutation_delta} > {threshold}",
+                )
+        except Exception:
+            pass
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
@@ -228,7 +286,20 @@ class BrowserClickAtTool(Tool):
         "Click using a vision bbox (vision_index=V_n) or raw (x,y) "
         "coordinates. Prefer vision_index whenever the vision agent "
         "labelled the target — the server snaps to the actual interactive "
-        "element inside the bbox, eliminating off-by-pixel misses."
+        "element inside the bbox, eliminating off-by-pixel misses.\n\n"
+        "TOGGLE SEMANTICS: when V_n shows `active=true` (a filter chip, "
+        "checkbox, or radio that's already ON), clicking it AGAIN will "
+        "UN-toggle it (un-apply the filter, uncheck the box, deselect "
+        "the radio). This is the natural undo for filter mistakes — "
+        "if you accidentally applied the wrong filter, just re-click "
+        "the same V_n. Do NOT use browser_navigate or "
+        "browser_rewind_to_checkpoint to undo a filter; those reload "
+        "the page and lose other filtering progress.\n\n"
+        "JUST-TOGGLED MARKER: after a click, the next vision response "
+        "may show `just_toggled=on` or `just_toggled=off` next to "
+        "`active=` — that means YOUR last click flipped this control. "
+        "If `just_toggled=on` appeared on a control whose label "
+        "doesn't match the task, re-click the same V_n to reverse it."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -274,11 +345,31 @@ class BrowserClickAtTool(Tool):
             target_key = f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
         else:
             target_key = "click_at(?)"
-        dead = self.s.check_dead_click(target_key)
-        if dead:
-            self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
-            return dead
-        self.s.register_click_attempt(target_key)
+        # For the (x, y) path we don't have a bbox to read is_active
+        # from, so run the dead-click guard with no toggle context here.
+        # The vision_index path defers the check until AFTER bbox
+        # resolution (line ~XYZ below) so it can pass the bbox's
+        # current is_active and trigger the toggle-aware exemption.
+        if vision_index is None:
+            dead = self.s.check_dead_click(target_key)
+            if dead:
+                self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
+                return dead
+            self.s.register_click_attempt(target_key)
+            # Surgical undo: open a pending entry for raw-coord clicks.
+            # No bbox/label info — pre_active is None, classification
+            # falls through to "toggle" then demotes to "nav" if the
+            # click ends up navigating.
+            self.s.begin_click_record(
+                tool="browser_click_at",
+                target_key=target_key,
+                vision_index=None,
+                label=f"({x},{y})",
+                box_2d=None,
+                pre_active=None,
+                expected_url_change=False,
+                is_form_submit=False,
+            )
 
         payload: dict[str, Any]
         log_target: str
@@ -455,6 +546,74 @@ class BrowserClickAtTool(Tool):
                             f"group, then re-screenshot and retry "
                             f"V{vision_index}."
                         )
+            # v4 C3 — bbox-aware dead-click guard. Pass the bbox's
+            # CURRENT is_active so the guard recognizes a re-click as
+            # a legitimate filter toggle (rather than flailing) when
+            # the state has flipped since the last click on this V_n.
+            bbox_active_now = bool(getattr(bbox, "is_active", False))
+            # Cross-tool: vision_pipeline's DOM enrichment populates
+            # bbox.dom_index when it can match a vision bbox to a
+            # selectorMap entry. Pass it to the dead-click guard so a
+            # bbox click on the same DOM element a previous DOM-index
+            # click toggled (less common direction, but valid) is also
+            # caught. The TS-resolved snap.dom_index in the response
+            # below will refine this if it differs.
+            bbox_dom_index = getattr(bbox, "dom_index", None)
+            dead = self.s.check_dead_click(
+                target_key,
+                current_active_state=bbox_active_now,
+                dom_index=(
+                    int(bbox_dom_index)
+                    if isinstance(bbox_dom_index, int) and bbox_dom_index >= 0
+                    else None
+                ),
+            )
+            if dead:
+                self.s.log_activity(
+                    f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "",
+                )
+                return dead
+            # v4 C6 — record the bbox's label, current active state,
+            # and box_2d so the post-click vision pass can match the
+            # SAME bbox in the new response and stamp `just_toggled`
+            # if its is_active flipped.
+            bbox_label_for_state = (
+                getattr(bbox, "label", "") or ""
+            )[:120]
+            box_2d_copy = list(getattr(bbox, "box_2d", []) or []) or None
+            self.s.register_click_attempt(
+                target_key,
+                target_label=bbox_label_for_state,
+                target_active_state=bbox_active_now,
+                target_box_2d=box_2d_copy,
+                target_dom_index=(
+                    int(bbox_dom_index)
+                    if isinstance(bbox_dom_index, int) and bbox_dom_index >= 0
+                    else None
+                ),
+            )
+            # Surgical undo: open a pending entry now we have full bbox
+            # context. is_form_submit heuristic on the bbox label catches
+            # destructive primary buttons; the safety-net regex inside
+            # begin_click_record catches the rest.
+            _is_submitlike = bool(
+                bbox_label_for_state
+                and re.search(
+                    r"(?i)\b(submit|search|sign\s*in|sign\s*up|register"
+                    r"|continue|next|place\s+order|buy|pay|checkout)\b",
+                    bbox_label_for_state,
+                )
+            )
+            self.s.begin_click_record(
+                tool="browser_click_at",
+                target_key=target_key,
+                vision_index=int(vision_index),
+                label=bbox_label_for_state,
+                box_2d=box_2d_copy,
+                pre_active=bbox_active_now,
+                expected_url_change=False,
+                is_form_submit=_is_submitlike,
+            )
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
                 return (
@@ -525,9 +684,60 @@ class BrowserClickAtTool(Tool):
                 f"browser_screenshot to refresh vision."
                 + (f"\n{alts}" if alts else "")
             )
+        # v6 F1 — invalidate frozen vision epoch on significant
+        # mutation. After a filter apply / list re-render, the brain's
+        # V_n coords from before the click now point at shifted
+        # positions; resolving the next click_at against the frozen
+        # epoch lands on the wrong element. Drop the epoch so the
+        # next click_at must wait for the fresh prefetch (already
+        # scheduled below) or call browser_screenshot. Threshold 8 ≈
+        # filter applies / list re-renders / modal opens; ignores
+        # focus-shift-only changes (1-3 mutations).
+        try:
+            effect = (data or {}).get("effect") or {}
+            mutation_delta = int(effect.get("mutation_delta") or 0)
+            try:
+                threshold = int(
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                )
+            except ValueError:
+                threshold = 8
+            if mutation_delta > threshold:
+                self.s._vision_epoch_response = None
+                self.s.log_activity(
+                    f"click_at{log_target}(EPOCH_DIRTY)",
+                    f"mutation_delta={mutation_delta} > {threshold}",
+                )
+        except Exception:
+            pass
+        # Surgical undo: finalize the pending entry before record_url
+        # rewrites self.current_url. begin_click_record already stamped
+        # pre_url at dispatch time so this is just folding the response.
+        self.s.finalize_click_record(response=data)
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
             self.s.record_url(actual_url)
+        # Cross-tool: refine last_click_dom_index from the TS-side
+        # `snap.dom_index` (post-resolve, more accurate than the
+        # vision_pipeline's pre-click DOM enrichment which can drift
+        # when the page was animating mid-click).
+        _resolved_dom_idx = (
+            data.get("snap", {}).get("dom_index")
+            if isinstance(data, dict) else None
+        )
+        if isinstance(_resolved_dom_idx, int) and _resolved_dom_idx >= 0:
+            self.s.last_click_dom_index = _resolved_dom_idx
+        # Auto-refresh element_fingerprints from the click response.
+        # The TS bridge now ships `fingerprints` with every click reply
+        # so the Python cache stays in sync after a re-render. Without
+        # this, a follow-up DOM-index click sends a STALE fingerprint
+        # that may collide with the new occupant of [N], silently
+        # misclicking. (B6 in the plan.)
+        _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(_fp_map, dict):
+            self.s.element_fingerprints = {
+                int(k): v for k, v in _fp_map.items() if isinstance(v, str)
+            }
         snap = data.get("snap")  # {x, y, snapped: bool, target?: str, warning?: str}
         if snap:
             snap_note = (
@@ -860,6 +1070,22 @@ class BrowserClickSelectorTool(Tool):
         if linear is not None:
             payload["linear"] = linear
 
+        # Surgical undo: open a pending entry. pre_active is None for
+        # selector clicks (we don't probe aria state on this path); the
+        # label safety-net regex still catches destructive selectors
+        # like 'button.delete' / '#submit' and classifies them
+        # irreversible. url_changed demotion in finalize handles nav.
+        self.s.begin_click_record(
+            tool="browser_click_selector",
+            target_key=f"click_selector({selector})",
+            vision_index=None,
+            label=selector,
+            box_2d=None,
+            pre_active=None,
+            expected_url_change=False,
+            is_form_submit=False,
+        )
+
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/click-selector",
@@ -878,8 +1104,17 @@ class BrowserClickSelectorTool(Tool):
                 target=selector,
                 reason=str(err)[:120],
             )
+            # Drop the pending undo entry — the click never landed.
+            self.s._pending_undo_entry = None
             return f"[click_selector_failed] {err}"
         data = r.json()
+        self.s.finalize_click_record(response=data)
+        # Auto-refresh element_fingerprints from the click response. (B6)
+        _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(_fp_map, dict):
+            self.s.element_fingerprints = {
+                int(k): v for k, v in _fp_map.items() if isinstance(v, str)
+            }
         clicked = data.get("clicked", {})
         self.s.record_step(
             "browser_click_selector",
