@@ -60,6 +60,90 @@ from . import content as _content
 logger = logging.getLogger(__name__)
 
 
+# Shadow-DOM piercing helpers, mirrored from src/browser/slider-helpers.ts.
+# Concatenated into every frame.evaluate(...) call in the slider methods so
+# selector probes resolve into open shadow roots (Chase mds-slider, any
+# Lit/React widget that hosts a native range input under a custom element).
+# Keep this string in sync with the TS version.
+_SHADOW_DOM_HELPERS_SRC = """
+function __sb_queryDeep(root, sel) {
+  if (!root) return null;
+  var direct = (root.querySelector ? root.querySelector(sel) : null);
+  if (direct) return direct;
+  var queue = [root];
+  while (queue.length) {
+    var node = queue.shift();
+    var children = (node.children || []);
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (c.shadowRoot) {
+        var hit = c.shadowRoot.querySelector(sel);
+        if (hit) return hit;
+        queue.push(c.shadowRoot);
+      }
+      if (c.children && c.children.length) queue.push(c);
+    }
+  }
+  return null;
+}
+function __sb_queryAllDeep(root, sel) {
+  if (!root) return [];
+  var out = [];
+  var seen = (typeof Set === 'function') ? new Set() : null;
+  function pushUnique(el) {
+    if (seen) { if (seen.has(el)) return; seen.add(el); }
+    out.push(el);
+  }
+  function collect(scope) {
+    if (!scope || !scope.querySelectorAll) return;
+    var hits = scope.querySelectorAll(sel);
+    for (var i = 0; i < hits.length; i++) pushUnique(hits[i]);
+  }
+  collect(root);
+  var queue = [root];
+  while (queue.length) {
+    var node = queue.shift();
+    var children = (node.children || []);
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (c.shadowRoot) { collect(c.shadowRoot); queue.push(c.shadowRoot); }
+      if (c.children && c.children.length) queue.push(c);
+    }
+  }
+  return out;
+}
+function __sb_walkDeepElements(root, visit) {
+  if (!root) return;
+  var queue = [root];
+  while (queue.length) {
+    var node = queue.shift();
+    var children = (node.children || []);
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      var stop = visit(c);
+      if (stop === false) return;
+      if (c.shadowRoot) queue.push(c.shadowRoot);
+      if (c.children && c.children.length) queue.push(c);
+    }
+  }
+}
+function __sb_dispatchHostSignal(el, eventNames) {
+  try {
+    var current = el;
+    var guard = 0;
+    while (current && guard++ < 8) {
+      var root = current.getRootNode ? current.getRootNode() : null;
+      if (!root || root === document || !root.host) break;
+      for (var i = 0; i < eventNames.length; i++) {
+        try { root.host.dispatchEvent(new Event(eventNames[i], { bubbles: true })); } catch (e) {}
+      }
+      current = root.host;
+    }
+  } catch (e) {}
+}
+"""
+
+
 def _env_light_mode() -> bool:
     """Global kill-switch for T3 antibot overhead.
 
@@ -3203,6 +3287,50 @@ class T3SessionManager:
         st = await self.state(sid)
         return {"success": True, "url": st["url"], "title": st["title"], "elements": st["elements"]}
 
+    async def _frame_offset(self, page: Any, frame: Any) -> tuple[float, float]:
+        """Mirror of page.ts getFrameOffset with the URL-match fallback.
+
+        Cross-origin iframes can throw on frame.frame_element(); silently
+        defaulting to (0,0) lands drag coordinates in the wrong place
+        (the chasecdn case). We try frame_element() first, then scan the
+        parent frame's <iframe> elements for a src match.
+        """
+        if frame is page.main_frame:
+            return 0.0, 0.0
+        try:
+            fe = await frame.frame_element()
+            if fe is not None:
+                box = await fe.bounding_box()
+                if box:
+                    return float(box["x"]), float(box["y"])
+        except Exception:
+            pass
+        try:
+            parent = frame.parent_frame or page.main_frame
+            url = frame.url
+            offset = await parent.evaluate(
+                "(targetUrl) => {"
+                "const ifs = Array.prototype.slice.call(document.querySelectorAll('iframe'));"
+                "for (const f of ifs) {"
+                "  if (f.src === targetUrl) {"
+                "    const r = f.getBoundingClientRect();"
+                "    return { x: r.x, y: r.y };"
+                "  }"
+                "}"
+                "return null;"
+                "}",
+                url,
+            )
+            if offset:
+                return float(offset["x"]), float(offset["y"])
+        except Exception:
+            pass
+        logger.warning(
+            "[t3._frame_offset] could not resolve offset for frame %s; using (0,0)",
+            getattr(frame, "url", "?"),
+        )
+        return 0.0, 0.0
+
     async def set_slider(
         self,
         sid: str,
@@ -3222,10 +3350,13 @@ class T3SessionManager:
         page = s.page
         import json as _json
 
-        # Find the frame that contains the selector.
+        # Find the frame that contains the selector. Shadow-DOM-piercing
+        # query so custom elements (mds-slider on Chase, Lit/React
+        # wrappers) resolve to the inner native input.
         probe_src = (
+            _SHADOW_DOM_HELPERS_SRC + ";"
             "(function(sel){"
-            "var el=document.querySelector(sel);"
+            "var el=__sb_queryDeep(document,sel);"
             "if(!el)return null;"
             "var tag=el.tagName.toLowerCase();"
             "var type=(el.type||'').toLowerCase();"
@@ -3283,13 +3414,17 @@ class T3SessionManager:
             else:
                 target = float(_to_abs(float(value)))
             set_src = (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(sel,target){"
-                "var first=document.querySelector(sel);"
+                "var first=__sb_queryDeep(document,sel);"
                 "if(!first)return {ok:false,reason:'not-found'};"
                 "var els=[first];"
                 "if(Array.isArray(target)){"
+                "  var rootScope=first.getRootNode?first.getRootNode():document;"
                 "  var p=first.parentElement;"
-                "  if(p){var sibs=Array.prototype.slice.call(p.querySelectorAll('input[type=\"range\"]'));"
+                "  if(p){var sibs=__sb_queryAllDeep(p,'input[type=\"range\"]');"
+                "    if(sibs.length<2&&rootScope&&rootScope!==document)"
+                "      sibs=__sb_queryAllDeep(rootScope,'input[type=\"range\"]');"
                 "    if(sibs.length>=2)els=sibs.slice(0,2);}"
                 "}"
                 "var before=els.map(function(e){return parseFloat(e.value);});"
@@ -3308,6 +3443,7 @@ class T3SessionManager:
                 "  if(setter)setter.call(el,String(v));else el.value=String(v);"
                 "  el.dispatchEvent(new Event('input',{bubbles:true}));"
                 "  el.dispatchEvent(new Event('change',{bubbles:true}));"
+                "  __sb_dispatchHostSignal(el,['input','change']);"
                 "}"
                 "var after=els.map(function(e){return parseFloat(e.value);});"
                 "return {ok:true,before:before,after:after};"
@@ -3328,8 +3464,9 @@ class T3SessionManager:
         if kind in ("aria-slider", "range-input") and method in ("auto", "keyboard"):
             target_scalar = float(_to_abs(value[0] if isinstance(value, (list, tuple)) else float(value)))
             state_src = (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(sel){"
-                "var el=document.querySelector(sel);"
+                "var el=__sb_queryDeep(document,sel);"
                 "if(!el)return null;"
                 "var r=el.getBoundingClientRect();"
                 "var aNow=el.getAttribute('aria-valuenow');"
@@ -3347,17 +3484,8 @@ class T3SessionManager:
                 st is not None
                 and all(math.isfinite(st[k]) for k in ("cur", "lo", "hi"))
             ):
-                # Frame offset: cross-origin iframes start at their iframe element's box.
-                off_x, off_y = 0.0, 0.0
-                if resolved_frame is not page.main_frame:
-                    try:
-                        fe = await resolved_frame.frame_element()
-                        if fe is not None:
-                            box = await fe.bounding_box()
-                            if box:
-                                off_x, off_y = box["x"], box["y"]
-                    except Exception:
-                        pass
+                # Frame offset with URL-match fallback for cross-origin frames.
+                off_x, off_y = await self._frame_offset(page, resolved_frame)
                 cx = round(st["x"] + st["w"] / 2 + off_x)
                 cy = round(st["y"] + st["h"] / 2 + off_y)
                 try:
@@ -3379,8 +3507,9 @@ class T3SessionManager:
                         if i % 25 == 24:
                             await asyncio.sleep(0.008)
                 after_src = (
+                    _SHADOW_DOM_HELPERS_SRC + ";"
                     "(function(sel){"
-                    "var el=document.querySelector(sel);"
+                    "var el=__sb_queryDeep(document,sel);"
                     "if(!el)return null;"
                     "var aNow=el.getAttribute('aria-valuenow');"
                     "if(aNow!=null)return parseFloat(aNow);"
@@ -3407,10 +3536,15 @@ class T3SessionManager:
                 else:
                     ratio = 0.5
             rect_src = (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(sel){"
-                "var el=document.querySelector(sel);"
+                "var el=__sb_queryDeep(document,sel);"
                 "if(!el)return null;"
                 "var track=el.closest('[role=\"slider\"],[class*=\"slider\" i],[class*=\"track\" i]')||el;"
+                "if(track===el){"
+                "  var rs=el.getRootNode?el.getRootNode():null;"
+                "  if(rs&&rs.host){var ht=rs.host.closest&&rs.host.closest('[role=\"slider\"],[class*=\"slider\" i],[class*=\"track\" i]');if(ht)track=ht;}"
+                "}"
                 "var tr=track.getBoundingClientRect();"
                 "var hr=el.getBoundingClientRect();"
                 "return {track:{x:tr.x,y:tr.y,w:tr.width,h:tr.height},"
@@ -3426,16 +3560,7 @@ class T3SessionManager:
                     "error": "could not read thumb/track rect",
                     "framesSearched": frames_searched,
                 }
-            off_x, off_y = 0.0, 0.0
-            if resolved_frame is not page.main_frame:
-                try:
-                    fe = await resolved_frame.frame_element()
-                    if fe is not None:
-                        box = await fe.bounding_box()
-                        if box:
-                            off_x, off_y = box["x"], box["y"]
-                except Exception:
-                    pass
+            off_x, off_y = await self._frame_offset(page, resolved_frame)
             start_x = round(rect["thumb"]["x"] + rect["thumb"]["w"] / 2 + off_x)
             start_y = round(rect["thumb"]["y"] + rect["thumb"]["h"] / 2 + off_y)
             end_x = round(
@@ -3463,8 +3588,9 @@ class T3SessionManager:
                     "framesSearched": frames_searched,
                 }
             after_src2 = (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(sel){"
-                "var el=document.querySelector(sel);"
+                "var el=__sb_queryDeep(document,sel);"
                 "if(!el)return null;"
                 "var aNow=el.getAttribute('aria-valuenow');"
                 "if(aNow!=null)return parseFloat(aNow);"
@@ -3555,13 +3681,14 @@ class T3SessionManager:
         s = self._get(sid)
         page = s.page
         scan_js = (
+            _SHADOW_DOM_HELPERS_SRC + ";"
             "(function(){"
             "try {"
             "var out = [];"
             "var sel = ['input[type=\"range\"]','[role=\"slider\"]','[aria-valuenow]',"
             "'[class*=\"handle\" i]','[class*=\"thumb\" i]','[class*=\"slider-button\" i]',"
             "'[class*=\"slider-handle\" i]','[data-handle]'].join(',');"
-            "var found = Array.prototype.slice.call(document.querySelectorAll(sel));"
+            "var found = __sb_queryAllDeep(document, sel);"
             "var seen = new Set();"
             "for (var i = 0; i < found.length; i++) {"
             "var el = found[i]; var r = el.getBoundingClientRect();"
@@ -3576,22 +3703,21 @@ class T3SessionManager:
             "var hcy = r.top + r.height / 2;"
             "var ytol = Math.max(r.height * 4, 80);"
             "var label = ''; var bestDy = Infinity;"
-            "var walker = document.createTreeWalker("
-            "document.body || document.documentElement, NodeFilter.SHOW_ELEMENT, null);"
-            "var cand;"
-            "while ((cand = walker.nextNode())) {"
-            "if (cand === el || cand.contains(el)) continue;"
-            "var cr = cand.getBoundingClientRect();"
-            "if (!cr || cr.width === 0 || cr.height === 0) continue;"
-            "if (cr.height > 80) continue;"
+            "var elRef = el;"
+            "__sb_walkDeepElements(document.body || document.documentElement, function(cand){"
+            "if (cand === elRef) return;"
+            "try { if (cand.contains && cand.contains(elRef)) return; } catch(e){}"
+            "var cr = cand.getBoundingClientRect ? cand.getBoundingClientRect() : null;"
+            "if (!cr || cr.width === 0 || cr.height === 0) return;"
+            "if (cr.height > 80) return;"
             "var text = (cand.textContent || '').replace(/\\s+/g, ' ').trim();"
-            "if (!text || text.length > 200 || text.length < 3) continue;"
+            "if (!text || text.length > 200 || text.length < 3) return;"
             "var ccy = cr.top + cr.height / 2;"
             "var dy = Math.abs(ccy - hcy);"
-            "if (dy > ytol) continue;"
-            "if (!/[A-Za-z]/.test(text)) continue;"
+            "if (dy > ytol) return;"
+            "if (!/[A-Za-z]/.test(text)) return;"
             "if (dy < bestDy) { bestDy = dy; label = text; }"
-            "}"
+            "});"
             "out.push({ kind: kind, bbox: { x: r.left, y: r.top, w: r.width, h: r.height }, label: label });"
             "}"
             "return out;"
@@ -3605,16 +3731,7 @@ class T3SessionManager:
         except Exception:
             frames = []
         for f in frames:
-            off_x, off_y = 0.0, 0.0
-            if f is not page.main_frame:
-                try:
-                    fe = await f.frame_element()
-                    if fe is not None:
-                        box = await fe.bounding_box()
-                        if box:
-                            off_x, off_y = box["x"], box["y"]
-                except Exception:
-                    pass
+            off_x, off_y = await self._frame_offset(page, f)
             try:
                 hits = await f.evaluate(scan_js)
             except Exception:
@@ -3688,30 +3805,27 @@ class T3SessionManager:
         # — concatenate into one string the regex can match.
         def _scan_js(local_cy: float) -> str:
             return (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(pat, hcy, ytol){"
                 "try{"
                 "var re = new RegExp(pat);"
                 "var best = null;"
-                "var walker = document.createTreeWalker("
-                "document.body || document.documentElement,"
-                "NodeFilter.SHOW_ELEMENT, null);"
-                "var el;"
-                "while ((el = walker.nextNode())) {"
-                "var r = el.getBoundingClientRect();"
-                "if (!r || r.width === 0 || r.height === 0) continue;"
-                "if (r.height > 80) continue;"
+                "__sb_walkDeepElements(document.body || document.documentElement, function(el){"
+                "var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;"
+                "if (!r || r.width === 0 || r.height === 0) return;"
+                "if (r.height > 80) return;"
                 "var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();"
-                "if (!text || text.length > 300) continue;"
-                "var m = re.exec(text); if (!m) continue;"
-                "var num = parseFloat(m[1]); if (!isFinite(num)) continue;"
+                "if (!text || text.length > 300) return;"
+                "var m = re.exec(text); if (!m) return;"
+                "var num = parseFloat(m[1]); if (!isFinite(num)) return;"
                 "var cy = r.top + r.height / 2;"
                 "var dy = Math.abs(cy - hcy);"
-                "if (dy > ytol) continue;"
+                "if (dy > ytol) return;"
                 "var area = r.width * r.height;"
                 "if (best === null || dy < best.dy || (dy === best.dy && area < best.area)) {"
                 "best = { dy: dy, area: area, value: num, text: text };"
                 "}"
-                "}"
+                "});"
                 "return best ? { value: best.value, text: best.text } : null;"
                 "} catch(e){ return null; }"
                 f"}})({_json.dumps(pattern_src)}, {local_cy}, {y_tolerance})"
@@ -3723,16 +3837,7 @@ class T3SessionManager:
             except Exception:
                 frames = []
             for f in frames:
-                off_x, off_y = 0.0, 0.0
-                if f is not page.main_frame:
-                    try:
-                        fe = await f.frame_element()
-                        if fe is not None:
-                            box = await fe.bounding_box()
-                            if box:
-                                off_x, off_y = box["x"], box["y"]
-                    except Exception:
-                        pass
+                off_x, off_y = await self._frame_offset(page, f)
                 local_cy = handle_cy - off_y
                 try:
                     result = await f.evaluate(_scan_js(local_cy))
@@ -3760,22 +3865,20 @@ class T3SessionManager:
             # Same element-walk as _scan_js so diagnostic text matches
             # what the scanner sees. Returns up to 10 row-sized labels.
             sample_js = (
+                _SHADOW_DOM_HELPERS_SRC + ";"
                 "(function(hcy, ytol){"
                 "try {"
                 "var out = [];"
-                "var walker = document.createTreeWalker("
-                "document.body || document.documentElement, NodeFilter.SHOW_ELEMENT, null);"
-                "var el;"
-                "while ((el = walker.nextNode())) {"
-                "var r = el.getBoundingClientRect();"
-                "if (!r || r.width === 0 || r.height === 0) continue;"
-                "if (r.height > 80) continue;"
+                "__sb_walkDeepElements(document.body || document.documentElement, function(el){"
+                "var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;"
+                "if (!r || r.width === 0 || r.height === 0) return;"
+                "if (r.height > 80) return;"
                 "var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();"
-                "if (!text || text.length > 300) continue;"
+                "if (!text || text.length > 300) return;"
                 "var cy = r.top + r.height / 2;"
-                "if (Math.abs(cy - hcy) > ytol) continue;"
-                "out.push(text); if (out.length >= 10) break;"
-                "}"
+                "if (Math.abs(cy - hcy) > ytol) return;"
+                "out.push(text); if (out.length >= 10) return false;"
+                "});"
                 "return out;"
                 "} catch(e) { return []; }"
                 f"}})({handle_cy}, {y_tolerance})"

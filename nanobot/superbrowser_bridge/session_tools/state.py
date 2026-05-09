@@ -166,6 +166,13 @@ class BrowserSessionState:
         # Reset on every screenshot. Used to surface "vision bboxes are
         # habitually wrapping non-clickable containers" hints.
         self.snap_miss_count: int = 0
+        # Per-session asyncio.Lock that serializes cursor-driven slider
+        # operations (set_slider_at, drag_slider_until). The CDP /
+        # patchright mouse cursor is session-scoped — concurrent drags
+        # clobber each other. Lazily created by the slider tools the
+        # first time they run, but pre-declared here so attribute
+        # access doesn't AttributeError before the first call.
+        self.slider_drag_lock: Optional[asyncio.Lock] = None
         # Active session ID (set by browser_open)
         self.session_id: str = ""
         # How many times has BrowserOpenTool had to refuse a redundant call?

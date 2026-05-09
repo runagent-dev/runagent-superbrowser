@@ -12,6 +12,7 @@ import { buildDomTree, type PageState, type DialogInfo, type DOMElementNode } fr
 import { getAccessibilitySnapshot } from './accessibility.js';
 import { dispatchClick, dispatchHover, dispatchDrag, dispatchScroll } from './input-mouse.js';
 import { humanClick } from './humanize.js';
+import { SHADOW_DOM_HELPERS_SRC } from './slider-helpers.js';
 import { typeText as cdpTypeText, pressKeyCombo, clearField, dispatchKey } from './input-keyboard.js';
 import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
@@ -1443,15 +1444,25 @@ export class PageWrapper {
         : toAbs(value as number);
 
       // String-based evaluate to avoid esbuild __name helper injection
-      // when the TS source is loaded via tsx watch.
-      const src = `(function(sel, target){
-        var first = document.querySelector(sel);
+      // when the TS source is loaded via tsx watch. Uses shadow-DOM-
+      // piercing helpers so custom elements (mds-slider on chase.com,
+      // any Lit/React widget that hosts a native range input inside an
+      // open shadow root) resolve. After setting .value we ALSO fire
+      // input/change on the shadow host so widget-level listeners
+      // recompute — the inner-input event doesn't always escape.
+      const src = SHADOW_DOM_HELPERS_SRC + `;(function(sel, target){
+        var first = __sb_queryDeep(document, sel);
         if (!first) return { ok: false, reason: 'not-found' };
         var els = [first];
         if (Array.isArray(target)) {
+          // Look in the same root as 'first' for sibling range inputs.
+          var rootScope = first.getRootNode ? first.getRootNode() : document;
           var parent = first.parentElement;
           if (parent) {
-            var sibs = Array.prototype.slice.call(parent.querySelectorAll('input[type="range"]'));
+            var sibs = __sb_queryAllDeep(parent, 'input[type="range"]');
+            if (sibs.length < 2 && rootScope && rootScope !== document) {
+              sibs = __sb_queryAllDeep(rootScope, 'input[type="range"]');
+            }
             if (sibs.length >= 2) els = sibs.slice(0, 2);
           }
         }
@@ -1471,6 +1482,7 @@ export class PageWrapper {
           if (setter) setter.call(el, String(v)); else el.value = String(v);
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
+          __sb_dispatchHostSignal(el, ['input','change']);
         }
         var after = els.map(function(e){ return parseFloat(e.value); });
         return { ok: true, before: before, after: after };
@@ -1497,8 +1509,8 @@ export class PageWrapper {
         && (method === 'auto' || method === 'keyboard')) {
       const target = Array.isArray(value) ? toAbs(value[0]) : toAbs(value);
       // Need current value + viewport rect to focus.
-      const stateSrc = `(function(sel){
-        var el = document.querySelector(sel);
+      const stateSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
         var r = el.getBoundingClientRect();
         var aNow = el.getAttribute('aria-valuenow');
@@ -1536,8 +1548,8 @@ export class PageWrapper {
             if (i % 25 === 24) await new Promise((r) => setTimeout(r, 8));
           }
         }
-        const afterSrc = `(function(sel){
-          var el = document.querySelector(sel);
+        const afterSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+          var el = __sb_queryDeep(document, sel);
           if (!el) return null;
           var aNow = el.getAttribute('aria-valuenow');
           if (aNow != null) return parseFloat(aNow);
@@ -1565,10 +1577,20 @@ export class PageWrapper {
                 ? (value - min) / Math.max(1e-9, (max - min))
                 : 0.5))
         : (as === 'ratio' ? value[0] : 0.5);
-      const rectSrc = `(function(sel){
-        var el = document.querySelector(sel);
+      const rectSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
+        // closest() walks light-DOM ancestors only; for shadow-rooted
+        // sliders the track is usually a sibling/parent in the same root,
+        // so closest still resolves it. If not, fall back to the host.
         var track = el.closest('[role="slider"],[class*="slider" i],[class*="track" i]') || el;
+        if (track === el) {
+          var rootScope = el.getRootNode ? el.getRootNode() : null;
+          if (rootScope && rootScope.host) {
+            var hostTrack = rootScope.host.closest && rootScope.host.closest('[role="slider"],[class*="slider" i],[class*="track" i]');
+            if (hostTrack) track = hostTrack;
+          }
+        }
         var tr = track.getBoundingClientRect();
         var hr = el.getBoundingClientRect();
         return {
@@ -1600,8 +1622,8 @@ export class PageWrapper {
       });
       await this.waitForIdle(400).catch(() => {});
       // Best-effort read-back (range input exposes .value; others may not).
-      const afterSrc2 = `(function(sel){
-        var el = document.querySelector(sel);
+      const afterSrc2 = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
         var aNow = el.getAttribute('aria-valuenow');
         if (aNow != null) return parseFloat(aNow);
@@ -1641,8 +1663,8 @@ export class PageWrapper {
     const main = this.page.mainFrame();
     const sorted = [main, ...frames.filter((f) => f !== main)];
     const framesSearched: string[] = [];
-    const probeSrc = `(function(sel){
-      var el = document.querySelector(sel);
+    const probeSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+      var el = __sb_queryDeep(document, sel);
       if (!el) return null;
       var tag = el.tagName.toLowerCase();
       var type = (el.type || '').toLowerCase();
@@ -1728,7 +1750,7 @@ export class PageWrapper {
     bbox: { x: number; y: number; w: number; h: number };
     label: string;
   }>> {
-    const scanSrc = `(function(){
+    const scanSrc = SHADOW_DOM_HELPERS_SRC + `;(function(){
       try {
         var out = [];
         // Heuristic selector: native range, ARIA sliders, and elements
@@ -1743,7 +1765,7 @@ export class PageWrapper {
           '[class*="slider-handle" i]',
           '[data-handle]',
         ].join(',');
-        var found = Array.prototype.slice.call(document.querySelectorAll(sel));
+        var found = __sb_queryAllDeep(document, sel);
         var seen = new Set();
         for (var i = 0; i < found.length; i++) {
           var el = found[i];
@@ -1762,33 +1784,31 @@ export class PageWrapper {
           if (tag === 'input' && type === 'range') kind = 'range-input';
           else if (role === 'slider' || el.hasAttribute('aria-valuenow')) kind = 'aria-slider';
 
-          // Find the nearest row-level label (same textContent scanner
-          // we use in dragSliderUntil). Looks up to 120px above/below.
+          // Find the nearest row-level label across light DOM + shadow
+          // roots. Looks up to 120px above/below the handle row.
           var hcy = r.top + r.height / 2;
           var ytol = Math.max(r.height * 4, 80);
           var label = '';
           var bestDy = Infinity;
-          var walker = document.createTreeWalker(
-            document.body || document.documentElement,
-            NodeFilter.SHOW_ELEMENT, null);
-          var cand;
-          while ((cand = walker.nextNode())) {
-            if (cand === el || cand.contains(el)) continue;
-            var cr = cand.getBoundingClientRect();
-            if (!cr || cr.width === 0 || cr.height === 0) continue;
-            if (cr.height > 80) continue;
+          var elRef = el;
+          __sb_walkDeepElements(document.body || document.documentElement, function(cand) {
+            if (cand === elRef) return;
+            try { if (cand.contains && cand.contains(elRef)) return; } catch(e){}
+            var cr = cand.getBoundingClientRect ? cand.getBoundingClientRect() : null;
+            if (!cr || cr.width === 0 || cr.height === 0) return;
+            if (cr.height > 80) return;
             var text = (cand.textContent || '').replace(/\\s+/g, ' ').trim();
-            if (!text || text.length > 200 || text.length < 3) continue;
+            if (!text || text.length > 200 || text.length < 3) return;
             var ccy = cr.top + cr.height / 2;
             var dy = Math.abs(ccy - hcy);
-            if (dy > ytol) continue;
+            if (dy > ytol) return;
             // Prefer labels that contain a letter (skip pure "25" tick marks).
-            if (!/[A-Za-z]/.test(text)) continue;
+            if (!/[A-Za-z]/.test(text)) return;
             if (dy < bestDy) {
               bestDy = dy;
               label = text;
             }
-          }
+          });
 
           out.push({
             kind: kind,
@@ -1810,16 +1830,9 @@ export class PageWrapper {
     const main = this.page.mainFrame();
     const ordered = [main, ...frames.filter((f) => f !== main)];
     for (const frame of ordered) {
-      let offX = 0, offY = 0;
-      if (frame !== main) {
-        try {
-          const fe = await frame.frameElement();
-          if (fe) {
-            const box = await fe.boundingBox();
-            if (box) { offX = box.x; offY = box.y; }
-          }
-        } catch { /* skip */ }
-      }
+      const off = await this.getFrameOffset(frame);
+      const offX = off.x;
+      const offY = off.y;
       try {
         const hits = (await frame.evaluate(scanSrc)) as
           Array<{ kind: 'range-input' | 'aria-slider' | 'custom';
@@ -1901,35 +1914,29 @@ export class PageWrapper {
     // textContent concatenates descendants into one string. Filters
     // (height <= 80, textContent <= 300) keep us on row-sized elements
     // and reject large ancestors (body, main) that would match anything.
-    const scanSrc = (handleCyLocal: number, yTolerance: number) => `(function(pat, hcy, ytol){
+    const scanSrc = (handleCyLocal: number, yTolerance: number) => SHADOW_DOM_HELPERS_SRC + `;(function(pat, hcy, ytol){
       try {
         var re = new RegExp(pat);
         var best = null;
-        var walker = document.createTreeWalker(
-          document.body || document.documentElement,
-          NodeFilter.SHOW_ELEMENT,
-          null
-        );
-        var el;
-        while ((el = walker.nextNode())) {
-          var r = el.getBoundingClientRect();
-          if (!r || r.width === 0 || r.height === 0) continue;
-          if (r.height > 80) continue;
+        __sb_walkDeepElements(document.body || document.documentElement, function(el) {
+          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!r || r.width === 0 || r.height === 0) return;
+          if (r.height > 80) return;
           var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-          if (!text || text.length > 300) continue;
+          if (!text || text.length > 300) return;
           var m = re.exec(text);
-          if (!m) continue;
+          if (!m) return;
           var num = parseFloat(m[1]);
-          if (!isFinite(num)) continue;
+          if (!isFinite(num)) return;
           var cy = r.top + r.height / 2;
           var dy = Math.abs(cy - hcy);
-          if (dy > ytol) continue;
+          if (dy > ytol) return;
           var area = r.width * r.height;
           if (best === null || dy < best.dy || (dy === best.dy && area < best.area)) {
             best = { dy: dy, area: area, value: num, text: text,
                      x: r.left, y: r.top, w: r.width, h: r.height };
           }
-        }
+        });
         return best ? { value: best.value, text: best.text,
                         x: best.x, y: best.y, w: best.w, h: best.h } : null;
       } catch (e) { return null; }
@@ -1945,17 +1952,8 @@ export class PageWrapper {
     }> => {
       const frames = this.page.frames();
       for (const frame of frames) {
-        let offX = 0, offY = 0;
-        if (frame !== this.page.mainFrame()) {
-          try {
-            const fe = await frame.frameElement();
-            if (fe) {
-              const box = await fe.boundingBox();
-              if (box) { offX = box.x; offY = box.y; }
-            }
-          } catch { /* skip */ }
-        }
-        const localCy = handleCy - offY;
+        const off = await this.getFrameOffset(frame);
+        const localCy = handleCy - off.y;
         // Only scan frames whose viewport could contain the handle row.
         // (Handles the case of mini-iframes unrelated to the slider.)
         try {
@@ -1981,24 +1979,20 @@ export class PageWrapper {
       // element-walk + textContent logic as the main scanner, so the
       // LLM sees what labels ARE on the row (e.g. "Age Range: 25 to 75")
       // and can adjust the regex accordingly.
-      const sampleSrc = `(function(hcy, ytol){
+      const sampleSrc = SHADOW_DOM_HELPERS_SRC + `;(function(hcy, ytol){
         try {
           var out = [];
-          var walker = document.createTreeWalker(
-            document.body || document.documentElement,
-            NodeFilter.SHOW_ELEMENT, null);
-          var el;
-          while ((el = walker.nextNode())) {
-            var r = el.getBoundingClientRect();
-            if (!r || r.width === 0 || r.height === 0) continue;
-            if (r.height > 80) continue;
+          __sb_walkDeepElements(document.body || document.documentElement, function(el) {
+            var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!r || r.width === 0 || r.height === 0) return;
+            if (r.height > 80) return;
             var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-            if (!text || text.length > 300) continue;
+            if (!text || text.length > 300) return;
             var cy = r.top + r.height / 2;
-            if (Math.abs(cy - hcy) > ytol) continue;
+            if (Math.abs(cy - hcy) > ytol) return;
             out.push(text);
-            if (out.length >= 10) break;
-          }
+            if (out.length >= 10) return false;
+          });
           return out;
         } catch(e) { return []; }
       })(${handleCy}, ${yTolerance})`;
@@ -2143,15 +2137,45 @@ export class PageWrapper {
     frame: import('puppeteer-core').Frame,
   ): Promise<{ x: number; y: number }> {
     if (frame === this.page.mainFrame()) return { x: 0, y: 0 };
+    // Primary: ask Puppeteer for the frame's host element. Works for
+    // same-origin and most cross-origin frames.
     try {
       const handle = await frame.frameElement();
-      if (!handle) return { x: 0, y: 0 };
-      const box = await handle.boundingBox();
-      if (!box) return { x: 0, y: 0 };
-      return { x: box.x, y: box.y };
+      if (handle) {
+        const box = await handle.boundingBox();
+        if (box) return { x: box.x, y: box.y };
+      }
     } catch {
-      return { x: 0, y: 0 };
+      /* fall through to URL-match fallback */
     }
+    // Fallback: scan the parent frame for an <iframe> whose .src matches
+    // this frame's url. Cross-origin iframes can throw on frameElement()
+    // but the host iframe element is always reachable from the parent
+    // frame's DOM. Returning {0,0} silently lands drag coords in the
+    // wrong place — surface a warning when both paths fail.
+    try {
+      const parent = frame.parentFrame() ?? this.page.mainFrame();
+      const url = frame.url();
+      const offset = await parent.evaluate((targetUrl: string) => {
+        const iframes = Array.prototype.slice.call(
+          document.querySelectorAll('iframe'),
+        ) as HTMLIFrameElement[];
+        for (const f of iframes) {
+          if (f.src === targetUrl || (f.contentWindow && f.contentWindow.location && f.contentWindow.location.href === targetUrl)) {
+            const r = f.getBoundingClientRect();
+            return { x: r.x, y: r.y };
+          }
+        }
+        return null;
+      }, url);
+      if (offset) return offset;
+    } catch {
+      /* swallow */
+    }
+    console.warn(
+      `[page.getFrameOffset] could not resolve offset for frame ${frame.url()}; using (0,0)`,
+    );
+    return { x: 0, y: 0 };
   }
 
   /**

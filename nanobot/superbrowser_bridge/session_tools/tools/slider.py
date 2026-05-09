@@ -58,9 +58,15 @@ class BrowserSetSliderTool(Tool):
         "Set a slider's value by number. Works for native <input type=range>, "
         "ARIA sliders (role=slider / aria-valuenow), and CSS-custom widgets. "
         "Prefer this over browser_drag for sliders — it auto-picks the most "
-        "reliable strategy and crosses iframe boundaries. For dual-thumb "
-        "sliders (e.g. an age range) pass value_json='[lo, hi]'. Returns the "
-        "strategy used plus before/after values so you can verify the slide."
+        "reliable strategy, crosses iframe boundaries, and pierces open "
+        "shadow DOM (Chase mds-slider, Lit/React custom-element wrappers). "
+        "For dual-thumb sliders on a single track (e.g. an age range) pass "
+        "value_json='[lo, hi]'. Returns the strategy used plus before/after "
+        "values so you can verify the slide. CALL ONE AT A TIME — when "
+        "setting multiple sliders (e.g. min + max filter inputs), wait for "
+        "each call to return before issuing the next; parallel calls are "
+        "serialized by an internal lock and re-screenshot is needed between "
+        "them so vision indices stay fresh."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -111,6 +117,11 @@ class BrowserSetSliderTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
+            self.s.record_cursor_failure(
+                strategy="slider_set",
+                target=selector,
+                reason=f"http_{r.status_code}: {str(err)[:80]}",
+            )
             return f"[set_slider_failed] {err}"
         data = r.json()
         outcome = data.get("outcome", {}) or {}
@@ -124,6 +135,11 @@ class BrowserSetSliderTool(Tool):
             data.get("url", ""),
         )
         if strategy == "unresolved" or err:
+            self.s.record_cursor_failure(
+                strategy="slider_set",
+                target=selector,
+                reason=str(err or "unresolved")[:80],
+            )
             return f"[set_slider_failed] {err or 'unresolved'} (selector={selector})"
         caption = (
             f"Set slider {selector} via {strategy}: {before} → {after} "
@@ -183,7 +199,10 @@ class BrowserSetSliderAtTool(Tool):
         "slider; (2) pick the V_n of the HANDLE you want to move; (3) "
         "call this tool with the target numeric value. The tool finds "
         "the adjacent track, dispatches a humanised bezier drag, and "
-        "returns the post-drag rendered label text so you can verify."
+        "returns the post-drag rendered label text so you can verify. "
+        "CALL ONE AT A TIME — multiple sliders MUST be sequenced; the "
+        "internal lock serializes them, and you must re-screenshot "
+        "between calls so V_n indices are fresh."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -227,6 +246,11 @@ class BrowserSetSliderAtTool(Tool):
 
         resp = self.s.vision_for_target_resolution()
         if resp is None:
+            self.s.record_cursor_failure(
+                strategy="slider_set_at",
+                target=f"V{vision_index}",
+                reason="no_vision",
+            )
             return (
                 "[set_slider_at_failed:no_vision] No recent vision response. "
                 "Call browser_screenshot first so slider bboxes are indexed."
@@ -234,6 +258,11 @@ class BrowserSetSliderAtTool(Tool):
 
         handle_bbox = resp.get_bbox(int(vision_index))
         if handle_bbox is None:
+            self.s.record_cursor_failure(
+                strategy="slider_set_at",
+                target=f"V{vision_index}",
+                reason=f"bad_vision_index ({len(resp.bboxes)} bboxes)",
+            )
             return (
                 f"[set_slider_at_failed:bad_vision_index] V{vision_index} "
                 f"is out of range (only {len(resp.bboxes)} bboxes cached)."
@@ -249,6 +278,11 @@ class BrowserSetSliderAtTool(Tool):
 
         iw, ih = resp.image_width, resp.image_height
         if iw <= 0 or ih <= 0:
+            self.s.record_cursor_failure(
+                strategy="slider_set_at",
+                target=f"V{vision_index}",
+                reason="no_image_dims",
+            )
             return "[set_slider_at_failed:no_image_dims] Re-screenshot first."
         dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
         hx0, hy0, hx1, hy1 = handle_bbox.to_pixels(iw, ih, dpr=dpr_val)
@@ -314,6 +348,11 @@ class BrowserSetSliderAtTool(Tool):
                     except ValueError:
                         pass
             if mn is None or mx is None:
+                self.s.record_cursor_failure(
+                    strategy="slider_set_at",
+                    target=f"V{vision_index}",
+                    reason="no_minmax",
+                )
                 return (
                     "[set_slider_at_failed:no_minmax] Cannot infer min/max "
                     "from adjacent label; pass value_min/value_max or use "
@@ -331,6 +370,11 @@ class BrowserSetSliderAtTool(Tool):
             # Fall back: use the handle's bbox as a tiny pseudo-track.
             # The drag still fires from the handle centre, but end = start,
             # so this is effectively a no-op. Return diagnostic.
+            self.s.record_cursor_failure(
+                strategy="slider_set_at",
+                target=f"V{vision_index}",
+                reason="no_track",
+            )
             return (
                 f"[set_slider_at_failed:no_track] Could not find a "
                 f"role='slider_widget' bbox adjacent to V{vision_index}. "
@@ -350,6 +394,11 @@ class BrowserSetSliderAtTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
+            self.s.record_cursor_failure(
+                strategy="slider_set_at",
+                target=f"V{vision_index}",
+                reason=f"http_{r.status_code}: {str(err)[:80]}",
+            )
             return f"[set_slider_at_failed] {err}"
         data = r.json()
         outcome = data.get("outcome", {}) or {}
@@ -386,14 +435,17 @@ class BrowserListSliderHandlesTool(Tool):
     name = "browser_list_slider_handles"
     description = (
         "Enumerate all slider handles on the page via DOM introspection "
-        "(NO vision). Walks every frame, including cross-origin ones, "
-        "and returns each handle's index, frame_url, kind, bbox (in "
-        "document CSS pixels), and the closest row-level label text. "
-        "Use this when vision is flaky or returning empty bboxes, or "
-        "when you already know the slider's logical label (e.g. "
-        "'Monthly contribution') and want to pick by text. Then pass "
-        "the bbox directly into browser_drag_slider_until via the "
-        "`handle_bbox` arg — skips the vision lookup entirely."
+        "(NO vision). Walks every frame (including cross-origin) and "
+        "every open shadow root, returning each handle's index, "
+        "frame_url, kind, bbox (in document CSS pixels), and the closest "
+        "row-level label text. Use this when vision is flaky or "
+        "returning empty bboxes, or when you already know the slider's "
+        "logical label (e.g. 'Monthly contribution') and want to pick "
+        "by text. Then pass the bbox directly into "
+        "browser_drag_slider_until via the `handle_bbox` arg — skips the "
+        "vision lookup entirely. For filter widgets with separate min "
+        "and max sliders, call this once, then iterate set_slider / "
+        "drag_slider_until per handle SEQUENTIALLY."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -416,10 +468,20 @@ class BrowserListSliderHandlesTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
+            self.s.record_cursor_failure(
+                strategy="slider_list",
+                target="list_slider_handles",
+                reason=f"http_{r.status_code}: {str(err)[:80]}",
+            )
             return f"[list_slider_handles_failed] {err}"
         data = r.json() or {}
         handles = data.get("handles") or []
         if not handles:
+            self.s.record_cursor_failure(
+                strategy="slider_list",
+                target="list_slider_handles",
+                reason="empty",
+            )
             return (
                 "[list_slider_handles:empty] No slider handles found in "
                 "any frame. Page may still be loading — scroll or wait, "
@@ -512,17 +574,20 @@ class BrowserDragSliderUntilTool(Tool):
     name = "browser_drag_slider_until"
     description = (
         "Closed-loop slider drag. Holds the mouse down on the handle, "
-        "steps incrementally, reads the rendered value label from the "
-        "iframe DOM after each step, and stops when the label shows the "
-        "target value. THE right tool for custom widgets where vision "
-        "can't reliably identify the full track geometry (Chase/JPM "
-        "calculators, React/Angular sliders with no aria-valuenow). "
-        "Unlike browser_set_slider_at (open-loop), this never overshoots "
-        "and recovers automatically from non-linear widget scaling. "
-        "Workflow: (1) browser_screenshot → vision returns slider_handle "
-        "V_n values; (2) call this tool with vision_index=V_n and your "
-        "numeric target; (3) inspect the returned trace + final_value to "
-        "verify the label reached the target."
+        "steps incrementally, reads the rendered value label (across "
+        "all frames AND open shadow roots) after each step, and stops "
+        "when the label shows the target value. THE right tool for "
+        "custom widgets where vision can't reliably identify the full "
+        "track geometry (Chase/JPM calculators, React/Angular sliders "
+        "with no aria-valuenow). Unlike browser_set_slider_at "
+        "(open-loop), this never overshoots and recovers automatically "
+        "from non-linear widget scaling. Workflow: (1) "
+        "browser_screenshot → vision returns slider_handle V_n values "
+        "(or use browser_list_slider_handles to skip vision); (2) call "
+        "this tool with vision_index=V_n / handle_bbox / label_hint and "
+        "your numeric target; (3) inspect the returned trace + "
+        "final_value to verify. CALL ONE AT A TIME — the internal lock "
+        "serializes parallel calls; re-screenshot between sliders."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -545,12 +610,11 @@ class BrowserDragSliderUntilTool(Tool):
         gate = await _feedback_gate("browser_drag_slider_until")
         if gate:
             return gate
-        ok, gate_msg = await _require_fresh_vision(
-            self.s, session_id,
+        sync_block = await self.s.ensure_vision_synced(
             reason=f"browser_drag_slider_until(target={target_value})",
         )
-        if not ok:
-            return gate_msg
+        if sync_block:
+            return sync_block
         # Serialize drags on this session. If the LLM fired this tool in
         # parallel for multiple sliders, we queue them up so the cursor
         # owns one slider at a time. Without this lock, concurrent drags
@@ -682,6 +746,11 @@ class BrowserDragSliderUntilTool(Tool):
             session_id, vision_index, handle_bbox_json, label_hint,
         )
         if handle_pix is None:
+            self.s.record_cursor_failure(
+                strategy="slider_drag_until",
+                target=str(source_desc)[:120],
+                reason="no_handle",
+            )
             msg = f"[drag_slider_until_failed:no_handle] {source_desc}"
             print(f"   {msg}")
             return msg
@@ -713,6 +782,11 @@ class BrowserDragSliderUntilTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
+            self.s.record_cursor_failure(
+                strategy="slider_drag_until",
+                target=str(source_desc)[:120],
+                reason=f"http_{r.status_code}: {str(err)[:80]}",
+            )
             return f"[drag_slider_until_failed] {err}"
         data = r.json()
         out = data.get("outcome", {}) or {}
@@ -738,6 +812,11 @@ class BrowserDragSliderUntilTool(Tool):
                 reason = "value_lost_mid_drag"
             else:
                 reason = "target_not_reached"
+            self.s.record_cursor_failure(
+                strategy="slider_drag_until",
+                target=str(source_desc)[:120],
+                reason=f"{reason} (target={target_value}, final={final_v})",
+            )
             lines.append(
                 f"[drag_slider_until_failed:{reason}] "
                 f"{source_desc} target={target_value} "
