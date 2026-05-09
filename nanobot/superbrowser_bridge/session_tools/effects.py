@@ -60,6 +60,16 @@ _ATOMIC_FIX_TEXT_JS = """
                                        : HTMLInputElement.prototype;
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
       if (desc && desc.set) {
+        // React 16+ caches the prior value in el._valueTracker. If the
+        // tracker matches el.value at dispatch time, React short-circuits
+        // its synthetic onChange and the framework never sees the typed
+        // text — autocomplete/search loops on controlled inputs (e.g.
+        // Google Maps' search box) silently break. Resetting the tracker
+        // forces a non-match. No-op on non-React inputs.
+        const tracker = el._valueTracker;
+        if (tracker && typeof tracker.setValue === 'function') {
+          try { tracker.setValue(''); } catch (_) {}
+        }
         desc.set.call(el, target);
         el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: target}));
         el.dispatchEvent(new Event('change', {bubbles: true}));

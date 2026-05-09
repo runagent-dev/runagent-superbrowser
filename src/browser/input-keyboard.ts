@@ -111,6 +111,23 @@ export async function dispatchKey(
     modifiers,
   });
 
+  // CDP does not auto-synthesize a legacy `keypress` event from keyDown
+  // alone — a `char` dispatch in between is what produces it. typeText
+  // already does this for printable characters (lines 75-80); without
+  // parity here, Enter's keypress never fires and submit handlers that
+  // gate on it (Google Maps' search submit, some classic forms) stay
+  // silent. Scoped to Enter to keep the change minimal.
+  if (key === 'Enter') {
+    await client.send('Input.dispatchKeyEvent', {
+      type: 'char',
+      text: '\r',
+      key: info.key,
+      code: info.code,
+      windowsVirtualKeyCode: info.keyCode,
+      nativeVirtualKeyCode: info.keyCode,
+    });
+  }
+
   await client.send('Input.dispatchKeyEvent', {
     type: 'keyUp',
     key: info.key,
