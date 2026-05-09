@@ -31,6 +31,11 @@ import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
 import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot } from './effect.js';
+import {
+  waitForTargetStable,
+  capturePageRef,
+  compareViewportShift,
+} from '../browser/page-readiness.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -672,6 +677,22 @@ export function createHttpServer(
         includeCursorElements: req.query.cursor === 'true',
       });
 
+      // When this /state call is producing a screenshot for the brain
+      // (useVision=true), capture the page reference frame
+      // (scrollY/scrollHeight/viewport dims) right after getState so
+      // the /click handler can detect a layout shift between this
+      // capture and a subsequent click. We only update when vision is
+      // requested — the brain's mental model is anchored to the last
+      // screenshot, not to side-channel /state probes.
+      if (useVision) {
+        try {
+          const ref = await capturePageRef(page.getRawPage());
+          page.setVisionPageRef(ref);
+        } catch {
+          /* best-effort — never block /state on a ref capture failure */
+        }
+      }
+
       // Fetch device pixel ratio so the client can scale CSS bounds to
       // device pixels when drawing bbox overlays on the screenshot.
       let devicePixelRatio = 1;
@@ -743,11 +764,88 @@ export function createHttpServer(
         // click at the snapped centre, return the resolved point so
         // the bridge can log/trace which element actually received
         // the input.
-        const snap = await page.clickInBbox(bbox, {
+        //
+        // Layer 1 — viewport-shift gate. The brain's V_n bbox is in
+        // viewport-CSS coordinates frozen at vision-capture time. If
+        // the page has scrolled or the layout has reflowed since
+        // (lazy-load, banner injection, modal open), those CSS coords
+        // now point at the wrong absolute element — labels alone
+        // can't catch this when the new occupant is the same kind
+        // of widget. Reject early so the brain re-screenshots
+        // instead of dispatching against a stale frame.
+        const stored = page.getVisionPageRef();
+        const currentRef = await capturePageRef(page.getRawPage());
+        const shift = compareViewportShift(stored, currentRef);
+        if (process.env.VIEWPORT_SHIFT_DEBUG === '1') {
+          console.log(
+            `[viewport_shift] shifted=${shift.shifted}`
+            + ` reason=${shift.reason}`
+            + ` dy=${shift.delta.scrollY}`
+            + ` dh=${shift.delta.scrollHeight}`
+            + ` dvh=${shift.delta.viewportHeight}`,
+          );
+        }
+        if (shift.shifted) {
+          res.json({
+            error: 'viewport_shifted',
+            reason: shift.reason,
+            delta: shift.delta,
+            stored: shift.stored,
+            current: shift.current,
+            expected_label,
+            bbox,
+          });
+          return;
+        }
+
+        // Layer 2 — pre-dispatch stability gate. Even on a non-shifted
+        // page, the target element itself may be mid-animation.
+        // waitForTargetStable polls in-page (one CDP roundtrip) until
+        // the captured element's rect holds still and the surrounding
+        // tree quiets. On stable, re-aim onto the element's CURRENT
+        // bounds — the LLM's bbox is a hint, not a contract. On
+        // timeout we proceed anyway; clickInBbox Phase 1/2 +
+        // post-click verify catch the rest.
+        let dispatchBbox = bbox;
+        const cx = (bbox.x0 + bbox.x1) / 2;
+        const cy = (bbox.y0 + bbox.y1) / 2;
+        const stab = await waitForTargetStable(
+          page.getRawPage(),
+          { kind: 'point', x: cx, y: cy },
+        );
+        if (stab.lastBounds && stab.lastBounds.w > 0 && stab.lastBounds.h > 0) {
+          const lb = stab.lastBounds;
+          dispatchBbox = {
+            x0: lb.x, y0: lb.y, x1: lb.x + lb.w, y1: lb.y + lb.h,
+          };
+        }
+        if (process.env.CLICK_STABILITY_DEBUG === '1') {
+          console.log(
+            `[click_stability] branch=vision_bbox stable=${stab.stable}`
+            + ` reason=${stab.reason} samples=${stab.samples}`,
+          );
+        }
+        const snap = await page.clickInBbox(dispatchBbox, {
           button,
           clickCount,
           expectedLabel: expected_label,
         });
+        // Label-mismatch escape: clickInBbox Phase 2 grid-scan found
+        // no candidate matching the vision label and skipped dispatch.
+        // Surface as `element_mismatch` (the shape click.py:667-686
+        // already handles) so the brain re-screenshots instead of
+        // clicking the wrong neighbour. Skip settle/state — no click
+        // fired, page state unchanged, the bridge's fingerprint cache
+        // from the previous tick is still valid.
+        if (snap.labelMismatch) {
+          res.json({
+            error: 'element_mismatch',
+            expected_label,
+            coords: { x: snap.x, y: snap.y },
+            found: snap.found,
+          });
+          return;
+        }
         await settleForEffect(page.getRawPage());
         const effectAfter = await captureEffect(page.getRawPage());
         const newState = await page.getState({ useVision: false, includeConsole: true });
@@ -867,11 +965,30 @@ export function createHttpServer(
                 XPathResult.FIRST_ORDERED_NODE_TYPE, null,
               ).singleNodeValue;
               if (!node || !(node instanceof HTMLElement)) return null;
-              // Scroll into view first so off-screen targets get a real
-              // viewport rect — clickInBbox needs viewport coords.
-              try {
-                node.scrollIntoView({ block: 'center', behavior: 'instant' });
-              } catch { /* ignore — older engines */ }
+              // Scroll into view ONLY when the element isn't already
+              // visible. The previous `block: 'center'` re-centred on
+              // every click — even when the element was already a few
+              // pixels off-centre — shifting the viewport 100-400px
+              // each call. That broke the brain's V_n bboxes (which
+              // are in viewport CSS coords) for every NEXT click,
+              // because the element under coords (cx,cy) was now a
+              // different absolute element. `'nearest'` only scrolls
+              // when at least one edge is outside the viewport, and
+              // scrolls the minimum amount to bring the element in.
+              const r0 = node.getBoundingClientRect();
+              const inView = (
+                r0.top >= 0 && r0.bottom <= window.innerHeight
+                && r0.left >= 0 && r0.right <= window.innerWidth
+              );
+              if (!inView) {
+                try {
+                  node.scrollIntoView({
+                    block: 'nearest',
+                    inline: 'nearest',
+                    behavior: 'instant',
+                  });
+                } catch { /* ignore — older engines */ }
+              }
               const r = node.getBoundingClientRect();
               return {
                 x: r.left, y: r.top, w: r.width, h: r.height,
@@ -893,10 +1010,46 @@ export function createHttpServer(
               || ''
             ).slice(0, 80).trim();
 
+            // Pre-dispatch stability gate. The live bounds we just
+            // queried are a single sample taken one tick ago; on
+            // heavy-rendering sites the element may still be mid-
+            // animation. Polling in-page until the rect quiets — and
+            // the surrounding tree's mutation counter quiets — turns
+            // a coordinate race into a 150-600ms wait. On timeout we
+            // still dispatch with the most recent bounds (strictly
+            // fresher than `live`), trusting clickInBbox Phase 1/2
+            // and post-click verify to catch the residual misses.
+            let dispatchBounds = live;
+            const stab = await waitForTargetStable(
+              page.getRawPage(),
+              { kind: 'xpath', xpath: element.xpath },
+            );
+            if (
+              stab.lastBounds
+              && stab.lastBounds.w > 0
+              && stab.lastBounds.h > 0
+            ) {
+              dispatchBounds = {
+                x: stab.lastBounds.x,
+                y: stab.lastBounds.y,
+                w: stab.lastBounds.w,
+                h: stab.lastBounds.h,
+                tag: live.tag,
+              };
+            }
+            if (process.env.CLICK_STABILITY_DEBUG === '1') {
+              console.log(
+                `[click_stability] branch=dom_index xpath=${element.xpath}`
+                + ` stable=${stab.stable} reason=${stab.reason}`
+                + ` samples=${stab.samples}`,
+              );
+            }
+
             const snap = await page.clickInBbox(
               {
-                x0: live.x, y0: live.y,
-                x1: live.x + live.w, y1: live.y + live.h,
+                x0: dispatchBounds.x, y0: dispatchBounds.y,
+                x1: dispatchBounds.x + dispatchBounds.w,
+                y1: dispatchBounds.y + dispatchBounds.h,
               },
               { button, clickCount, expectedLabel: expectedLabel || undefined },
             );
@@ -1093,6 +1246,38 @@ export function createHttpServer(
         }
       }
 
+      // Pre-type value probe — gives the LLM "before X, now Y" feedback so
+      // a silent clear-failure-and-append doesn't look like a clean type.
+      // Best-effort: empty default if probe throws.
+      let pretypeValue = '';
+      try {
+        const sel = element.enhancedCssSelectorForElement();
+        pretypeValue = await page.getRawPage().evaluate((s: string) => {
+          const el = document.querySelector(s);
+          if (!el) return '';
+          const valEl = el as unknown as { value?: string };
+          if (typeof valEl.value === 'string') return valEl.value || '';
+          if ((el as HTMLElement).isContentEditable) {
+            return (el as HTMLElement).innerText || '';
+          }
+          return '';
+        }, sel);
+      } catch (_e) { /* probe is best-effort */ }
+
+      // Skip-match short-circuit: field already matches target, no work
+      // needed (mirrors the t3 contract at interactive_session.py:2889-2897).
+      if (pretypeValue === text && pretypeValue !== '') {
+        const newState = await page.getState({ useVision: false, includeConsole: true });
+        res.json({
+          success: true,
+          elements: newState.elementTree.clickableElementsToString(),
+          effect: { url_changed: false, mutation_delta: 0, focused_changed: false },
+          pretype_action: 'skip_match',
+          pretype_value: pretypeValue,
+        });
+        return;
+      }
+
       const r = await page.typeText(element, text, clear !== false);
       if (!r.success) {
         res.status(400).json({
@@ -1107,10 +1292,16 @@ export function createHttpServer(
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false, includeConsole: true });
+
+      // Empty before → typed_into_empty; non-empty before → cleared_and_typed.
+      const pretypeAction = pretypeValue ? 'cleared_and_typed' : 'typed_into_empty';
+
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         effect: diffEffect(effectBefore, effectAfter),
+        pretype_action: pretypeAction,
+        pretype_value: pretypeValue,
       });
     } catch (err) {
       handleError(res, err);

@@ -238,14 +238,21 @@ _DETECT_JS = """
       );
       if (cfFrame) {
         out.frame_url = cfFrame.src || '';
-        // CF embeds the sitekey as ?k=0x4AAA... in the iframe src on
-        // some builds; on others it lives on a parent element with
-        // data-sitekey. Try both.
+        // CF embeds the sitekey in three places depending on the
+        // build: ?k=0x4AAA..., ?sitekey=0x4AAA..., or as a path
+        // segment (.../turnstile/.../0x4AAAAAAADnPIDROrmt1Wwj/).
+        // Path-segment is what cars.com serves circa 2026-05.
         try {
           const u = new URL(cfFrame.src, location.href);
           out.site_key = u.searchParams.get('k')
             || u.searchParams.get('sitekey')
             || '';
+          if (!out.site_key) {
+            // Path scan: look for the canonical 0x... 24-char hex
+            // sitekey anywhere in the path segments.
+            const m = u.pathname.match(/\\b(0x[0-9a-zA-Z]{20,32})\\b/);
+            if (m) out.site_key = m[1];
+          }
         } catch (_) { /* malformed URL — leave site_key empty */ }
         if (!out.site_key) {
           const dk = document.querySelector('[data-sitekey]');

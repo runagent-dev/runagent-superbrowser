@@ -466,6 +466,17 @@ class BrowserSessionState:
             F5 fix; otherwise the brain's V_n picked from page A
             resolves against page A's bbox list while the click lands
             on page B, with bboxes that no longer apply).
+
+        Returns None when the epoch was previously frozen
+        (`_vision_epoch_id > 0`) but has since been invalidated
+        (`_vision_epoch_response is None`). This catches the
+        mid-session staleness cascade: a previous click's mutation
+        cleared the epoch, the background prefetch refreshed
+        `_last_vision_response` with new bboxes the brain has not
+        yet observed, and the brain's V_n indices were picked from
+        the OLD bbox list. Returning None forces the consumer to
+        emit its existing `no_vision` / `epoch_invalidated` error
+        so the brain re-screenshots before clicking.
         """
         if self._vision_epoch_response is not None:
             epoch_url = self._normalize_url(self._vision_epoch_url or "")
@@ -475,6 +486,12 @@ class BrowserSessionState:
                 # post-mutation prefetch and matches the current page.
                 return self._last_vision_response
             return self._vision_epoch_response
+        # Epoch was previously frozen but is now None — invalidated
+        # mid-session. Refuse to fall through to a prefetch the brain
+        # hasn't seen. Allow `_vision_epoch_id == 0` (first turn /
+        # tests) to keep falling through to the live response.
+        if self._vision_epoch_id > 0:
+            return None
         return self._last_vision_response
 
     def record_cursor_failure(

@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """must go to this site https://www.cars.com/ Find the cheapest used hatchback car listing in Madison which has black interiors with a heated seat option and premium sound system. use browser tools."""
+        """must go to this site https://www.chase.com/personal/investments/retirement/retirement-calculators/401K-403B-calculator .Using a calculator to determine how much I can have in my 401(k) account at retirement, if I work from age 22 to 65, with an annual rate of return of 3%, annual employee contributions of $8,000, and annual employer contributions of $8,000. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

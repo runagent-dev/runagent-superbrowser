@@ -5,8 +5,8 @@
  * Handles key combos like "Control+A", "Meta+Shift+P", special keys, etc.
  */
 
-import type { CDPSession } from 'puppeteer-core';
-import { Modifiers } from './input-mouse.js';
+import type { CDPSession, Page } from 'puppeteer-core';
+import { Modifiers, dispatchClick } from './input-mouse.js';
 
 /** Key code mappings for special keys. */
 const KEY_CODES: Record<string, { key: string; code: string; keyCode: number }> = {
@@ -199,23 +199,94 @@ export async function pressKeyCombo(
 }
 
 /**
- * Clear a text field: Select All (Ctrl+A) → Backspace.
- * With triple-click fallback if field not empty after first attempt.
- * Pattern from BrowserOS keyboard.ts clearField.
+ * Clear a text field with three escalating layers, matching the proven
+ * t3 pattern at nanobot/superbrowser_bridge/antibot/interactive_session.py:2912-2964.
+ *
+ * 1. Native value-setter via JS (React/Vue safe — invalidates _valueTracker
+ *    and fires input/change events).
+ * 2. Ctrl+A + Delete keystroke (plain HTML inputs whose handlers gate on
+ *    real keyboard events). Delete, not Backspace — the t3 pattern uses
+ *    Delete; Backspace can move focus or trigger browser back-nav on
+ *    edge cases.
+ * 3. Verify; if still non-empty, triple-click select-all + Delete.
+ *
+ * Best-effort void return — callers needing a hard guarantee should
+ * re-probe value before typing (the /type endpoint does).
  */
 export async function clearField(
   client: CDPSession,
+  page: Page,
   x: number,
   y: number,
 ): Promise<void> {
-  // First attempt: Ctrl+A → Backspace
+  // Layer 1: native setter — React/Vue safe.
+  try {
+    await page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y);
+        if (!el) return false;
+        try {
+          const tag = el.tagName;
+          let proto: PropertyDescriptor | null = null;
+          if (tag === 'TEXTAREA') {
+            proto = Object.getOwnPropertyDescriptor(
+              HTMLTextAreaElement.prototype, 'value',
+            ) || null;
+          } else if (tag === 'INPUT') {
+            proto = Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype, 'value',
+            ) || null;
+          }
+          if (proto && proto.set) {
+            // React 16+ tracker invalidation, mirrors _ATOMIC_FIX_TEXT_JS.
+            const tracker = (el as unknown as { _valueTracker?: { setValue?: (v: string) => void } })._valueTracker;
+            if (tracker && typeof tracker.setValue === 'function') {
+              try { tracker.setValue(''); } catch (_e) { /* tracker missing */ }
+            }
+            proto.set.call(el, '');
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          } else if ((el as HTMLElement).isContentEditable) {
+            (el as HTMLElement).textContent = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+            // Fallback for elements whose prototype lookup failed.
+            (el as unknown as { value?: string }).value = '';
+          }
+        } catch (_e) { /* fall through to keystroke layer */ }
+        return true;
+      },
+      { x, y },
+    );
+  } catch (_e) { /* best-effort — fall through */ }
+
+  // Layer 2: Ctrl+A + Delete keystrokes (plain HTML; Delete avoids
+  // Backspace edge cases like browser back-nav).
   await pressKeyCombo(client, 'Control+a');
   await new Promise((r) => setTimeout(r, 50));
-  await dispatchKey(client, 'Backspace');
+  await dispatchKey(client, 'Delete');
   await new Promise((r) => setTimeout(r, 50));
 
-  // If still has content, try triple-click + Backspace
-  // The caller should check if the field is actually empty
+  // Layer 3: verify; triple-click + Delete if still non-empty.
+  let stillHas = '';
+  try {
+    stillHas = await page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y);
+        if (!el) return '';
+        const valEl = el as unknown as { value?: string };
+        if (typeof valEl.value === 'string') return valEl.value || '';
+        return (el as HTMLElement).textContent || '';
+      },
+      { x, y },
+    );
+  } catch (_e) { /* best-effort verify */ }
+  if (stillHas) {
+    await dispatchClick(client, x, y, { clickCount: 3 });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatchKey(client, 'Delete');
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 function normalizeModifier(key: string): string {

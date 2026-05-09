@@ -80,6 +80,38 @@ async def _phase4_auto_submit(s_page) -> bool:
         return False
 
 
+async def _extract_sitekey_from_frames(page) -> str | None:
+    """Walk page.frames for a Cloudflare/Turnstile iframe and pull the
+    sitekey out of the URL.
+
+    CF Turnstile sitekeys are 24-character `0x...` hex strings. They
+    can appear as:
+      - a query param:  ?k=0x4AAA... or ?sitekey=0x4AAA...
+      - a path segment: .../turnstile/.../0x4AAAAAAADnPIDROrmt1Wwj/
+
+    Returns the first match found, or None.
+    """
+    import re
+    pat = re.compile(r"\b(0x[0-9a-zA-Z]{20,32})\b")
+    for frame in page.frames:
+        url = frame.url or ""
+        if "challenges.cloudflare.com" not in url and "turnstile" not in url:
+            continue
+        try:
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(url)
+            qs = parse_qs(u.query or "")
+            for k in ("k", "sitekey"):
+                if qs.get(k):
+                    return qs[k][0]
+            m = pat.search(u.path or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            continue
+    return None
+
+
 async def _has_turnstile_token(s_page) -> bool:
     """True if the page's cf-turnstile-response input is populated."""
     try:
@@ -190,6 +222,16 @@ async def solve_cf_interstitial(
 
     # ----- Phase 3: 2captcha token -------------------------------------
     site_key = (info.site_key or "").strip()
+    if not site_key:
+        # Detect's `document.querySelector('iframe[src*="..."]')` misses
+        # the iframe when CF embeds it via closed Shadow DOM (cars.com
+        # 2026-05). `page.frames` still sees the underlying frame via
+        # Chrome's frame tree — pull the sitekey out of the frame URL
+        # path so Phase 3 has something to submit. Format observed:
+        # `.../turnstile/.../0x4AAAAAAADnPIDROrmt1Wwj/`.
+        site_key = await _extract_sitekey_from_frames(s.page) or ""
+        if site_key:
+            trace.append(f"phase3_prep: sitekey={site_key[:14]}... (from frames)")
     provider = (os.environ.get("CAPTCHA_PROVIDER") or "2captcha").lower()
     api_key = (
         os.environ.get("CAPTCHA_API_KEY")

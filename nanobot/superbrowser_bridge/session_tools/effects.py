@@ -29,8 +29,41 @@ BLOCKED_BROWSER_OPEN_HARD_STOP = 3
 _ATOMIC_FIX_TEXT_JS = """
 (() => {
   const x = __TARGET_X__, y = __TARGET_Y__, target = __TARGET_TEXT__;
-  const el = document.elementFromPoint(x, y);
+  let el = document.elementFromPoint(x, y);
   if (!el) return {ok: false, reason: 'no_element'};
+
+  // Wrapper-descent: when elementFromPoint hits a styled wrapper rather
+  // than the real <input> (petfinder's #findAPetLocation, Google Maps'
+  // #searchboxinput, MUI Autocomplete, plenty of Tailwind designs),
+  // descend into a usable descendant before bailing.
+  //   Pass A — descendant whose bounding box CONTAINS (x, y); pick the
+  //            smallest (innermost) one. Conservative — geometry-scoped.
+  //   Pass B — single-input wrapper fallback (exactly one descendant,
+  //            visible). Bounded — never picks from a list of options.
+  const isUsable = (n) => {
+    if (!n) return false;
+    const t = n.tagName ? n.tagName.toLowerCase() : '';
+    return t === 'input' || t === 'textarea' || !!n.isContentEditable;
+  };
+  if (!isUsable(el)) {
+    const candidates = el.querySelectorAll(
+      'input, textarea, [contenteditable=""], [contenteditable="true"]'
+    );
+    let best = null, bestArea = Infinity;
+    for (const c of candidates) {
+      const r = c.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      const a = r.width * r.height;
+      if (a < bestArea) { best = c; bestArea = a; }
+    }
+    if (!best && candidates.length === 1) {
+      const r = candidates[0].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) best = candidates[0];
+    }
+    if (best) el = best;
+  }
+
   const tag = el.tagName.toLowerCase();
   const isInput = tag === 'input' || tag === 'textarea';
   const isEditable = !!el.isContentEditable;

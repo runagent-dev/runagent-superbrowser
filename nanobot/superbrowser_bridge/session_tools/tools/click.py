@@ -234,11 +234,20 @@ class BrowserClickTool(Tool):
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
             try:
+                # Default 4 (was 8): a small filter that hides 1-2
+                # checkboxes produces ~5-8 mutations, just above the
+                # old threshold. Lowering to 4 lets light filters
+                # invalidate the frozen vision epoch so V_n indices
+                # captured BEFORE the filter don't resolve against
+                # shifted positions on the next click_at. Still
+                # ignores the 1-3 mutation focus-shift-only changes
+                # (button hover, input focus) the threshold was
+                # originally tuned to skip.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "4"
                 )
             except ValueError:
-                threshold = 8
+                threshold = 4
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(
@@ -374,6 +383,45 @@ class BrowserClickAtTool(Tool):
         payload: dict[str, Any]
         log_target: str
         if vision_index is not None:
+            # HARD epoch-invalidated gate. When a previous click's
+            # mutation_delta exceeded MUTATION_DIRTY_THRESHOLD,
+            # `_vision_epoch_response` was reset to None to keep V_n
+            # indices from resolving against shifted positions. But
+            # without this gate, `vision_for_target_resolution` falls
+            # back to `_last_vision_response`, which the background
+            # prefetch may have just refreshed with NEW bboxes the
+            # brain HAS NOT SEEN — so V_n (picked from the OLD bbox
+            # list in the brain's mental model) silently resolves to
+            # a different element in the NEW bbox list.
+            #
+            # `_vision_epoch_id > 0` distinguishes "epoch was
+            # invalidated mid-session" (refuse, force re-screenshot)
+            # from "first turn ever / mock-test no screenshot taken
+            # yet" (let it fall through, original behaviour). The
+            # epoch_id increments on every freeze_vision_epoch().
+            if (
+                self.s._vision_epoch_response is None
+                and getattr(self.s, "_vision_epoch_id", 0) > 0
+            ):
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
+                )
+                self.s.log_activity(
+                    f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
+                    f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
+                )
+                return (
+                    f"[click_at_failed:epoch_invalidated] V"
+                    f"{vision_index} resolves against a vision "
+                    f"snapshot that has been invalidated since you "
+                    f"saw it (a previous click changed the page "
+                    f"meaningfully — the bbox indices no longer "
+                    f"line up with the current page state). Call "
+                    f"browser_screenshot to refresh vision before "
+                    f"clicking."
+                    + (f"\n{alts}" if alts else "")
+                )
+
             # Prefer the frozen epoch (what the brain SAW on its last
             # screenshot), fall back to the live response only when no
             # epoch is set yet (pre-first-screenshot path / tests).
@@ -660,6 +708,39 @@ class BrowserClickAtTool(Tool):
             return f"[low_reward_band] {err}"
         r.raise_for_status()
         data = r.json()
+        # Viewport-shift guard. The TS handler compared the page's
+        # current scrollY/scrollHeight/viewport dims to what they were
+        # when the brain last received a screenshot. A shift means
+        # the V_n bbox is in a stale reference frame — clicking it
+        # would land on whatever happens to be at those CSS coords
+        # NOW, which is a different absolute element than the brain
+        # picked. Hard-invalidate the frozen epoch and surface a
+        # structured signal so the brain re-screenshots before
+        # retrying. This catches the case where the page reflowed
+        # globally (lazy-load, banner, modal) and labels alone can't
+        # disambiguate same-kind neighbours under the bbox.
+        if isinstance(data, dict) and data.get("error") == "viewport_shifted":
+            self.s._vision_epoch_response = None
+            delta = data.get("delta", {}) or {}
+            reason = data.get("reason", "shift")
+            dy = delta.get("scrollY", 0)
+            dh = delta.get("scrollHeight", 0)
+            dvh = delta.get("viewportHeight", 0)
+            self.s.log_activity(
+                f"click_at{log_target}(VIEWPORT_SHIFTED)",
+                f"reason={reason} dy={dy} dh={dh} dvh={dvh}",
+            )
+            return (
+                f"[click_at_failed:viewport_shifted reason={reason}] The "
+                f"page has shifted since your last screenshot "
+                f"(scrollY delta={dy}px, scrollHeight delta={dh}px"
+                + (f", viewportHeight delta={dvh}px" if dvh else "")
+                + "). Your V_n bboxes are anchored to a stale "
+                f"reference frame, so clicking one would land on "
+                f"whatever element happens to be at those CSS coords "
+                f"now (likely a same-kind neighbour). Call "
+                f"browser_screenshot to refresh vision before clicking."
+            )
         # Element-mismatch guard (P1.4). The T3 backend compared the
         # element at the click target to the vision label we sent and
         # decided they don't match. Don't dispatch — return an
@@ -697,11 +778,14 @@ class BrowserClickAtTool(Tool):
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
             try:
+                # See browser_click for the 4-vs-8 rationale. Light
+                # filter re-renders (5-8 mutations) used to slip
+                # through and let V_n resolve against pre-shift coords.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "4"
                 )
             except ValueError:
-                threshold = 8
+                threshold = 4
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(

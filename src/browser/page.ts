@@ -25,6 +25,7 @@ import {
   waitForVisualStable,
   detectErrorPage,
   type ErrorPage,
+  type PageRef,
 } from './page-readiness.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { inputEventBus } from './input-events.js';
@@ -130,6 +131,32 @@ export class PageWrapper {
    *  to humanize/input-mouse so input events can be broadcast to the
    *  live view via InputEventBus. */
   public sessionId?: string;
+
+  /**
+   * Page reference frame (scrollY, scrollHeight, viewport dims) at the
+   * moment the LAST vision-capable /state was served. The /click
+   * handler reads this to detect "page has shifted since the brain saw
+   * the screenshot" — when shifted, the V_n bbox the brain captured
+   * resolves against a stale frame and the click would land on a
+   * neighbour. See `compareViewportShift` in `page-readiness.ts`.
+   *
+   * Updated only when the brain actually receives a screenshot
+   * (useVision=true); a no-vision /state probe doesn't reset this so
+   * the brain's visual mental model stays the source of truth.
+   */
+  private lastVisionPageRef: PageRef | null = null;
+
+  /** Read what the page reference frame was when the brain last got a
+   *  screenshot. Returns null until the first vision capture. */
+  public getVisionPageRef(): PageRef | null {
+    return this.lastVisionPageRef;
+  }
+
+  /** Update the stored vision page reference. Called by the /state
+   *  handler immediately after the screenshot is built. */
+  public setVisionPageRef(ref: PageRef): void {
+    this.lastVisionPageRef = ref;
+  }
 
   constructor(
     private page: Page,
@@ -704,7 +731,22 @@ export class PageWrapper {
           );
           const el = result.singleNodeValue as HTMLElement;
           if (el) {
-            el.scrollIntoView({ block: 'center' });
+            // Only scroll when actually off-screen. `block: 'center'`
+            // would re-centre even a fully-visible element, shifting
+            // the viewport and invalidating the brain's pre-click
+            // V_n bboxes for the next call.
+            const r = el.getBoundingClientRect();
+            const inView = (
+              r.top >= 0 && r.bottom <= window.innerHeight
+              && r.left >= 0 && r.right <= window.innerWidth
+            );
+            if (!inView) {
+              el.scrollIntoView({
+                block: 'nearest',
+                inline: 'nearest',
+                behavior: 'instant',
+              });
+            }
             el.click();
           }
         }, element.xpath);
@@ -811,6 +853,18 @@ export class PageWrapper {
      *  tool dead-click guard can recognize that V_n and [N] resolve
      *  to the same DOM element. */
     targetXpath?: string;
+    /** Set when expectedLabel was provided AND Phase 2 grid-scan
+     *  could not find any candidate matching that label. The caller
+     *  must NOT dispatch a click — surface a structured mismatch so
+     *  the brain re-screenshots. Closes the silent-misclick gap on
+     *  filter-shift cases where a stale bbox now overlaps a
+     *  same-shape neighbour with a different label. */
+    labelMismatch?: boolean;
+    /** When `labelMismatch` is true, describes the wrong-label
+     *  element currently occupying the bbox. The /click handler
+     *  packs this into the `element_mismatch` response shape that
+     *  the Python bridge already knows how to surface. */
+    found?: { tag: string; role: string; text: string };
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -939,16 +993,19 @@ export class PageWrapper {
           // bbox centre). Grid-scan can find an alternate interactive
           // whose rect overlaps the bbox AND whose label aligns.
         }
-        // 2. Centre fell on empty space — bbox is probably loose or
-        //    off-page. Grid-scan fallback: pick the interactive element
-        //    whose rect overlaps the bbox most, click its own centre.
-        //    Chevron tiebreaker: when two grid hits have similar area
-        //    (within 30%) and one carries expand/collapse semantics
-        //    (aria-expanded, aria-haspopup, single chevron char,
-        //    aria-label matching expand/collapse/toggle/more), bias
-        //    toward the chevron. Only fires on row-shaped bboxes
-        //    (≥60×24) — for a small bbox the bbox itself IS the
-        //    chevron, no bias needed.
+        // 2. Centre fell on empty space OR Phase 1 label-match
+        //    failed — pick the interactive whose rect overlaps the
+        //    bbox most. Chevron tiebreaker biases toward expand/
+        //    collapse semantics on row-shaped bboxes.
+        //
+        //    Filter-shift fix: when expectedLabel is provided, weight
+        //    candidates by labelMatchScore (1.0 match, 0.05 mismatch,
+        //    0.1 unlabelled). Without this, a stale bbox that now
+        //    overlaps a same-shape neighbour silently snaps to the
+        //    neighbour. With it, only a label-matching candidate wins
+        //    on overlap; if no candidate matches the label, we report
+        //    `labelMismatch=true` and the caller skips dispatch so the
+        //    brain re-screenshots instead of misclicking.
         const isRowBbox = (b.x1 - b.x0) >= 60 && (b.y1 - b.y0) >= 24;
         const CHEVRON_CHARS = '▼▶◀▲►◄⌃⌄⋮+−×⨯›';
         const chevronScoreOf = (el: Element): number => {
@@ -961,9 +1018,25 @@ export class PageWrapper {
           if (/(expand|collapse|toggle|more)/.test(al)) return 1;
           return 0;
         };
+        const labelActive = args.expectedLabel.length >= 3;
+        const expLc = args.expectedLabel.toLowerCase().trim();
+        const labelScoreOf = (el: Element): number => {
+          if (!labelActive) return 1;
+          const full = (
+            ((el as HTMLElement).textContent || '') + ' '
+            + ((el as HTMLElement).getAttribute('aria-label') || '') + ' '
+            + ((el as HTMLElement).getAttribute('title') || '')
+          ).toLowerCase().replace(/\s+/g, ' ').trim();
+          if (!full) return 0.1;
+          if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) {
+            return 1;
+          }
+          return 0.05;
+        };
         let best: Element | null = null;
         let bestArea = 0;
         let bestComposite = 0;
+        let bestLabelScore = 0;
         for (let i = 1; i < 5; i++) {
           for (let j = 1; j < 5; j++) {
             const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
@@ -979,23 +1052,52 @@ export class PageWrapper {
               const area = ix * iy;
               if (area <= 0) continue;
               const cs = isRowBbox ? chevronScoreOf(hit) : 0;
+              const ls = labelScoreOf(hit);
               // Composite scoring: area dominates, chevron only nudges
-              // when this candidate is within 30% of the current best.
-              // For a clean single winner the existing largest-area
-              // logic is unchanged.
+              // when this candidate is within 30% of the current best
+              // (preserves existing single-winner behaviour). Then the
+              // label score multiplies the whole thing — when active,
+              // a 1.0 match beats any 0.05 mismatch unless the
+              // mismatch has 20× the area, which never happens for
+              // sibling checkboxes.
               const within30 = bestArea > 0 && area > bestArea * 0.7;
-              const composite = cs > 0 && within30
+              const baseScore = cs > 0 && within30
                 ? area + bestArea * 0.5 * cs
                 : area;
+              const composite = baseScore * ls;
               if (composite > bestComposite) {
                 bestComposite = composite;
                 bestArea = area;
+                bestLabelScore = ls;
                 best = hit;
               }
             }
           }
         }
         if (best) {
+          // Label-mismatch escape hatch: if the best candidate failed
+          // label-match (ls < 0.5 means 0.05 or 0.1 — i.e. mismatch or
+          // unlabelled when a label was expected), surface labelMismatch
+          // so the caller skips dispatch. This converts a silent
+          // misclick into a structured signal the bridge already
+          // surfaces as `element_mismatch`.
+          if (labelActive && bestLabelScore < 0.5) {
+            const r = best.getBoundingClientRect();
+            return {
+              x: Math.round(r.left + r.width / 2),
+              y: Math.round(r.top + r.height / 2),
+              snapped: false,
+              target: describe(best),
+              targetXpath: xpathOf(best),
+              labelMismatch: true,
+              found: {
+                tag: best.tagName.toLowerCase(),
+                role: ((best as HTMLElement).getAttribute('role') || ''),
+                text: ((best as HTMLElement).textContent || '')
+                  .replace(/\s+/g, ' ').trim().slice(0, 120),
+              },
+            };
+          }
           const r = best.getBoundingClientRect();
           return {
             x: Math.round(r.left + r.width / 2),
@@ -1024,6 +1126,14 @@ export class PageWrapper {
         bbox,
         snap.target,
       );
+    }
+
+    // Label-mismatch escape: Phase 2 grid-scan found no candidate
+    // matching expectedLabel. Skip dispatch and let the caller surface
+    // a structured mismatch (the bridge then forces the brain to
+    // re-screenshot instead of clicking the wrong neighbour).
+    if (snap.labelMismatch) {
+      return snap;
     }
 
     const client = await this.getCDPSession();
@@ -2147,7 +2257,7 @@ export class PageWrapper {
         await new Promise((r) => setTimeout(r, 100));
 
         if (clear) {
-          await clearField(client, coords.x, coords.y);
+          await clearField(client, this.page, coords.x, coords.y);
           await new Promise((r) => setTimeout(r, 50));
         }
 
