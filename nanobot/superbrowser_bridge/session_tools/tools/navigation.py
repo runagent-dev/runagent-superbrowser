@@ -102,6 +102,17 @@ class BrowserOpenTool(Tool):
                     max_stealth=max_stealth,
                 )
             except Exception as exc:
+                # Log the full traceback to stdout — without this, T3 launch
+                # failures (Xvfb race, profile lock, patchright handshake)
+                # surface only as a one-line string in the agent's tool
+                # result, making the operator chase ghosts. Mirrors the
+                # diagnostic log file at /tmp/superbrowser/t3_errors.log.
+                import traceback as _tb
+                print(
+                    f"  [t3_open_failed] {type(exc).__name__}: "
+                    f"{str(exc)[:300]}"
+                )
+                _tb.print_exc()
                 return (
                     f"[t3_open_failed] Could not open Tier-3 undetected "
                     f"Chromium session: {type(exc).__name__}: {str(exc)[:200]}"
