@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """must go to this site https://www.bestbuy.com/ .Search for 33 to 49inch Qled gaming monitor with a 240hz refresh rate that is within $1000 to $2000. use browser tools."""
+        """must go to this site https://www.google.com/maps/ Find the top-rated hotel in Manhattan, NY, suitable for 4 guests, and identify the fastest public transportation option from the hotel to LGA airport. use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
