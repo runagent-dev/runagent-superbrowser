@@ -226,6 +226,33 @@ _DETECT_JS = """
       if (hasPlatformScript) out.notes.push('cf_signal:challenge-platform');
       if (titleMatch) out.notes.push('cf_signal:title');
       if (bodyMatch) out.notes.push('cf_signal:body');
+
+      // Newer Managed Challenges embed a Turnstile-style checkbox in a
+      // cross-origin iframe at challenges.cloudflare.com/cdn-cgi/... The
+      // widget-mode `turnstile` block above only matches /turnstile in
+      // the path, so these fall here. Surface the iframe src + sitekey
+      // so the solver can click the checkbox or hand the sitekey to a
+      // token vendor.
+      const cfFrame = document.querySelector(
+        'iframe[src*="challenges.cloudflare.com"]'
+      );
+      if (cfFrame) {
+        out.frame_url = cfFrame.src || '';
+        // CF embeds the sitekey as ?k=0x4AAA... in the iframe src on
+        // some builds; on others it lives on a parent element with
+        // data-sitekey. Try both.
+        try {
+          const u = new URL(cfFrame.src, location.href);
+          out.site_key = u.searchParams.get('k')
+            || u.searchParams.get('sitekey')
+            || '';
+        } catch (_) { /* malformed URL — leave site_key empty */ }
+        if (!out.site_key) {
+          const dk = document.querySelector('[data-sitekey]');
+          if (dk) out.site_key = dk.getAttribute('data-sitekey') || '';
+        }
+        out.notes.push('cf_signal:interactive_iframe');
+      }
     }
   }
 

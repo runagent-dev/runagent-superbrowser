@@ -1467,6 +1467,133 @@ class T3SessionManager:
             "error": "",
         }
 
+    async def _find_cf_checkbox_target(
+        self, sid: str,
+    ) -> Optional[tuple[float, float]]:
+        """Locate the Turnstile checkbox in a CF Managed Challenge.
+
+        Walks the page's frames for any whose URL matches
+        challenges.cloudflare.com (any path — Managed Challenge serves
+        from /cdn-cgi/challenge-platform/, widget mode from /turnstile).
+        For each candidate iframe, reads the parent-frame `<iframe>`
+        element's bounding box and returns viewport coords of the
+        checkbox: ~28 px in from the left, vertical center. Mirrors the
+        TS-side `turnstile.ts:findCheckbox` heuristic.
+
+        Returns `None` if no candidate frame exists or its bbox is
+        unusable (e.g. width < 20 px). Caller decides whether to skip
+        Phase 2 click and escalate.
+        """
+        try:
+            s = self._get(sid)
+        except KeyError:
+            return None
+        # Try the main-frame iframe element first — most builds expose
+        # the iframe directly in the parent DOM.
+        try:
+            box = await s.page.evaluate(
+                """() => {
+                    const sels = [
+                        'iframe[src*="challenges.cloudflare.com"]',
+                        'iframe[src*="turnstile"]',
+                        '.cf-turnstile',
+                        '[data-sitekey]',
+                    ];
+                    for (const sel of sels) {
+                        const el = document.querySelector(sel);
+                        if (!el) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 20 && r.height > 20) {
+                            return {
+                                x: r.left + 28,
+                                y: r.top + r.height / 2,
+                            };
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            if box and isinstance(box, dict):
+                return float(box["x"]), float(box["y"])
+        except Exception:
+            pass
+        # Fallback: walk child frames. Patchright's frame.frame_element()
+        # returns the parent-side <iframe> handle even when the frame
+        # itself is cross-origin, so its bounding_box is reliable.
+        for frame in s.page.frames:
+            url = frame.url or ""
+            if "challenges.cloudflare.com" not in url and "turnstile" not in url:
+                continue
+            try:
+                handle = await frame.frame_element()
+            except Exception:
+                continue
+            if handle is None:
+                continue
+            try:
+                box = await handle.bounding_box()
+            except Exception:
+                box = None
+            if not box:
+                continue
+            w = float(box.get("width") or 0)
+            h = float(box.get("height") or 0)
+            if w < 20 or h < 20:
+                continue
+            return float(box["x"]) + 28.0, float(box["y"]) + h / 2.0
+        return None
+
+    async def _click_cf_checkbox(
+        self, sid: str, x: float, y: float,
+    ) -> bool:
+        """Humanized click on the Turnstile checkbox at (x, y).
+
+        CF Turnstile inside a cross-origin iframe is strict about click
+        timing — Playwright's instant `mouse.click()` (~10ms down+up) is
+        bot-like enough to be ignored. Real users:
+          1. Move cursor to target along a curved path
+          2. Settle briefly before pressing
+          3. Hold the button down ~80-160ms
+          4. Release
+        Mirrors the TS-side `humanClick` ladder.
+
+        Returns True on success, False on any internal failure (the
+        caller treats False as "phase failed, escalate" rather than
+        raising).
+        """
+        import random as _rng
+        try:
+            s = self._get(sid)
+        except KeyError:
+            return False
+        try:
+            await self._move_cursor_smooth(sid, float(x), float(y))
+        except Exception:
+            pass
+        # Settle: cursor lands, briefly pauses before pressing. CF reads
+        # cursor velocity at the press moment — landing-then-pressing
+        # mimics a real user, while clicking-mid-arc looks bot-like.
+        await asyncio.sleep(_rng.uniform(0.06, 0.18))
+        try:
+            await s.page.mouse.move(float(x), float(y))
+            await s.page.mouse.down()
+            # Hold the button for a real-feeling duration. <40ms is
+            # bot-class, >300ms drifts into "drag" territory. Real
+            # checkbox clicks measure ~80-160ms.
+            await asyncio.sleep(_rng.uniform(0.08, 0.16))
+            await s.page.mouse.up()
+            return True
+        except Exception as exc:
+            logger.warning("cf_checkbox click failed (sid=%s): %s", sid, exc)
+            # Best-effort clean-up: release the button if down() succeeded
+            # but up() didn't. Avoids leaving the session with a held
+            # mouse-down state that breaks subsequent clicks.
+            try:
+                await s.page.mouse.up()
+            except Exception:
+                pass
+            return False
+
     async def _goto_with_warmup(
         self, sid: str, url: str, timeout_s: float,
         *,
