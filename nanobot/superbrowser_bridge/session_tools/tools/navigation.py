@@ -505,9 +505,15 @@ class BrowserNavigateTool(Tool):
             )
             # Block Google Search as an escape hatch — `google.com/search`,
             # `google.com/?q=`, `google.com/images`, etc. The LLM must stay
-            # on the pinned domain even when it's frustrated.
+            # on the pinned domain even when it's frustrated. Only fires
+            # for CROSS-site hops to Google: when the pinned domain itself
+            # is google.com (e.g. the user opened Google Maps directly),
+            # intra-Google navigation to /maps, /search, etc. is legitimate
+            # and must be allowed — otherwise the agent can't recover by
+            # navigating to a coords-anchored Maps URL when geo-IP put the
+            # initial viewport in the wrong region.
             _is_google = _target_host == "google.com" or _target_host.endswith(".google.com") or _target_host.endswith(".google.co")
-            _looks_like_search = _is_google and (
+            _looks_like_search = _is_google and not _is_pinned and (
                 _target_path.startswith("/search")
                 or _target_path.startswith("/images")
                 or _target_path.startswith("/maps")
