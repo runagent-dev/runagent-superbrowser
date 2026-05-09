@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """must go to this site https://www.google.com/maps/ Find the top-rated hotel in Manhattan, NY, suitable for 4 guests, and identify the fastest public transportation option from the hotel to LGA airport. use browser tools."""
+        """must go to this site https://www.cars.com/ Find the cheapest used hatchback car listing in Madison which has black interiors with a heated seat option and premium sound system. use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
