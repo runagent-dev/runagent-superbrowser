@@ -229,6 +229,27 @@ _DOM_INDEXER_PATH = Path(__file__).parent / "dom_indexer.js"
 _XVFB_STARTED: bool = False
 
 
+def _display_is_live(display: str) -> bool:
+    """Return True if an X server is actually serving `display`.
+
+    Probes by checking `/tmp/.X<n>-lock` and `/tmp/.X11-unix/X<n>` —
+    Xvfb writes both on bind and removes them on shutdown. Avoids
+    depending on `xdpyinfo` being installed. Returns False for
+    unparseable DISPLAY strings (the caller falls back to spawn).
+    """
+    if not display:
+        return False
+    # Strip leading host part ("host:99" → "99"), strip screen suffix
+    # (":99.0" → "99").
+    d = display.split(":", 1)[-1].split(".", 1)[0]
+    if not d.isdigit():
+        return False
+    return (
+        Path(f"/tmp/.X{d}-lock").exists()
+        or Path(f"/tmp/.X11-unix/X{d}").exists()
+    )
+
+
 def _maybe_start_xvfb(headless: bool) -> None:
     """If we're launching headful on a host with no DISPLAY, try to spawn
     Xvfb and point the browser at it. No-op otherwise.
@@ -237,6 +258,11 @@ def _maybe_start_xvfb(headless: bool) -> None:
     display. Silent fallback when Xvfb isn't installed — caller stays
     headful-intent, but with no DISPLAY the browser will fail naturally
     and the operator sees a clear "xvfb not found" log line.
+
+    Trusting `os.environ['DISPLAY']` blindly is wrong — `.env` may set
+    `DISPLAY=:99` in anticipation of an Xvfb that never actually
+    started on this host (e.g. a fresh VM). Probe the lock/socket
+    files before short-circuiting.
     """
     global _XVFB_STARTED
     if _XVFB_STARTED:
@@ -245,19 +271,31 @@ def _maybe_start_xvfb(headless: bool) -> None:
         return
     if os.environ.get("T3_AUTO_XVFB", "1") == "0":
         return
-    if os.environ.get("DISPLAY"):
-        return  # Caller already has a display — don't stomp on it.
+    current_display = os.environ.get("DISPLAY") or ""
+    if current_display and _display_is_live(current_display):
+        # Real X server already running on this DISPLAY — adopt it,
+        # don't stomp.
+        _XVFB_STARTED = True
+        return
     import shutil as _shutil
     import subprocess as _subprocess
     xvfb_bin = _shutil.which("Xvfb")
     if not xvfb_bin:
         logger.warning(
-            "T3_HEADLESS=0 but Xvfb is not installed and DISPLAY is "
-            "unset — browser launch will likely fail. "
-            "apt install xvfb, or set T3_HEADLESS=1."
+            "T3_HEADLESS=0 but Xvfb is not installed and no live X "
+            "server at DISPLAY=%r — browser launch will fail. "
+            "apt install xvfb, or set T3_HEADLESS=1.",
+            current_display,
         )
         return
-    display = os.environ.get("T3_XVFB_DISPLAY") or ":99"
+    # Pick the display: explicit T3_XVFB_DISPLAY > stale DISPLAY > :99.
+    # Reusing the stale DISPLAY value avoids a confusing mismatch
+    # between what the operator set and what Xvfb actually serves.
+    display = (
+        os.environ.get("T3_XVFB_DISPLAY")
+        or current_display
+        or ":99"
+    )
     try:
         _subprocess.Popen(
             [xvfb_bin, display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
@@ -269,10 +307,22 @@ def _maybe_start_xvfb(headless: bool) -> None:
         os.environ["DISPLAY"] = display
         _XVFB_STARTED = True
         logger.info("started Xvfb on %s (display=%s)", xvfb_bin, display)
-        # Give Xvfb a moment to bind the socket before Chrome tries to
-        # connect. Avoids flaky "cannot open display" on fast boxes.
+        # Wait for the lock file to materialize so Chrome doesn't race
+        # the Xvfb bind. The 0.3 s blanket sleep was both flaky on slow
+        # boxes (Chrome starting before Xvfb was ready, dying with
+        # TargetClosedError) and wasteful on fast boxes.
         import time as _time
-        _time.sleep(0.3)
+        d = display.split(":", 1)[-1].split(".", 1)[0]
+        for _ in range(40):  # up to 4 s
+            if d.isdigit() and _display_is_live(display):
+                break
+            _time.sleep(0.1)
+        else:
+            logger.warning(
+                "Xvfb spawn returned but display %s never bound a "
+                "lock file — browser launch may fail.",
+                display,
+            )
     except Exception as exc:
         logger.warning("failed to start Xvfb: %s — falling back to headless", exc)
 
@@ -509,9 +559,13 @@ class T3SessionManager:
         async with self._lock:
             if self._browser is not None:
                 return
-            self._pw = await async_playwright().start()
+            # Spawn Xvfb BEFORE patchright's Node host starts. Node
+            # snapshots env at start(); if we set DISPLAY afterwards
+            # it never reaches the Chrome subprocess and Chrome dies
+            # with "Missing X server or $DISPLAY".
             headless = os.environ.get("T3_HEADLESS", "1") != "0"
             _maybe_start_xvfb(headless)
+            self._pw = await async_playwright().start()
             args = [
                 # Existing canonical stealth flag.
                 "--disable-blink-features=AutomationControlled",
@@ -629,6 +683,16 @@ class T3SessionManager:
             # way as the ephemeral path does.
             async with self._lock:
                 if self._pw is None:
+                    # Spawn Xvfb BEFORE patchright's Node host starts.
+                    # Node snapshots env at start(); a DISPLAY mutation
+                    # afterwards never reaches the Chrome subprocess and
+                    # launch_persistent_context dies with "Missing X
+                    # server or $DISPLAY". Idempotent — does nothing if
+                    # already started or T3_AUTO_XVFB=0.
+                    persist_headless = os.environ.get(
+                        "T3_HEADLESS", "1",
+                    ) != "0"
+                    _maybe_start_xvfb(persist_headless)
                     self._pw = await async_playwright().start()
                 if self._cleanup_task is None or self._cleanup_task.done():
                     self._cleanup_task = asyncio.create_task(self._janitor())
