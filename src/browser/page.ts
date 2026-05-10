@@ -1541,15 +1541,27 @@ export class PageWrapper {
     // below skips humanClick (no Bezier sweep). Emit a short
     // interpolated travel so the cursor doesn't appear to teleport.
     // No effect on CDP — purely overlay.
+    //
+    // GATE on `linear` to avoid double-sweep when the caller opts INTO
+    // humanization (`linear: false`). `humanClick` starts its Bezier
+    // path from a RANDOM offset of the target (humanize.ts:95-96), not
+    // from lastCursor — so emitting our linear sweep first would land
+    // the cursor at the target, then humanClick would jump it back to
+    // a random nearby point and re-sweep. Visible jitter. When `linear`
+    // is true (the default for selector clicks), humanClick is skipped
+    // and our sweep is the only animation the overlay sees.
+    const willBeLinear = opts?.linear ?? true;
     if (this.sessionId) {
-      await inputEventBus.emitSweep(this.sessionId, x, y);
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, x, y);
+      }
       inputEventBus.emitClickTarget(this.sessionId, x, y, true, undefined, selector);
     }
     const client = await this.getCDPSession();
     await dispatchClick(client, x, y, {
       button: opts?.button,
       clickCount: opts?.clickCount,
-      linear: opts?.linear ?? true,  // selector-based default: deterministic
+      linear: willBeLinear,
       sessionId: this.sessionId,
     });
     await this.waitForIdle(1000).catch(() => {});
@@ -2256,13 +2268,27 @@ export class PageWrapper {
       } catch { return ''; }
     };
 
+    // Cosmetic cursor sweeps for the linear path — same rationale as
+    // clickSelector: when `linear: true`, the dispatch teleports and
+    // emits no `mouse_move` bus events, so the overlay shows no
+    // intermediate frames. Gated on linear to avoid double-sweep when
+    // humanClick/humanDrag is running its own Bezier animation.
     const tryClickClick = async (): Promise<void> => {
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, fx, fy);
+      }
       await dispatchClick(client, fx, fy, { linear, sessionId: this.sessionId });
       await new Promise((r) => setTimeout(r, opts?.holdMs ?? 120));
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, tx, ty);
+      }
       await dispatchClick(client, tx, ty, { linear, sessionId: this.sessionId });
       await this.waitForIdle(600).catch(() => {});
     };
     const tryDrag = async (): Promise<void> => {
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, fx, fy);
+      }
       await dispatchDrag(client, fx, fy, tx, ty, {
         linear, steps: opts?.steps, sessionId: this.sessionId,
       });
