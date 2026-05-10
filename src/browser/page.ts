@@ -686,6 +686,11 @@ export class PageWrapper {
       if (p2.rect) {
         const cx = Math.round(p2.rect.x + p2.rect.w / 2);
         const cy = Math.round(p2.rect.y + p2.rect.h / 2);
+        // Cosmetic sweep — Puppeteer.click bypasses our humanize.ts
+        // pipeline, so the overlay never sees mouse_move events.
+        if (this.sessionId) {
+          await inputEventBus.emitSweep(this.sessionId, cx, cy);
+        }
         this._emitClickTargetForElement(cx, cy, p2.rect, selector);
       }
       await this.page.click(selector);
@@ -1302,6 +1307,18 @@ export class PageWrapper {
     // Broadcast resolved target to live viewers BEFORE the click so the
     // crosshair appears in the same frame the click lands.
     if (this.sessionId) {
+      // Cosmetic sweep for the linear branch — when dispatchClick
+      // teleports (autocomplete or caller-supplied linear=true), no
+      // CDP mouseMoved events fire and the live-view cursor jumps
+      // without intermediate frames. emitSweep updates ONLY the WS
+      // overlay (no CDP), so it's safe even for autocomplete (where
+      // real intermediate hovers would dismiss the dropdown).
+      const willBeLinear =
+        options?.linear === true
+        || (options?.linear == null && snap.isAutocompleteOption === true);
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, snap.x, snap.y);
+      }
       inputEventBus.emitClickTarget(
         this.sessionId,
         snap.x,
@@ -1501,7 +1518,13 @@ export class PageWrapper {
       }
     }
 
+    // Cosmetic cursor sweep — the live-view overlay only animates when
+    // mouse_move bus events arrive, and the deterministic dispatch
+    // below skips humanClick (no Bezier sweep). Emit a short
+    // interpolated travel so the cursor doesn't appear to teleport.
+    // No effect on CDP — purely overlay.
     if (this.sessionId) {
+      await inputEventBus.emitSweep(this.sessionId, x, y);
       inputEventBus.emitClickTarget(this.sessionId, x, y, true, undefined, selector);
     }
     const client = await this.getCDPSession();

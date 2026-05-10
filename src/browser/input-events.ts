@@ -90,11 +90,26 @@ export interface VisionPendingEvent {
 }
 
 class InputEventBus extends EventEmitter {
+  /**
+   * Last known cursor position per session. Updated on every
+   * `emitMouseMove` and `emitClickTarget`. Used by `emitSweep` to
+   * compute the start of a cosmetic cursor travel for linear-mode
+   * clicks (which otherwise teleport without intermediate frames).
+   *
+   * Entries are dropped via `clearSession` from the WS cleanup hook.
+   * Headless-only sessions that never had a viewer accumulate one
+   * entry each — the size is bounded by the session lifetime cap.
+   */
+  private lastCursor = new Map<string, { x: number; y: number }>();
+
   emitMouseMove(sessionId: string, x: number, y: number): void {
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    this.lastCursor.set(sessionId, { x: rx, y: ry });
     this.emit('mouse_move', {
       sessionId,
-      x: Math.round(x),
-      y: Math.round(y),
+      x: rx,
+      y: ry,
       ts: Date.now(),
     } satisfies MouseMoveEvent);
   }
@@ -116,15 +131,77 @@ class InputEventBus extends EventEmitter {
     bbox?: { x0: number; y0: number; x1: number; y1: number },
     target?: string,
   ): void {
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    this.lastCursor.set(sessionId, { x: rx, y: ry });
     this.emit('click_target', {
       sessionId,
-      x: Math.round(x),
-      y: Math.round(y),
+      x: rx,
+      y: ry,
       snapped,
       bbox,
       target,
       ts: Date.now(),
     } satisfies ClickTargetEvent);
+  }
+
+  /**
+   * Last known cursor position, or `undefined` if none recorded yet.
+   * Read by `emitSweep` to compute the travel-from coords.
+   */
+  getLastCursor(sessionId: string): { x: number; y: number } | undefined {
+    return this.lastCursor.get(sessionId);
+  }
+
+  /**
+   * Drop per-session state. Call from the WS cleanup path when the
+   * last viewer for a session disconnects.
+   */
+  clearSession(sessionId: string): void {
+    this.lastCursor.delete(sessionId);
+  }
+
+  /**
+   * Emit a short interpolated mouse-move sweep ending at `(toX, toY)`.
+   *
+   * Purely cosmetic — drives the live-view cursor overlay only,
+   * does NOT touch CDP or affect what the page sees. Used at the
+   * three visible click sites that go through linear/deterministic
+   * dispatch (`clickSelector` default, autocomplete in `clickInBbox`,
+   * and the Tier 2 Puppeteer fallback in `clickElement`).
+   *
+   * Defaults: 5 emits with ~30ms spacing (matches the 30 FPS WS
+   * throttle in `websocket.ts:213` — more emits get dropped). Total
+   * wall-clock travel ~150ms, in line with `humanClick`'s 100–200ms
+   * pre-click hesitation.
+   *
+   * If no prior cursor position is recorded, starts from ~150px
+   * up-and-left of the target (mirrors `humanClick`'s
+   * `randomOffset(200)`).
+   */
+  async emitSweep(
+    sessionId: string,
+    toX: number,
+    toY: number,
+    opts?: { steps?: number; stepDelayMs?: number },
+  ): Promise<void> {
+    const steps = Math.max(2, opts?.steps ?? 5);
+    const stepDelay = Math.max(20, opts?.stepDelayMs ?? 30);
+    const target = { x: Math.round(toX), y: Math.round(toY) };
+    const origin = this.lastCursor.get(sessionId) ?? {
+      x: target.x - 150,
+      y: target.y - 120,
+    };
+    if (origin.x === target.x && origin.y === target.y) return;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const px = Math.round(origin.x + (target.x - origin.x) * t);
+      const py = Math.round(origin.y + (target.y - origin.y) * t);
+      this.emitMouseMove(sessionId, px, py);
+      if (i < steps) {
+        await new Promise<void>((r) => setTimeout(r, stepDelay));
+      }
+    }
   }
 
   emitVisionBboxes(

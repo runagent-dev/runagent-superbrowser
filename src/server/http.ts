@@ -1593,11 +1593,12 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { selector, button, clickCount, linear, ensureVisible } = req.body ?? {};
-      if (typeof selector !== 'string' || !selector) {
+      const { selector: rawSelector, button, clickCount, linear, ensureVisible } = req.body ?? {};
+      if (typeof rawSelector !== 'string' || !rawSelector) {
         res.status(400).json({ error: 'selector is required' });
         return;
       }
+      const selector = normalizeIdSelector(rawSelector);
       const result = await page.clickSelector(selector, {
         button, clickCount, linear, ensureVisible,
       });
@@ -2690,4 +2691,23 @@ function handleError(res: express.Response, err: unknown): void {
     const code = msg.includes('Too many requests') ? 429 : 500;
     res.status(code).json({ error: msg });
   }
+}
+
+/**
+ * Repair brain-emitted CSS selectors with unescaped React `useId()` IDs.
+ *
+ * React 18's `useId()` produces IDs like `:r13:`. In CSS these must be
+ * backslash-escaped (`\:`) or `document.querySelector` parses the colons
+ * as pseudo-classes and the call silently matches nothing — the exact
+ * shape of the "radix selector failed for no reason" bug.
+ *
+ * Idempotent: the regex requires the `:` to immediately follow `#` or an
+ * ID prefix (no backslash in between), so already-escaped selectors like
+ * `#radix-\:r13\:` pass through unchanged.
+ */
+export function normalizeIdSelector(sel: string): string {
+  return sel.replace(
+    /#([a-zA-Z_][\w-]*)?(:r[a-z0-9]+:?)/g,
+    (_m, prefix, idTail) => `#${prefix ?? ''}${idTail.replace(/:/g, '\\:')}`,
+  );
 }

@@ -189,7 +189,13 @@ export function attachWebSocketServer(
       const set = bindings.get(sessionId);
       if (set) {
         set.delete(binding);
-        if (set.size === 0) bindings.delete(sessionId);
+        if (set.size === 0) {
+          bindings.delete(sessionId);
+          // Last viewer disconnected — drop the per-session cursor
+          // state used by emitSweep so the map doesn't grow unbounded
+          // across the process lifetime.
+          inputEventBus.clearSession(sessionId);
+        }
       }
       feedbackBus.off('event', onFeedback);
       // Remove this viewer from screencast — stops CDP stream if last viewer.

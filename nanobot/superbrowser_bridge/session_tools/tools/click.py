@@ -30,6 +30,65 @@ from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 
 
+# Dynamic-ID detector for `browser_click_selector`.
+#
+# React 18's `useId()` emits IDs like `:r13:` (a leading colon + base-32
+# counter + trailing colon). Radix wraps it as `radix-:r13:`, Headless
+# UI uses `headlessui-*-NN`, and some libraries stamp `__id_NNNN`. All
+# four rotate between renders — the brain captures the ID once, the
+# page re-mounts, and the selector is stale.
+#
+# `re.search` (not `re.match`) so compound selectors like
+# `.modal #radix-:r13:` are caught too. Idempotent w.r.t. escaped
+# colons (`\\?` accepts the optional backslash).
+_DYNAMIC_ID_RE = re.compile(
+    r"#(?:"
+    r"(?:[a-zA-Z_][\w-]*)?\\?:r[a-z0-9]+"
+    r"|headlessui-"
+    r"|__id_"
+    r")"
+)
+
+
+async def _attempt_epoch_recovery(
+    state: BrowserSessionState,
+    session_id: str,
+    vision_index: int,
+) -> bool:
+    """Refresh the vision epoch in-tool when the brain's V_n resolves
+    against an invalidated snapshot.
+
+    Returns True when the fresh vision response contains a valid bbox
+    for `vision_index` (caller should fall through to the existing
+    dispatch path). Returns False on any failure: vision disabled,
+    prefetch errored, or V_n missing from the fresh response.
+
+    The recovery is invisible to the brain — `screenshot_budget` is
+    NOT decremented and turn counters are NOT bumped a second time.
+    Reuses `_schedule_vision_prefetch` so we get the same compound-row
+    split / DOM enrichment / just-toggled marker pipeline as a normal
+    screenshot would.
+    """
+    task = _schedule_vision_prefetch(state, session_id)
+    if task is None:
+        return False
+    try:
+        resp = await task
+    except Exception:
+        return False
+    if resp is None:
+        return False
+    # Freeze the fresh response as the current epoch so the brain's
+    # V_n resolves against what we just refreshed (not against any
+    # stale state). The prefetch path doesn't freeze by design — only
+    # screenshot tool calls or this recovery path do.
+    try:
+        state.freeze_vision_epoch()
+    except Exception:
+        return False
+    return resp.get_bbox(int(vision_index)) is not None
+
+
 def _click_pending_screenshot_block(state: BrowserSessionState) -> str | None:
     """Refuse a click when an autocomplete dropdown is open and the
     brain hasn't taken a fresh screenshot since typing — the V_n / CSS
@@ -519,24 +578,39 @@ class BrowserClickAtTool(Tool):
                 self.s._vision_epoch_response is None
                 and getattr(self.s, "_vision_epoch_id", 0) > 0
             ):
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
+                # Phase 3.2: in-tool auto-recovery. Instead of forcing
+                # the brain to call `browser_screenshot` then re-issue
+                # the click, refresh the vision epoch internally and
+                # retry once. Capped with a local boolean — if the
+                # fresh pass also doesn't resolve V_n, the page truly
+                # changed and we fall through to the original error.
+                recovered = await _attempt_epoch_recovery(
+                    self.s, session_id, int(vision_index),
                 )
-                self.s.log_activity(
-                    f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
-                    f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
-                )
-                return (
-                    f"[click_at_failed:epoch_invalidated] V"
-                    f"{vision_index} resolves against a vision "
-                    f"snapshot that has been invalidated since you "
-                    f"saw it (a previous click changed the page "
-                    f"meaningfully — the bbox indices no longer "
-                    f"line up with the current page state). Call "
-                    f"browser_screenshot to refresh vision before "
-                    f"clicking."
-                    + (f"\n{alts}" if alts else "")
-                )
+                if recovered:
+                    self.s.log_activity(
+                        f"click_at(V{vision_index})(EPOCH_RECOVERED)",
+                        f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
+                    )
+                else:
+                    alts = _vision_alternatives_hint(
+                        self.s, exclude_index=int(vision_index), limit=3,
+                    )
+                    self.s.log_activity(
+                        f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
+                        f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
+                    )
+                    return (
+                        f"[click_at_failed:epoch_invalidated] V"
+                        f"{vision_index} resolves against a vision "
+                        f"snapshot that has been invalidated since "
+                        f"you saw it (a previous click changed the "
+                        f"page meaningfully — the bbox indices no "
+                        f"longer line up with the current page "
+                        f"state). Call browser_screenshot to refresh "
+                        f"vision before clicking."
+                        + (f"\n{alts}" if alts else "")
+                    )
 
             # Prefer the frozen epoch (what the brain SAW on its last
             # screenshot), fall back to the live response only when no
@@ -1307,6 +1381,32 @@ class BrowserClickSelectorTool(Tool):
         self.s.last_type_had_suggestions = False
         self.s.last_type_anchor_label = ""
         self.s.last_autocomplete_suggestions = []
+
+        # Phase 1.2: dynamic-ID guard. React's `useId()` and friends
+        # generate IDs that rotate between renders (`:r13:` → `:r14:`).
+        # Selector dispatch on these silently fails or hits the wrong
+        # element by the time the click lands. Reject upstream so the
+        # brain routes to `browser_click_at(vision_index=...)` on the
+        # first call instead of wasting a round-trip on a stale ID.
+        # Note: `begin_click_record` hasn't fired yet, so no undo entry
+        # needs cleanup.
+        if _DYNAMIC_ID_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="dynamic_id_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(DYNAMIC_ID_REJECTED)", "",
+            )
+            return (
+                f"[click_selector_rejected:dynamic_id] Selector "
+                f"{selector!r} uses a React-generated dynamic ID "
+                f"(useId() / radix-:rN: / headlessui-* / __id_*) that "
+                f"changes between renders. Call "
+                f"browser_click_at(vision_index=V_n) instead — the "
+                f"vision bbox is stable across re-renders."
+            )
 
         payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
         if button is not None:
