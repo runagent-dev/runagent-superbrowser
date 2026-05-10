@@ -837,6 +837,10 @@ export class PageWrapper {
        *  Phase 1 falls through to Phase 2 grid-scan instead of
        *  trusting the centre element. */
       expectedLabel?: string;
+      /** Force a deterministic teleport click — no bezier sweep, no
+       *  pre-click hover. Caller wins over the auto-detected
+       *  isAutocompleteOption path. */
+      linear?: boolean;
     },
   ): Promise<{
     x: number;
@@ -866,6 +870,14 @@ export class PageWrapper {
      *  packs this into the `element_mismatch` response shape that
      *  the Python bridge already knows how to surface. */
     found?: { tag: string; role: string; text: string };
+    /** Set when the snapped element looks like an autocomplete /
+     *  typeahead suggestion (role=option inside listbox/combobox/
+     *  menu, or descendant of an aria-haspopup="listbox" ancestor).
+     *  These dropdowns close on the bezier sweep's mouseout/blur
+     *  events from intermediate neighbors, so the dispatcher uses
+     *  a `linear:true` teleport click instead — mouse jumps to the
+     *  exact target with no in-between hovers. */
+    isAutocompleteOption?: boolean;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -877,6 +889,41 @@ export class PageWrapper {
         const SEL = 'a,button,input,select,textarea,'
           + '[role="button"],[role="link"],[role="checkbox"],'
           + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+        // Autocomplete / typeahead dropdown detector. Real-world
+        // autocompletes (Google search bar, Booking.com destination
+        // search, Yelp service search ["nail trimming" → suggestions])
+        // close the popup on mouseout/blur fired by neighbours. The
+        // bezier mouse path sweeps across siblings on its way to the
+        // target, dismissing the dropdown before the click lands.
+        // When this returns true, clickInBbox switches to a
+        // teleport-click (linear:true) so the cursor jumps straight
+        // to the target with no intermediate hovers.
+        const isAutocompleteOptionEl = (el: Element | null): boolean => {
+          if (!el) return false;
+          // Direct role-option signal.
+          const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+          if (role === 'option' || role === 'menuitem') return true;
+          // Walk up to 6 ancestors looking for popup signals. 6 is
+          // enough to clear typical wrapping like
+          //   .suggestion > .row > .label-wrap → host listbox.
+          let walker: Element | null = el;
+          for (let depth = 0; walker && depth < 6; depth += 1) {
+            const r = (walker.getAttribute && walker.getAttribute('role') || '').toLowerCase();
+            if (r === 'listbox' || r === 'combobox' || r === 'menu') return true;
+            const haspopup = walker.getAttribute && walker.getAttribute('aria-haspopup');
+            if (haspopup === 'listbox' || haspopup === 'menu' || haspopup === 'true') return true;
+            const autocomplete = walker.getAttribute && walker.getAttribute('aria-autocomplete');
+            if (autocomplete === 'list' || autocomplete === 'both') return true;
+            // Headless UI / Radix popup state.
+            const ds = walker.getAttribute && walker.getAttribute('data-state');
+            if (ds === 'open' && (walker.getAttribute('data-radix-popper-content-wrapper') !== null
+              || (walker.getAttribute('class') || '').toLowerCase().includes('popover'))) {
+              return true;
+            }
+            walker = walker.parentElement;
+          }
+          return false;
+        };
         const cx = Math.round((b.x0 + b.x1) / 2);
         const cy = Math.round((b.y0 + b.y1) / 2);
         const describe = (el: Element): string => {
@@ -985,6 +1032,7 @@ export class PageWrapper {
             target: describe(interactive),
             warning,
             targetXpath: xpathOf(interactive),
+            isAutocompleteOption: isAutocompleteOptionEl(interactive),
           };
           } /* end if (labelMatch) */
           // labelMatch=false: fall through to Phase 2 grid-scan below.
@@ -1106,6 +1154,7 @@ export class PageWrapper {
             snapped: true,
             target: describe(best),
             targetXpath: xpathOf(best),
+            isAutocompleteOption: isAutocompleteOptionEl(best),
           };
         }
         // 3. Hard fallback: click the raw centre anyway. snapped=false
@@ -1138,7 +1187,21 @@ export class PageWrapper {
     }
 
     const client = await this.getCDPSession();
-    await dispatchClick(client, snap.x, snap.y, { ...options, sessionId: this.sessionId });
+    // Autocomplete suggestions: switch to a teleport click so the
+    // mouse jumps straight to the target with no in-between hovers.
+    // The bezier sweep otherwise crosses neighbouring options whose
+    // mouseout/blur handlers dismiss the dropdown before the click
+    // lands — the user types "nail trimming", a suggestion appears,
+    // the bezier pass over earlier suggestions closes the popup,
+    // and the click then falls onto whatever's behind. Caller-
+    // supplied `linear` always wins so this only kicks in when the
+    // tool didn't already make a choice.
+    const dispatchOpts = {
+      ...options,
+      sessionId: this.sessionId,
+      linear: options?.linear ?? (snap.isAutocompleteOption === true),
+    };
+    await dispatchClick(client, snap.x, snap.y, dispatchOpts);
     await this.waitForIdle(1000).catch(() => {});
     return snap;
   }
@@ -2279,6 +2342,46 @@ export class PageWrapper {
         tried.push('cdp');
         await dispatchClick(client, coords.x, coords.y, { sessionId: this.sessionId });
         await new Promise((r) => setTimeout(r, 100));
+
+        const focusedOk = await this.page.evaluate((sel: string) => {
+          const target = document.querySelector(sel) as HTMLElement | null;
+          const active = document.activeElement as HTMLElement | null;
+          if (!target || !active) return false;
+          return target === active
+            || target.contains(active)
+            || active.contains(target);
+        }, selector);
+        if (!focusedOk) {
+          try {
+            await this.page.evaluate((sel: string) => {
+              const el = document.querySelector(sel) as HTMLElement | null;
+              if (el) (el as HTMLElement).focus();
+            }, selector);
+            await new Promise((r) => setTimeout(r, 80));
+            const refocused = await this.page.evaluate((sel: string) => {
+              const target = document.querySelector(sel) as HTMLElement | null;
+              const active = document.activeElement as HTMLElement | null;
+              if (!target || !active) return false;
+              return target === active
+                || target.contains(active)
+                || active.contains(target);
+            }, selector);
+            if (!refocused) {
+              return {
+                success: false,
+                reason: 'focus_lost',
+                tried,
+                error: 'Click landed but focus moved before type — likely a dropdown stole focus.',
+                alternatives: [
+                  'Take a fresh screenshot and pick the input by V_n',
+                  'If an autocomplete is open, browser_click_at the suggestion you want',
+                ],
+              };
+            }
+          } catch {
+            /* best-effort — fall through to type attempt */
+          }
+        }
 
         if (clear) {
           await clearField(client, this.page, coords.x, coords.y);

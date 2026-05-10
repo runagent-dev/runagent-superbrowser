@@ -106,6 +106,11 @@ class BrowserClickTool(Tool):
             is_form_submit=False,
         )
         self.s.consecutive_click_calls += 1
+        # Releases the autocomplete-pending guard set by browser_type /
+        # browser_type_at. Clicking commits a suggestion (or moves on
+        # intentionally), so type tools may proceed afterward.
+        self.s.last_type_had_suggestions = False
+        self.s.last_type_anchor_label = ""
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
@@ -332,6 +337,9 @@ class BrowserClickAtTool(Tool):
         self.s._brain_turn_counter += 1
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
+        # Release the autocomplete-pending guard (see BrowserClickTool).
+        self.s.last_type_had_suggestions = False
+        self.s.last_type_anchor_label = ""
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return (
                 f"[BLOCKED] browser_click_at used "
@@ -1145,6 +1153,9 @@ class BrowserClickSelectorTool(Tool):
         self.s._brain_turn_counter += 1
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls += 1
+        # Release the autocomplete-pending guard (see BrowserClickTool).
+        self.s.last_type_had_suggestions = False
+        self.s.last_type_anchor_label = ""
 
         payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
         if button is not None:

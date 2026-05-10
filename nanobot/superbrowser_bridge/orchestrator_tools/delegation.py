@@ -1265,43 +1265,160 @@ CRITICAL RULES:
 
             # --- Network-layer block fallback (pre-captcha) ----------------
             # NETWORK_BLOCKED means the site refused at the TLS/edge layer
-            # (403/429/503 etc). No page-interaction trick will fix this;
-            # the only remediations are different IP, different TLS
-            # fingerprint, or giving up and searching public sources.
-            # Route to search worker if viable, same as the captcha path,
-            # but don't re-burn a browser attempt.
+            # (403/429/503 etc). No page-interaction trick will fix this
+            # on T1; T3 (undetected Chromium + residential proxy) might.
+            # If T3 also fails, fall through to the search worker.
             network_blocked = bool(
                 worker_state.network_blocked
                 or (content and "NETWORK_BLOCKED" in content)
             )
+
+            # Layer A — automatic T3 escalation before giving up on the
+            # browser. The worker spawn just hit a block on T1 (the
+            # default tier="auto" selected T1, then 4xx/5xx came back).
+            # T3's undetected Chromium + residential proxy + heavier
+            # humanization stack passes a meaningful share of those
+            # blocks, so retry the SAME task with explicit tier=t3
+            # instructions before routing to search.
+            #
+            # Capped at one T3 escalation per task via _t3_escalation_done
+            # so a hard-blocked site doesn't loop on T3 forever. 404 is
+            # gated by T3_RETRY_ON_404 (default 1: many anti-bot stacks
+            # return 404 to mask blocks; setting to 0 makes 404 go
+            # straight to search since genuine "URL doesn't exist" 404
+            # won't be fixed by T3).
+            if (
+                network_blocked
+                and not kw.get("_t3_escalation_done")
+                and not kw.get("_network_fallback_done")
+            ):
+                _status = worker_state.last_network_status or 0
+                _retry_on_404 = os.environ.get("T3_RETRY_ON_404", "1") not in ("0", "false", "no")
+                _should_t3_escalate = (
+                    (_status >= 400 and _status != 404)
+                    or (_status == 404 and _retry_on_404)
+                    or _status == 0  # connection error, no status
+                )
+                if _should_t3_escalate:
+                    print(
+                        f"\n>> network block on {domain} (status={_status}) "
+                        f"— T1 worker blocked, escalating to T3 before search"
+                    )
+                    # Re-prefix the worker's instructions with an explicit
+                    # T3 directive. The worker LLM honours the prepended
+                    # block better than a kwarg flag because browser_open
+                    # is the hot path and it reads its tier from the
+                    # tool-call args.
+                    t3_instructions = (
+                        "## ESCALATION CONTEXT — T1 BLOCKED\n"
+                        f"The previous browser worker hit HTTP {_status} on "
+                        f"{domain or url} when running on Tier 1 (Puppeteer). "
+                        f"Open this URL with `browser_open(tier=\"t3\")` "
+                        f"explicitly — do NOT use tier=\"auto\" since auto "
+                        f"will pick T1 again and re-burn the same block. "
+                        f"T3 uses undetected Chromium + residential proxy "
+                        f"and passes most TLS/IP-layer refusals.\n"
+                        "## ORIGINAL TASK\n"
+                        f"{instructions}"
+                    )
+                    try:
+                        return await self.execute(
+                            instructions=t3_instructions,
+                            url=url,
+                            force=True,  # bypass classifier — we know we want browser
+                            enable_human_handoff=enable_human_handoff,
+                            _t3_escalation_done=True,
+                            # Carry the ORIGINAL instructions through so a
+                            # downstream search fallback (when T3 also
+                            # blocks) doesn't query for the T3 directive
+                            # text instead of the actual user task.
+                            _original_instructions=kw.get(
+                                "_original_instructions", instructions,
+                            ),
+                            **{
+                                k: v for k, v in kw.items()
+                                if k not in (
+                                    "_t3_escalation_done", "instructions",
+                                    "url", "force", "enable_human_handoff",
+                                    "_original_instructions",
+                                )
+                            },
+                        )
+                    except Exception as t3_exc:
+                        print(f"  [T3 escalation also failed: {t3_exc}]")
+                        # Fall through to the existing search fallback below
+                        # rather than crashing the task.
+
             if network_blocked and not kw.get("_network_fallback_done"):
+                # When this is the second leg after a T3 escalation that
+                # also failed, log the full chain so the user can see
+                # we tried both tiers before giving up on the browser.
+                _tier_chain = (
+                    "T1+T3" if kw.get("_t3_escalation_done") else "T1"
+                )
                 print(
                     f"\n>> network block on {domain} "
                     f"(status={worker_state.last_network_status}) "
-                    f"— not retrying browser, routing to search"
+                    f"— browser exhausted ({_tier_chain}), routing to search"
                 )
+                # When 404 hit on BOTH tiers, the URL itself is almost
+                # certainly wrong (LLM-guessed path that doesn't exist
+                # on the site). T3 won't fix bad URLs — print a hint so
+                # the operator/log reader can spot the pattern.
+                if (
+                    worker_state.last_network_status == 404
+                    and kw.get("_t3_escalation_done")
+                ):
+                    print(
+                        f"  [diagnostic] both T1 and T3 returned 404 — the "
+                        f"URL is likely wrong (LLM-guessed path). Search "
+                        f"will be asked to find the correct entry URL."
+                    )
                 viable_for_search = classification["approach"] in ("search", "hybrid")
                 if viable_for_search:
-                    rewritten = _rewrite_for_search(instructions, url)
+                    # Use the ORIGINAL instructions (pre-T3-escalation
+                    # prefix) as the search input so the question is the
+                    # actual user task, not the "T1 BLOCKED" directive.
+                    _orig_instructions = kw.get(
+                        "_original_instructions", instructions,
+                    )
+                    rewritten = _rewrite_for_search(_orig_instructions, url)
                     try:
                         # Local import to avoid a module-level circular
                         # dependency between search_tools and orchestrator_tools.
                         from superbrowser_bridge.search_tools import DelegateSearchTaskTool
                         search_tool = DelegateSearchTaskTool()
+                        # Better hint when 404 vs other status codes — the
+                        # right remediation is different.
+                        _hint_url = url or domain
+                        if worker_state.last_network_status == 404:
+                            _hint = (
+                                f"Both T1 (Puppeteer) and T3 (undetected "
+                                f"Chromium) attempts on {_hint_url} returned "
+                                f"HTTP 404. The URL is likely wrong. Find "
+                                f"the actual entry URL on the site (search "
+                                f"the site's own brand for the feature, "
+                                f"e.g. site:{domain} '<feature name>') and "
+                                f"return that URL plus the answer if "
+                                f"snippets contain it."
+                            )
+                        else:
+                            _hint = (
+                                f"Originally attempted via browser on {_hint_url} "
+                                f"but site returned HTTP "
+                                f"{worker_state.last_network_status}. "
+                                f"Use search snippets + public pages."
+                            )
                         fallback_result = await search_tool.execute(
                             question=rewritten,
-                            search_hints=(
-                                f"Originally attempted via browser on {url or domain} "
-                                f"but site returned HTTP {worker_state.last_network_status}. "
-                                f"Use search snippets + public pages."
-                            ),
+                            search_hints=_hint,
                             force=True,
                             _fallback_from_browser=True,
                         )
                         return (
                             f"[Network-blocked on {domain} "
                             f"(HTTP {worker_state.last_network_status}) "
-                            f"— auto-fell-back to search]\n\n"
+                            f"— auto-fell-back to search after {_tier_chain}]\n\n"
                             f"{fallback_result}\n\n"
                             f"[Original browser attempt summary]\n{content[:500]}"
                         )

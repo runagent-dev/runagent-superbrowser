@@ -587,6 +587,18 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
                   updateCursor(msg.data.x, msg.data.y);
                   break;
                 case 'cursor_target':
+                  // Snap the cursor SVG to the click site at the same
+                  // moment the burst appears. Otherwise the burst lands
+                  // at B while the bezier-driven cursor is still
+                  // traveling from A — which reads as "hallucinating
+                  // click" even though the real click went to B all
+                  // along. The server emits cursor_target BEFORE the
+                  // bezier completes (page.ts:1119 — "appears in the
+                  // same frame the click lands") so the cursor SVG has
+                  // to catch up here on the client.
+                  if (msg.data && typeof msg.data.x === 'number') {
+                    updateCursor(msg.data.x, msg.data.y);
+                  }
                   showClickTarget(msg.data);
                   break;
                 case 'vision_bboxes':

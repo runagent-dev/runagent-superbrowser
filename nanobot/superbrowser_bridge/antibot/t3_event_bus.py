@@ -130,9 +130,14 @@ class T3EventBus:
     def emit_cursor_move(self, session_id: str, x: float, y: float) -> None:
         """Emit a cursor-move event, throttled per-session to roughly
         30 FPS. Caller emits unconditionally; the throttle lives here.
+
+        We deliberately don't gate on subscriber count: `_push` already
+        no-ops when there are no subscribers, and skipping the throttle
+        bookkeeping in that case used to leave a stale `_last_cursor_ts`
+        entry that could fire-store an event right when a viewer
+        connects. Consistent with how `click_target` and `keystroke`
+        already behave.
         """
-        if not self._subs.get(session_id):
-            return
         now = time.monotonic()
         last = self._last_cursor_ts.get(session_id, 0.0)
         if now - last < _CURSOR_THROTTLE_S:

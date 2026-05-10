@@ -28,6 +28,206 @@ from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 
 
+_AUTOCOMPLETE_SCAN_JS = """
+(async () => {
+  // Debounce wait — many autocomplete widgets fetch suggestions on a
+  // 100-300ms debounce, so an immediate scan misses them.
+  await new Promise(r => requestAnimationFrame(() => r()));
+  await new Promise(r => setTimeout(r, 300));
+
+  const seen = new Set();
+  const out = [];
+  const selectors = [
+    // Standard ARIA listbox / option
+    '[role="listbox"] [role="option"]',
+    '[role="combobox"] + * li',
+    '[role="combobox"] + * [role="option"]',
+    '[role="option"]:not([aria-hidden="true"])',
+    '[aria-selected]:not([aria-hidden="true"])',
+    // Generic class-name patterns
+    '.autocomplete-suggestions li, .autocomplete li',
+    'ul.suggestions li, .suggestions li',
+    '.MuiAutocomplete-listbox li',
+    '[aria-live] li',
+    '.dropdown-menu.show li, .dropdown-menu[style*="display: block"] li',
+    '.ui-autocomplete li',
+    '[class*="autocomplete"][class*="option"]',
+    '[class*="suggestion"] li, [class*="suggestions"] li',
+    // Algolia InstantSearch / Autocomplete
+    '.ais-Hits-list .ais-Hits-item',
+    '[class*="ais-Hits-item"]',
+    '[class*="aa-Item"]',
+    '[class*="aa-Suggestion"]',
+    // Downshift
+    '[id^="downshift"] [role="option"]',
+    '[id^="downshift"] li',
+    // React Select / similar
+    '[class*="select__option"]',
+    '[id*="-option-"]',
+    // Reach UI
+    '[data-reach-combobox-option]',
+    // Headless UI
+    '[id^="headlessui-listbox-option-"]',
+    '[id^="headlessui-combobox-option-"]',
+  ];
+  for (const sel of selectors) {
+    let nodes;
+    try { nodes = document.querySelectorAll(sel); } catch { continue; }
+    nodes.forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 30 || r.height < 10) return;
+      if (r.top > window.innerHeight * 1.5) return;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return;
+      const txt = (el.innerText || el.textContent || '').trim();
+      if (!txt || txt.length > 120 || seen.has(txt)) return;
+      seen.add(txt);
+      out.push({
+        text: txt,
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+      });
+    });
+  }
+
+  // ARIA-based detection on the focused/typed-into input. Catches
+  // widgets whose listbox DOM doesn't match any of our selectors —
+  // we still know an autocomplete is wired up, even if we can't
+  // enumerate the items.
+  const el = document.activeElement;
+  let isAutocompleteInput = false;
+  let popupId = null;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const ariaAutocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+    const ariaHaspopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+    const ariaExpanded = (el.getAttribute('aria-expanded') || '').toLowerCase();
+    const ariaControls = el.getAttribute('aria-controls') || '';
+    isAutocompleteInput = (
+      role === 'combobox' || role === 'searchbox' ||
+      ariaAutocomplete === 'list' || ariaAutocomplete === 'both' ||
+      ariaAutocomplete === 'inline' ||
+      ariaHaspopup === 'listbox' || ariaHaspopup === 'menu' ||
+      ariaHaspopup === 'grid' || ariaHaspopup === 'tree' ||
+      ariaHaspopup === 'dialog' ||
+      ariaExpanded === 'true' ||
+      !!ariaControls
+    );
+    popupId = ariaControls || null;
+  }
+
+  // Popup-via-aria-controls visibility check. If the input points at
+  // an explicit popup id, see if that popup is on-screen with content.
+  let popupVisible = false;
+  if (popupId) {
+    const popup = document.getElementById(popupId);
+    if (popup) {
+      const r = popup.getBoundingClientRect();
+      const cs = window.getComputedStyle(popup);
+      popupVisible = (
+        r.width > 0 && r.height > 0 &&
+        cs.display !== 'none' && cs.visibility !== 'hidden'
+      );
+    }
+  }
+
+  const detected = out.length > 0 || isAutocompleteInput || popupVisible;
+  return {
+    suggestions: out.slice(0, 8),
+    detected,
+    is_autocomplete_input: isAutocompleteInput,
+    popup_visible: popupVisible,
+  };
+})();
+"""
+
+
+async def _scan_autocomplete_suggestions(session_id: str) -> dict:
+    """Probe the page for autocomplete state. Returns:
+        {
+          'suggestions': list[dict] (visible options with center coords),
+          'detected': bool (True if suggestions found OR ARIA says combobox),
+          'is_autocomplete_input': bool,
+          'popup_visible': bool,
+        }
+    Best-effort — returns an empty dict on probe error.
+    """
+    empty: dict = {
+        "suggestions": [],
+        "detected": False,
+        "is_autocomplete_input": False,
+        "popup_visible": False,
+    }
+    try:
+        sr = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": _AUTOCOMPLETE_SCAN_JS},
+            timeout=5.0,
+        )
+        if sr.status_code != 200:
+            return empty
+        body = sr.json()
+        got = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(got, dict):
+            return empty
+        suggestions = got.get("suggestions") or []
+        if not isinstance(suggestions, list):
+            suggestions = []
+        suggestions = [s for s in suggestions if isinstance(s, dict) and s.get("text")]
+        out = {
+            "suggestions": suggestions,
+            "detected": bool(got.get("detected")),
+            "is_autocomplete_input": bool(got.get("is_autocomplete_input")),
+            "popup_visible": bool(got.get("popup_visible")),
+        }
+        print(
+            f"  [autocomplete scan: suggestions={len(suggestions)} "
+            f"aria_input={out['is_autocomplete_input']} "
+            f"popup_visible={out['popup_visible']} "
+            f"detected={out['detected']}]"
+        )
+        return out
+    except Exception as exc:
+        print(f"  [autocomplete scan failed: {exc}]")
+    return empty
+
+
+def _autocomplete_pending_block(
+    state: BrowserSessionState,
+    current_target_label: str,
+) -> str | None:
+    """Refuse typing into a DIFFERENT field while a previous type's
+    autocomplete dropdown stands open and unpicked. Returns the
+    refusal string when the guard fires, else None.
+    """
+    if not state.last_type_had_suggestions:
+        return None
+    if not state.last_type_anchor_label:
+        return None
+    if state.last_type_anchor_label == current_target_label:
+        return None
+    elapsed = time.time() - state.last_type_at
+    if elapsed >= 30.0:
+        # Stale; auto-clear and pass through.
+        state.last_type_had_suggestions = False
+        state.last_type_anchor_label = ""
+        return None
+    return (
+        f"[autocomplete_pending_block] Field {state.last_type_anchor_label} "
+        f"has an open autocomplete dropdown that you opened "
+        f"{int(elapsed)}s ago by typing — and you never picked a "
+        f"suggestion. Refusing to type into {current_target_label} "
+        f"(a DIFFERENT field) while the first one is unresolved.\n"
+        f"PRIMARY FIX: take a browser_screenshot, then "
+        f"browser_click_at(vision_index=V_n) on the suggestion bbox "
+        f"that matches the value you typed. ONLY THEN type into the "
+        f"next field.\n"
+        f"If you actually want to abandon the first field: take a "
+        f"browser_screenshot first (clears this guard), then retry."
+    )
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -112,6 +312,10 @@ class BrowserTypeAtTool(Tool):
         target_y: float
         label: str
         if vision_index is not None:
+            current_label = f"V{vision_index}"
+            block = _autocomplete_pending_block(self.s, current_label)
+            if block:
+                return block
             resp = self.s.vision_for_target_resolution()
             if resp is None:
                 return (
@@ -165,6 +369,9 @@ class BrowserTypeAtTool(Tool):
             target_x = float(x)
             target_y = float(y)
             label = f"({int(target_x)},{int(target_y)})"
+            block = _autocomplete_pending_block(self.s, label)
+            if block:
+                return block
             print(f"\n>> browser_type_at(({x},{y}), text={text[:30]!r})")
         else:
             return "[type_at_failed:bad_args] Provide either vision_index or both x and y."
@@ -246,6 +453,62 @@ class BrowserTypeAtTool(Tool):
                 synthetic_data["auto_corrected"] = True
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
+
+        # Post-type autocomplete scan (mirrors browser_type). Surfaces
+        # any visible suggestion list inline + sets the pending guard
+        # so a follow-up type into a DIFFERENT field is refused until
+        # the brain commits via browser_click_at(V_n).
+        scan: dict = {"suggestions": [], "detected": False}
+        if changed:
+            scan = await _scan_autocomplete_suggestions(session_id)
+        suggestions: list[dict] = scan.get("suggestions") or []
+        detected: bool = bool(scan.get("detected"))
+        if suggestions:
+            caption += (
+                f"\n\nAutocomplete suggestions visible "
+                f"({len(suggestions)}):"
+            )
+            for i, s in enumerate(suggestions, start=1):
+                caption += (
+                    f"\n  {i}. {s['text']!r} → "
+                    f"browser_click_at(x={s['x']}, y={s['y']})"
+                )
+            caption += (
+                "\nNEXT TURN: take a browser_screenshot — these "
+                "suggestions will appear as bboxes (V_n with "
+                "role='content'). Click the matching V_n via "
+                "browser_click_at(vision_index=V_n) — most reliable. "
+                "(x, y) above is a fallback. Avoid browser_keys "
+                "ArrowDown+Enter; some sites won't commit via "
+                "keyboard. DO NOT type into another field until you "
+                "click a suggestion."
+            )
+        elif detected:
+            # ARIA / popup-id detected an autocomplete-wired input but
+            # we couldn't enumerate items (custom widget). Tell the
+            # brain explicitly — and arm the pending guard so it must
+            # screenshot + click before moving on.
+            caption += (
+                "\n\n[AUTOCOMPLETE_LIKELY_PENDING] This input has "
+                "ARIA autocomplete semantics (combobox / "
+                "aria-controls / aria-expanded) and a suggestion "
+                "dropdown is most likely loading or already open — "
+                "but the suggestion DOM doesn't match common "
+                "patterns so we can't enumerate items inline.\n"
+                "NEXT TURN: take a browser_screenshot, then "
+                "browser_click_at(vision_index=V_n) on the matching "
+                "suggestion bbox. DO NOT type into another field "
+                "until you click a suggestion (refused by guard)."
+            )
+        if suggestions or detected:
+            self.s.last_type_had_suggestions = True
+            self.s.last_type_anchor_label = label
+            self.s.last_type_at = time.time()
+        else:
+            # Clean type — clear any stale pending flag.
+            self.s.last_type_had_suggestions = False
+            self.s.last_type_anchor_label = ""
+
         # Phase 2.1: notify the active form_session that this field was
         # typed into. Promotes its FieldStatus to FILLED (or
         # AWAIT_AUTOCOMPLETE if declared with autocomplete=true at
@@ -486,6 +749,11 @@ class BrowserTypeTool(Tool):
         sync_block = await self.s.ensure_vision_synced(reason="browser_type")
         if sync_block:
             return sync_block
+        # Autocomplete-pending guard (Phase 4): block a new field while
+        # the prior type's suggestion dropdown is still unresolved.
+        block = _autocomplete_pending_block(self.s, f"[{index}]")
+        if block:
+            return block
         self.s._brain_turn_counter += 1
 
         # --- Dead-type guard --------------------------------------------
@@ -521,10 +789,15 @@ class BrowserTypeTool(Tool):
                     f"You already typed {self.s.last_type_text!r} into this "
                     f"field seconds ago. Typing again WILL concatenate "
                     f"(producing garbage like \"{self.s.last_type_text}{text}\"). "
-                    f"An autocomplete dropdown probably appeared — take a "
-                    f"browser_screenshot, then browser_click the right "
-                    f"suggestion (or browser_keys ArrowDown+Enter). Only "
-                    f"retype if you pass clear=true AND the field is empty."
+                    f"An autocomplete dropdown almost certainly opened.\n"
+                    f"PRIMARY FIX: take a browser_screenshot, then "
+                    f"browser_click_at(vision_index=V_n) on the matching "
+                    f"suggestion bbox. Bbox clicks land precisely on the "
+                    f"suggestion text and commit the value.\n"
+                    f"FALLBACK only if no suggestion bbox appears in vision: "
+                    f"browser_keys ArrowDown+Enter (less reliable — some "
+                    f"sites need a real click). Only retype if you pass "
+                    f"clear=true AND the field is empty."
                 )
 
         self.s.consecutive_click_calls += 1  # type is also step-by-step
@@ -573,60 +846,20 @@ class BrowserTypeTool(Tool):
         # Probe the page for newly-appeared autocomplete suggestions. If
         # we find any, surface them inline so the LLM picks one instead
         # of re-typing the full phrase.
-        suggestions: list[dict] = []
-        try:
-            scan_js = """
-            (() => {
-              const seen = new Set();
-              const out = [];
-              const selectors = [
-                '[role="listbox"] [role="option"]',
-                '[role="combobox"] + * li',
-                '.autocomplete-suggestions li, .autocomplete li',
-                'ul.suggestions li, .suggestions li',
-                '.MuiAutocomplete-listbox li',
-                '[aria-live] li',
-                '.dropdown-menu.show li, .dropdown-menu[style*="display: block"] li',
-                '.ui-autocomplete li',
-                '[class*="autocomplete"][class*="option"]',
-                '[class*="suggestion"] li, [class*="suggestions"] li',
-              ];
-              for (const sel of selectors) {
-                document.querySelectorAll(sel).forEach(el => {
-                  const r = el.getBoundingClientRect();
-                  if (r.width < 30 || r.height < 10) return;
-                  if (r.top > window.innerHeight * 1.5) return;
-                  const txt = (el.innerText || el.textContent || '').trim();
-                  if (!txt || txt.length > 120 || seen.has(txt)) return;
-                  seen.add(txt);
-                  out.push({
-                    text: txt,
-                    x: Math.round(r.left + r.width / 2),
-                    y: Math.round(r.top + r.height / 2),
-                  });
-                });
-              }
-              return out.slice(0, 8);
-            })();
-            """
-            sr = await _request_with_backoff(
-                "POST",
-                f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
-                json={"script": scan_js},
-                timeout=5.0,
-            )
-            if sr.status_code == 200:
-                body = sr.json()
-                got = body.get("result") if isinstance(body, dict) else None
-                if isinstance(got, list):
-                    suggestions = [s for s in got if isinstance(s, dict) and s.get("text")]
-        except Exception as exc:
-            print(f"  [dropdown scan failed: {exc}]")
+        scan: dict = await _scan_autocomplete_suggestions(session_id)
+        suggestions: list[dict] = scan.get("suggestions") or []
+        detected: bool = bool(scan.get("detected"))
+        if suggestions or detected:
+            self.s.last_type_had_suggestions = True
+            self.s.last_type_anchor_label = f"[{index}]"
+        else:
+            self.s.last_type_had_suggestions = False
+            self.s.last_type_anchor_label = ""
 
         self.s.record_step(
             "browser_type",
             f'index={index}, text="{text[:30]}"',
-            f"ok ({len(suggestions)} suggestions)" if suggestions else "ok",
+            f"ok ({len(suggestions)} suggestions, detected={detected})" if (suggestions or detected) else "ok",
         )
 
         # Surface pre-type inspection info so the LLM knows whether we
@@ -655,9 +888,26 @@ class BrowserTypeTool(Tool):
             for i, s in enumerate(suggestions, start=1):
                 caption += f"\n  {i}. {s['text']!r} → browser_click_at(x={s['x']}, y={s['y']})"
             caption += (
-                "\nDO NOT browser_type again into this field — pick a "
-                "suggestion above via browser_click_at or use browser_keys "
-                "(ArrowDown + Enter) to select the first one."
+                "\nNEXT TURN: take a browser_screenshot — the suggestion "
+                "list will appear as bboxes (V_n with role='content'). "
+                "Click the matching V_n via browser_click_at(vision_index="
+                "V_n) — this is the most reliable way to commit. The "
+                "(x, y) coords above are a fallback if no V_n is emitted. "
+                "Avoid browser_keys ArrowDown+Enter; some sites won't "
+                "commit the value via keyboard. DO NOT browser_type again."
+            )
+        elif detected:
+            caption += (
+                "\n\n[AUTOCOMPLETE_LIKELY_PENDING] This input has ARIA "
+                "autocomplete semantics (combobox / aria-controls / "
+                "aria-expanded) and a suggestion dropdown is most likely "
+                "loading or already open — but the suggestion DOM "
+                "doesn't match common patterns so we can't enumerate "
+                "items inline.\n"
+                "NEXT TURN: take a browser_screenshot, then "
+                "browser_click_at(vision_index=V_n) on the matching "
+                "suggestion bbox. DO NOT browser_type into another "
+                "field until you click a suggestion (refused by guard)."
             )
 
         # Post-type semantic verification (index-addressed variant).
@@ -693,7 +943,14 @@ class BrowserTypeTool(Tool):
 )
 class BrowserKeysTool(Tool):
     name = "browser_keys"
-    description = "Send keyboard keys or shortcuts."
+    description = (
+        "Send keyboard keys or shortcuts (Enter, Tab, Escape, "
+        "Control+A, etc.). For autocomplete suggestions, prefer "
+        "browser_click_at(vision_index=V_n) on the suggestion bbox "
+        "— bbox clicks commit the value reliably across more sites; "
+        "ArrowDown+Enter is a fallback only when no suggestion bbox "
+        "is emitted."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state

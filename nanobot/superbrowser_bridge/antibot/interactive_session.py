@@ -189,6 +189,96 @@ def _humanize_mode() -> str:
     return "auto"
 
 
+async def _capture_page_ref(page: Any) -> dict[str, int]:
+    """Capture the current page reference frame in a single evaluate.
+
+    Mirrors src/browser/page-readiness.ts capturePageRef. Returned dict
+    keys: scrollY, scrollHeight, viewportHeight, viewportWidth — same
+    shape as the TS PageRef so log/diff messages line up. Never throws;
+    on failure returns a zero snapshot so the caller can decide
+    whether to skip the comparison.
+    """
+    try:
+        ref = await page.evaluate(
+            "() => ({"
+            "scrollY: Math.round(window.scrollY || 0),"
+            "scrollHeight: Math.max("
+            "(document.body && document.body.scrollHeight) || 0,"
+            "(document.documentElement && document.documentElement.scrollHeight) || 0),"
+            "viewportHeight: window.innerHeight || 0,"
+            "viewportWidth: window.innerWidth || 0,"
+            "})"
+        )
+        if isinstance(ref, dict):
+            return {
+                "scrollY": int(ref.get("scrollY") or 0),
+                "scrollHeight": int(ref.get("scrollHeight") or 0),
+                "viewportHeight": int(ref.get("viewportHeight") or 0),
+                "viewportWidth": int(ref.get("viewportWidth") or 0),
+            }
+    except Exception:
+        pass
+    return {"scrollY": 0, "scrollHeight": 0, "viewportHeight": 0, "viewportWidth": 0}
+
+
+def _compare_viewport_shift(
+    stored: Optional[dict],
+    current: dict,
+) -> dict[str, Any]:
+    """Compare two page reference frames. Mirrors compareViewportShift
+    in src/browser/page-readiness.ts.
+
+    Returns `{shifted, reason, delta, stored, current}`. `shifted` is
+    True when any per-axis delta exceeds its threshold:
+      - scrollY: VIEWPORT_SHIFT_PX (default 12)
+      - scrollHeight: VIEWPORT_SHIFT_HEIGHT_PX (default 100)
+      - viewport dims: VIEWPORT_SHIFT_VIEWPORT_PX (default 24)
+
+    Kill switch: VIEWPORT_SHIFT_DISABLE=1 returns shifted=False with
+    reason='disabled'. Use during incident triage if the gate over-
+    fires on a specific site.
+    """
+    zero_delta = {
+        "scrollY": 0, "scrollHeight": 0, "viewportHeight": 0, "viewportWidth": 0,
+    }
+    if os.environ.get("VIEWPORT_SHIFT_DISABLE") == "1":
+        return {
+            "shifted": False, "reason": "disabled", "delta": zero_delta,
+            "stored": stored, "current": current,
+        }
+    if not stored:
+        return {
+            "shifted": False, "reason": "no_baseline", "delta": zero_delta,
+            "stored": stored, "current": current,
+        }
+    def _intenv(k: str, default: int) -> int:
+        try:
+            v = int(os.environ.get(k) or "")
+            return max(1, v)
+        except ValueError:
+            return default
+    scroll_px = _intenv("VIEWPORT_SHIFT_PX", 12)
+    height_px = _intenv("VIEWPORT_SHIFT_HEIGHT_PX", 100)
+    viewport_px = _intenv("VIEWPORT_SHIFT_VIEWPORT_PX", 24)
+    delta = {
+        "scrollY": int(current["scrollY"]) - int(stored["scrollY"]),
+        "scrollHeight": int(current["scrollHeight"]) - int(stored["scrollHeight"]),
+        "viewportHeight": int(current["viewportHeight"]) - int(stored["viewportHeight"]),
+        "viewportWidth": int(current["viewportWidth"]) - int(stored["viewportWidth"]),
+    }
+    if abs(delta["scrollY"]) > scroll_px:
+        return {"shifted": True, "reason": "scroll", "delta": delta,
+                "stored": stored, "current": current}
+    if abs(delta["scrollHeight"]) > height_px:
+        return {"shifted": True, "reason": "height", "delta": delta,
+                "stored": stored, "current": current}
+    if abs(delta["viewportHeight"]) > viewport_px or abs(delta["viewportWidth"]) > viewport_px:
+        return {"shifted": True, "reason": "viewport", "delta": delta,
+                "stored": stored, "current": current}
+    return {"shifted": False, "reason": "no_shift", "delta": delta,
+            "stored": stored, "current": current}
+
+
 def _labels_match(expected: str, el_info: dict) -> bool:
     """Return True when the element at the click target plausibly
     matches the vision agent's label for this bbox.
@@ -622,6 +712,16 @@ class _ManagedSession:
     # easy sites match T1 performance while hard sites keep the full
     # armor. Forced on by T3_LIGHT_MODE=1.
     light_mode: bool = False
+    # Page reference frame (scrollY/scrollHeight/viewport dims) at the
+    # moment the LAST vision-capable state() was served. click_at()
+    # re-captures the current ref and compares against this — when the
+    # delta exceeds threshold (lazy-load injection, banner, modal),
+    # the V_n bbox the brain captured resolves against a stale frame
+    # so we refuse the click and ask the brain to re-screenshot.
+    # Mirrors PageWrapper.lastVisionPageRef in src/browser/page.ts.
+    # `None` until the first vision capture; never reset by no-vision
+    # state() probes.
+    last_vision_page_ref: Optional[dict] = None
 
 
 class T3SessionManager:
@@ -737,7 +837,13 @@ class T3SessionManager:
         self,
         url: Optional[str] = None,
         *,
-        viewport: tuple[int, int] = (1366, 768),
+        # Aligned with T1's default (src/browser/engine.ts:55) — same
+        # viewport ⇒ same vision pipeline output. Previously T3 used
+        # (1366, 768) which is 30% shorter, so each screenshot covered
+        # less above-fold content; the same vision intent produced
+        # less accurate bboxes than T1. Override per-call when a host
+        # genuinely needs a different size.
+        viewport: tuple[int, int] = (1280, 1100),
         proxy: Optional[str] = None,
         task_id: str = "",
         import_state: Optional[dict] = None,
@@ -1406,15 +1512,50 @@ class T3SessionManager:
             # Already on target — just update state, no motion needed.
             s.cursor_x, s.cursor_y = tx, ty
             return
-        # Light mode: teleport the cursor in a single move. Skips the
-        # 50-500ms bezier humanization that real anti-bot sites need
-        # but easy sites don't. Matches T1's "no cursor simulation"
-        # behaviour so perceived click latency drops to T1 levels.
+        # Light mode: teleport the real cursor in a single move (skips
+        # the 50-500ms bezier humanization that real anti-bot sites need
+        # but easy sites don't — matches T1's perceived click latency).
+        # The browser cursor still teleports, so anti-bot sensors see
+        # the same single mouseMoved event they always did. We then
+        # emit a short visual-only interpolation to the live-viewer bus
+        # so the SVG arrow glides between (sx,sy) and (tx,ty) instead of
+        # jumping. No extra real `page.mouse.move` calls — stealth
+        # posture is unchanged from before this hook existed.
         if s.light_mode or _env_light_mode():
             try:
                 await s.page.mouse.move(tx, ty)
             except Exception:
                 pass
+            try:
+                from . import t3_event_bus as _bus_mod
+                _bus = _bus_mod.default()
+            except Exception:
+                _bus = None
+            if _bus is not None:
+                # 8 frames at ~22ms cadence ≈ 180ms glide. The bus's
+                # 33ms throttle (t3_event_bus.py:37) caps wire fan-out
+                # to ~6 events even if the loop runs faster. Eased so
+                # the SVG decelerates on arrival like a real cursor.
+                _vis_steps = 8
+                try:
+                    for _i in range(1, _vis_steps + 1):
+                        _t = _i / _vis_steps
+                        _t2 = _t * _t * (3 - 2 * _t)
+                        _vx = sx + (tx - sx) * _t2
+                        _vy = sy + (ty - sy) * _t2
+                        try:
+                            _bus.emit_cursor_move(sid, _vx, _vy)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.022)
+                    # Snap visual cursor to the exact target so the
+                    # ensuing click_target lands on top of the SVG.
+                    try:
+                        _bus.emit_cursor_move(sid, tx, ty)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             s.cursor_x, s.cursor_y = tx, ty
             return
         # Step count scales with distance so short hops aren't
@@ -2120,6 +2261,19 @@ class T3SessionManager:
             _bus.default().emit_navigation(
                 sid, state.get("url", ""), state.get("title", ""),
             )
+            # Cursor heartbeat: a viewer that connects during the
+            # post-nav handoff message would otherwise see a hidden SVG
+            # arrow until the next click. Emitting the current cursor
+            # position here makes the arrow appear at the right spot
+            # the moment the viewer subscribes.
+            try:
+                s_obj = self._sessions.get(sid)
+                if s_obj is not None:
+                    _bus.default().emit_cursor_move(
+                        sid, float(s_obj.cursor_x), float(s_obj.cursor_y),
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
         return {**nav, **{k: v for k, v in state.items() if k not in nav}}
@@ -2195,6 +2349,18 @@ class T3SessionManager:
             )
         except Exception:
             pass
+
+        # Capture the page reference frame whenever the brain receives
+        # a screenshot. Mirrors http.ts:689 — the brain's V_n bboxes
+        # are anchored to THIS frame, and click_at compares against it
+        # to detect drift before dispatching. Only fires on vision-
+        # capable state() calls so a no-vision probe (state polling)
+        # doesn't reset the baseline mid-session.
+        if use_vision and screenshot_b64:
+            try:
+                s.last_vision_page_ref = await _capture_page_ref(s.page)
+            except Exception:
+                pass
 
         # Compute element fingerprints for the stale-index guard.
         fingerprints: dict[int, str] = {}
@@ -2536,31 +2702,248 @@ class T3SessionManager:
         snapped = False
         snap_target = ""
         snap_info: Optional[dict] = None
+        # Set true by the snap eval when the snapped element is inside
+        # a typeahead/listbox popup. Primary strategy then teleports
+        # the cursor straight to the target (no bezier sweep) to avoid
+        # firing mouseout on neighbour options that close the dropdown.
+        is_autocomplete_target = False
         if bbox is not None:
+            # Layer 1 — viewport-shift gate. Mirrors src/server/http.ts:776
+            # for parity. The brain's V_n bbox is in viewport-CSS
+            # coordinates frozen at vision-capture time. If the page
+            # has scrolled or reflowed since (lazy-load, banner, modal),
+            # those CSS coords now point at the wrong absolute element
+            # — labels alone can't catch this when the new occupant is
+            # the same kind of widget. Reject early so the brain
+            # re-screenshots instead of clicking a stale frame.
             try:
+                stored = s.last_vision_page_ref
+                current_ref = await _capture_page_ref(s.page)
+                shift = _compare_viewport_shift(stored, current_ref)
+                if os.environ.get("VIEWPORT_SHIFT_DEBUG") == "1":
+                    logger.info(
+                        "[viewport_shift] shifted=%s reason=%s "
+                        "dy=%s dh=%s dvh=%s",
+                        shift["shifted"], shift["reason"],
+                        shift["delta"]["scrollY"],
+                        shift["delta"]["scrollHeight"],
+                        shift["delta"]["viewportHeight"],
+                    )
+                if shift["shifted"]:
+                    return {
+                        "success": False,
+                        "error": "viewport_shifted",
+                        "reason": shift["reason"],
+                        "delta": shift["delta"],
+                        "stored": shift["stored"],
+                        "current": shift["current"],
+                    }
+            except Exception as exc:
+                logger.debug("viewport-shift check failed: %s", exc)
+
+            # Phase 1 + Phase 2 snap (mirrors src/browser/page.ts:868-1110).
+            # Phase 1: try the bbox centre. If the element there is
+            # interactive and (when expectedLabel given) labels match,
+            # use it. Otherwise Phase 2 runs a 4x4 grid scan with
+            # composite scoring (area * label-score). When a label is
+            # active and no candidate scores >=0.5, return labelMismatch
+            # so the caller surfaces element_mismatch to the brain
+            # rather than silently misclicking a same-shape neighbour.
+            #
+            # Single evaluate: cheaper than 2-3 round-trips for the
+            # phase-1-fail case. Result shape:
+            #   { ok: true, x, y, tag, text, snapped, labelScore }
+            #   { ok: false, labelMismatch: true, found: {...}, x, y }
+            #   null  — no interactive element overlaps the bbox at all
+            try:
+                _exp_label = (expected_label or "").strip()
                 snap_info = await s.page.evaluate(
-                    """({x0, y0, x1, y1}) => {
-                      const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-                      const el = document.elementFromPoint(cx, cy);
-                      if (!el) return null;
-                      const r = el.getBoundingClientRect();
-                      const ex = r.left + r.width / 2, ey = r.top + r.height / 2;
-                      if (ex < x0 || ex > x1 || ey < y0 || ey > y1) return null;
-                      return {x: ex, y: ey, tag: el.tagName.toLowerCase(),
-                              text: (el.innerText || '').slice(0, 40)};
+                    """(args) => {
+                      const b = args.b;
+                      const expLc = (args.expectedLabel || '').toLowerCase().trim();
+                      const labelActive = expLc.length >= 3;
+                      const SEL = 'a,button,input,select,textarea,'
+                        + '[role="button"],[role="link"],[role="checkbox"],'
+                        + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+                      const labelScoreOf = (el) => {
+                        if (!labelActive) return 1;
+                        const full = (
+                          (el.textContent || '') + ' '
+                          + (el.getAttribute && el.getAttribute('aria-label') || '') + ' '
+                          + (el.getAttribute && el.getAttribute('title') || '')
+                        ).toLowerCase().replace(/\\s+/g, ' ').trim();
+                        if (!full) return 0.1;
+                        if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) return 1;
+                        return 0.05;
+                      };
+                      const isRowBbox = (b.x1 - b.x0) >= 60 && (b.y1 - b.y0) >= 24;
+                      const CHEVRON_CHARS = '\\u25BC\\u25B6\\u25C0\\u25B2\\u25BA\\u25C4\\u2303\\u2304\\u22EE+\\u2212\\u00D7\\u2A2F\\u203A';
+                      const chevronScoreOf = (el) => {
+                        if (el.getAttribute && el.getAttribute('aria-expanded') !== null) return 3;
+                        if (el.getAttribute && el.getAttribute('aria-haspopup')) return 2;
+                        const t = (el.textContent || '').trim();
+                        if (t.length === 1 && CHEVRON_CHARS.includes(t)) return 2;
+                        const al = (el.getAttribute && el.getAttribute('aria-label') || '').toLowerCase();
+                        if (/(expand|collapse|toggle|more)/.test(al)) return 1;
+                        return 0;
+                      };
+                      // Autocomplete / typeahead detector — same logic as
+                      // src/browser/page.ts. When the snapped element is a
+                      // suggestion in a popup, the caller will skip the
+                      // bezier mouse approach (which sweeps over neighbour
+                      // options and dismisses the dropdown via mouseout)
+                      // and use a teleport click instead.
+                      const isAutocompleteOptionEl = (el) => {
+                        if (!el) return false;
+                        const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                        if (role === 'option' || role === 'menuitem') return true;
+                        let walker = el;
+                        for (let depth = 0; walker && depth < 6; depth += 1) {
+                          const r = (walker.getAttribute && walker.getAttribute('role') || '').toLowerCase();
+                          if (r === 'listbox' || r === 'combobox' || r === 'menu') return true;
+                          const haspopup = walker.getAttribute && walker.getAttribute('aria-haspopup');
+                          if (haspopup === 'listbox' || haspopup === 'menu' || haspopup === 'true') return true;
+                          const ac = walker.getAttribute && walker.getAttribute('aria-autocomplete');
+                          if (ac === 'list' || ac === 'both') return true;
+                          const ds = walker.getAttribute && walker.getAttribute('data-state');
+                          if (ds === 'open' && (
+                            walker.getAttribute('data-radix-popper-content-wrapper') !== null
+                            || (walker.getAttribute('class') || '').toLowerCase().includes('popover')
+                          )) return true;
+                          walker = walker.parentElement;
+                        }
+                        return false;
+                      };
+                      // Phase 1: bbox centre snap.
+                      const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+                      const centreEl = document.elementFromPoint(cx, cy);
+                      if (centreEl) {
+                        const interactive = centreEl.closest ? centreEl.closest(SEL) : null;
+                        if (interactive) {
+                          const r = interactive.getBoundingClientRect();
+                          const ex = r.left + r.width / 2, ey = r.top + r.height / 2;
+                          if (ex >= b.x0 && ex <= b.x1 && ey >= b.y0 && ey <= b.y1) {
+                            const ls = labelScoreOf(interactive);
+                            if (!labelActive || ls >= 0.5) {
+                              return {
+                                ok: true, x: ex, y: ey,
+                                tag: interactive.tagName.toLowerCase(),
+                                text: (interactive.textContent || '').slice(0, 40),
+                                snapped: true, labelScore: ls,
+                                isAutocompleteOption: isAutocompleteOptionEl(interactive),
+                              };
+                            }
+                            // Phase 1 found interactive but label diverged
+                            // — fall through to Phase 2 grid-scan to look
+                            // for a label-matching alternate.
+                          }
+                        }
+                      }
+                      // Phase 2: 4x4 grid scan, composite area * label.
+                      let best = null, bestArea = 0, bestComposite = 0, bestLabelScore = 0;
+                      for (let i = 1; i < 5; i++) {
+                        for (let j = 1; j < 5; j++) {
+                          const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
+                          const py = b.y0 + ((b.y1 - b.y0) * j) / 5;
+                          let stack = [];
+                          try { stack = document.elementsFromPoint(px, py); } catch (e) { stack = []; }
+                          for (const el of stack) {
+                            const hit = el.closest ? el.closest(SEL) : null;
+                            if (!hit) continue;
+                            const r = hit.getBoundingClientRect();
+                            const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
+                            const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
+                            const area = ix * iy;
+                            if (area <= 0) continue;
+                            const cs = isRowBbox ? chevronScoreOf(hit) : 0;
+                            const ls = labelScoreOf(hit);
+                            const within30 = bestArea > 0 && area > bestArea * 0.7;
+                            const baseScore = (cs > 0 && within30)
+                              ? area + bestArea * 0.5 * cs
+                              : area;
+                            const composite = baseScore * ls;
+                            if (composite > bestComposite) {
+                              bestComposite = composite;
+                              bestArea = area;
+                              bestLabelScore = ls;
+                              best = hit;
+                            }
+                          }
+                        }
+                      }
+                      if (best) {
+                        const r = best.getBoundingClientRect();
+                        const ex = Math.round(r.left + r.width / 2);
+                        const ey = Math.round(r.top + r.height / 2);
+                        if (labelActive && bestLabelScore < 0.5) {
+                          // Surface labelMismatch — the caller will
+                          // refuse to dispatch and return element_mismatch
+                          // to the brain so it re-screenshots.
+                          return {
+                            ok: false, labelMismatch: true,
+                            x: ex, y: ey,
+                            found: {
+                              tag: best.tagName.toLowerCase(),
+                              role: (best.getAttribute && best.getAttribute('role') || ''),
+                              text: (best.textContent || '')
+                                .replace(/\\s+/g, ' ').trim().slice(0, 120),
+                            },
+                          };
+                        }
+                        return {
+                          ok: true, x: ex, y: ey,
+                          tag: best.tagName.toLowerCase(),
+                          text: (best.textContent || '').slice(0, 40),
+                          snapped: true, labelScore: bestLabelScore,
+                          isAutocompleteOption: isAutocompleteOptionEl(best),
+                        };
+                      }
+                      return null;
                     }""",
                     {
-                        "x0": float(bbox.get("x0", x)),
-                        "y0": float(bbox.get("y0", y)),
-                        "x1": float(bbox.get("x1", x)),
-                        "y1": float(bbox.get("y1", y)),
+                        "b": {
+                            "x0": float(bbox.get("x0", x)),
+                            "y0": float(bbox.get("y0", y)),
+                            "x1": float(bbox.get("x1", x)),
+                            "y1": float(bbox.get("y1", y)),
+                        },
+                        "expectedLabel": _exp_label,
                     },
                 )
                 if isinstance(snap_info, dict):
-                    target_x = float(snap_info.get("x", x))
-                    target_y = float(snap_info.get("y", y))
-                    snapped = True
-                    snap_target = f"{snap_info.get('tag','')}:{snap_info.get('text','')}"
+                    if snap_info.get("ok") is False and snap_info.get("labelMismatch"):
+                        # Phase 2 found candidates but none matched
+                        # the expected label — surface element_mismatch
+                        # without dispatching the click.
+                        found = snap_info.get("found") or {}
+                        return {
+                            "success": False,
+                            "error": "element_mismatch",
+                            "expected_label": _exp_label[:120],
+                            "found": {
+                                "tag": found.get("tag"),
+                                "role": found.get("role"),
+                                "text": (found.get("text") or "")[:120],
+                            },
+                            "coords": {
+                                "x": int(snap_info.get("x", x)),
+                                "y": int(snap_info.get("y", y)),
+                            },
+                            "strategy": (strategy or "primary"),
+                        }
+                    if snap_info.get("ok") is True:
+                        target_x = float(snap_info.get("x", x))
+                        target_y = float(snap_info.get("y", y))
+                        snapped = True
+                        # Autocomplete-option flag — caller skips bezier
+                        # cursor approach and teleports to avoid the
+                        # mouseout-on-neighbour dropdown dismiss bug.
+                        is_autocomplete_target = bool(
+                            snap_info.get("isAutocompleteOption")
+                        )
+                        snap_target = (
+                            f"{snap_info.get('tag','')}:{snap_info.get('text','')}"
+                        )
             except Exception as exc:
                 logger.debug("snap eval failed: %s", exc)
 
@@ -2570,7 +2953,14 @@ class T3SessionManager:
         # Catches the "vision said 'Buy Now' but the element at (x,y)
         # is actually a parent <section>" class of misfires that would
         # otherwise land a click on the wrong target.
-        if expected_label and expected_label.strip():
+        #
+        # When `bbox` was provided, the in-snap grid-scan already did
+        # this check (with the more accurate labelScore composite) and
+        # either returned element_mismatch or accepted a labelScore >=
+        # 0.5 candidate — so this block is gated on `bbox is None` to
+        # avoid re-checking with a stricter heuristic that could
+        # contradict the snap.
+        if bbox is None and expected_label and expected_label.strip():
             try:
                 elem_info = await s.page.evaluate(
                     """([x, y]) => {
@@ -2632,11 +3022,31 @@ class T3SessionManager:
         _light_click = bool(s.light_mode or _env_light_mode())
         try:
             if strat == "primary":
-                await self._move_cursor_smooth(sid, target_x, target_y)
+                if is_autocomplete_target:
+                    # Teleport — no bezier sweep across neighbour
+                    # suggestions, no mouseout dismissing the dropdown
+                    # before the click lands. Still emit a few visual
+                    # cursor frames to the viewer so the SVG arrow
+                    # tracks the jump (otherwise the viewer's last
+                    # cursor position would lag the click target).
+                    try:
+                        await s.page.mouse.move(target_x, target_y)
+                    except Exception:
+                        pass
+                    try:
+                        from . import t3_event_bus as _bus_a
+                        _bus_a.default().emit_cursor_move(
+                            sid, float(target_x), float(target_y),
+                        )
+                    except Exception:
+                        pass
+                    s.cursor_x, s.cursor_y = target_x, target_y
+                else:
+                    await self._move_cursor_smooth(sid, target_x, target_y)
                 # Skip the 50ms settle in light mode — matches T1 which
                 # has no such pause. The move + click can fire in the
                 # same tick.
-                if not _light_click:
+                if not _light_click and not is_autocomplete_target:
                     await asyncio.sleep(0.05)
                 await s.page.mouse.click(
                     target_x, target_y, delay=click_dwell_ms,
@@ -2662,6 +3072,12 @@ class T3SessionManager:
                         key = "Space"
                 await s.page.keyboard.press(key)
             elif strat == "js":
+                # Approach the cursor visually before the JS click so the
+                # viewer's SVG arrow lands on the click site rather than
+                # showing a click ring out of nowhere. The actual click
+                # is dispatched via JS (no mouse event) — this only
+                # affects what the viewer renders.
+                await self._move_cursor_smooth(sid, target_x, target_y)
                 js_click = """([x, y]) => {
                   const el = document.elementFromPoint(x, y);
                   if (!el) return {ok: false, reason: 'no element'};
@@ -2673,6 +3089,9 @@ class T3SessionManager:
                 }"""
                 await s.page.evaluate(js_click, [target_x, target_y])
             elif strat == "parent":
+                # Same rationale as the js branch: keep the viewer's
+                # cursor consistent across all click strategies.
+                await self._move_cursor_smooth(sid, target_x, target_y)
                 parent_js = """([x, y]) => {
                   let el = document.elementFromPoint(x, y);
                   if (!el) return {ok: false, reason: 'no element'};
@@ -2763,6 +3182,125 @@ class T3SessionManager:
         return await self.click_at(sid, cx, cy, bbox={
             "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3],
         })
+
+    async def click_selector(
+        self,
+        sid: str,
+        selector: str,
+        *,
+        button: str = "left",
+        click_count: int = 1,
+        ensure_visible: bool = True,
+    ) -> dict[str, Any]:
+        """Click the centre of a DOM element by CSS selector. Mirrors
+        T1's PageWrapper.clickSelector (src/browser/page.ts:1222) —
+        same return shape (`{success, clicked: {x, y, rect}, url, ...}`)
+        so the bridge tool consumes it transparently.
+
+        Critically: routes through `_move_cursor_smooth` so the live
+        viewer's SVG arrow glides to the click target. Without this,
+        every browser_click_selector call landed instantly with no
+        cursor motion, which is most of what the agent does in
+        practice on stable selectors. T1's clickSelector uses
+        humanClick (bezier + cursor emit); this is the T3 mirror.
+        """
+        s = self._get(sid)
+        try:
+            rect = await s.page.evaluate(
+                "(args) => {"
+                "  const el = document.querySelector(args.sel);"
+                "  if (!el) return null;"
+                "  if (args.ensureVisible) {"
+                "    const r0 = el.getBoundingClientRect();"
+                "    const inView = ("
+                "      r0.top >= 0 && r0.bottom <= window.innerHeight"
+                "      && r0.left >= 0 && r0.right <= window.innerWidth"
+                "    );"
+                "    if (!inView) {"
+                "      try { el.scrollIntoView({block:'nearest', inline:'nearest', behavior:'instant'}); }"
+                "      catch (e) { try { el.scrollIntoView(); } catch (e2) {} }"
+                "    }"
+                "  }"
+                "  const r = el.getBoundingClientRect();"
+                "  if (r.width <= 0 || r.height <= 0) return null;"
+                "  return {x: r.left, y: r.top, w: r.width, h: r.height,"
+                "          cx: r.left + r.width / 2, cy: r.top + r.height / 2};"
+                "}",
+                {"sel": selector, "ensureVisible": bool(ensure_visible)},
+            )
+        except Exception as exc:
+            return {"success": False, "error": f"selector eval failed: {exc}"[:200]}
+        if not isinstance(rect, dict):
+            return {
+                "success": False,
+                "error": f"clickSelector: selector not found or zero-size: {selector}",
+            }
+        cx = float(rect.get("cx") or 0)
+        cy = float(rect.get("cy") or 0)
+        # Bezier approach via the shared helper. In light_mode this
+        # still emits visual cursor frames (the P0.1 fix) so the SVG
+        # glides; in full humanize it does the real bezier.
+        try:
+            await self._move_cursor_smooth(sid, cx, cy)
+        except Exception:
+            pass
+        # Click target event for the viewer overlay so the operator
+        # also sees the snapped target rectangle, not just the cursor.
+        try:
+            from . import t3_event_bus as _bus
+            _bus.default().emit_click_target(
+                sid,
+                x=cx, y=cy, snapped=True,
+                bbox={
+                    "x0": float(rect.get("x") or 0),
+                    "y0": float(rect.get("y") or 0),
+                    "x1": float(rect.get("x") or 0) + float(rect.get("w") or 0),
+                    "y1": float(rect.get("y") or 0) + float(rect.get("h") or 0),
+                },
+                target=f"selector:{selector}",
+                strategy="primary",
+            )
+        except Exception:
+            pass
+        try:
+            try:
+                dwell_min = int(os.environ.get("T3_CLICK_DELAY_MS_MIN") or "40")
+                dwell_max = int(os.environ.get("T3_CLICK_DELAY_MS_MAX") or "120")
+            except ValueError:
+                dwell_min, dwell_max = 40, 120
+            import random as _rng
+            dwell = _rng.uniform(dwell_min, max(dwell_min, dwell_max))
+            await s.page.mouse.click(
+                cx, cy,
+                button=button if button in ("left", "right", "middle") else "left",
+                click_count=int(click_count or 1),
+                delay=dwell,
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)[:200], "selector": selector}
+        try:
+            await s.page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=1500 if (s.light_mode or _env_light_mode()) else 5000,
+            )
+        except Exception:
+            pass
+        st = await self.state(sid, use_vision=False, include_screenshot=False)
+        return {
+            "success": True,
+            "clicked": {
+                "x": int(cx), "y": int(cy),
+                "rect": {
+                    "x": int(rect.get("x") or 0),
+                    "y": int(rect.get("y") or 0),
+                    "w": int(rect.get("w") or 0),
+                    "h": int(rect.get("h") or 0),
+                },
+            },
+            "url": st.get("url", ""),
+            "title": st.get("title", ""),
+            "elements": st.get("elements", ""),
+        }
 
     async def fix_text_at(
         self,
@@ -3215,7 +3753,7 @@ class T3SessionManager:
         try:
             from . import t3_event_bus as _bus
             vp = await s.page.evaluate(
-                "() => ({w: window.innerWidth || 1366, h: window.innerHeight || 768})",
+                "() => ({w: window.innerWidth || 1280, h: window.innerHeight || 1100})",
             )
             cx = float(vp.get("w", 1366)) / 2
             cy = float(vp.get("h", 768)) / 2
@@ -3241,6 +3779,429 @@ class T3SessionManager:
             return {"success": False, "error": str(exc)[:200]}
         st = await self.state(sid)
         return {"success": True, "elements": st["elements"], "scrollInfo": st["scrollInfo"]}
+
+    async def scroll_until(
+        self,
+        sid: str,
+        *,
+        target_text: Optional[str] = None,
+        target_role: Optional[str] = None,
+        direction: str = "down",
+        max_iterations: int = 10,
+        step_ratio: float = 0.55,
+        auto_reverse: bool = True,
+        container_selector: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Scroll the page (or a container) incrementally until a
+        target text / role becomes visible. Lean port of
+        src/browser/page.ts:scrollUntil — same return shape so
+        navigation.py:browser_scroll_until can consume it transparently.
+
+        Behaviour preserved:
+          - find target by walking interactive + heading elements
+          - regex if `target_text` compiles, otherwise substring
+          - step size = max(80, viewport * step_ratio)
+          - plateau detection: 2 consecutive no-progress steps → stop
+          - optional auto_reverse when forward leg makes progress but
+            doesn't find the target (tries the other direction once)
+          - shape compat: trace[] returned (empty for now), reason
+            taxonomy matches T1 (matched / page_end / page_start /
+            max_iterations / no_target / reversed_no_match /
+            no_scroll_surface / no_forward_progress)
+
+        Skipped vs T1 (would balloon code without changing common-case
+        behaviour):
+          - per-step "what entered view" trace
+          - chosenContainer diagnostics
+          - cadence presets (caller passes step_ratio directly)
+          - target_in_no_scrollable_container probe
+        """
+        s = self._get(sid)
+        target_text = (target_text or "").strip()
+        target_role = (target_role or "").strip()
+        container_selector = (container_selector or "").strip() or None
+
+        async def _geom() -> dict[str, int]:
+            if container_selector:
+                r = await s.page.evaluate(
+                    "(sel) => { const el = document.querySelector(sel);"
+                    "  if (!el) return null;"
+                    "  return {y: Math.round(el.scrollTop),"
+                    "          vp: Math.round(el.clientHeight),"
+                    "          total: Math.round(el.scrollHeight)};"
+                    "}", container_selector,
+                )
+                if isinstance(r, dict):
+                    return {"y": int(r.get("y") or 0), "vp": int(r.get("vp") or 0),
+                            "total": int(r.get("total") or 0)}
+                return {"y": 0, "vp": 0, "total": 0}
+            r = await s.page.evaluate(
+                "() => ({y: Math.round(window.scrollY || 0),"
+                " vp: window.innerHeight || 0,"
+                " total: Math.max(document.body && document.body.scrollHeight || 0,"
+                "                 document.documentElement && document.documentElement.scrollHeight || 0)})"
+            )
+            return {"y": int(r.get("y") or 0), "vp": int(r.get("vp") or 0),
+                    "total": int(r.get("total") or 0)}
+
+        async def _scroll_by(delta: int) -> bool:
+            before = (await _geom())["y"]
+            try:
+                if container_selector:
+                    await s.page.evaluate(
+                        "(args) => { const el = document.querySelector(args.sel);"
+                        "  if (el) el.scrollBy(0, args.d); }",
+                        {"sel": container_selector, "d": delta},
+                    )
+                else:
+                    await s.page.evaluate(f"window.scrollBy(0, {int(delta)})")
+            except Exception:
+                return False
+            await asyncio.sleep(0.15)
+            after = (await _geom())["y"]
+            return after != before
+
+        if not target_text and not target_role:
+            info = await _geom()
+            return {
+                "found": False, "iterations": 0,
+                "finalScrollY": info["y"], "scrolledPx": 0,
+                "reason": "no_target", "trace": [],
+                "startScrollY": info["y"],
+                "containerSelector": container_selector or "",
+            }
+
+        # Try regex compile; fall back to substring.
+        try:
+            re_compile = re.compile(target_text, re.IGNORECASE) if target_text else None
+        except re.error:
+            re_compile = None
+        regex_src = re_compile.pattern if re_compile is not None else target_text
+
+        find_match_js = (
+            "(args) => {"
+            "  const rs = args.regexSrc, ir = args.isRegex, role = args.role,"
+            "        container = args.container;"
+            "  const matchText = (txt) => {"
+            "    if (!rs) return true;"
+            "    if (ir) { try { return new RegExp(rs, 'i').test(txt); }"
+            "             catch (e) { return txt.toLowerCase().includes(rs.toLowerCase()); } }"
+            "    return txt.toLowerCase().includes(rs.toLowerCase());"
+            "  };"
+            "  const root = container ? (document.querySelector(container) || document) : document;"
+            "  const containerEl = container ? root : null;"
+            "  const isHiddenByCollapse = (el) => {"
+            "    let w = el.parentElement, d = 0;"
+            "    while (w && w !== document.body && d < 12) {"
+            "      if (w.tagName === 'DETAILS' && !w.open) return true;"
+            "      if (w.getAttribute && w.getAttribute('aria-expanded') === 'false') return true;"
+            "      w = w.parentElement; d++;"
+            "    }"
+            "    return false;"
+            "  };"
+            "  const isVisible = (el) => {"
+            "    const r = el.getBoundingClientRect();"
+            "    if (r.width <= 0 || r.height <= 0) return false;"
+            "    if (containerEl) {"
+            "      const cr = containerEl.getBoundingClientRect();"
+            "      if (r.bottom < cr.top || r.top > cr.bottom) return false;"
+            "    } else {"
+            "      if (r.bottom < 0 || r.top > window.innerHeight) return false;"
+            "    }"
+            "    const cs = window.getComputedStyle(el);"
+            "    if (cs.visibility === 'hidden' || cs.display === 'none') return false;"
+            "    if (isHiddenByCollapse(el)) return false;"
+            "    return true;"
+            "  };"
+            "  const sel = 'a, button, input, select, textarea, label, summary,"
+            "    [role], [aria-label], [data-testid], h1, h2, h3, h4, h5,"
+            "    li, td, th, span, div';"
+            "  const els = root.querySelectorAll(sel);"
+            "  for (const el of els) {"
+            "    if (!isVisible(el)) continue;"
+            "    if (role) {"
+            "      const er = (el.getAttribute('role') || el.tagName.toLowerCase()).toLowerCase();"
+            "      if (er !== role.toLowerCase()) continue;"
+            "    }"
+            "    const txt = (el.innerText || el.textContent || '').trim();"
+            "    const aria = el.getAttribute('aria-label') || '';"
+            "    const ph = el.getAttribute('placeholder') || '';"
+            "    const composite = (txt + '\\n' + aria + '\\n' + ph).trim();"
+            "    if (matchText(composite)) {"
+            "      const id = el.getAttribute('id'); const dt = el.getAttribute('data-testid');"
+            "      let s = el.tagName.toLowerCase();"
+            "      if (id) s += '#' + id;"
+            "      if (dt) s += '[data-testid=\"' + dt + '\"]';"
+            "      return {selector: s, text: composite.slice(0, 120)};"
+            "    }"
+            "  }"
+            "  return null;"
+            "}"
+        )
+
+        async def _find() -> Optional[dict]:
+            try:
+                r = await s.page.evaluate(
+                    find_match_js,
+                    {
+                        "regexSrc": regex_src,
+                        "isRegex": re_compile is not None,
+                        "role": target_role,
+                        "container": container_selector,
+                    },
+                )
+                return r if isinstance(r, dict) else None
+            except Exception:
+                return None
+
+        start_info = await _geom()
+        start_y = start_info["y"]
+        step_delta = max(80, round(start_info["vp"] * max(0.1, min(1.0, step_ratio))))
+
+        # Freebie check.
+        m = await _find()
+        if m:
+            info = await _geom()
+            return {
+                "found": True, "iterations": 0,
+                "finalScrollY": info["y"], "scrolledPx": 0,
+                "reason": "matched",
+                "matchedSelector": m.get("selector"),
+                "matchedText": m.get("text"),
+                "trace": [], "startScrollY": start_y,
+                "containerSelector": container_selector or "",
+            }
+
+        async def _scan(dirn: str, iter_start: int) -> dict[str, Any]:
+            iters = iter_start
+            no_progress = 0
+            sign = 1 if dirn == "down" else -1
+            last_y = (await _geom())["y"]
+            while iters < max_iterations:
+                iters += 1
+                moved = await _scroll_by(sign * step_delta)
+                cur = await _geom()
+                if not moved or cur["y"] == last_y:
+                    no_progress += 1
+                    if no_progress >= 2:
+                        # Real plateau — page edge or non-scrollable.
+                        edge = "page_end" if dirn == "down" else "page_start"
+                        if iter_start == 0 and cur["y"] == 0 and dirn == "down":
+                            return {"_terminal": False, "reason": "no_scroll_surface",
+                                    "iterations": iters, "finalScrollY": cur["y"]}
+                        return {"_terminal": False, "reason": edge,
+                                "iterations": iters, "finalScrollY": cur["y"]}
+                else:
+                    no_progress = 0
+                    last_y = cur["y"]
+                m2 = await _find()
+                if m2:
+                    return {"_terminal": True, "reason": "matched",
+                            "iterations": iters, "finalScrollY": cur["y"],
+                            "matchedSelector": m2.get("selector"),
+                            "matchedText": m2.get("text")}
+            return {"_terminal": False, "reason": "max_iterations",
+                    "iterations": iters, "finalScrollY": last_y}
+
+        forward = await _scan(direction, 0)
+        if forward["_terminal"]:
+            cur = await _geom()
+            return {
+                "found": True, "iterations": forward["iterations"],
+                "finalScrollY": forward["finalScrollY"],
+                "scrolledPx": abs(forward["finalScrollY"] - start_y),
+                "reason": "matched",
+                "matchedSelector": forward.get("matchedSelector"),
+                "matchedText": forward.get("matchedText"),
+                "trace": [], "startScrollY": start_y,
+                "containerSelector": container_selector or "",
+            }
+
+        # Forward leg didn't match. Auto-reverse if requested AND
+        # forward made enough progress to be worth reversing (avoid
+        # rewinding 0px when target is in a non-scrollable container).
+        forward_progress = abs(forward["finalScrollY"] - start_y)
+        if auto_reverse and forward_progress >= 100:
+            other = "up" if direction == "down" else "down"
+            backward = await _scan(other, forward["iterations"])
+            if backward["_terminal"]:
+                return {
+                    "found": True, "iterations": backward["iterations"],
+                    "finalScrollY": backward["finalScrollY"],
+                    "scrolledPx": abs(backward["finalScrollY"] - start_y),
+                    "reason": "matched", "reversed": True,
+                    "matchedSelector": backward.get("matchedSelector"),
+                    "matchedText": backward.get("matchedText"),
+                    "trace": [], "startScrollY": start_y,
+                    "containerSelector": container_selector or "",
+                }
+            return {
+                "found": False, "iterations": backward["iterations"],
+                "finalScrollY": backward["finalScrollY"],
+                "scrolledPx": abs(backward["finalScrollY"] - start_y),
+                "reason": "reversed_no_match", "reversed": True,
+                "trace": [], "startScrollY": start_y,
+                "containerSelector": container_selector or "",
+            }
+        return {
+            "found": False, "iterations": forward["iterations"],
+            "finalScrollY": forward["finalScrollY"],
+            "scrolledPx": forward_progress,
+            "reason": forward["reason"],
+            "trace": [], "startScrollY": start_y,
+            "containerSelector": container_selector or "",
+        }
+
+    async def scroll_within(
+        self,
+        sid: str,
+        *,
+        container_selector: Optional[str] = None,
+        direction: str = "down",
+        amount: Any = "page",  # "page", "half", or pixel int
+        target_text: Optional[str] = None,
+        max_iterations: int = 12,
+    ) -> dict[str, Any]:
+        """Scroll inside a specific container (popup/listbox/menu).
+
+        Lean port of src/browser/page.ts:scrollWithin. Resolves the
+        container — explicit selector wins; otherwise auto-detect the
+        topmost visible role=listbox/menu/dialog or its scrollable
+        ancestor. With `target_text`, delegates to scroll_until scoped
+        to the resolved container. Without target, performs a one-shot
+        scroll by `amount`.
+
+        Skipped vs T1: z-index sort, focused-element fallback for
+        container detection. T1 has them; common cases hit the popup
+        path first so they rarely fire.
+        """
+        s = self._get(sid)
+        resolved = (container_selector or "").strip()
+        if not resolved:
+            try:
+                resolved = await s.page.evaluate(
+                    "() => {"
+                    "  const sels = ['[role=\"listbox\"]:not([aria-hidden=\"true\"])',"
+                    "                '[role=\"menu\"]:not([aria-hidden=\"true\"])',"
+                    "                '[role=\"dialog\"]:not([aria-hidden=\"true\"])',"
+                    "                '[data-headlessui-state=\"open\"]',"
+                    "                '[data-state=\"open\"]'];"
+                    "  const findScrollHost = (start) => {"
+                    "    let cur = start;"
+                    "    while (cur && cur !== document.body) {"
+                    "      const cs = window.getComputedStyle(cur);"
+                    "      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')"
+                    "          && cur.scrollHeight > cur.clientHeight + 4) return cur;"
+                    "      cur = cur.parentElement;"
+                    "    }"
+                    "    return null;"
+                    "  };"
+                    "  const isVisible = (el) => {"
+                    "    const r = el.getBoundingClientRect();"
+                    "    if (r.width <= 0 || r.height <= 0) return false;"
+                    "    const cs = window.getComputedStyle(el);"
+                    "    return cs.visibility !== 'hidden' && cs.display !== 'none';"
+                    "  };"
+                    "  const cands = [];"
+                    "  for (const sel of sels) {"
+                    "    for (const el of document.querySelectorAll(sel)) {"
+                    "      if (!isVisible(el)) continue;"
+                    "      let host = null;"
+                    "      const cs = window.getComputedStyle(el);"
+                    "      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')"
+                    "          && el.scrollHeight > el.clientHeight + 4) host = el;"
+                    "      else host = findScrollHost(el);"
+                    "      if (host) cands.push(host);"
+                    "    }"
+                    "  }"
+                    "  if (!cands.length) return '';"
+                    "  const winner = cands[0];"
+                    "  const id = 'sb-scroll-host-' + Math.random().toString(36).slice(2, 10);"
+                    "  winner.setAttribute('data-sb-scroll-host', id);"
+                    "  return '[data-sb-scroll-host=\"' + id + '\"]';"
+                    "}"
+                ) or ""
+            except Exception:
+                resolved = ""
+
+        if not resolved:
+            info = await s.page.evaluate(
+                "() => ({y: Math.round(window.scrollY || 0)})"
+            ) or {}
+            return {
+                "found": False, "iterations": 0,
+                "finalScrollY": int(info.get("y") or 0),
+                "scrolledPx": 0, "reason": "no_container",
+                "trace": [], "startScrollY": int(info.get("y") or 0),
+                "containerSelector": container_selector or "",
+                "resolvedContainer": "",
+            }
+
+        if (target_text or "").strip():
+            r = await self.scroll_until(
+                sid,
+                target_text=target_text,
+                direction=direction,
+                max_iterations=max_iterations,
+                container_selector=resolved,
+                step_ratio=0.30,  # cadence='fine'
+                auto_reverse=True,
+            )
+            return {**r, "resolvedContainer": resolved}
+
+        # Pixel scroll inside the container.
+        try:
+            geom = await s.page.evaluate(
+                "(sel) => { const el = document.querySelector(sel);"
+                "  if (!el) return null;"
+                "  return {y: Math.round(el.scrollTop), vp: Math.round(el.clientHeight)};"
+                "}", resolved,
+            ) or {}
+        except Exception:
+            geom = {}
+        start_y = int(geom.get("y") or 0)
+        vp = int(geom.get("vp") or 400)
+        if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+            delta = int(amount)
+        elif amount == "half":
+            delta = round(vp / 2)
+        else:
+            delta = vp
+        if direction == "up":
+            delta = -delta
+        try:
+            await s.page.evaluate(
+                "(args) => { const el = document.querySelector(args.sel);"
+                "  if (el) el.scrollBy(0, args.d); }",
+                {"sel": resolved, "d": delta},
+            )
+        except Exception as exc:
+            return {
+                "found": False, "iterations": 1,
+                "finalScrollY": start_y, "scrolledPx": 0,
+                "reason": "no_scroll_surface",
+                "trace": [], "startScrollY": start_y,
+                "containerSelector": container_selector or "",
+                "resolvedContainer": resolved,
+                "error": str(exc)[:120],
+            }
+        await asyncio.sleep(0.2)
+        try:
+            after = await s.page.evaluate(
+                "(sel) => { const el = document.querySelector(sel);"
+                "  return el ? Math.round(el.scrollTop) : 0; }", resolved,
+            )
+        except Exception:
+            after = start_y
+        return {
+            "found": False, "iterations": 1,
+            "finalScrollY": int(after or 0),
+            "scrolledPx": abs(int(after or 0) - start_y),
+            "reason": "page_end" if delta != 0 and after == start_y else "matched",
+            "trace": [], "startScrollY": start_y,
+            "containerSelector": container_selector or "",
+            "resolvedContainer": resolved,
+        }
 
     async def drag(
         self,

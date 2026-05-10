@@ -294,6 +294,15 @@ class BrowserSessionState:
         self.last_type_index: int = -1
         self.last_type_text: str = ""
         self.last_type_at: float = 0.0
+        # Set True when the post-type autocomplete scan found ≥1
+        # suggestion. `last_type_anchor_label` holds the human-readable
+        # label of the typed-into field (e.g. "V3" or "[42]"). The next
+        # type tool refuses if the target is a DIFFERENT field while
+        # this flag is set — forces the brain to commit the suggestion
+        # (click V_n) before moving on. Cleared on the next successful
+        # click of any kind, on screenshot, or on timeout (30s).
+        self.last_type_had_suggestions: bool = False
+        self.last_type_anchor_label: str = ""
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
