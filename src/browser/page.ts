@@ -1394,7 +1394,7 @@ export class PageWrapper {
     x: number; y: number; w: number; h: number;
     cx: number; cy: number;
     visible: boolean; inViewport: boolean;
-  } | null>> {
+  } | { __syntaxError: true; message: string } | null>> {
     return await this.page.evaluate(
       (sels: string[], ensure: boolean) => {
         return sels.map((sel) => {
@@ -1405,9 +1405,22 @@ export class PageWrapper {
           // still in tree), that's what gets picked, the rect is zero-
           // size, and clickSelector throws "selector not found or zero-
           // size" even though a visible match exists later.
+          //
+          // SyntaxError is reported separately so callers can
+          // distinguish "invalid CSS" from "valid CSS, no match" —
+          // the Python bridge rejects Playwright/jQuery extensions
+          // (`:has-text`, `:contains`, etc.) upfront, but any other
+          // malformed selector still surfaces a useful error here
+          // instead of being mislabelled as a missing element.
           let nodeList: NodeListOf<Element>;
           try { nodeList = document.querySelectorAll(sel); }
-          catch { return null; }
+          catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (err instanceof DOMException && err.name === 'SyntaxError') {
+              return { __syntaxError: true as const, message: msg };
+            }
+            return null;
+          }
           if (nodeList.length === 0) return null;
           let el: HTMLElement | null = null;
           for (const c of Array.from(nodeList)) {
@@ -1460,6 +1473,11 @@ export class PageWrapper {
     },
   ): Promise<{ x: number; y: number; rect: { x: number; y: number; w: number; h: number } }> {
     const [rect] = await this.getRects([selector], { ensureVisible: opts?.ensureVisible ?? true });
+    if (rect && '__syntaxError' in rect) {
+      throw new BadRequest(
+        `clickSelector: invalid CSS syntax in selector ${selector}: ${rect.message}`,
+      );
+    }
     if (!rect || !rect.visible) {
       throw new BadRequest(`clickSelector: selector not found or zero-size: ${selector}`);
     }
@@ -2201,6 +2219,16 @@ export class PageWrapper {
       [fromSelector, toSelector],
       { ensureVisible: true },
     );
+    if (fromRect && '__syntaxError' in fromRect) {
+      throw new Error(
+        `dragSelectors: invalid CSS syntax in fromSelector ${fromSelector}: ${fromRect.message}`,
+      );
+    }
+    if (toRect && '__syntaxError' in toRect) {
+      throw new Error(
+        `dragSelectors: invalid CSS syntax in toSelector ${toSelector}: ${toRect.message}`,
+      );
+    }
     if (!fromRect || !fromRect.visible) {
       throw new Error(`dragSelectors: fromSelector not found: ${fromSelector}`);
     }

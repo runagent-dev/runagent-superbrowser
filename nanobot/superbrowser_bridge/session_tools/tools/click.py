@@ -50,6 +50,68 @@ _DYNAMIC_ID_RE = re.compile(
 )
 
 
+# Playwright / jQuery extension pseudo-selectors. The brain knows these
+# from training data and assumes they're CSS — but `document.querySelector`
+# throws SyntaxError on them, which the TS getRects path swallows. The
+# brain then sees "selector not found or zero-size" (indistinguishable
+# from a real missing element) and goes on a 5-tool fishing trip.
+#
+# Catching upfront with a regex turns 8 turns into 1: the brain gets a
+# clear advisory pointing it to `browser_click_at(vision_index=...)`.
+#
+# Matches:
+#   :has-text("X"), :contains("X")        — text matching
+#   :visible, :hidden                     — jQuery visibility
+#   :eq(N), :first, :last, :odd, :even    — jQuery indexing
+#   :button, :input, :checkbox, :radio,
+#   :submit, :selected, :enabled,
+#   :disabled, :file, :image, :password,
+#   :reset, :text                         — jQuery form filters
+#                                            (note: `:enabled`/`:disabled`
+#                                            ARE valid CSS but emitted
+#                                            often in jQuery patterns
+#                                            with `:button` etc.)
+#   text=, role=, xpath=                  — Playwright engine prefixes
+#   >> (chain operator)                   — Playwright selector chain
+#
+# `:not(...)`, `:is(...)`, `:has(...)`, `:where(...)`, `:nth-child(...)`,
+# `:first-child`, `:first-of-type`, `:last-child`, etc. and other
+# STANDARD CSS pseudos are explicitly NOT in this set — they parse
+# fine in querySelector. The negative lookahead `(?![-\w])` after each
+# bare jQuery keyword rejects the standard-CSS hyphenated forms (e.g.
+# `:first-child` is CSS, `:first` alone is jQuery).
+_PLAYWRIGHT_PSEUDO_RE = re.compile(
+    r"(?:"
+    r":has-text\("
+    r"|:contains\("
+    r"|:visible(?![-\w])"
+    r"|:hidden(?![-\w])"
+    r"|:eq\("
+    r"|:first(?![-\w])"
+    r"|:last(?![-\w])"
+    r"|:odd(?![-\w])"
+    r"|:even(?![-\w])"
+    r"|:button(?![-\w])"
+    r"|:input(?![-\w])"
+    r"|:checkbox(?![-\w])"
+    r"|:radio(?![-\w])"
+    r"|:submit(?![-\w])"
+    r"|:selected(?![-\w])"
+    r"|:file(?![-\w])"
+    r"|:image(?![-\w])"
+    r"|:password(?![-\w])"
+    r"|:reset(?![-\w])"
+    r"|>>\s*text="
+    r"|>>\s*role="
+    r"|>>\s*xpath="
+    r"|(?:^|\s)text="
+    r"|(?:^|\s)role="
+    r"|(?:^|\s)xpath="
+    r")",
+    re.IGNORECASE,
+)
+
+
 async def _attempt_epoch_recovery(
     state: BrowserSessionState,
     session_id: str,
@@ -1406,6 +1468,39 @@ class BrowserClickSelectorTool(Tool):
                 f"changes between renders. Call "
                 f"browser_click_at(vision_index=V_n) instead — the "
                 f"vision bbox is stable across re-renders."
+            )
+
+        # Phase 1.3: Playwright/jQuery pseudo-selector guard. The brain
+        # knows `:has-text("X")`, `:contains("X")`, `text=X`, `:visible`
+        # etc. from Playwright/jQuery training data and assumes they're
+        # CSS. `document.querySelector` throws SyntaxError on them, the
+        # TS getRects wrapper swallows it, and the brain sees "selector
+        # not found" — indistinguishable from a missing element. The
+        # brain then wastes 5+ turns on `browser_eval`/markdown lookups
+        # before falling through to raw coords.
+        #
+        # Reject with an explicit advisory that names what the brain
+        # tried and where to route instead.
+        if _PLAYWRIGHT_PSEUDO_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="playwright_pseudo_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(PLAYWRIGHT_PSEUDO_REJECTED)", "",
+            )
+            return (
+                f"[click_selector_rejected:playwright_pseudo] Selector "
+                f"{selector!r} uses Playwright/jQuery extension syntax "
+                f"(:has-text, :contains, :visible, :hidden, :eq, :first, "
+                f":button, text=, role=, xpath=, >> chain, etc.) — these "
+                f"are NOT standard CSS and document.querySelector throws "
+                f"SyntaxError on them. To click an element BY ITS TEXT, "
+                f"call browser_click_at(vision_index=V_n) — vision "
+                f"already labels each visible button by its text. To "
+                f"click by stable hook, use a real CSS selector "
+                f"(`.square-54`, `#email`, `[data-testid=submit]`)."
             )
 
         payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
