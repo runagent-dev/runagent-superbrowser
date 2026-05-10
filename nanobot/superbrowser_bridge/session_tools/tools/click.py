@@ -314,30 +314,54 @@ class BrowserClickTool(Tool):
         # will land on the wrong element. Forcing the next click to
         # require a fresh screenshot (or letting the in-flight
         # prefetch settle) catches the page-shift misclick cascade.
+        verify_note = ""
         try:
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
+            url_changed_eff = bool(effect.get("url_changed"))
             try:
                 # Default 4 (was 8): a small filter that hides 1-2
                 # checkboxes produces ~5-8 mutations, just above the
-                # old threshold. Lowering to 4 lets light filters
-                # invalidate the frozen vision epoch so V_n indices
-                # captured BEFORE the filter don't resolve against
-                # shifted positions on the next click_at. Still
-                # ignores the 1-3 mutation focus-shift-only changes
-                # (button hover, input focus) the threshold was
-                # originally tuned to skip.
+                # old threshold. 4 was too aggressive — every accordion
+                # toggle / tab switch / chevron expand sits at 4-8
+                # mutations and invalidating the vision epoch on those
+                # surfaces [epoch_invalidated] on the brain's next
+                # legitimate click, which conditioned the brain to
+                # distrust clicks and drift toward eval/run_script.
+                # Middle ground 6 covers filter applies (>=7 mutations)
+                # but rides over light UI toggles. Override via env
+                # MUTATION_DIRTY_THRESHOLD if a specific site needs it.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "4"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "6"
                 )
             except ValueError:
-                threshold = 4
+                threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(
                     f"click([{index}])(EPOCH_DIRTY)",
                     f"mutation_delta={mutation_delta} > {threshold}",
                 )
+            # Silent-click detection — same shape as BrowserClickAtTool's
+            # post-click verify, but in-band: zero mutations + no URL
+            # change is the canonical "click went out, page didn't react"
+            # signal. Surface as [click_silent] so the brain re-screen-
+            # shots / tries a different target instead of believing
+            # `Clicked [N]` succeeded. Cheap (no extra HTTP — the effect
+            # block is already in the response).
+            if (
+                mutation_delta == 0
+                and not url_changed_eff
+                and os.environ.get("VERIFY_AFTER_CLICK", "1") != "0"
+            ):
+                verify_note = (
+                    f"\n[click_silent reason=no_effect] Click [{index}] "
+                    f"dispatched but produced zero DOM mutations and no "
+                    f"URL change. Target may be non-interactive, covered "
+                    f"by an overlay, or the page is mid-load. Call "
+                    f"browser_screenshot to re-vision before retrying."
+                )
+                self.s.log_activity(f"click([{index}])(SILENT)", "no_effect")
         except Exception:
             pass
         actual_url = data.get("url", self.s.current_url)
@@ -352,7 +376,7 @@ class BrowserClickTool(Tool):
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked [{index}]"),
+            self.s.build_text_only(data, f"Clicked [{index}]") + verify_note,
         )
 
 
@@ -870,14 +894,16 @@ class BrowserClickAtTool(Tool):
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
             try:
-                # See browser_click for the 4-vs-8 rationale. Light
-                # filter re-renders (5-8 mutations) used to slip
-                # through and let V_n resolve against pre-shift coords.
+                # See browser_click for the 4-vs-6-vs-8 rationale.
+                # Light toggles (tabs, chevrons, accordions) sit at
+                # 4-6 mutations; 6 covers filter re-renders (>=7)
+                # without surfacing [epoch_invalidated] on legitimate
+                # UI state changes.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "4"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "6"
                 )
             except ValueError:
-                threshold = 4
+                threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(
@@ -944,22 +970,31 @@ class BrowserClickAtTool(Tool):
 
         # Post-click verification — look up the postcondition the planner
         # attached to this target (by vision_index or by coord match)
-        # and run it via verify_action. Runs only for t3 sessions and
-        # when VERIFY_AFTER_CLICK is enabled (default on). A miss is
-        # reported in the caption so the brain can decide to retry with
-        # a different strategy or call browser_plan_next_steps.
+        # and run it via verify_action. Runs on BOTH t1 and t3 sessions
+        # when VERIFY_AFTER_CLICK is enabled (default on). The t3-only
+        # gate that used to live here was the root cause of t1's
+        # "phantom click" symptom — t1 silently treated dispatched but
+        # ineffective clicks as success. verify_action.py routes the
+        # state read through HTTP /state for t1 sessions and through
+        # T3SessionManager for t3 sessions, so the same check works on
+        # both tiers. The js/keyboard escalation ladder below stays t3-
+        # native (mgr.click_at(strategy=...)) but a parallel HTTP-routed
+        # branch handles t1 escalation against the same /click endpoint.
         verify_note = ""
-        if session_id.startswith("t3-") and \
-                os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
+        if os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
             postcond = self._lookup_postcondition(vision_index, x, y)
             if postcond is not None:
                 try:
                     from superbrowser_bridge.antibot import interactive_session as _t3mgr
                     from superbrowser_bridge.verify_action import verify_after, PreState
-                    mgr = _t3mgr.default()
+                    mgr = _t3mgr.default() if session_id.startswith("t3-") else None
+                    pre_state = PreState(
+                        url=self.s.current_url or "",
+                        dom_hash=self.s._last_dom_hash or "",
+                    )
                     vr = await verify_after(
                         mgr, session_id, postcond,
-                        pre_state=PreState(url=self.s.current_url or ""),
+                        pre_state=pre_state,
                         state=self.s,
                     )
                     if not vr.verified:
@@ -983,29 +1018,56 @@ class BrowserClickAtTool(Tool):
                         if is_silent_default and \
                                 os.environ.get("CLICK_LADDER_AUTO", "1") != "0" and \
                                 payload.get("bbox"):
+                            alt_bbox = payload.get("bbox")
+                            alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
+                            alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
                             for alt_strategy in ("js", "keyboard"):
                                 try:
-                                    from superbrowser_bridge.antibot import (
-                                        interactive_session as _t3mgr2,
-                                    )
-                                    mgr2 = _t3mgr2.default()
-                                    alt_bbox = payload.get("bbox")
-                                    alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
-                                    alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
-                                    alt_resp = await mgr2.click_at(
-                                        session_id, alt_x, alt_y,
-                                        bbox=alt_bbox,
-                                        strategy=alt_strategy,
-                                    )
+                                    if session_id.startswith("t3-"):
+                                        # T3 path: in-process manager.
+                                        from superbrowser_bridge.antibot import (
+                                            interactive_session as _t3mgr2,
+                                        )
+                                        mgr2 = _t3mgr2.default()
+                                        alt_resp = await mgr2.click_at(
+                                            session_id, alt_x, alt_y,
+                                            bbox=alt_bbox,
+                                            strategy=alt_strategy,
+                                        )
+                                    else:
+                                        # T1 path: TS /click endpoint with
+                                        # `strategy` field. Mirrors the t3
+                                        # ladder so brain sees the same
+                                        # `[click_escalated]` advisory on
+                                        # both tiers.
+                                        alt_payload: dict[str, Any] = {
+                                            "x": alt_x, "y": alt_y,
+                                            "bbox": alt_bbox,
+                                            "strategy": alt_strategy,
+                                        }
+                                        ar = await _request_with_backoff(
+                                            "POST",
+                                            f"{SUPERBROWSER_URL}/session/{session_id}/click",
+                                            json=alt_payload,
+                                            timeout=10.0,
+                                        )
+                                        if ar.status_code != 200:
+                                            continue
+                                        alt_body = ar.json() or {}
+                                        # Treat a 200 with an `error` field
+                                        # (e.g. element_mismatch) as a
+                                        # non-success — escalation didn't
+                                        # land, try next strategy.
+                                        if alt_body.get("error"):
+                                            continue
+                                        alt_resp = {"success": True, **alt_body}
                                     if not isinstance(alt_resp, dict) or \
                                             not alt_resp.get("success"):
                                         continue
                                     # Re-verify after the escalated strategy.
                                     vr2 = await verify_after(
                                         mgr, session_id, postcond,
-                                        pre_state=PreState(
-                                            url=self.s.current_url or "",
-                                        ),
+                                        pre_state=pre_state,
                                         state=self.s,
                                     )
                                     if vr2.verified:
@@ -1305,6 +1367,16 @@ class BrowserClickSelectorTool(Tool):
             f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
             data.get("url", ""),
         )
+        # Anti-pattern: if `selector` matches `#<id>` and <id> was
+        # stamped onto an element via browser_eval / browser_run_script
+        # within the last few turns, surface a corrective advisory.
+        # See state.check_anti_pattern_selector for the heuristic.
+        anti_pattern = self.s.check_anti_pattern_selector(selector)
+        if anti_pattern:
+            self.s.log_activity(
+                f"click_selector({selector})(ANTI_PATTERN)",
+                "stamped-id-then-click_selector",
+            )
         # click_selector is a mutation — advance the observation token
         # and schedule a vision prefetch so the next screenshot is warm.
         self.s.advance_observation_token("click_selector")
@@ -1315,6 +1387,8 @@ class BrowserClickSelectorTool(Tool):
         )
         if data.get("elements"):
             caption += f"\n{data['elements']}"
+        if anti_pattern:
+            caption += anti_pattern
         return await _append_fresh_vision(
             _vision_task,
             _maybe_no_effect_prefix(

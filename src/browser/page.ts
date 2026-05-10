@@ -30,6 +30,7 @@ import {
 } from './page-readiness.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { inputEventBus } from './input-events.js';
+import { BadRequest } from './errors.js';
 
 /**
  * Structured result of a tool invocation at the browser layer. Designed so
@@ -809,6 +810,59 @@ export class PageWrapper {
   }
 
   /**
+   * Silent-click escalation: dispatch a JS-level `el.click()` on the
+   * element under (x, y). Bypasses the bezier sweep (which can dismiss
+   * autocomplete popups via mouseout on intermediate siblings) and any
+   * site-side guard that gates on bezier-style mouse movement (some
+   * frameworks short-circuit click handlers when the preceding mousemove
+   * trail looks "too natural"). Used by the click ladder when the
+   * primary CDP dispatch produced zero DOM mutations.
+   *
+   * The dispatched event is `isTrusted=false` — bot-aware sites may
+   * silently reject it, but in practice many handlers don't bother
+   * checking and a JS click DOES produce the expected mutation.
+   */
+  async dispatchJsClickAt(x: number, y: number): Promise<void> {
+    if (this.sessionId) {
+      inputEventBus.emitClickTarget(this.sessionId, x, y, false);
+    }
+    await this.page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y);
+        if (el && typeof (el as HTMLElement).click === 'function') {
+          (el as HTMLElement).click();
+        }
+      },
+      { x, y },
+    );
+    await this.waitForIdle(1000).catch(() => {});
+  }
+
+  /**
+   * Silent-click escalation: focus the element under (x, y), then
+   * press Enter via CDP. Last-resort recovery for buttons/links that
+   * accept keyboard activation but gated their click handler in a way
+   * that swallows synthetic mouse events. The keyboard event is
+   * trusted (CDP-dispatched).
+   */
+  async dispatchKeyboardEnterAt(x: number, y: number): Promise<void> {
+    if (this.sessionId) {
+      inputEventBus.emitClickTarget(this.sessionId, x, y, false);
+    }
+    await this.page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y) as HTMLElement | null;
+        if (el && typeof el.focus === 'function') {
+          try { el.focus(); } catch { /* tabindex -1 / non-focusable: ignore */ }
+        }
+      },
+      { x, y },
+    );
+    await this.page.keyboard.press('Enter');
+    await this.waitForIdle(1000).catch(() => {});
+  }
+
+  /**
    * Click inside a vision-supplied bbox — pinpoint mode.
    *
    * Design: trust Gemini's bbox. The click lands on the geometric
@@ -1390,10 +1444,63 @@ export class PageWrapper {
   ): Promise<{ x: number; y: number; rect: { x: number; y: number; w: number; h: number } }> {
     const [rect] = await this.getRects([selector], { ensureVisible: opts?.ensureVisible ?? true });
     if (!rect || !rect.visible) {
-      throw new Error(`clickSelector: selector not found or zero-size: ${selector}`);
+      throw new BadRequest(`clickSelector: selector not found or zero-size: ${selector}`);
     }
     const x = Math.round(rect.cx);
     const y = Math.round(rect.cy);
+
+    // Coverage check — same shape as the A1 preclick validator in
+    // clickElement, mirroring the labelMismatch escape in clickInBbox.
+    // MUST run BEFORE the crosshair emit, otherwise the live viewer
+    // flashes a green target while we abort dispatch — that's the
+    // exact "burst but page doesn't change" bug clickInBbox already
+    // fixed at line 1244 (return-before-emit on labelMismatch).
+    //
+    // We accept either an exact match (`top === expected`) or an
+    // expected-contains-top relationship (the click bubbles up — this
+    // covers the legitimate `<label for><input/></label>` case where
+    // the input occludes its label centre). Any other top element is
+    // an overlay or wrong frame; abort with a structured 400 so the
+    // bridge can surface the reason.
+    if (process.env.SUPERBROWSER_PRECLICK_VALIDATE !== '0') {
+      const validation = await this.page.evaluate(
+        (args: { sel: string; cx: number; cy: number }) => {
+          const expected = document.querySelector(args.sel) as HTMLElement | null;
+          if (!expected) return { ok: false as const, reason: 'no_expected' as const };
+          let stack: Element[] = [];
+          try { stack = document.elementsFromPoint(args.cx, args.cy); } catch { stack = []; }
+          if (stack.length === 0) {
+            return { ok: false as const, reason: 'empty_stack' as const };
+          }
+          const top = stack[0] as HTMLElement;
+          if (top === expected || expected.contains(top)) {
+            return { ok: true as const };
+          }
+          if (top.tagName.toLowerCase() === 'iframe') {
+            return { ok: false as const, reason: 'target_in_iframe' as const };
+          }
+          const overlayTag = top.tagName.toLowerCase();
+          const overlayId = top.id ? `#${top.id}` : '';
+          const overlayCls = (top.className && typeof top.className === 'string')
+            ? `.${top.className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
+            : '';
+          return {
+            ok: false as const,
+            reason: 'covered_by_overlay' as const,
+            overlay: `${overlayTag}${overlayId}${overlayCls}`,
+          };
+        },
+        { sel: selector, cx: x, cy: y },
+      );
+      if (!validation.ok) {
+        const detail = ('overlay' in validation && validation.overlay)
+          ? ` by ${validation.overlay}` : '';
+        throw new BadRequest(
+          `clickSelector: target validation failed (${validation.reason}${detail}) for selector: ${selector}`,
+        );
+      }
+    }
+
     if (this.sessionId) {
       inputEventBus.emitClickTarget(this.sessionId, x, y, true, undefined, selector);
     }

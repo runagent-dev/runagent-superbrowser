@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """must go to this site https://www.wineaccess.com/ .Find  the highest critic-scored white wine, from Oregon, priced under $40, that pairs well with dessert and fish both. Use browser tools."""
+        """must go to this site https://www.wineaccess.com/ .Find  the highest critic-scored white wine, from Oregon, priced under $40, that pairs well with dessert or fish but select both. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

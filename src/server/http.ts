@@ -737,7 +737,7 @@ export function createHttpServer(
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label } = req.body as {
+      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label, strategy } = req.body as {
         index?: number;
         x?: number;
         y?: number;
@@ -757,6 +757,16 @@ export function createHttpServer(
          *  aligns — catches page-shift cases where the bbox centre
          *  now lies on a different element. */
         expected_label?: string;
+        /** Silent-click escalation ladder: when the bridge detected a
+         *  no-op primary click, it retries via `strategy: 'js'` (direct
+         *  el.click() in the page context — bypasses bezier sweep
+         *  guards) or `strategy: 'keyboard'` (focus + Enter — works
+         *  for buttons/links that gate on key events). Mirrors what
+         *  T3SessionManager.click_at(strategy=...) does for t3
+         *  sessions; this lets t1 sessions hit the same recovery
+         *  path. Only meaningful when bbox is provided. Falls through
+         *  to the primary path when omitted or set to 'primary'. */
+        strategy?: 'primary' | 'js' | 'keyboard';
       };
 
       if (bbox !== undefined) {
@@ -825,6 +835,45 @@ export function createHttpServer(
             + ` reason=${stab.reason} samples=${stab.samples}`,
           );
         }
+
+        // Strategy escalation: when the bridge sends `strategy: 'js'`
+        // or `strategy: 'keyboard'` (the silent-click ladder fired
+        // because the primary CDP click produced zero DOM mutations),
+        // dispatch via the alternate mechanism instead of going through
+        // clickInBbox's snap pipeline. Mirrors T3SessionManager.click_at
+        // (strategy=...) so t1 sessions get the same recovery
+        // behaviour as t3. The bridge re-runs verify_after on the
+        // response to decide if the escalation landed.
+        if (strategy === 'js' || strategy === 'keyboard') {
+          const dispatchX = (dispatchBbox.x0 + dispatchBbox.x1) / 2;
+          const dispatchY = (dispatchBbox.y0 + dispatchBbox.y1) / 2;
+          if (strategy === 'js') {
+            await page.dispatchJsClickAt(dispatchX, dispatchY);
+          } else {
+            await page.dispatchKeyboardEnterAt(dispatchX, dispatchY);
+          }
+          await settleForEffect(page.getRawPage());
+          const effectAfterAlt = await captureEffect(page.getRawPage());
+          const newStateAlt = await page.getState({
+            useVision: false, includeConsole: true,
+          });
+          res.json({
+            success: true,
+            url: newStateAlt.url,
+            title: newStateAlt.title,
+            elements: newStateAlt.elementTree.clickableElementsToString(),
+            consoleErrors: newStateAlt.consoleErrors,
+            pendingDialogs: newStateAlt.pendingDialogs,
+            snap: { x: dispatchX, y: dispatchY, snapped: false, target: '' },
+            strategy,
+            effect: diffEffect(effectBefore, effectAfterAlt),
+            fingerprints: fingerprintMap(
+              newStateAlt.selectorMap, newStateAlt.selectorEntries,
+            ),
+          });
+          return;
+        }
+
         const snap = await page.clickInBbox(dispatchBbox, {
           button,
           clickCount,

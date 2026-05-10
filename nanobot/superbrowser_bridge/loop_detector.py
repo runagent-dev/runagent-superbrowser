@@ -123,8 +123,9 @@ class LoopDetector:
             return (
                 "[LOOP-ESCALATE: same action repeated again. Try a DIFFERENT "
                 "approach: a new selector, browser_wait_for for expected content, "
-                "reload via browser_navigate to the same URL, or combine multiple "
-                "steps in a single browser_run_script. Do NOT fabricate data.]"
+                "reload via browser_navigate to the same URL, or try the same "
+                "target via a stable CSS selector (browser_click_selector). "
+                "Do NOT fabricate data.]"
             )
         return (
             "[LOOP-CRITICAL: action has repeated many times. Switch strategy — "
@@ -149,16 +150,17 @@ class LoopDetector:
             return (
                 f"[STAGNATION: the page has not changed in {self._stagnation_count} "
                 "iterations. Either your action had no effect or you are on the "
-                "wrong page. Try: (1) browser_eval to check DOM mutation, "
-                "(2) browser_wait_for for the expected content, or "
-                "(3) navigate elsewhere if this page won't yield the answer.]"
+                "wrong page. Try: (1) browser_wait_for for the expected content, "
+                "(2) browser_scroll_until in case the target is below the fold, "
+                "or (3) navigate elsewhere if this page won't yield the answer.]"
             )
         return (
             "[STAGNATION-ESCALATE: page still unchanged. Try a CONCRETE recovery: "
             "browser_wait_for for dynamic content, reload via browser_navigate, "
-            "navigate to a different URL, or use browser_run_script to interact. "
-            "Do NOT fabricate data. If this page genuinely cannot yield the answer, "
-            "navigate elsewhere or return done(success=False) with an honest reason.]"
+            "navigate to a different URL, or try the action via "
+            "browser_click_selector with a stable CSS hook. Do NOT fabricate data. "
+            "If this page genuinely cannot yield the answer, navigate elsewhere "
+            "or return done(success=False) with an honest reason.]"
         )
 
     def reset_action_nudge(self) -> None:

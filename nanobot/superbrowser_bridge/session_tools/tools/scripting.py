@@ -34,7 +34,18 @@ from ..state import BrowserSessionState
 )
 class BrowserEvalTool(Tool):
     name = "browser_eval"
-    description = "Execute JavaScript in the browser page. FREE — no screenshot cost."
+    description = (
+        "Execute JavaScript in the browser page — READ-ONLY inspection "
+        "only (innerText, aria-state, getBoundingClientRect, element "
+        "counts). Do NOT use this to work around a click failure by "
+        "stamping a custom id onto an element and then clicking it via "
+        "browser_click_selector — that anti-pattern is bot-detectable on "
+        "hardened sites and a sign you're working around the issue "
+        "instead of fixing it. If click_at(V_n) / click([N]) isn't "
+        "landing, re-screenshot to refresh vision and retry, or use "
+        "browser_click_selector with a CSS attribute the page already "
+        "exposes (id, data-*, aria-label)."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
@@ -43,6 +54,12 @@ class BrowserEvalTool(Tool):
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
         print(f"\n>> browser_eval({script[:60]}...)")
+        # Record any `.id = 'X'` / setAttribute('id', 'X') stamps in this
+        # script so a follow-up browser_click_selector('#X') trips the
+        # stamp-id anti-pattern detector. Cheap regex scan, no false-
+        # positive on read-only scripts (those just won't contain the
+        # patterns).
+        self.s.record_stamped_ids_from_script(script)
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
@@ -74,7 +91,12 @@ class BrowserEvalTool(Tool):
                 "[blocked_op:…] error. Keep false for read-only "
                 "inspection (readyState, innerText, aria-labels). Only "
                 "flip true when no cursor tool can express the action; "
-                "isTrusted=false JS clicks are bot-detected by WAFs."
+                "isTrusted=false JS clicks are bot-detected by WAFs. "
+                "Do NOT use this to .click() an element you could reach "
+                "via click_at(V_n) or click_selector. In particular, the "
+                "stamp-id anti-pattern (assign a custom .id via eval, "
+                "then click via selector) is bot-detectable and emits a "
+                "runtime [anti_pattern_detected] advisory."
             ),
             default=False,
         ),
@@ -288,6 +310,13 @@ class BrowserRunScriptTool(Tool):
         data = r.json()
 
         self.s.actions_since_screenshot += 1
+        # Anti-pattern: record any id stamps performed by this script
+        # for the stamp-id detector. Only when the script actually
+        # succeeded — a blocked / failed script didn't actually
+        # mutate the DOM. mutates=False scripts can't change ids
+        # (sandbox blocks DOM writes) so skip them entirely.
+        if bool(mutates) and bool(data.get("success")):
+            self.s.record_stamped_ids_from_script(script)
 
         # v4 D3 — record outcome in the run_script ledger so worker_hook
         # can detect 3-of-5 failures and inject the redirect-to-vision

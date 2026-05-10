@@ -367,6 +367,14 @@ class BrowserSessionState:
         # freshness gate to compute epoch age in turns.
         self._brain_turn_counter: int = 0
 
+        # Anti-pattern detection: maps stamped id (e.g., 'my-companion-btn')
+        # to _brain_turn_counter at the moment it was stamped via
+        # browser_eval / browser_run_script. When a follow-up
+        # browser_click_selector('#<id>') fires within MAX_STAMP_AGE
+        # turns, we emit [anti_pattern_detected] so the brain learns
+        # the stamp-then-click pattern is recognized and discouraged.
+        self._recently_stamped_ids: dict[str, int] = {}
+
     @property
     def backend(self) -> str:
         """Tier of the active session. `t3` for patchright (undetected
@@ -697,6 +705,91 @@ class BrowserSessionState:
         # Wall-clock for the click-pending-screenshot guard.
         import time as _t
         self.last_screenshot_at = _t.time()
+
+    # --- stamp-id anti-pattern detection ----------------------------------
+    #
+    # The brain has been observed inventing this workaround when click_at
+    # fails repeatedly:
+    #     browser_eval(`document.querySelectorAll(...)[N].id = 'my-id'`)
+    #     browser_click_selector('#my-id')
+    # That bypasses the cursor ladder, stamps a synthetic id onto an
+    # element via eval (isTrusted=false adjacent), and then clicks via
+    # selector. It's bot-detectable on hardened sites and a sign the
+    # brain is fighting the click tools instead of using them properly.
+    # We watch for it at runtime and emit a one-shot [anti_pattern]
+    # advisory the next time the brain reaches for a selector that
+    # matches a recently-stamped id.
+
+    _STAMP_ID_PATTERN = None  # lazy-init compiled regex (per-class cache)
+    _STAMP_MAX_AGE_TURNS = 4
+
+    def record_stamped_ids_from_script(self, script: str) -> None:
+        """Scan a script for `.id = 'X'` or `setAttribute('id', 'X')`
+        and remember X with the current brain_turn_counter. Always
+        runs eviction (even on empty script) so stale stamps don't
+        outlive their MAX_STAMP_AGE window when called from
+        check_anti_pattern_selector's call sites.
+        """
+        cls = type(self)
+        # Always evict stale entries first — keeps the window honest
+        # regardless of how this method is reached.
+        cutoff = self._brain_turn_counter - cls._STAMP_MAX_AGE_TURNS
+        if self._recently_stamped_ids:
+            self._recently_stamped_ids = {
+                k: v for k, v in self._recently_stamped_ids.items()
+                if v >= cutoff
+            }
+        if not script:
+            return
+        import re
+        if cls._STAMP_ID_PATTERN is None:
+            cls._STAMP_ID_PATTERN = re.compile(
+                r"""\.id\s*=\s*['"]([\w\-]+)['"]"""
+                r"""|setAttribute\(\s*['"]id['"]\s*,\s*['"]([\w\-]+)['"]"""
+            )
+        for m in cls._STAMP_ID_PATTERN.finditer(script):
+            stamped = m.group(1) or m.group(2)
+            if stamped:
+                self._recently_stamped_ids[stamped] = self._brain_turn_counter
+
+    def check_anti_pattern_selector(self, selector: str) -> str | None:
+        """If `selector` is an id-selector (`#<id>`) AND <id> was stamped
+        via eval / run_script within the last _STAMP_MAX_AGE_TURNS turns,
+        return an advisory string. Else None. Only fires on an EXACT
+        id-selector head — `#foo .bar` won't trip on a stamped `foo`
+        because the brain is targeting a descendant, which suggests it
+        had a reason. The pure `#stamped-id` case is the smoking gun.
+        """
+        s = (selector or "").strip()
+        if not s.startswith("#"):
+            return None
+        # Extract candidate id: everything between `#` and the next
+        # combinator / pseudo / attribute char. `#foo`, `#foo:hover`,
+        # `#foo[disabled]`, `#foo > .bar` all extract `foo`.
+        candidate = s[1:]
+        for sep in (" ", ">", "+", "~", ":", "[", ".", "#"):
+            if sep in candidate:
+                candidate = candidate.split(sep, 1)[0]
+        if not candidate or candidate not in self._recently_stamped_ids:
+            return None
+        # Inline staleness check so the advisory never fires past the
+        # MAX_AGE window even if no eval/run_script call has come
+        # through to trigger a fresh eviction pass.
+        stamped_at = self._recently_stamped_ids[candidate]
+        if self._brain_turn_counter - stamped_at > type(self)._STAMP_MAX_AGE_TURNS:
+            del self._recently_stamped_ids[candidate]
+            return None
+        return (
+            f"\n[anti_pattern_detected] id='{candidate}' was stamped via "
+            f"browser_eval / browser_run_script in the last few actions "
+            f"and you're now clicking it via selector. This pattern is "
+            f"bot-detectable on hardened sites and a sign you're working "
+            f"around click_at(V_n) / click([N]) instead of fixing the "
+            f"underlying issue. Next time: re-screenshot to refresh the "
+            f"V_n vision pass and use browser_click_at on the bbox, or "
+            f"target the element via its existing CSS hooks (data-*, "
+            f"aria-label, role) rather than a custom id you stamped."
+        )
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:
