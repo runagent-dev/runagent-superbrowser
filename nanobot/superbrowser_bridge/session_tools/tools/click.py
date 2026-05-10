@@ -30,6 +30,40 @@ from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 
 
+def _click_pending_screenshot_block(state: BrowserSessionState) -> str | None:
+    """Refuse a click when an autocomplete dropdown is open and the
+    brain hasn't taken a fresh screenshot since typing — the V_n / CSS
+    selector the brain is about to act on is anchored to the
+    pre-typing page state. Without this gate the click lands on
+    whatever happens to be at that bbox in the OLD vision response,
+    which is "the click had no effect" from the brain's perspective.
+
+    Mirrors `_autocomplete_pending_block` in input_text.py but applies
+    to clicks instead of types. Returns the refusal string when the
+    guard fires, else None.
+    """
+    if not getattr(state, "last_type_had_suggestions", False):
+        return None
+    last_type_at = float(getattr(state, "last_type_at", 0.0) or 0.0)
+    last_shot_at = float(getattr(state, "last_screenshot_at", 0.0) or 0.0)
+    if last_shot_at >= last_type_at and last_type_at > 0.0:
+        # A screenshot was taken AFTER the type opened the dropdown —
+        # the brain has fresh vision; let the click proceed.
+        return None
+    anchor = getattr(state, "last_type_anchor_label", "") or "the input"
+    return (
+        f"[click_pending_screenshot] You typed into {anchor} and an "
+        f"autocomplete dropdown opened, but you have NOT taken a "
+        f"screenshot since. The V_n indices and CSS selectors you "
+        f"have right now are anchored to the page BEFORE the dropdown "
+        f"appeared, so this click would land on whatever element was "
+        f"at that bbox in the pre-dropdown page (typically a no-op "
+        f"or the wrong element). Call browser_screenshot first; the "
+        f"dropdown items will then be labelled as V_n bboxes you can "
+        f"click via browser_click_at(vision_index=V_n)."
+    )
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -106,11 +140,18 @@ class BrowserClickTool(Tool):
             is_form_submit=False,
         )
         self.s.consecutive_click_calls += 1
+        # Refuse a stale click after type opened a dropdown. The brain
+        # MUST take a screenshot first so V_n / DOM-index resolves
+        # against the post-type page state.
+        pending = _click_pending_screenshot_block(self.s)
+        if pending:
+            return pending
         # Releases the autocomplete-pending guard set by browser_type /
         # browser_type_at. Clicking commits a suggestion (or moves on
         # intentionally), so type tools may proceed afterward.
         self.s.last_type_had_suggestions = False
         self.s.last_type_anchor_label = ""
+        self.s.last_autocomplete_suggestions = []
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
@@ -216,6 +257,44 @@ class BrowserClickTool(Tool):
         # Successful HTTP response — clear the timeout counter so the
         # flail guard doesn't trip on a future unrelated hiccup.
         self.s.consecutive_click_timeouts = 0
+        # Element-mismatch escape (mirrors BrowserClickAtTool). The
+        # backend's clickInBbox Phase 2 grid-scan refused to dispatch
+        # because the element at index [N]'s live bounds is now a
+        # different label than expected — page shifted, list re-
+        # ordered, etc. Without this check, a 200-OK with
+        # error=element_mismatch was being treated as success and the
+        # brain reported "Clicked [N]" while the page hadn't actually
+        # changed (the long-standing "burst but no nav" symptom on
+        # DOM-index click). Surface as a structured failure so the
+        # brain re-screenshots and picks again.
+        if isinstance(data, dict) and data.get("error") == "element_mismatch":
+            found = data.get("found", {}) or {}
+            self.s.snap_miss_count += 1
+            self.s.record_cursor_failure(
+                strategy="click",
+                target=f"[{index}]",
+                reason=(
+                    f"element_mismatch tag={(found.get('tag') or '?').lower()} "
+                    f"text={(found.get('text') or '')[:60]!r}"
+                ),
+            )
+            self.s.log_activity(
+                f"click([{index}])(ELEM_MISMATCH)",
+                f"found={found.get('tag','?')}",
+            )
+            await _fetch_elements(session_id, self.s)
+            return (
+                f"[click_failed:element_mismatch] DOM index [{index}] "
+                f"resolves to a <{(found.get('tag') or '?').lower()} "
+                f"role='{found.get('role','')}'> with text='"
+                f"{(found.get('text') or '')[:80]}', which doesn't "
+                f"match the expected label for [{index}]. The page "
+                f"likely re-rendered (filter applied, list re-sorted) "
+                f"and [{index}] now points at a different element. "
+                f"Re-read the elements list above and pick a current "
+                f"[index], or call browser_screenshot to refresh "
+                f"vision before retrying."
+            )
         # Surgical undo: finalize the pending entry with the response.
         # `pre_url` / `pre_dom_hash` were already captured at
         # begin_click_record time, so finalize doesn't need them passed
@@ -337,9 +416,14 @@ class BrowserClickAtTool(Tool):
         self.s._brain_turn_counter += 1
         self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
+        # Refuse stale click after type opened a dropdown — see helper.
+        pending = _click_pending_screenshot_block(self.s)
+        if pending:
+            return pending
         # Release the autocomplete-pending guard (see BrowserClickTool).
         self.s.last_type_had_suggestions = False
         self.s.last_type_anchor_label = ""
+        self.s.last_autocomplete_suggestions = []
         if self.s.click_at_count > self.s.MAX_CLICK_AT:
             return (
                 f"[BLOCKED] browser_click_at used "
@@ -1153,9 +1237,14 @@ class BrowserClickSelectorTool(Tool):
         self.s._brain_turn_counter += 1
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls += 1
+        # Refuse stale click after type opened a dropdown — see helper.
+        pending = _click_pending_screenshot_block(self.s)
+        if pending:
+            return pending
         # Release the autocomplete-pending guard (see BrowserClickTool).
         self.s.last_type_had_suggestions = False
         self.s.last_type_anchor_label = ""
+        self.s.last_autocomplete_suggestions = []
 
         payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
         if button is not None:

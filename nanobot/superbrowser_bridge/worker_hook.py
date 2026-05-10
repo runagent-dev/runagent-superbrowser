@@ -480,6 +480,11 @@ class BrowserWorkerHook(AgentHook):
         # or raw (x, y). Suppress when the brain just clicked (the click
         # may itself be the suggestion-pick) or when no clickable
         # content bboxes were emitted.
+        #
+        # Note: if the vision agent misses the popup (no flag), the
+        # click-pending-screenshot guard in click.py still forces a
+        # re-screenshot before any click; once vision sees the dropdown
+        # the brain can pick V_n straight from the screenshot.
         if os.environ.get("WORKER_AUTOCOMPLETE_HINT", "1") not in ("0", "false", "no"):
             try:
                 last_resp = getattr(self.state, "_last_vision_response", None)

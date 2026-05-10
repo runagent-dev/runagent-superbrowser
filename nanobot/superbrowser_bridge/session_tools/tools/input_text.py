@@ -401,6 +401,23 @@ class BrowserTypeAtTool(Tool):
         ) or {}
         if not isinstance(result, dict) or not result.get("ok"):
             reason = (result or {}).get("reason", "unknown") if isinstance(result, dict) else "bad_shape"
+            # Educational redirect for the most common LLM hallucination:
+            # typing into a non-input target. The atomic JS already detected
+            # this and surfaced `tag` (button, td, div, …) — name it and
+            # point at the right tool so the brain doesn't escalate to
+            # browser_run_script.
+            if reason == "not_input" and isinstance(result, dict):
+                tag = str(result.get("tag", "") or "?")
+                return (
+                    f"[type_at_failed:not_input tag={tag}] at {label}. "
+                    f"V_n is not a text input — the element under the "
+                    f"cursor is a <{tag}>. If this is a calendar/date "
+                    f"cell, call browser_pick_date(date='YYYY-MM-DD'). "
+                    f"If it's any other clickable target (button, "
+                    f"option, gridcell), call browser_click_at("
+                    f"vision_index={vision_index if vision_index is not None else '<V_n>'}). "
+                    f"Do not retry browser_type_at on this target."
+                )
             return f"[type_at_failed:{reason}] at {label}. detail={result}"
 
         before = str(result.get("before", "") or "")
@@ -463,51 +480,31 @@ class BrowserTypeAtTool(Tool):
             scan = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
-        if suggestions:
+        if suggestions or detected:
+            count_str = str(len(suggestions)) if suggestions else "?"
             caption += (
-                f"\n\nAutocomplete suggestions visible "
-                f"({len(suggestions)}):"
-            )
-            for i, s in enumerate(suggestions, start=1):
-                caption += (
-                    f"\n  {i}. {s['text']!r} → "
-                    f"browser_click_at(x={s['x']}, y={s['y']})"
-                )
-            caption += (
-                "\nNEXT TURN: take a browser_screenshot — these "
-                "suggestions will appear as bboxes (V_n with "
-                "role='content'). Click the matching V_n via "
-                "browser_click_at(vision_index=V_n) — most reliable. "
-                "(x, y) above is a fallback. Avoid browser_keys "
-                "ArrowDown+Enter; some sites won't commit via "
-                "keyboard. DO NOT type into another field until you "
-                "click a suggestion."
-            )
-        elif detected:
-            # ARIA / popup-id detected an autocomplete-wired input but
-            # we couldn't enumerate items (custom widget). Tell the
-            # brain explicitly — and arm the pending guard so it must
-            # screenshot + click before moving on.
-            caption += (
-                "\n\n[AUTOCOMPLETE_LIKELY_PENDING] This input has "
-                "ARIA autocomplete semantics (combobox / "
-                "aria-controls / aria-expanded) and a suggestion "
-                "dropdown is most likely loading or already open — "
-                "but the suggestion DOM doesn't match common "
-                "patterns so we can't enumerate items inline.\n"
-                "NEXT TURN: take a browser_screenshot, then "
-                "browser_click_at(vision_index=V_n) on the matching "
-                "suggestion bbox. DO NOT type into another field "
-                "until you click a suggestion (refused by guard)."
+                f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
+                f"suggestion dropdown is now visible. NEXT TURN: take "
+                f"a browser_screenshot — the dropdown items will be "
+                f"labelled as V_n bboxes; click the one you want via "
+                f"browser_click_at(vision_index=V_n). Any click you "
+                f"attempt before that screenshot is REFUSED (the "
+                f"current V_n / selectors are anchored to the "
+                f"pre-dropdown page). Do NOT browser_run_script / "
+                f"browser_eval to enumerate suggestions; the "
+                f"screenshot will show them. Do NOT use Arrow+Enter; "
+                f"many sites won't commit the value via keyboard."
             )
         if suggestions or detected:
             self.s.last_type_had_suggestions = True
             self.s.last_type_anchor_label = label
             self.s.last_type_at = time.time()
+            self.s.last_autocomplete_suggestions = list(suggestions)
         else:
             # Clean type — clear any stale pending flag.
             self.s.last_type_had_suggestions = False
             self.s.last_type_anchor_label = ""
+            self.s.last_autocomplete_suggestions = []
 
         # Phase 2.1: notify the active form_session that this field was
         # typed into. Promotes its FieldStatus to FILLED (or
@@ -852,9 +849,11 @@ class BrowserTypeTool(Tool):
         if suggestions or detected:
             self.s.last_type_had_suggestions = True
             self.s.last_type_anchor_label = f"[{index}]"
+            self.s.last_autocomplete_suggestions = list(suggestions)
         else:
             self.s.last_type_had_suggestions = False
             self.s.last_type_anchor_label = ""
+            self.s.last_autocomplete_suggestions = []
 
         self.s.record_step(
             "browser_type",
@@ -881,33 +880,20 @@ class BrowserTypeTool(Tool):
             )
         else:
             caption = f'Typed "{text}" into [{index}]'
-        if suggestions:
+        if suggestions or detected:
+            count_str = str(len(suggestions)) if suggestions else "?"
             caption += (
-                f"\n\nAutocomplete suggestions visible ({len(suggestions)}):"
-            )
-            for i, s in enumerate(suggestions, start=1):
-                caption += f"\n  {i}. {s['text']!r} → browser_click_at(x={s['x']}, y={s['y']})"
-            caption += (
-                "\nNEXT TURN: take a browser_screenshot — the suggestion "
-                "list will appear as bboxes (V_n with role='content'). "
-                "Click the matching V_n via browser_click_at(vision_index="
-                "V_n) — this is the most reliable way to commit. The "
-                "(x, y) coords above are a fallback if no V_n is emitted. "
-                "Avoid browser_keys ArrowDown+Enter; some sites won't "
-                "commit the value via keyboard. DO NOT browser_type again."
-            )
-        elif detected:
-            caption += (
-                "\n\n[AUTOCOMPLETE_LIKELY_PENDING] This input has ARIA "
-                "autocomplete semantics (combobox / aria-controls / "
-                "aria-expanded) and a suggestion dropdown is most likely "
-                "loading or already open — but the suggestion DOM "
-                "doesn't match common patterns so we can't enumerate "
-                "items inline.\n"
-                "NEXT TURN: take a browser_screenshot, then "
-                "browser_click_at(vision_index=V_n) on the matching "
-                "suggestion bbox. DO NOT browser_type into another "
-                "field until you click a suggestion (refused by guard)."
+                f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
+                f"suggestion dropdown is now visible. NEXT TURN: take "
+                f"a browser_screenshot — the dropdown items will be "
+                f"labelled as V_n bboxes; click the one you want via "
+                f"browser_click_at(vision_index=V_n). Any click you "
+                f"attempt before that screenshot is REFUSED (the "
+                f"current V_n / selectors are anchored to the "
+                f"pre-dropdown page). Do NOT browser_run_script / "
+                f"browser_eval to enumerate suggestions; the "
+                f"screenshot will show them. Do NOT use Arrow+Enter; "
+                f"many sites won't commit the value via keyboard."
             )
 
         # Post-type semantic verification (index-addressed variant).

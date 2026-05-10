@@ -963,6 +963,18 @@ export async function selectOptionByLabel(
   // with `data-sb-opt-candidate`. Returns the count tagged so the
   // wait loop knows when it can stop. The pickAttempt and listbox-
   // scroll helpers below all read this single tag.
+  //
+  // Popup-scoping (added 2026-05-10): when the open dropdown lives in
+  // a recognisable container — ARIA listbox/menu/dialog, library
+  // state attrs (Headless UI / Radix / data-state="open"), or a
+  // newly-mounted container near the trigger — restrict candidate
+  // tagging to descendants of that container. Without this scope the
+  // DOM-diff fallback below was vacuuming up homepage buttons whose
+  // pre-visible tag had been lost across a React re-render (SpotHero
+  // homepage time picker returned 'Use current location' / 'View All
+  // Stadiums' as candidates). Falls back to whole-document search
+  // when no root can be identified — preserves the existing happy
+  // path for ARIA-clean dropdowns.
   const collectAndTagCandidates = (): Promise<number> => page.evaluate(
     (args: { sels: string[]; triggerSel: string }) => {
       const { sels, triggerSel } = args;
@@ -978,16 +990,126 @@ export async function selectOptionByLabel(
         return true;
       };
       const triggerEl = triggerSel ? document.querySelector(triggerSel) : null;
+
+      // ----- popup-root detection -----
+      // Cascade A → B → C, first hit wins.
+      let popupRoot: Element | null = null;
+
+      // A1. aria-controls on the trigger points at the popup id.
+      if (triggerEl) {
+        const controlsId = triggerEl.getAttribute('aria-controls');
+        if (controlsId) {
+          const ctrl = document.getElementById(controlsId);
+          if (ctrl && isVisible(ctrl as HTMLElement)) popupRoot = ctrl;
+        }
+      }
+
+      // A2. ARIA role-based popups visible somewhere on the page.
+      if (!popupRoot) {
+        const ariaPopupSelectors = [
+          '[role="listbox"]:not([aria-hidden="true"])',
+          '[role="menu"]:not([aria-hidden="true"])',
+          '[role="dialog"]:not([aria-hidden="true"])',
+          '[role="grid"]:not([aria-hidden="true"])',
+          '[role="tree"]:not([aria-hidden="true"])',
+        ];
+        for (const sel of ariaPopupSelectors) {
+          let found: Element | null = null;
+          try {
+            for (const c of Array.from(document.querySelectorAll(sel))) {
+              if (!isVisible(c as HTMLElement)) continue;
+              if (c === triggerEl) continue;
+              if (triggerEl && c.contains(triggerEl)) continue;
+              found = c; break;
+            }
+          } catch { /* selector unsupported — skip */ }
+          if (found) { popupRoot = found; break; }
+        }
+      }
+
+      // B. Library state attrs — Headless UI / Radix / generic `data-state`.
+      if (!popupRoot) {
+        const libSelectors = [
+          '[data-headlessui-state~="open"]',
+          '[data-state="open"]',
+          '[data-radix-popper-content-wrapper]',
+          '[data-floating-ui-portal]',
+        ];
+        for (const sel of libSelectors) {
+          let found: Element | null = null;
+          try {
+            for (const c of Array.from(document.querySelectorAll(sel))) {
+              if (!isVisible(c as HTMLElement)) continue;
+              if (c === triggerEl) continue;
+              if (triggerEl && c.contains(triggerEl)) continue;
+              found = c; break;
+            }
+          } catch { /* skip */ }
+          if (found) { popupRoot = found; break; }
+        }
+      }
+
+      // C. Geometric/diff fallback — find the newly-mounted container
+      //    closest to the trigger that contains option-shaped children.
+      //    Required for SpotHero-style custom pickers that emit no
+      //    ARIA roles and no library state attrs.
+      if (!popupRoot && triggerEl) {
+        const triggerRect = (triggerEl as HTMLElement).getBoundingClientRect();
+        const triggerCx = triggerRect.left + triggerRect.width / 2;
+        const triggerCy = triggerRect.top + triggerRect.height / 2;
+        const MAX_DISTANCE = 800;
+        const containerCandidates = Array.from(document.querySelectorAll<HTMLElement>(
+          'div, section, ul, [class*="popper"], [class*="menu"], '
+          + '[class*="dropdown"], [class*="picker"], [class*="modal"], '
+          + '[class*="popover"], [class*="overlay"]',
+        ));
+        let bestRoot: Element | null = null;
+        let bestArea = Infinity;
+        for (const c of containerCandidates) {
+          if (!isVisible(c)) continue;
+          if (c.hasAttribute('data-sb-pre-visible')) continue;
+          // Skip elements that contain the trigger — they're the page
+          // layout itself, not a freshly opened popup.
+          if (c.contains(triggerEl)) continue;
+          const r = c.getBoundingClientRect();
+          if (r.width < 100 || r.height < 60) continue;
+          const ccx = r.left + r.width / 2;
+          const ccy = r.top + r.height / 2;
+          const dist = Math.hypot(ccx - triggerCx, ccy - triggerCy);
+          if (dist > MAX_DISTANCE) continue;
+          // Must contain newly-mounted interactive children — that's
+          // what makes it a popup vs. a long-standing layout box.
+          const newChildren = c.querySelectorAll(
+            'button:not([data-sb-pre-visible]), '
+            + '[role="option"]:not([data-sb-pre-visible]), '
+            + '[role="menuitem"]:not([data-sb-pre-visible]), '
+            + 'li:not([data-sb-pre-visible]), '
+            + 'a:not([data-sb-pre-visible])',
+          );
+          if (newChildren.length < 1) continue;
+          // Prefer the SMALLEST qualifying container — tighter scope.
+          const area = r.width * r.height;
+          if (area < bestArea) { bestArea = area; bestRoot = c; }
+        }
+        if (bestRoot) popupRoot = bestRoot;
+      }
+
       const tagSet = (el: Element): void => {
         if (el === triggerEl) return;
         if (triggerEl && triggerEl.contains(el)) return;
+        // Hard-reject anything outside the popup root when we found
+        // one. This is the actual fix — homepage buttons get filtered
+        // out even if their pre-visible tag was lost across a re-render.
+        if (popupRoot && !popupRoot.contains(el)) return;
         (el as HTMLElement).setAttribute('data-sb-opt-candidate', '1');
       };
+
+      const searchRoot: ParentNode = popupRoot ?? document;
 
       // 1. Standard role-based selectors (preferred when present).
       for (const s of sels) {
         try {
-          for (const el of Array.from(document.querySelectorAll(s))) {
+          for (const el of Array.from(searchRoot.querySelectorAll(s))) {
             if (isVisible(el as HTMLElement)) tagSet(el);
           }
         } catch { /* skip bad selector */ }
@@ -1029,7 +1151,8 @@ export async function selectOptionByLabel(
       // Candidate pool — broaden beyond the pre-snapshot set: anything
       // that became visible AFTER tagging may be a new option even if
       // it's a freshly-mounted div outside our pre-tagged scope.
-      const pool = document.querySelectorAll<HTMLElement>(
+      // Scope to popupRoot when known to keep candidates tight.
+      const pool = (popupRoot ?? document).querySelectorAll<HTMLElement>(
         'li, button, a, [role], [data-value], [data-option-value], div, span',
       );
       let added = 0;
@@ -1037,7 +1160,11 @@ export async function selectOptionByLabel(
       for (const el of Array.from(pool)) {
         if (added >= cap) break;
         if (el.hasAttribute('data-sb-opt-candidate')) continue;
-        if (el.hasAttribute('data-sb-pre-visible')) continue;  // was visible BEFORE click
+        // pre-visible filter: redundant inside a confirmed popupRoot
+        // (anything inside a freshly-opened popup is by construction
+        // newly visible) but harmless and protects us when the popup
+        // root mounts a previously-hidden subtree.
+        if (el.hasAttribute('data-sb-pre-visible')) continue;
         if (!isVisible(el)) continue;
         if (!isOptionShaped(el)) continue;
         if (el === triggerEl) continue;

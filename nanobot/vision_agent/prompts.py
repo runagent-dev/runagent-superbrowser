@@ -158,6 +158,8 @@ Page-type coverage rules (CRITICAL for dense filter/booking UIs):
     * Inputs covered by the overlay must STILL be emitted (with
       role_in_scene='target' or 'content'); the brain needs to know
       they exist so it can return to them after picking.
+    * Includes calendar day cells and time-picker options when the
+      picker overlay is currently open.
 - For FORM sliders (retirement calculators, filter ranges, volume controls,
   any <input type=range>, role=slider, or visual track+thumb pair that is
   NOT a captcha), emit THREE bboxes per slider in this order so their V_n

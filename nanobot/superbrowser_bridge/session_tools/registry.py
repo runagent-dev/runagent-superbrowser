@@ -35,6 +35,8 @@ from .tools import (
     BrowserListSliderHandlesTool,
     BrowserNavigateTool,
     BrowserOpenTool,
+    BrowserPickDateTool,
+    BrowserPickTimeTool,
     BrowserPlanNextStepsTool,
     BrowserRequestHelpTool,
     BrowserRewindToCheckpointTool,
@@ -85,6 +87,8 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserScrollWithinTool(state),    # in-popup/listbox scroll
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
+        BrowserPickDateTool(state),
+        BrowserPickTimeTool(state),
         BrowserFormPlanTool(state),
         BrowserEvalTool(state),
         BrowserRunScriptTool(state),

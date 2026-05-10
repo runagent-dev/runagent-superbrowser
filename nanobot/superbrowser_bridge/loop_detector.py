@@ -100,7 +100,14 @@ class LoopDetector:
         # mode (DOM indices renumber after each pick; V-indices go stale
         # past 10s). Tell the brain to abandon raw clicks BEFORE the
         # generic "switch selector" fallback.
-        cascade_hint = _cascade_dropdown_hint(tool_name, args)
+        # Calendar/time-picker hint takes precedence over the dropdown
+        # hint — date pickers and dropdowns can both surface as "click
+        # loops on a button", but the right escape hatch is different
+        # (browser_pick_date/time vs browser_select_option).
+        cascade_hint = (
+            _cascade_calendar_hint(tool_name, args)
+            or _cascade_dropdown_hint(tool_name, args)
+        )
 
         self._action_nudge_count += 1
         if self._action_nudge_count == 1:
@@ -197,4 +204,39 @@ def _cascade_dropdown_hint(tool_name: str, args: dict | None) -> str | None:
         "  • browser_form_plan(intent=..., fields=[{label,value}, ...])  — for ≥2 dependent dropdowns\n"
         "Both tools label-anchor the trigger (no index, no V-index) and "
         "settle between steps so the next listbox can populate."
+    )
+
+
+def _cascade_calendar_hint(tool_name: str, args: dict | None) -> str | None:
+    """Detect "stuck on a calendar / time picker" and steer toward
+    browser_pick_date / browser_pick_time.
+
+    Triggers when the repeated tool is a click variant whose serialized
+    args mention date/calendar/time/picker keywords — i.e. clicking
+    next-month-button repeatedly, click-looping on day cells, or
+    hammering a time `<select>`. SpotHero's `data-testid="DatePicker
+    Header-next-month-button"` is the canonical example.
+    """
+    if tool_name not in _CLICK_TOOLS:
+        return None
+    try:
+        blob = json.dumps(args or {}, default=str).lower()
+    except Exception:
+        blob = str(args or "").lower()
+    needles = (
+        "date", "calendar", "datepicker", "picker", "month",
+        "day", "time", "starts", "ends", "clock",
+    )
+    if not any(n in blob for n in needles):
+        return None
+    return (
+        "[CALENDAR/TIME-CLICK-LOOP] You are click-looping on what looks "
+        "like a calendar or time picker. Stop driving it manually:\n"
+        "  • browser_pick_date(date='YYYY-MM-DD') — auto-navigates "
+        "month/year, clicks the day cell\n"
+        "  • browser_pick_time(time='HH:MM' or 'h:mm AM/PM') — handles "
+        "native <input type=time>, <select>, and ARIA options\n"
+        "If the picker is hidden behind a trigger, click the trigger "
+        "ONCE with browser_click_at(V_n), then call the picker tool. "
+        "DO NOT click prev/next month arrows manually."
     )

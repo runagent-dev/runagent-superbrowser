@@ -1054,6 +1054,25 @@ export function createHttpServer(
               { button, clickCount, expectedLabel: expectedLabel || undefined },
             );
 
+            // Label-mismatch escape (mirror of the vision-bbox branch
+            // earlier in this handler). When clickInBbox Phase 2 grid-
+            // scan can't find a candidate matching expectedLabel
+            // (page shifted; the original [N] now overlaps a sibling
+            // with different text), dispatch is skipped — surface
+            // that as element_mismatch so click.py reports the miss
+            // instead of treating snap.labelMismatch=true as silent
+            // success. Skip settle/state — no click fired, page
+            // unchanged, the prior fingerprint cache is still valid.
+            if (snap.labelMismatch) {
+              res.json({
+                error: 'element_mismatch',
+                expected_label: expectedLabel || undefined,
+                coords: { x: snap.x, y: snap.y },
+                found: snap.found,
+              });
+              return;
+            }
+
             await settleForEffect(page.getRawPage());
             const effectAfter = await captureEffect(page.getRawPage());
             const newState = await page.getState({
@@ -1543,6 +1562,110 @@ export function createHttpServer(
         // Fresh per-index fingerprints — keeps the Python bridge's
         // cache in sync without a follow-up /state round-trip.
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Pick a date in a calendar widget. Sidesteps the click-loop the
+   * worker hits when it tries `browser_type_at` on a calendar grid
+   * cell — cells are <button>/<td>/<div role="gridcell">, not <input>,
+   * so the atomic write rejects them with `not_input`.
+   *
+   * Strategy is picked in-page by `pickDate`: native HTML5 input first
+   * (cheapest), then ARIA grid + month navigation, then data-attr.
+   */
+  app.post('/session/:id/pick-date', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const { date, selector, bbox } = req.body ?? {};
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      res.status(400).json({ error: 'date must be a YYYY-MM-DD string' });
+      return;
+    }
+    let bboxParam: { x0: number; y0: number; x1: number; y1: number } | undefined;
+    if (bbox != null && typeof bbox === 'object'
+        && typeof bbox.x0 === 'number' && typeof bbox.y0 === 'number'
+        && typeof bbox.x1 === 'number' && typeof bbox.y1 === 'number') {
+      bboxParam = {
+        x0: Number(bbox.x0), y0: Number(bbox.y0),
+        x1: Number(bbox.x1), y1: Number(bbox.y1),
+      };
+    }
+    const selectorParam = (typeof selector === 'string' && selector.length > 0)
+      ? selector : undefined;
+
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      const result = await page.pickDate(date, {
+        selector: selectorParam,
+        bbox: bboxParam,
+      });
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false }).catch(() => null);
+      res.json({
+        ...result,
+        elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
+        effect: diffEffect(effectBefore, effectAfter),
+        fingerprints: newState
+          ? fingerprintMap(newState.selectorMap, newState.selectorEntries)
+          : undefined,
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Pick a time-of-day in any picker shape: native <input type=time>,
+   * native <select> with time options, ARIA listbox/menu options,
+   * library [data-time] attrs. Sidesteps the SpotHero-style failure
+   * where browser_select_option's label-match doesn't fit because the
+   * <select>'s aria-label is "Starts" / "Ends" rather than "Start
+   * time", and the brain falls back to brittle
+   * `browser_run_script(mutates=true)` to set <select>.value.
+   */
+  app.post('/session/:id/pick-time', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    const { time, selector, bbox } = req.body ?? {};
+    if (typeof time !== 'string' || !time.trim()) {
+      res.status(400).json({ error: 'time must be a non-empty string ("HH:MM" 24h or "h:mm AM/PM")' });
+      return;
+    }
+    let bboxParam: { x0: number; y0: number; x1: number; y1: number } | undefined;
+    if (bbox != null && typeof bbox === 'object'
+        && typeof bbox.x0 === 'number' && typeof bbox.y0 === 'number'
+        && typeof bbox.x1 === 'number' && typeof bbox.y1 === 'number') {
+      bboxParam = {
+        x0: Number(bbox.x0), y0: Number(bbox.y0),
+        x1: Number(bbox.x1), y1: Number(bbox.y1),
+      };
+    }
+    const selectorParam = (typeof selector === 'string' && selector.length > 0)
+      ? selector : undefined;
+
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      const result = await page.pickTime(time, {
+        selector: selectorParam,
+        bbox: bboxParam,
+      });
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false }).catch(() => null);
+      res.json({
+        ...result,
+        elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
+        effect: diffEffect(effectBefore, effectAfter),
+        fingerprints: newState
+          ? fingerprintMap(newState.selectorMap, newState.selectorEntries)
+          : undefined,
       });
     } catch (err) {
       handleError(res, err);

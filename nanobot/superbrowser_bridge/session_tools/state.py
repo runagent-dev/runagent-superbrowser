@@ -75,6 +75,11 @@ class BrowserSessionState:
         self.screenshotted_keys: set[tuple[str, str]] = set()
         self.last_screenshot_url: str = ""
         self.last_page_content_hash: str = ""
+        # Wall-clock seconds of the most recent successful screenshot.
+        # Used by the autocomplete-pending click guard to refuse stale
+        # V_n / selector clicks that fire before the brain re-screenshots
+        # to see the dropdown. 0.0 means "never screenshotted yet".
+        self.last_screenshot_at: float = 0.0
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
@@ -303,6 +308,13 @@ class BrowserSessionState:
         # click of any kind, on screenshot, or on timeout (30s).
         self.last_type_had_suggestions: bool = False
         self.last_type_anchor_label: str = ""
+        # Most recent autocomplete-scan output (list of {text, x, y}).
+        # Stashed verbatim from `_scan_autocomplete_suggestions` so the
+        # worker_hook can map each suggestion's pixel center to a V_n
+        # bbox in the next vision response — keeps the brain on the
+        # bbox path even when the vision agent misses the
+        # `autocomplete_open` flag.
+        self.last_autocomplete_suggestions: list = []
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
@@ -682,6 +694,9 @@ class BrowserSessionState:
             self.screenshotted_keys.add((norm, content_hash or ""))
         self.last_screenshot_url = norm
         self.last_page_content_hash = content_hash or ""
+        # Wall-clock for the click-pending-screenshot guard.
+        import time as _t
+        self.last_screenshot_at = _t.time()
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:
