@@ -1,31 +1,28 @@
-"""Unit test: `browser_click_at(vision_index=...)` auto-recovers from an
-invalidated vision epoch instead of returning [click_at_failed:epoch_invalidated].
+"""Unit test: `browser_click_at(vision_index=...)` HARD-rejects on an
+invalidated vision epoch and forces the brain to re-screenshot.
 
-Before the fix: when a previous click set mutation_delta >
-MUTATION_DIRTY_THRESHOLD, `_vision_epoch_response` was reset to None
-and any subsequent `vision_index` click hit a hard gate that forced
-the brain to call `browser_screenshot` manually.
+An earlier draft of this fix attempted an in-tool "recovery" that
+refreshed the vision response and re-resolved V_n against it. That was
+wrong: V_n is a POSITIONAL index into a ranked bbox list, and the
+ranking shifts when the page mutates. After recovery, V_5 in the new
+response is a different element than V_5 in the old response — so the
+recovered click landed on the wrong button silently, causing the brain
+to chase phantom state changes for several turns before giving up.
 
-After the fix: the tool refreshes the vision epoch internally (via
-_schedule_vision_prefetch + freeze_vision_epoch) and retries the
-resolution. If V_n still doesn't resolve, the original error returns —
-otherwise execution falls through to the normal dispatch path.
-
-This test exercises both branches: recovered (fresh response contains
-V_n) and unrecovered (fresh response missing V_n).
+The correct behaviour is: hard-reject, return an explicit error, let
+the brain call `browser_screenshot` to see the new bbox numbering, and
+re-pick V_n on that fresh snapshot. The extra turn is the right cost.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
 from superbrowser_bridge.session_tools.state import BrowserSessionState
 from superbrowser_bridge.session_tools.tools.click import (
     BrowserClickAtTool,
-    _attempt_epoch_recovery,
 )
 
 
@@ -35,128 +32,84 @@ def anyio_backend() -> str:
 
 
 def _make_state_with_invalidated_epoch() -> BrowserSessionState:
-    """Build a state where the epoch was previously frozen and then
-    invalidated by a high-mutation click."""
     s = BrowserSessionState()
     s._brain_turn_counter = 5
     s.current_url = "https://example.test/"
-    # Simulate "epoch was frozen at some point" — id > 0 means an
-    # epoch was taken; `_vision_epoch_response = None` means it was
-    # invalidated.
     s._vision_epoch_id = 3
     s._vision_epoch_response = None
     s._last_vision_response = None
-    s.screenshot_budget = 4  # Recovery must NOT decrement this.
+    s.screenshot_budget = 4
     return s
 
 
-def _fake_vision_response_with_bbox(index: int):
-    """Build a stub vision response whose `get_bbox(n)` returns a fake
-    bbox iff `n == index`. Mirrors the minimum surface area the click
-    path reads off the response object."""
-    bbox = SimpleNamespace(
-        x0=100.0, y0=100.0, x1=200.0, y1=150.0,
-        label="Submit", confidence=0.95,
-        role_in_scene="target", intent_relevant=True,
-        clickable=True, is_active=False,
-        to_pixels=lambda iw, ih, dpr=1.0: (100, 100, 200, 150),
-    )
-    resp = SimpleNamespace(
-        bboxes=[bbox],
-        screenshot_freshness="fresh",
-        summary="ok",
-        image_width=1280,
-        image_height=720,
-        dpr=1.0,
-        get_bbox=lambda n: bbox if n == index else None,
-    )
-    return resp, bbox
-
-
-# ---------------- _attempt_epoch_recovery -----------------------
-
-def _make_fake_task(state: BrowserSessionState, resp) -> "asyncio.Task":
-    """Return an awaitable that, when awaited, stamps the fake response
-    onto state._last_vision_response (mirroring what the real prefetch
-    `_run()` does) and returns the response."""
-    import asyncio
-
-    async def _run():
-        state._last_vision_response = resp
-        return resp
-
-    return asyncio.ensure_future(_run())
-
-
 @pytest.mark.anyio
-async def test_recovery_succeeds_when_vn_present() -> None:
-    s = _make_state_with_invalidated_epoch()
-    resp, _bbox = _fake_vision_response_with_bbox(2)
-    fake_task = _make_fake_task(s, resp)
-
-    with patch(
-        "superbrowser_bridge.session_tools.tools.click._schedule_vision_prefetch",
-        return_value=fake_task,
-    ):
-        ok = await _attempt_epoch_recovery(s, "sess1", 2)
-
-    assert ok is True
-    # Recovery re-froze the epoch.
-    assert s._vision_epoch_response is resp
-    # Budget unaffected.
-    assert s.screenshot_budget == 4
-
-
-@pytest.mark.anyio
-async def test_recovery_returns_false_when_vn_missing() -> None:
-    s = _make_state_with_invalidated_epoch()
-    resp, _bbox = _fake_vision_response_with_bbox(2)
-    fake_task = _make_fake_task(s, resp)
-
-    with patch(
-        "superbrowser_bridge.session_tools.tools.click._schedule_vision_prefetch",
-        return_value=fake_task,
-    ):
-        # V_5 isn't in the fresh response (which only has V_2).
-        ok = await _attempt_epoch_recovery(s, "sess1", 5)
-
-    assert ok is False
-
-
-@pytest.mark.anyio
-async def test_recovery_returns_false_when_prefetch_disabled() -> None:
-    s = _make_state_with_invalidated_epoch()
-
-    with patch(
-        "superbrowser_bridge.session_tools.tools.click._schedule_vision_prefetch",
-        return_value=None,
-    ):
-        ok = await _attempt_epoch_recovery(s, "sess1", 2)
-
-    assert ok is False
-    # Budget still untouched.
-    assert s.screenshot_budget == 4
-
-
-# ---------------- end-to-end BrowserClickAtTool ----------------
-
-@pytest.mark.anyio
-async def test_click_at_returns_error_when_recovery_fails() -> None:
-    """When recovery can't resolve V_n, the existing error message
-    must still surface so the brain knows to re-screenshot."""
+async def test_click_at_rejects_on_invalidated_epoch() -> None:
+    """Invalidated epoch must produce the explicit error string so the
+    brain knows to re-screenshot. Critically, the tool MUST NOT
+    silently dispatch a click against the live vision response — V_n
+    in the new ranking points to a different element."""
     s = _make_state_with_invalidated_epoch()
     tool = BrowserClickAtTool(s)
 
-    async def _no_op(*_a, **_kw):
-        return None
+    async def _fail_if_dispatched(*_a, **_kw):
+        raise AssertionError(
+            "Click dispatched despite invalidated epoch — would have "
+            "clicked the wrong element. The hard-reject was bypassed."
+        )
 
     with patch.object(s, "ensure_vision_synced", return_value=None), \
          patch(
-            "superbrowser_bridge.session_tools.tools.click._schedule_vision_prefetch",
-            return_value=None,
+            "superbrowser_bridge.session_tools.tools.click._request_with_backoff",
+            side_effect=_fail_if_dispatched,
         ):
         out = await tool.execute(session_id="sess1", vision_index=4)
 
     assert "[click_at_failed:epoch_invalidated]" in out
-    # Budget still untouched after the failed recovery.
+    assert "browser_screenshot" in out, (
+        "error message must instruct the brain to re-screenshot"
+    )
+    # Screenshot budget untouched — no implicit screenshot fired.
     assert s.screenshot_budget == 4
+
+
+@pytest.mark.anyio
+async def test_click_at_raw_coords_unaffected_by_invalidated_epoch() -> None:
+    """The hard-reject is scoped to vision_index. Raw `(x,y)` coords
+    are direct viewport addresses and don't depend on the ranking, so
+    they must pass through the gate normally."""
+    s = _make_state_with_invalidated_epoch()
+    tool = BrowserClickAtTool(s)
+
+    class _FakeResp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = ""
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {
+                "clicked": {"x": 100, "y": 200},
+                "url": "https://example.test/",
+                "elements": "",
+                "fingerprints": {},
+                "snapped": True,
+            }
+
+    async def _fake_dispatch(*_a, **_kw):
+        return _FakeResp()
+
+    with patch.object(s, "ensure_vision_synced", return_value=None), \
+         patch.object(s, "advance_observation_token"), \
+         patch(
+            "superbrowser_bridge.session_tools.tools.click._request_with_backoff",
+            side_effect=_fake_dispatch,
+        ), patch(
+            "superbrowser_bridge.session_tools.tools.click._schedule_vision_prefetch",
+            return_value=None,
+        ), patch(
+            "superbrowser_bridge.session_tools.tools.click._append_fresh_vision",
+            side_effect=lambda _t, caption, **_kw: caption,
+        ):
+        out = await tool.execute(session_id="sess1", x=100.0, y=200.0)
+
+    assert "[click_at_failed:epoch_invalidated]" not in str(out)

@@ -112,45 +112,6 @@ _PLAYWRIGHT_PSEUDO_RE = re.compile(
 )
 
 
-async def _attempt_epoch_recovery(
-    state: BrowserSessionState,
-    session_id: str,
-    vision_index: int,
-) -> bool:
-    """Refresh the vision epoch in-tool when the brain's V_n resolves
-    against an invalidated snapshot.
-
-    Returns True when the fresh vision response contains a valid bbox
-    for `vision_index` (caller should fall through to the existing
-    dispatch path). Returns False on any failure: vision disabled,
-    prefetch errored, or V_n missing from the fresh response.
-
-    The recovery is invisible to the brain — `screenshot_budget` is
-    NOT decremented and turn counters are NOT bumped a second time.
-    Reuses `_schedule_vision_prefetch` so we get the same compound-row
-    split / DOM enrichment / just-toggled marker pipeline as a normal
-    screenshot would.
-    """
-    task = _schedule_vision_prefetch(state, session_id)
-    if task is None:
-        return False
-    try:
-        resp = await task
-    except Exception:
-        return False
-    if resp is None:
-        return False
-    # Freeze the fresh response as the current epoch so the brain's
-    # V_n resolves against what we just refreshed (not against any
-    # stale state). The prefetch path doesn't freeze by design — only
-    # screenshot tool calls or this recovery path do.
-    try:
-        state.freeze_vision_epoch()
-    except Exception:
-        return False
-    return resp.get_bbox(int(vision_index)) is not None
-
-
 def _click_pending_screenshot_block(state: BrowserSessionState) -> str | None:
     """Refuse a click when an autocomplete dropdown is open and the
     brain hasn't taken a fresh screenshot since typing — the V_n / CSS
@@ -640,39 +601,34 @@ class BrowserClickAtTool(Tool):
                 self.s._vision_epoch_response is None
                 and getattr(self.s, "_vision_epoch_id", 0) > 0
             ):
-                # Phase 3.2: in-tool auto-recovery. Instead of forcing
-                # the brain to call `browser_screenshot` then re-issue
-                # the click, refresh the vision epoch internally and
-                # retry once. Capped with a local boolean — if the
-                # fresh pass also doesn't resolve V_n, the page truly
-                # changed and we fall through to the original error.
-                recovered = await _attempt_epoch_recovery(
-                    self.s, session_id, int(vision_index),
+                # HARD reject. Auto-recovery (refreshing vision + re-
+                # resolving V_n against the new response) is NOT safe
+                # here: V_n is a POSITIONAL index into a ranked bbox
+                # list, and re-ranking on a mutated page puts a
+                # different element at position N. A "successful"
+                # recovery would silently click the wrong element.
+                # The only correct path is to force the brain to call
+                # `browser_screenshot`, see the new bbox numbering,
+                # and re-pick V_n — even though that costs one extra
+                # turn.
+                alts = _vision_alternatives_hint(
+                    self.s, exclude_index=int(vision_index), limit=3,
                 )
-                if recovered:
-                    self.s.log_activity(
-                        f"click_at(V{vision_index})(EPOCH_RECOVERED)",
-                        f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
-                    )
-                else:
-                    alts = _vision_alternatives_hint(
-                        self.s, exclude_index=int(vision_index), limit=3,
-                    )
-                    self.s.log_activity(
-                        f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
-                        f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
-                    )
-                    return (
-                        f"[click_at_failed:epoch_invalidated] V"
-                        f"{vision_index} resolves against a vision "
-                        f"snapshot that has been invalidated since "
-                        f"you saw it (a previous click changed the "
-                        f"page meaningfully — the bbox indices no "
-                        f"longer line up with the current page "
-                        f"state). Call browser_screenshot to refresh "
-                        f"vision before clicking."
-                        + (f"\n{alts}" if alts else "")
-                    )
+                self.s.log_activity(
+                    f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
+                    f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
+                )
+                return (
+                    f"[click_at_failed:epoch_invalidated] V"
+                    f"{vision_index} resolves against a vision "
+                    f"snapshot that has been invalidated since you "
+                    f"saw it (a previous click changed the page "
+                    f"meaningfully — the bbox indices no longer "
+                    f"line up with the current page state). Call "
+                    f"browser_screenshot to refresh vision before "
+                    f"clicking."
+                    + (f"\n{alts}" if alts else "")
+                )
 
             # Prefer the frozen epoch (what the brain SAW on its last
             # screenshot), fall back to the live response only when no
