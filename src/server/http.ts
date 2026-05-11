@@ -879,6 +879,34 @@ export function createHttpServer(
           clickCount,
           expectedLabel: expected_label,
         });
+        // Phase B: cross-origin OOPIF fallback. clickInBbox's in-page
+        // descent (Phase A) couldn't access iframe.contentDocument
+        // because of the same-origin policy — its dispatched click
+        // landed on the iframe host, no-op. Walk page.frames() to
+        // locate the OOPIF and dispatch a frame-local snap + viewport
+        // CDP click. On success we MERGE the new snap result onto the
+        // original (preserving the rest of the post-click pipeline:
+        // settle, effect diff, dom_index resolution, etc.).
+        if (snap.warning === 'target_in_iframe_cross_origin') {
+          try {
+            const frameSnap = await page.clickInIframeFrame(dispatchBbox, {
+              button,
+              clickCount,
+              expectedLabel: expected_label,
+            });
+            if (frameSnap.snapped) {
+              Object.assign(snap, frameSnap);
+            } else if (frameSnap.warning) {
+              // Annotate with the resolution failure so the bridge can
+              // surface the right hint (iframe_not_resolved /
+              // iframe_no_target).
+              snap.warning = frameSnap.warning;
+            }
+          } catch (e) {
+            console.warn('[click] clickInIframeFrame fallback failed:',
+              (e as Error).message);
+          }
+        }
         // Label-mismatch escape: clickInBbox Phase 2 grid-scan found
         // no candidate matching the vision label and skipped dispatch.
         // Surface as `element_mismatch` (the shape click.py:667-686
@@ -1593,15 +1621,27 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { selector: rawSelector, button, clickCount, linear, ensureVisible } = req.body ?? {};
+      const {
+        selector: rawSelector, button, clickCount, linear, ensureVisible,
+        in_iframe: inIframe,
+      } = req.body ?? {};
       if (typeof rawSelector !== 'string' || !rawSelector) {
         res.status(400).json({ error: 'selector is required' });
         return;
       }
       const selector = normalizeIdSelector(rawSelector);
-      const result = await page.clickSelector(selector, {
-        button, clickCount, linear, ensureVisible,
-      });
+      // Phase D: when `in_iframe` (CSS for the iframe host) is provided,
+      // resolve the inner selector inside that frame instead of the
+      // top-level document. Same call surface for the bridge — Python
+      // tool only adds the optional param.
+      const result = (typeof inIframe === 'string' && inIframe.length > 0)
+        ? await page.clickSelectorInIframe(
+            normalizeIdSelector(inIframe), selector,
+            { button, clickCount, linear },
+          )
+        : await page.clickSelector(selector, {
+            button, clickCount, linear, ensureVisible,
+          });
       const newState = await page.getState({ useVision: false });
       res.json({
         success: true,

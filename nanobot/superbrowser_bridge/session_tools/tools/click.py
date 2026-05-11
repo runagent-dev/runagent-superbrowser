@@ -1038,18 +1038,37 @@ class BrowserClickAtTool(Tool):
                 f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
                 if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
             )
-            # A2: surface clickInBbox warnings so the brain can react.
-            # The click still dispatched; this is advisory — but on
-            # 'target_in_iframe' the click reliably hits the iframe
-            # host instead of inner content, so the brain should
-            # plan around it (e.g., switch to selector inside the
-            # iframe document).
+            # Surface clickInBbox warnings so the brain can react.
+            # Variants (Phase A/B):
+            #   - target_in_iframe_resolved: same-origin descent worked,
+            #     click landed on the inner element. Short success note.
+            #   - target_in_iframe_cross_origin: contentDocument blocked
+            #     by SOP; server-side Frame walk (clickInIframeFrame)
+            #     either succeeded (replaces this warning with _resolved)
+            #     or failed (this warning stays — actionable hint below).
+            #   - target_in_iframe: legacy — descent ran but stopped
+            #     without finding an inner SEL match. Click landed on
+            #     iframe host. Brain should escalate.
+            #   - pointer_events_none_ancestor: existing pe:none case.
             warn = snap.get("warning")
-            if warn == "target_in_iframe":
+            chain = snap.get("iframe_chain") or []
+            if warn == "target_in_iframe_resolved":
+                hops = f" depth={len(chain)}" if chain else ""
+                snap_note += f" [iframe_descent_ok{hops}]"
+            elif warn == "target_in_iframe_cross_origin":
                 snap_note += (
-                    " [WARN:target_in_iframe — click landed on the "
-                    "<iframe> host, NOT inner content. Inner-doc "
-                    "selectors require iframe-scoped tooling.]"
+                    " [WARN:iframe_cross_origin — outer-doc click cannot"
+                    " reach inner content (cross-origin SOP). Use"
+                    " browser_click_selector with in_iframe=<host_css>"
+                    " or scope DOM via iframe.contentDocument from a"
+                    " same-origin entry point.]"
+                )
+            elif warn == "target_in_iframe":
+                snap_note += (
+                    " [WARN:target_in_iframe — descent stopped without"
+                    " finding an inner clickable. Click landed on the"
+                    " <iframe> host, NOT inner content. Re-screenshot"
+                    " or use iframe-scoped tooling.]"
                 )
             elif warn == "pointer_events_none_ancestor":
                 snap_note += (
@@ -1358,6 +1377,17 @@ class BrowserGetRectTool(Tool):
             ),
             nullable=True,
         ),
+        in_iframe=StringSchema(
+            description=(
+                "CSS selector of an <iframe> host. When provided, "
+                "`selector` is resolved INSIDE the iframe's contentFrame "
+                "instead of the top-level document. Use this when the "
+                "target lives inside an embedded frame (e.g. quizzes, "
+                "calculators, captcha widgets). Same-origin iframes work "
+                "directly; cross-origin OOPIFs use Puppeteer's Frame API."
+            ),
+            nullable=True,
+        ),
         required=["session_id", "selector"],
     )
 )
@@ -1368,7 +1398,9 @@ class BrowserClickSelectorTool(Tool):
         "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
         "whenever the target has a stable hook — chess squares "
         "(.square-54), form fields (#email), buttons with data-test-id, "
-        "captcha handles. Fails fast if the selector is missing or zero-size."
+        "captcha handles. For elements inside an <iframe>, pass "
+        "in_iframe=<host_css> to scope the selector to that frame. "
+        "Fails fast if the selector is missing or zero-size."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1381,9 +1413,11 @@ class BrowserClickSelectorTool(Tool):
         button: str | None = None,
         click_count: int | None = None,
         linear: bool | None = None,
+        in_iframe: str | None = None,
         **kw: Any,
     ) -> str:
-        print(f"\n>> browser_click_selector({selector!r})")
+        scope_note = f" in_iframe={in_iframe!r}" if in_iframe else ""
+        print(f"\n>> browser_click_selector({selector!r}{scope_note})")
         # Phase 1.1: hard sync gate.
         sync_block = await self.s.ensure_vision_synced(reason="browser_click_selector")
         if sync_block:
@@ -1466,6 +1500,8 @@ class BrowserClickSelectorTool(Tool):
             payload["clickCount"] = click_count
         if linear is not None:
             payload["linear"] = linear
+        if in_iframe:
+            payload["in_iframe"] = in_iframe
 
         # Surgical undo: open a pending entry. pre_active is None for
         # selector clicks (we don't probe aria state on this path); the

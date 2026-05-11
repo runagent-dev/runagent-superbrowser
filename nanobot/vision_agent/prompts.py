@@ -228,6 +228,14 @@ Scene hierarchy (NEW — enables a "clear blockers before main goal" planner):
     - "chrome"   = site header/nav/footer that is not the target.
     - "content"  = article body, product card on a listing, map tile.
     - "unknown"  = unsure; leave as default when you can't decide.
+- Iframe-hosted UIs (a quiz, calculator, embedded game, captcha widget —
+  any rectangular region with its own scrollbar or chrome distinct from
+  the surrounding page) are NORMAL TARGETS. Tag inner buttons / inputs
+  with their usual `role` and `role_in_scene='target'`. The bridge has
+  iframe-aware click pathways (Phase A in-page descent + Phase B Frame
+  walk) — you do NOT need to avoid clicking inside iframes. When the
+  whole iframe is itself a target (e.g. "click the embedded video"),
+  emit ONE bbox covering the iframe with `role='other'`.
 - `layer_id` on every bbox = the id of the SceneLayer it belongs to.
   A bbox in the cookie banner gets layer_id="L0_modal" (or whatever id
   you gave that layer). A bbox in the site nav below the modal gets

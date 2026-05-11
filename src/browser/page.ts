@@ -636,7 +636,7 @@ export class PageWrapper {
                 tried,
                 error:
                   reasonStr === 'target_in_iframe'
-                    ? `Click target is inside an <iframe>; CDP coords land on the iframe host, not the inner element. Switch to selectors scoped to the iframe document, or browser_click_at(vision_index=V_n) which snaps inside.`
+                    ? `Click target is inside an <iframe>; this index-based path lands on the iframe host. Use browser_click_at(vision_index=V_n) — it descends through same-origin iframes and falls back to a Frame walk for cross-origin OOPIFs. Or use browser_click_selector(selector='<inner>', in_iframe='<host_css>') to target by CSS inside the frame.`
                     : reasonStr === 'rect_shifted'
                     ? `Element shifted between probe and dispatch (${validation.overlay}px) — page is mid-render. Re-screenshot to re-acquire fresh coords.`
                     : reasonStr === 'empty_stack'
@@ -906,10 +906,20 @@ export class PageWrapper {
     y: number;
     snapped: boolean;
     target?: string;
-    /** A2: advisory flag when the snapped element is inside an iframe
-     *  ('target_in_iframe') or has a pointer-events:none ancestor
-     *  ('pointer_events_none_ancestor'). The click still dispatches —
-     *  the bridge surfaces this so the brain can react. */
+    /** Advisory flag for the bridge. Variants:
+     *  - 'target_in_iframe_resolved': same-origin iframe descent
+     *    found the inner interactive element; click landed on the
+     *    real target. Informational, not an error.
+     *  - 'target_in_iframe_cross_origin': contentDocument was blocked
+     *    by same-origin policy; the in-page snap could not descend.
+     *    The /click handler falls back to Puppeteer Frame walk
+     *    (clickInIframeFrame).
+     *  - 'target_in_iframe': legacy — descent attempted but stopped
+     *    without finding an inner SEL match. Click landed on iframe
+     *    host; the bridge should escalate.
+     *  - 'pointer_events_none_ancestor': an ancestor has
+     *    pointer-events:none; click may have passed through to a
+     *    layer behind. */
     warning?: string;
     /** Xpath of the snapped interactive element — the /click handler
      *  uses it to look up the corresponding selectorMap index, so the
@@ -937,6 +947,11 @@ export class PageWrapper {
      *  a `linear:true` teleport click instead — mouse jumps to the
      *  exact target with no in-between hovers. */
     isAutocompleteOption?: boolean;
+    /** Phase A: xpaths of the iframe host elements that the snap
+     *  descended through to reach the inner target. Empty/undefined
+     *  when the snap stayed in the top-level document. Bridge logs
+     *  it for telemetry; tests can assert that descent occurred. */
+    iframe_chain?: string[];
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -983,8 +998,11 @@ export class PageWrapper {
           }
           return false;
         };
-        const cx = Math.round((b.x0 + b.x1) / 2);
-        const cy = Math.round((b.y0 + b.y1) / 2);
+        // `let` so Phase A's iframe descent can update these to the
+        // inner element's viewport coords. Phase 2 (grid scan) doesn't
+        // reuse them — it operates directly off `b.x0..b.y1`.
+        let cx = Math.round((b.x0 + b.x1) / 2);
+        let cy = Math.round((b.y0 + b.y1) / 2);
         const describe = (el: Element): string => {
           const tag = el.tagName.toLowerCase();
           const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
@@ -1080,6 +1098,64 @@ export class PageWrapper {
           if (descendant) {
             interactive = descendant;
           }
+          // === Phase A: same-origin iframe descent ===
+          // When `interactive` IS an iframe (vision bbox covered an
+          // iframe host element), the centre coords land on the
+          // iframe's BORDER from the outer document's perspective —
+          // CDP click at (cx,cy) hits the host, not the inner button.
+          // Descend into iframe.contentDocument and re-snap there.
+          // contentDocument throws on cross-origin → flag for the
+          // server-side Frame walk fallback (Phase B). Cap depth at
+          // 3 to handle iframes-inside-iframes without infinite loops.
+          let iframeChain: string[] = [];
+          let iframeDescentFailed = false;
+          let descentDepth = 0;
+          while (interactive
+                 && interactive.tagName.toLowerCase() === 'iframe'
+                 && descentDepth < 3) {
+            const iframeEl = interactive as HTMLIFrameElement;
+            const ir = iframeEl.getBoundingClientRect();
+            const localX = cx - ir.left;
+            const localY = cy - ir.top;
+            let innerDoc: Document | null = null;
+            try { innerDoc = iframeEl.contentDocument; } catch { /* x-origin */ }
+            if (!innerDoc) { iframeDescentFailed = true; break; }
+            let innerStack: Element[] = [];
+            try {
+              innerStack = innerDoc.elementsFromPoint(localX, localY);
+            } catch { innerStack = []; }
+            const innerCentre = innerStack.find(
+              (el) => el !== innerDoc!.documentElement && el !== innerDoc!.body,
+            );
+            if (!innerCentre) break;
+            // Mirror the top-level snap: walk stack for SEL match,
+            // fall back to closest(SEL) ancestor of the centre element.
+            let innerInteractive: Element | null = null;
+            for (const el of innerStack) {
+              if (el === innerDoc.documentElement || el === innerDoc.body) break;
+              try {
+                if ((el as Element).matches(SEL)) {
+                  innerInteractive = el as Element;
+                  break;
+                }
+              } catch { /* ignore */ }
+            }
+            if (!innerInteractive) {
+              innerInteractive = (innerCentre as Element).closest(SEL) || innerCentre;
+            }
+            iframeChain.push(xpathOf(iframeEl));
+            // Recompute viewport (cx,cy) from the inner element's
+            // frame-local rect. The host's getBoundingClientRect()
+            // gives us the viewport offset; the inner rect is in
+            // iframe-local coords, so add ir.left/ir.top to translate.
+            const innerRect = (innerInteractive as HTMLElement).getBoundingClientRect();
+            cx = Math.round(ir.left + innerRect.left + innerRect.width / 2);
+            cy = Math.round(ir.top + innerRect.top + innerRect.height / 2);
+            interactive = innerInteractive;
+            descentDepth += 1;
+          }
+          const descended = iframeChain.length > 0;
+          // === end Phase A ===
           // v6 F2: label-match check. When vision provided an
           // expectedLabel, verify the snapped element's text/aria-label
           // aligns. After a page shift, the bbox centre may now hit a
@@ -1118,7 +1194,21 @@ export class PageWrapper {
           // them so the brain can react.
           let warning: string | undefined;
           if (interactive.tagName.toLowerCase() === 'iframe') {
-            warning = 'target_in_iframe';
+            // Phase A: descent left us still on an iframe. Either
+            // contentDocument was inaccessible (cross-origin) or the
+            // descent loop hit no inner SEL match. Cross-origin path
+            // is handled server-side via clickInIframeFrame; legacy
+            // 'target_in_iframe' covers the rarer "descent stopped"
+            // case so existing callers keep their behaviour.
+            warning = iframeDescentFailed
+              ? 'target_in_iframe_cross_origin'
+              : 'target_in_iframe';
+          } else if (descended) {
+            // Phase A: same-origin descent succeeded — click is about
+            // to land on the real inner element. Informational only;
+            // existing callers that branch on `warning` won't match
+            // any of the legacy strings.
+            warning = 'target_in_iframe_resolved';
           } else {
             // Walk up to body looking for pointer-events:none on
             // ancestors. A leaf with pointer-events:none doesn't
@@ -1142,9 +1232,13 @@ export class PageWrapper {
           // padding outside the child's rect, which would dispatch
           // the click on a non-handler. For wrapper elements the
           // bbox centre is still right.
+          //
+          // Phase A: if iframe descent succeeded, cx/cy ALREADY point
+          // at the inner element's viewport coords — don't let the
+          // (outer-doc) descendant search override them.
           let dispatchX = cx;
           let dispatchY = cy;
-          if (descendant) {
+          if (descendant && !descended) {
             const dr = (descendant as HTMLElement).getBoundingClientRect();
             dispatchX = Math.round(dr.left + dr.width / 2);
             dispatchY = Math.round(dr.top + dr.height / 2);
@@ -1157,6 +1251,7 @@ export class PageWrapper {
             warning,
             targetXpath: xpathOf(interactive),
             isAutocompleteOption: isAutocompleteOptionEl(interactive),
+            iframe_chain: descended ? iframeChain : undefined,
           };
           } /* end if (labelMatch) */
           // labelMatch=false: fall through to Phase 2 grid-scan below.
@@ -1566,6 +1661,134 @@ export class PageWrapper {
     });
     await this.waitForIdle(1000).catch(() => {});
     return { x, y, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } };
+  }
+
+  /**
+   * Phase D — selector click scoped to an <iframe>. The brain calls
+   * `browser_click_selector(selector='button.start', in_iframe='#quiz')`
+   * when the target lives inside an embedded frame. Resolution path:
+   *
+   *  1. Resolve the iframe host element in the main document via
+   *     page.$(`hostSelector`). 400 if missing.
+   *  2. Walk page.frames() to find the matching Puppeteer Frame for
+   *     that host (URL-match / boundingBox containment).
+   *  3. Run `frame.evaluate(querySelector + getBoundingClientRect)`
+   *     to get the inner element's frame-local rect. 400 if missing.
+   *  4. Translate frame-local centre → viewport coords using the host
+   *     iframe's bounding box (works for same-origin AND cross-origin
+   *     OOPIFs because the host element is always reachable from the
+   *     parent document).
+   *  5. Dispatch a CDP click at the viewport coords. Chromium's
+   *     compositor routes hit-tests through the OOPIF.
+   */
+  async clickSelectorInIframe(
+    hostSelector: string,
+    selector: string,
+    opts?: {
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+      linear?: boolean;
+    },
+  ): Promise<{
+    x: number;
+    y: number;
+    rect: { x: number; y: number; w: number; h: number };
+    iframe_host: string;
+    frame_url: string;
+  }> {
+    // Step 1+2: resolve host element + matching Frame.
+    const hostHandle = await this.page.$(hostSelector);
+    if (!hostHandle) {
+      throw new BadRequest(
+        `clickSelectorInIframe: iframe host not found: ${hostSelector}`,
+      );
+    }
+    const hostBox = await hostHandle.boundingBox();
+    if (!hostBox || hostBox.width <= 0 || hostBox.height <= 0) {
+      await hostHandle.dispose();
+      throw new BadRequest(
+        `clickSelectorInIframe: iframe host zero-size or off-page: ${hostSelector}`,
+      );
+    }
+    const frame = await hostHandle.contentFrame();
+    await hostHandle.dispose();
+    if (!frame) {
+      throw new BadRequest(
+        `clickSelectorInIframe: contentFrame() returned null for ${hostSelector}`
+        + ' — the host may be a sandboxed iframe with srcdoc/about:blank.',
+      );
+    }
+
+    // Step 3: frame-local selector resolution.
+    const inner = await frame.evaluate((sel: string) => {
+      // Visibility-aware querySelector: walk querySelectorAll and pick
+      // the first non-zero-rect match. Mirrors the top-level getRects
+      // resilience (page.ts:1485) so a closed-listbox sibling earlier
+      // in DOM order doesn't shadow the visible target.
+      let chosen: Element | null = null;
+      try {
+        const list = document.querySelectorAll(sel);
+        for (const el of Array.from(list)) {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { chosen = el; break; }
+        }
+      } catch (e) {
+        return { __syntaxError: true as const, message: (e as Error).message };
+      }
+      if (!chosen) return null;
+      const r = (chosen as HTMLElement).getBoundingClientRect();
+      return {
+        x: r.x, y: r.y, w: r.width, h: r.height,
+        cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+      };
+    }, selector);
+    if (inner && '__syntaxError' in inner) {
+      throw new BadRequest(
+        `clickSelectorInIframe: invalid CSS in inner selector ${selector}: ${inner.message}`,
+      );
+    }
+    if (!inner) {
+      throw new BadRequest(
+        `clickSelectorInIframe: inner selector not found or zero-size: ${selector}`
+        + ` (inside ${hostSelector})`,
+      );
+    }
+
+    // Step 4: translate frame-local centre → viewport coords.
+    const x = Math.round(hostBox.x + inner.cx);
+    const y = Math.round(hostBox.y + inner.cy);
+    const rect = {
+      x: Math.round(hostBox.x + inner.x),
+      y: Math.round(hostBox.y + inner.y),
+      w: Math.round(inner.w),
+      h: Math.round(inner.h),
+    };
+
+    const willBeLinear = opts?.linear ?? true;
+    if (this.sessionId) {
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, x, y);
+      }
+      inputEventBus.emitClickTarget(
+        this.sessionId, x, y, true, undefined,
+        `${hostSelector} >> ${selector}`,
+      );
+    }
+
+    // Step 5: CDP click at viewport coords.
+    const client = await this.getCDPSession();
+    await dispatchClick(client, x, y, {
+      button: opts?.button,
+      clickCount: opts?.clickCount,
+      linear: willBeLinear,
+      sessionId: this.sessionId,
+    });
+    await this.waitForIdle(1000).catch(() => {});
+    return {
+      x, y, rect,
+      iframe_host: hostSelector,
+      frame_url: frame.url(),
+    };
   }
 
   /**
@@ -3164,6 +3387,200 @@ export class PageWrapper {
       `[page.getFrameOffset] could not resolve offset for frame ${frame.url()}; using (0,0)`,
     );
     return { x: 0, y: 0 };
+  }
+
+  /**
+   * Phase B helper — find the Puppeteer Frame whose host iframe
+   * contains the given viewport coords, returning the frame plus the
+   * coords translated into iframe-local space. Used by
+   * `clickInIframeFrame` when in-page descent (Phase A) hit a cross-
+   * origin iframe boundary. Walks `page.frames()` skipping the main
+   * frame; for each non-main frame, resolves its host bounding box via
+   * `frameElement().boundingBox()` (works for same-origin AND most
+   * cross-origin iframes — see `getFrameOffset`'s URL-match fallback).
+   * Picks the deepest match (innermost iframe wins on nested cases).
+   */
+  private async findFrameForIframeAt(
+    vx: number,
+    vy: number,
+  ): Promise<{
+    frame: import('puppeteer-core').Frame;
+    localX: number;
+    localY: number;
+    hostBox: { x: number; y: number; w: number; h: number };
+  } | null> {
+    let best: {
+      frame: import('puppeteer-core').Frame;
+      localX: number;
+      localY: number;
+      hostBox: { x: number; y: number; w: number; h: number };
+      area: number;
+    } | null = null;
+    for (const frame of this.page.frames()) {
+      if (frame === this.page.mainFrame()) continue;
+      let box: { x: number; y: number; width: number; height: number } | null = null;
+      try {
+        const handle = await frame.frameElement();
+        if (handle) box = await handle.boundingBox();
+      } catch {
+        /* x-origin frameElement may throw; fall through */
+      }
+      if (!box) {
+        // Use getFrameOffset's URL-match fallback for x-origin frames
+        // whose frameElement() throws — gives us {x,y} but not w/h, so
+        // we skip nested iframe disambiguation in that case.
+        const off = await this.getFrameOffset(frame);
+        if (off.x === 0 && off.y === 0) continue;
+        box = { x: off.x, y: off.y, width: 1, height: 1 };
+      }
+      if (vx < box.x || vx > box.x + box.width
+       || vy < box.y || vy > box.y + box.height) continue;
+      const area = Math.max(1, box.width * box.height);
+      if (!best || area < best.area) {
+        // Smaller area = deeper / more specific match (iframe nested
+        // inside another iframe). Prefer the innermost.
+        best = {
+          frame,
+          localX: vx - box.x,
+          localY: vy - box.y,
+          hostBox: { x: box.x, y: box.y, w: box.width, h: box.height },
+          area,
+        };
+      }
+    }
+    if (!best) return null;
+    return {
+      frame: best.frame,
+      localX: best.localX,
+      localY: best.localY,
+      hostBox: best.hostBox,
+    };
+  }
+
+  /**
+   * Phase B — server-side cross-origin OOPIF click fallback. Invoked
+   * by the /click handler when `clickInBbox` returns
+   * `warning === 'target_in_iframe_cross_origin'` (Phase A's in-page
+   * descent could not access `iframe.contentDocument` due to SOP).
+   *
+   * Strategy: walk `page.frames()` to find the iframe hosting the
+   * bbox center. Run a frame-local snap inside `frame.evaluate()` to
+   * find the inner interactive element. Dispatch the CDP click at
+   * the recomputed viewport coords — Chromium's compositor routes it
+   * to the OOPIF for most cases. On dispatch failure (zero DOM
+   * mutation), the existing js/keyboard escalation ladder in the
+   * /click handler picks up the recovery path.
+   */
+  async clickInIframeFrame(
+    bbox: { x0: number; y0: number; x1: number; y1: number },
+    options?: {
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+      expectedLabel?: string;
+      linear?: boolean;
+    },
+  ): Promise<{
+    x: number;
+    y: number;
+    snapped: boolean;
+    target?: string;
+    targetXpath?: string;
+    warning?: string;
+    iframe_chain?: string[];
+  }> {
+    const cx = Math.round((bbox.x0 + bbox.x1) / 2);
+    const cy = Math.round((bbox.y0 + bbox.y1) / 2);
+    const found = await this.findFrameForIframeAt(cx, cy);
+    if (!found) {
+      return { x: cx, y: cy, snapped: false, warning: 'iframe_not_resolved' };
+    }
+    const { frame, localX, localY, hostBox } = found;
+
+    // Frame-local snap. Mirrors the inner-document descent block from
+    // `clickInBbox` Phase A but runs INSIDE `frame.evaluate()` so it
+    // works for cross-origin iframes too. Returns the inner element's
+    // frame-local centre rect; we add `hostBox.x/y` to translate back
+    // to viewport coords for CDP dispatch.
+    const snap = await frame.evaluate(
+      (args: { lx: number; ly: number; expectedLabel: string }) => {
+        const SEL = 'a,button,input,select,textarea,'
+          + '[role="button"],[role="link"],[role="checkbox"],'
+          + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+        let stack: Element[] = [];
+        try { stack = document.elementsFromPoint(args.lx, args.ly); } catch { stack = []; }
+        const centre = stack.find(
+          (el) => el !== document.documentElement && el !== document.body,
+        );
+        if (!centre) return null;
+        let interactive: Element | null = null;
+        for (const el of stack) {
+          if (el === document.documentElement || el === document.body) break;
+          try {
+            if ((el as Element).matches(SEL)) { interactive = el as Element; break; }
+          } catch { /* ignore */ }
+        }
+        if (!interactive) {
+          interactive = (centre as Element).closest(SEL) || centre;
+        }
+        const r = (interactive as HTMLElement).getBoundingClientRect();
+        const tag = interactive.tagName.toLowerCase();
+        const id = (interactive as HTMLElement).id ? `#${(interactive as HTMLElement).id}` : '';
+        const txt = ((interactive as HTMLElement).textContent || '').trim().slice(0, 30);
+        const xpath = (() => {
+          const parts: string[] = [];
+          let cur: Element | null = interactive;
+          while (cur && cur.nodeType === 1
+                 && cur !== document.documentElement.parentElement) {
+            const t = cur.tagName.toLowerCase();
+            let idx = 1;
+            let sib: Element | null = cur.previousElementSibling;
+            while (sib) {
+              if (sib.tagName.toLowerCase() === t) idx += 1;
+              sib = sib.previousElementSibling;
+            }
+            parts.unshift(`${t}[${idx}]`);
+            cur = cur.parentElement;
+          }
+          return '/' + parts.join('/');
+        })();
+        return {
+          localCx: Math.round(r.left + r.width / 2),
+          localCy: Math.round(r.top + r.height / 2),
+          target: `${tag}${id}${txt ? `[${txt}]` : ''}`,
+          targetXpath: xpath,
+          tag,
+        };
+      },
+      { lx: localX, ly: localY, expectedLabel: options?.expectedLabel ?? '' },
+    );
+    if (!snap) {
+      return { x: cx, y: cy, snapped: false, warning: 'iframe_no_target' };
+    }
+    // Translate frame-local centre back to viewport coords. Chromium's
+    // compositor uses viewport coords for hit-testing across the OOPIF
+    // boundary, so this is the right input for CDP dispatch.
+    const dispatchX = Math.round(hostBox.x + snap.localCx);
+    const dispatchY = Math.round(hostBox.y + snap.localCy);
+    const client = await this.getCDPSession();
+    await dispatchClick(client, dispatchX, dispatchY, {
+      ...options,
+      sessionId: this.sessionId,
+    });
+    await this.waitForIdle(800).catch(() => {});
+    // Best-effort xpath of the host iframe for telemetry. We don't
+    // have a direct frame.frameElement xpath helper — log the URL and
+    // a synthetic marker so the brain knows descent was the cross-
+    // origin path.
+    const frameUrl = frame.url();
+    return {
+      x: dispatchX,
+      y: dispatchY,
+      snapped: true,
+      target: snap.target,
+      targetXpath: snap.targetXpath,
+      warning: 'target_in_iframe_resolved',
+      iframe_chain: [`x-origin:${frameUrl.slice(0, 80)}`],
+    };
   }
 
   /**
