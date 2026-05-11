@@ -704,15 +704,18 @@ export function createHttpServer(
         }
       }
 
-      // Phase I: same-origin iframe content signature. The element tree
-      // only walks the main document — iframe-hosted UIs (quizzes,
-      // calculators) update their inner content while the outer DOM
-      // stays identical, which would otherwise cause the vision cache
-      // (keyed on dom_hash_of(elements)) to return stale bboxes. We
-      // emit a per-iframe summary (body.innerText length + first 200
-      // chars + scroll position) so the Python bridge can mix it into
-      // its dom_hash key. Cross-origin iframes throw on
-      // contentDocument access — handled silently and skipped.
+      // Phase I: same-origin iframe content signature. Includes:
+      //   - body.innerText length + first 200 chars + scrollY (catches
+      //     question-text changes, layout updates, new screens)
+      //   - input/textarea/select values + checked/selectedIndex state
+      //     (catches typing into iframe inputs — values are NOT in
+      //     innerText, so without this typing "44" into #userAnswer
+      //     leaves the signature unchanged and the vision cache stays
+      //     stale)
+      //   - active element id/tag (focus changes affect what
+      //     browser_keys will target next)
+      // Cross-origin iframes throw on contentDocument access — handled
+      // silently and skipped (empty contribution for those).
       let iframeSignature = '';
       try {
         iframeSignature = await page.getRawPage().evaluate(() => {
@@ -726,7 +729,56 @@ export function createHttpServer(
               if (d && d.body) {
                 const txt = (d.body.innerText || '').replace(/\s+/g, ' ').trim();
                 const sy = (d.defaultView && d.defaultView.scrollY) || 0;
-                inner = `len=${txt.length} sy=${Math.round(sy)} head=${txt.slice(0, 200)}`;
+                // Phase I': capture form field values. innerText does
+                // NOT include <input>/<textarea>/<select> values, so
+                // typing into iframe inputs is invisible to the outer
+                // signature without this. Cap at 30 fields and 50 chars
+                // each to keep the signature compact.
+                const fields = d.querySelectorAll('input,textarea,select');
+                const fvParts: string[] = [];
+                for (let j = 0; j < Math.min(fields.length, 30); j++) {
+                  const fe = fields[j] as HTMLInputElement
+                                       | HTMLTextAreaElement
+                                       | HTMLSelectElement;
+                  const tag = fe.tagName.toLowerCase();
+                  const id = fe.id ? `#${fe.id}` : `[${j}]`;
+                  let val = '';
+                  try {
+                    if (tag === 'select') {
+                      val = (fe as HTMLSelectElement).value || '';
+                    } else if (tag === 'input') {
+                      const inp = fe as HTMLInputElement;
+                      const t = (inp.type || 'text').toLowerCase();
+                      if (t === 'checkbox' || t === 'radio') {
+                        val = inp.checked ? '1' : '0';
+                      } else {
+                        val = inp.value || '';
+                      }
+                    } else {
+                      val = (fe as HTMLTextAreaElement).value || '';
+                    }
+                  } catch { val = ''; }
+                  // Only include non-empty values + every <select>
+                  // (so a default-select still appears) to keep size
+                  // bounded.
+                  if (val || tag === 'select') {
+                    fvParts.push(`${tag}${id}=${val.slice(0, 50)}`);
+                  }
+                }
+                const fv = fvParts.join('|');
+                // Active element marker — focus state inside the
+                // iframe. Affects whether browser_keys will hit the
+                // right field.
+                let activeMarker = '';
+                try {
+                  const ae = d.activeElement as HTMLElement | null;
+                  if (ae && ae !== d.body && ae !== d.documentElement) {
+                    const aeId = ae.id ? `#${ae.id}` : '';
+                    activeMarker = ` active=${ae.tagName.toLowerCase()}${aeId}`;
+                  }
+                } catch { /* ignore */ }
+                inner = `len=${txt.length} sy=${Math.round(sy)}`
+                      + `${activeMarker} fv=${fv} head=${txt.slice(0, 200)}`;
               }
             } catch { /* cross-origin */ }
             const r = f.getBoundingClientRect();

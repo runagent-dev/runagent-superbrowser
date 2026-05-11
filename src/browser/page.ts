@@ -1237,6 +1237,20 @@ export class PageWrapper {
             const innerRect = (innerInteractive as HTMLElement).getBoundingClientRect();
             cx = Math.round(ir.left + innerRect.left + innerRect.width / 2);
             cy = Math.round(ir.top + innerRect.top + innerRect.height / 2);
+            // Phase J: pre-focus iframe inputs. The upcoming CDP click
+            // transfers focus on most pages, but cross-frame focus is
+            // unreliable in headless Chromium — sometimes a click on
+            // an iframe input leaves focus on the OUTER document.body,
+            // and a follow-up `browser_keys` then types into the void.
+            // Set focus explicitly here so the keystroke target is
+            // committed before the click dispatches. Skip <select>
+            // (CDP click can't drive the native dropdown anyway; Phase
+            // G's hint redirects to browser_select_option).
+            const _innerTag = innerInteractive.tagName.toLowerCase();
+            if (_innerTag === 'input' || _innerTag === 'textarea'
+                || (innerInteractive as HTMLElement).isContentEditable) {
+              try { (innerInteractive as HTMLElement).focus(); } catch (_) { /* x-frame edge */ }
+            }
             interactive = innerInteractive;
             descentDepth += 1;
           }
@@ -1809,6 +1823,7 @@ export class PageWrapper {
     iframe_host: string;
     frame_url: string;
     native_select?: boolean;
+    focused_iframe_input?: boolean;
   }> {
     // Step 1+2: resolve host element + matching Frame.
     const hostHandle = await this.page.$(hostSelector);
@@ -1902,6 +1917,39 @@ export class PageWrapper {
       sessionId: this.sessionId,
     });
     await this.waitForIdle(1000).catch(() => {});
+
+    // Phase J: explicit focus for iframe inputs. CDP
+    // Input.dispatchMouseEvent at viewport coords reliably routes the
+    // hit-test through the compositor to the iframe element, but the
+    // FOCUS transfer for cross-frame inputs is not always carried
+    // along — Chromium occasionally leaves focus on the outer
+    // document.body. When the very next call is `browser_keys` (the
+    // typical sequence for filling iframe inputs), keys silently fly
+    // into document.body instead of the input.
+    //
+    // Force focus inside the iframe for text-bearing targets. Skip
+    // <select> (focus is set by CDP click and explicit focus may
+    // open the native dropdown which CDP can't drive anyway), skip
+    // buttons / links (no keyboard input expected).
+    const focusableTag =
+      inner.tag === 'input' || inner.tag === 'textarea';
+    if (focusableTag) {
+      try {
+        await frame.evaluate((sel: string) => {
+          const list = document.querySelectorAll(sel);
+          for (const el of Array.from(list)) {
+            const r = (el as HTMLElement).getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              try { (el as HTMLElement).focus(); } catch (_) { /* ignore */ }
+              break;
+            }
+          }
+        }, selector);
+      } catch {
+        /* best-effort — never block on focus transfer */
+      }
+    }
+
     return {
       x, y, rect,
       iframe_host: hostSelector,
@@ -1909,6 +1957,10 @@ export class PageWrapper {
       // Phase G: surface inner tag so the bridge can hint the brain
       // at browser_select_option when the target is a native <select>.
       native_select: inner.tag === 'select' ? true : undefined,
+      // Phase J: indicate that we explicitly focused an iframe-internal
+      // input. The bridge can surface this so the brain knows the
+      // next `browser_keys` will reliably land in the right field.
+      focused_iframe_input: focusableTag ? true : undefined,
     };
   }
 
