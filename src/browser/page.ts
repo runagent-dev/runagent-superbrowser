@@ -952,6 +952,13 @@ export class PageWrapper {
      *  when the snap stayed in the top-level document. Bridge logs
      *  it for telemetry; tests can assert that descent occurred. */
     iframe_chain?: string[];
+    /** Phase A: a stable CSS selector for the host iframe (best-guess
+     *  from id / aria-label / name, falling back to `iframe`). Set
+     *  whenever the snap touched an iframe — on success, miss, or
+     *  cross-origin failure. The bridge surfaces it so the brain can
+     *  pass it back via browser_click_selector(in_iframe=…) without
+     *  running an inspection script first. */
+    iframe_host_selector?: string;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -1099,55 +1106,126 @@ export class PageWrapper {
             interactive = descendant;
           }
           // === Phase A: same-origin iframe descent ===
-          // When `interactive` IS an iframe (vision bbox covered an
-          // iframe host element), the centre coords land on the
-          // iframe's BORDER from the outer document's perspective —
-          // CDP click at (cx,cy) hits the host, not the inner button.
-          // Descend into iframe.contentDocument and re-snap there.
-          // contentDocument throws on cross-origin → flag for the
-          // server-side Frame walk fallback (Phase B). Cap depth at
-          // 3 to handle iframes-inside-iframes without infinite loops.
+          // When `interactive` IS an iframe, the centre coords land on
+          // the iframe's BORDER from the outer document's perspective
+          // — CDP click at (cx,cy) hits the host, not the inner
+          // button. Descend into iframe.contentDocument and re-snap.
+          //
+          // Three failure modes get distinct signals:
+          //   - contentDocument throws or is null  → cross-origin or
+          //     unloaded; flag for Phase B Frame walk.
+          //   - innerCentre missing at pinpoint    → run an in-iframe
+          //     grid scan (vision bbox often loose for iframe targets;
+          //     centre lands on padding while the link is offset).
+          //   - inner grid scan also empty         → flag iframe_miss
+          //     so Phase B fallback fires in http.ts.
+          //
+          // Caps descent at depth 3 to handle iframes-inside-iframes
+          // without infinite loops.
           let iframeChain: string[] = [];
           let iframeDescentFailed = false;
+          let iframeDescentMissed = false;   // contentDocument ok but no inner clickable
+          let iframeHostSelector = '';        // best-guess CSS for the host (for bridge hint)
           let descentDepth = 0;
           while (interactive
                  && interactive.tagName.toLowerCase() === 'iframe'
                  && descentDepth < 3) {
             const iframeEl = interactive as HTMLIFrameElement;
             const ir = iframeEl.getBoundingClientRect();
-            const localX = cx - ir.left;
-            const localY = cy - ir.top;
+            const localCx = cx - ir.left;
+            const localCy = cy - ir.top;
+            // Capture a host selector for the bridge advisory. Prefer
+            // [id] / [aria-label] / [name] (stable hooks the brain
+            // can pass back via in_iframe). Falls back to tag+nth.
+            if (!iframeHostSelector) {
+              const id = (iframeEl as HTMLElement).id;
+              const ariaLabel = iframeEl.getAttribute('aria-label');
+              const name = iframeEl.getAttribute('name');
+              if (id) iframeHostSelector = `iframe#${id}`;
+              else if (ariaLabel) iframeHostSelector = `iframe[aria-label="${ariaLabel}"]`;
+              else if (name) iframeHostSelector = `iframe[name="${name}"]`;
+              else iframeHostSelector = 'iframe';
+            }
             let innerDoc: Document | null = null;
             try { innerDoc = iframeEl.contentDocument; } catch { /* x-origin */ }
             if (!innerDoc) { iframeDescentFailed = true; break; }
+
+            // Pinpoint inside iframe (frame-local elementsFromPoint).
             let innerStack: Element[] = [];
             try {
-              innerStack = innerDoc.elementsFromPoint(localX, localY);
+              innerStack = innerDoc.elementsFromPoint(localCx, localCy);
             } catch { innerStack = []; }
-            const innerCentre = innerStack.find(
+            let innerCentre = innerStack.find(
               (el) => el !== innerDoc!.documentElement && el !== innerDoc!.body,
             );
-            if (!innerCentre) break;
-            // Mirror the top-level snap: walk stack for SEL match,
-            // fall back to closest(SEL) ancestor of the centre element.
+
+            // If pinpoint missed (centre lands on iframe scrollbar /
+            // padding / loose-bbox whitespace), run a 5×5 grid scan
+            // INSIDE the iframe. Translates the outer bbox into
+            // iframe-local coords first. Picks the largest interactive
+            // whose iframe-local rect overlaps the bbox — same shape
+            // as Phase 2 grid scan at the top level.
             let innerInteractive: Element | null = null;
-            for (const el of innerStack) {
-              if (el === innerDoc.documentElement || el === innerDoc.body) break;
-              try {
-                if ((el as Element).matches(SEL)) {
-                  innerInteractive = el as Element;
-                  break;
+            if (!innerCentre) {
+              const localB = {
+                x0: b.x0 - ir.left, y0: b.y0 - ir.top,
+                x1: b.x1 - ir.left, y1: b.y1 - ir.top,
+              };
+              let best: Element | null = null;
+              let bestArea = 0;
+              for (let i = 1; i < 5; i++) {
+                for (let j = 1; j < 5; j++) {
+                  const px = localB.x0 + ((localB.x1 - localB.x0) * i) / 5;
+                  const py = localB.y0 + ((localB.y1 - localB.y0) * j) / 5;
+                  let stack: Element[] = [];
+                  try {
+                    stack = innerDoc.elementsFromPoint(px, py);
+                  } catch { stack = []; }
+                  for (const el of stack) {
+                    const hit = (el as Element).closest(SEL);
+                    if (!hit) continue;
+                    const r = (hit as HTMLElement).getBoundingClientRect();
+                    const ix = Math.max(0, Math.min(r.right, localB.x1) - Math.max(r.left, localB.x0));
+                    const iy = Math.max(0, Math.min(r.bottom, localB.y1) - Math.max(r.top, localB.y0));
+                    const area = ix * iy;
+                    if (area > bestArea) {
+                      bestArea = area;
+                      best = hit;
+                    }
+                  }
                 }
-              } catch { /* ignore */ }
+              }
+              if (best) {
+                innerInteractive = best;
+                innerCentre = best;
+              } else {
+                // Inner grid scan also empty — bbox doesn't overlap any
+                // clickable inside this iframe. Flag for Phase B.
+                iframeDescentMissed = true;
+                break;
+              }
             }
+
+            // Pinpoint succeeded. Walk the stack for the best SEL match
+            // (front-to-back z-order), then fall back to closest(SEL).
             if (!innerInteractive) {
-              innerInteractive = (innerCentre as Element).closest(SEL) || innerCentre;
+              for (const el of innerStack) {
+                if (el === innerDoc.documentElement || el === innerDoc.body) break;
+                try {
+                  if ((el as Element).matches(SEL)) {
+                    innerInteractive = el as Element;
+                    break;
+                  }
+                } catch { /* ignore */ }
+              }
+              if (!innerInteractive) {
+                innerInteractive = (innerCentre as Element).closest(SEL) || innerCentre;
+              }
             }
             iframeChain.push(xpathOf(iframeEl));
             // Recompute viewport (cx,cy) from the inner element's
-            // frame-local rect. The host's getBoundingClientRect()
-            // gives us the viewport offset; the inner rect is in
-            // iframe-local coords, so add ir.left/ir.top to translate.
+            // frame-local rect. ir.left/ir.top = host viewport offset;
+            // innerRect is iframe-local coords, so we add them.
             const innerRect = (innerInteractive as HTMLElement).getBoundingClientRect();
             cx = Math.round(ir.left + innerRect.left + innerRect.width / 2);
             cy = Math.round(ir.top + innerRect.top + innerRect.height / 2);
@@ -1194,15 +1272,26 @@ export class PageWrapper {
           // them so the brain can react.
           let warning: string | undefined;
           if (interactive.tagName.toLowerCase() === 'iframe') {
-            // Phase A: descent left us still on an iframe. Either
-            // contentDocument was inaccessible (cross-origin) or the
-            // descent loop hit no inner SEL match. Cross-origin path
-            // is handled server-side via clickInIframeFrame; legacy
-            // 'target_in_iframe' covers the rarer "descent stopped"
-            // case so existing callers keep their behaviour.
+            // Phase A descent could not produce an inner clickable.
+            // Three signals so the bridge / http.ts can route correctly:
+            //  - cross_origin: contentDocument blocked by SOP. Phase B
+            //    Frame walk applies (it can still access cross-origin
+            //    frames via Puppeteer's Target API).
+            //  - miss: contentDocument accessible BUT neither pinpoint
+            //    nor inner grid scan found a clickable overlapping the
+            //    bbox. Either the bbox is loose (covers padding only)
+            //    or the iframe has no clickable in this region.
+            //    Phase B still worth trying — its broader scan may
+            //    find a candidate.
+            //  - legacy `target_in_iframe`: should not fire now (the
+            //    descent loop always sets one of the above flags) —
+            //    kept for backward-compat with any callers that pattern-
+            //    match the legacy substring.
             warning = iframeDescentFailed
               ? 'target_in_iframe_cross_origin'
-              : 'target_in_iframe';
+              : (iframeDescentMissed
+                  ? 'target_in_iframe_miss'
+                  : 'target_in_iframe');
           } else if (descended) {
             // Phase A: same-origin descent succeeded — click is about
             // to land on the real inner element. Informational only;
@@ -1252,6 +1341,13 @@ export class PageWrapper {
             targetXpath: xpathOf(interactive),
             isAutocompleteOption: isAutocompleteOptionEl(interactive),
             iframe_chain: descended ? iframeChain : undefined,
+            // Bridge surfaces this so brain can pass it back via
+            // browser_click_selector(in_iframe=<host_selector>) without
+            // having to run a separate inspection script.
+            iframe_host_selector: (iframeDescentFailed || iframeDescentMissed
+                                    || iframeChain.length > 0)
+              ? iframeHostSelector || undefined
+              : undefined,
           };
           } /* end if (labelMatch) */
           // labelMatch=false: fall through to Phase 2 grid-scan below.
@@ -3496,39 +3592,28 @@ export class PageWrapper {
     }
     const { frame, localX, localY, hostBox } = found;
 
-    // Frame-local snap. Mirrors the inner-document descent block from
-    // `clickInBbox` Phase A but runs INSIDE `frame.evaluate()` so it
-    // works for cross-origin iframes too. Returns the inner element's
-    // frame-local centre rect; we add `hostBox.x/y` to translate back
-    // to viewport coords for CDP dispatch.
+    // Frame-local snap. Two-stage: pinpoint at the bbox centre, then
+    // 5×5 grid scan inside the bbox if pinpoint misses. The grid scan
+    // is critical for iframe targets — vision bboxes for iframe
+    // content are often loose (cover whitespace + the actual button),
+    // so the centre lands on padding. Mirrors Phase 2 grid scan from
+    // the top-level snap.
+    const bboxLocal = {
+      x0: bbox.x0 - hostBox.x, y0: bbox.y0 - hostBox.y,
+      x1: bbox.x1 - hostBox.x, y1: bbox.y1 - hostBox.y,
+    };
     const snap = await frame.evaluate(
-      (args: { lx: number; ly: number; expectedLabel: string }) => {
+      (args: {
+        lx: number; ly: number;
+        b: { x0: number; y0: number; x1: number; y1: number };
+        expectedLabel: string;
+      }) => {
         const SEL = 'a,button,input,select,textarea,'
           + '[role="button"],[role="link"],[role="checkbox"],'
           + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
-        let stack: Element[] = [];
-        try { stack = document.elementsFromPoint(args.lx, args.ly); } catch { stack = []; }
-        const centre = stack.find(
-          (el) => el !== document.documentElement && el !== document.body,
-        );
-        if (!centre) return null;
-        let interactive: Element | null = null;
-        for (const el of stack) {
-          if (el === document.documentElement || el === document.body) break;
-          try {
-            if ((el as Element).matches(SEL)) { interactive = el as Element; break; }
-          } catch { /* ignore */ }
-        }
-        if (!interactive) {
-          interactive = (centre as Element).closest(SEL) || centre;
-        }
-        const r = (interactive as HTMLElement).getBoundingClientRect();
-        const tag = interactive.tagName.toLowerCase();
-        const id = (interactive as HTMLElement).id ? `#${(interactive as HTMLElement).id}` : '';
-        const txt = ((interactive as HTMLElement).textContent || '').trim().slice(0, 30);
-        const xpath = (() => {
+        const xpathOf = (el: Element): string => {
           const parts: string[] = [];
-          let cur: Element | null = interactive;
+          let cur: Element | null = el;
           while (cur && cur.nodeType === 1
                  && cur !== document.documentElement.parentElement) {
             const t = cur.tagName.toLowerCase();
@@ -3542,16 +3627,70 @@ export class PageWrapper {
             cur = cur.parentElement;
           }
           return '/' + parts.join('/');
-        })();
-        return {
-          localCx: Math.round(r.left + r.width / 2),
-          localCy: Math.round(r.top + r.height / 2),
-          target: `${tag}${id}${txt ? `[${txt}]` : ''}`,
-          targetXpath: xpath,
-          tag,
         };
+        const buildResult = (interactive: Element, method: string) => {
+          const r = (interactive as HTMLElement).getBoundingClientRect();
+          const tag = interactive.tagName.toLowerCase();
+          const id = (interactive as HTMLElement).id ? `#${(interactive as HTMLElement).id}` : '';
+          const txt = ((interactive as HTMLElement).textContent || '').trim().slice(0, 30);
+          return {
+            localCx: Math.round(r.left + r.width / 2),
+            localCy: Math.round(r.top + r.height / 2),
+            target: `${tag}${id}${txt ? `[${txt}]` : ''}`,
+            targetXpath: xpathOf(interactive),
+            tag,
+            method,
+          };
+        };
+        // Stage 1: pinpoint at bbox centre.
+        let stack: Element[] = [];
+        try { stack = document.elementsFromPoint(args.lx, args.ly); } catch { stack = []; }
+        const centre = stack.find(
+          (el) => el !== document.documentElement && el !== document.body,
+        );
+        if (centre) {
+          let interactive: Element | null = null;
+          for (const el of stack) {
+            if (el === document.documentElement || el === document.body) break;
+            try {
+              if ((el as Element).matches(SEL)) { interactive = el as Element; break; }
+            } catch { /* ignore */ }
+          }
+          if (!interactive) {
+            interactive = (centre as Element).closest(SEL) || centre;
+          }
+          return buildResult(interactive, 'pinpoint');
+        }
+        // Stage 2: 5×5 grid scan inside the bbox (frame-local coords).
+        // Picks the largest interactive whose rect overlaps the bbox.
+        let best: Element | null = null;
+        let bestArea = 0;
+        for (let i = 1; i < 5; i++) {
+          for (let j = 1; j < 5; j++) {
+            const px = args.b.x0 + ((args.b.x1 - args.b.x0) * i) / 5;
+            const py = args.b.y0 + ((args.b.y1 - args.b.y0) * j) / 5;
+            let s: Element[] = [];
+            try { s = document.elementsFromPoint(px, py); } catch { s = []; }
+            for (const el of s) {
+              const hit = (el as Element).closest(SEL);
+              if (!hit) continue;
+              const r = (hit as HTMLElement).getBoundingClientRect();
+              const ix = Math.max(0, Math.min(r.right, args.b.x1) - Math.max(r.left, args.b.x0));
+              const iy = Math.max(0, Math.min(r.bottom, args.b.y1) - Math.max(r.top, args.b.y0));
+              const area = ix * iy;
+              if (area > bestArea) { bestArea = area; best = hit; }
+            }
+          }
+        }
+        if (!best) return null;
+        return buildResult(best, 'grid_scan');
       },
-      { lx: localX, ly: localY, expectedLabel: options?.expectedLabel ?? '' },
+      {
+        lx: localX,
+        ly: localY,
+        b: bboxLocal,
+        expectedLabel: options?.expectedLabel ?? '',
+      },
     );
     if (!snap) {
       return { x: cx, y: cy, snapped: false, warning: 'iframe_no_target' };

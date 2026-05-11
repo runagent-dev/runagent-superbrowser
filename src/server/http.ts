@@ -879,15 +879,26 @@ export function createHttpServer(
           clickCount,
           expectedLabel: expected_label,
         });
-        // Phase B: cross-origin OOPIF fallback. clickInBbox's in-page
-        // descent (Phase A) couldn't access iframe.contentDocument
-        // because of the same-origin policy — its dispatched click
-        // landed on the iframe host, no-op. Walk page.frames() to
-        // locate the OOPIF and dispatch a frame-local snap + viewport
-        // CDP click. On success we MERGE the new snap result onto the
-        // original (preserving the rest of the post-click pipeline:
-        // settle, effect diff, dom_index resolution, etc.).
-        if (snap.warning === 'target_in_iframe_cross_origin') {
+        // Phase B fallback: clickInBbox's in-page descent (Phase A)
+        // could not resolve the click target inside the iframe.
+        // Three cases trigger this path:
+        //   - cross_origin: contentDocument blocked by SOP; the Frame
+        //     walk uses Puppeteer's Target API which CAN access OOPIFs.
+        //   - miss: same-origin but neither pinpoint nor inner grid
+        //     scan found a clickable in the bbox region. Worth retry
+        //     because Phase B's snap may pick up a candidate the
+        //     in-page scan missed (it runs inside frame.evaluate, so
+        //     same JS engine but potentially different frame state).
+        //   - legacy `target_in_iframe`: shouldn't occur now but kept
+        //     defensively.
+        // Successful frameSnap REPLACES the original snap result so
+        // the rest of the pipeline (settle / effect diff / dom_index)
+        // uses the resolved target.
+        const needsFrameFallback =
+          snap.warning === 'target_in_iframe_cross_origin'
+          || snap.warning === 'target_in_iframe_miss'
+          || snap.warning === 'target_in_iframe';
+        if (needsFrameFallback) {
           try {
             const frameSnap = await page.clickInIframeFrame(dispatchBbox, {
               button,
@@ -895,11 +906,17 @@ export function createHttpServer(
               expectedLabel: expected_label,
             });
             if (frameSnap.snapped) {
+              // Preserve iframe_host_selector from Phase A (Phase B
+              // doesn't compute it the same way).
+              const phaseAHost = (snap as { iframe_host_selector?: string })
+                .iframe_host_selector;
               Object.assign(snap, frameSnap);
+              if (phaseAHost && !(snap as { iframe_host_selector?: string })
+                  .iframe_host_selector) {
+                (snap as { iframe_host_selector?: string })
+                  .iframe_host_selector = phaseAHost;
+              }
             } else if (frameSnap.warning) {
-              // Annotate with the resolution failure so the bridge can
-              // surface the right hint (iframe_not_resolved /
-              // iframe_no_target).
               snap.warning = frameSnap.warning;
             }
           } catch (e) {

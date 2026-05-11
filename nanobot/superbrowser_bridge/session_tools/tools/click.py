@@ -1040,35 +1040,67 @@ class BrowserClickAtTool(Tool):
             )
             # Surface clickInBbox warnings so the brain can react.
             # Variants (Phase A/B):
-            #   - target_in_iframe_resolved: same-origin descent worked,
-            #     click landed on the inner element. Short success note.
-            #   - target_in_iframe_cross_origin: contentDocument blocked
-            #     by SOP; server-side Frame walk (clickInIframeFrame)
-            #     either succeeded (replaces this warning with _resolved)
-            #     or failed (this warning stays — actionable hint below).
-            #   - target_in_iframe: legacy — descent ran but stopped
-            #     without finding an inner SEL match. Click landed on
-            #     iframe host. Brain should escalate.
+            #   - target_in_iframe_resolved: descent worked, click
+            #     landed on the inner element. Short success note.
+            #   - target_in_iframe_cross_origin: SOP blocked
+            #     contentDocument access; Phase B Frame walk also
+            #     failed. Brain should use in_iframe parameter.
+            #   - target_in_iframe_miss: same-origin BUT neither
+            #     pinpoint nor inner grid scan found a clickable in
+            #     the bbox region. Vision bbox is probably loose or
+            #     pointing at a non-interactive area.
+            #   - target_in_iframe: legacy fallback (should not fire).
             #   - pointer_events_none_ancestor: existing pe:none case.
+            #
+            # iframe_host_selector (when set) is a stable CSS the
+            # brain can pass back as in_iframe=<...> without first
+            # running an inspection script. We always include it in
+            # the WARN advisories so the recovery action is obvious.
             warn = snap.get("warning")
             chain = snap.get("iframe_chain") or []
+            host_sel = snap.get("iframe_host_selector") or ""
+            host_hint = (
+                f" host_selector={host_sel!r}" if host_sel else ""
+            )
             if warn == "target_in_iframe_resolved":
                 hops = f" depth={len(chain)}" if chain else ""
                 snap_note += f" [iframe_descent_ok{hops}]"
             elif warn == "target_in_iframe_cross_origin":
                 snap_note += (
-                    " [WARN:iframe_cross_origin — outer-doc click cannot"
-                    " reach inner content (cross-origin SOP). Use"
-                    " browser_click_selector with in_iframe=<host_css>"
-                    " or scope DOM via iframe.contentDocument from a"
-                    " same-origin entry point.]"
+                    f" [WARN:iframe_cross_origin{host_hint} — outer-doc"
+                    " click cannot reach inner content (cross-origin"
+                    " SOP). Call browser_click_selector(selector=<inner_css>,"
+                    f" in_iframe={host_sel!r}) to target the element"
+                    " directly."
+                    if host_sel
+                    else " [WARN:iframe_cross_origin — outer-doc click"
+                         " cannot reach inner content (cross-origin SOP)."
+                         " Use browser_click_selector with"
+                         " in_iframe=<host_css>.]"
+                )
+            elif warn == "target_in_iframe_miss":
+                snap_note += (
+                    f" [WARN:iframe_miss{host_hint} — descent ran but"
+                    " no clickable was found inside the bbox region."
+                    " Vision bbox may be loose. Re-screenshot to get a"
+                    " tighter bbox, or call browser_click_selector(selector="
+                    f"<inner_css>, in_iframe={host_sel!r})."
+                    if host_sel
+                    else " [WARN:iframe_miss — descent ran but no"
+                         " clickable was found in the bbox region."
+                         " Re-screenshot or use in_iframe with a tighter"
+                         " selector.]"
                 )
             elif warn == "target_in_iframe":
                 snap_note += (
-                    " [WARN:target_in_iframe — descent stopped without"
-                    " finding an inner clickable. Click landed on the"
-                    " <iframe> host, NOT inner content. Re-screenshot"
-                    " or use iframe-scoped tooling.]"
+                    f" [WARN:target_in_iframe{host_hint} — click landed"
+                    " on the <iframe> host, NOT inner content. Use"
+                    f" browser_click_selector(..., in_iframe={host_sel!r})"
+                    " or re-screenshot."
+                    if host_sel
+                    else " [WARN:target_in_iframe — click landed on the"
+                         " <iframe> host. Re-screenshot or use"
+                         " iframe-scoped tooling.]"
                 )
             elif warn == "pointer_events_none_ancestor":
                 snap_note += (
