@@ -104,6 +104,19 @@ class BrowserSelectTool(Tool):
             ),
             nullable=True,
         ),
+        in_iframe=StringSchema(
+            description=(
+                "CSS selector of an <iframe> host. When provided, the "
+                "<select> is resolved INSIDE the iframe's contentFrame "
+                "instead of the top-level document. Use this when the "
+                "target <select> lives inside an embedded frame (quizzes, "
+                "calculators, embedded forms). v1 supports NATIVE <select> "
+                "only — ARIA combobox/listbox dropdowns inside iframes "
+                "should be driven via browser_click_selector(in_iframe=, "
+                "...) on the trigger then the option."
+            ),
+            nullable=True,
+        ),
         required=["session_id", "value"],
     )
 )
@@ -124,7 +137,11 @@ class BrowserSelectOptionTool(Tool):
         "Pick a dropdown option by label+value. Works on native <select> "
         "AND custom listbox/combobox widgets. Returns {ok, picked_text, "
         "verified, candidates?} — on ambiguity, retry with one of the "
-        "candidates instead of clicking blindly."
+        "candidates instead of clicking blindly. For dropdowns inside "
+        "an <iframe>, pass in_iframe='iframe#host' — native <select>s "
+        "inside frames work directly (CDP click on a native <select> "
+        "does NOT open the dropdown in headless Chromium; this tool "
+        "sets the value programmatically + fires `change`)."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -143,17 +160,19 @@ class BrowserSelectOptionTool(Tool):
         timeout: int | None = None,
         extra_option_selectors: list[str] | None = None,
         vision_index: int | None = None,
+        in_iframe: str | None = None,
         **kw: Any,
     ) -> str:
+        iframe_note = f" in_iframe={in_iframe!r}" if in_iframe else ""
         if vision_index is not None:
             print(
                 f"\n>> browser_select_option(V{vision_index}, "
-                f"value={value!r}, label={label!r})"
+                f"value={value!r}, label={label!r}{iframe_note})"
             )
         else:
             print(
                 f"\n>> browser_select_option(label={label!r}, "
-                f"value={value!r})"
+                f"value={value!r}{iframe_note})"
             )
         payload: dict[str, Any] = {
             "label": label or "",
@@ -164,6 +183,8 @@ class BrowserSelectOptionTool(Tool):
             payload["timeout"] = int(timeout)
         if extra_option_selectors:
             payload["extra_option_selectors"] = list(extra_option_selectors)
+        if in_iframe:
+            payload["in_iframe"] = in_iframe
 
         # Vision-bbox path. Resolve V_n against the frozen vision epoch
         # (same path browser_click_at uses), apply the same freshness +

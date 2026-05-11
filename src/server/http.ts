@@ -21,7 +21,7 @@ import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
-import { selectOptionByLabel, selectOptionByVisionBbox } from '../browser/elements.js';
+import { selectOptionByLabel, selectOptionByVisionBbox, selectOptionInIframe } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
 import { renderCaptchaViewHtml } from './captcha-ui-html.js';
@@ -2201,6 +2201,7 @@ export function createHttpServer(
       label, value, fuzzy, timeout,
       extra_option_selectors,
       bbox, expected_label,
+      in_iframe: inIframe,
     } = req.body || {};
     // Either label OR bbox must be supplied. When bbox is present we
     // dispatch to the vision-bbox path which sidesteps DOM-text
@@ -2210,6 +2211,7 @@ export function createHttpServer(
       && typeof bbox.x0 === 'number' && typeof bbox.y0 === 'number'
       && typeof bbox.x1 === 'number' && typeof bbox.y1 === 'number'
     );
+    const hasIframeHost = typeof inIframe === 'string' && inIframe.length > 0;
     if (!hasBbox && (typeof label !== 'string' || !label.trim())) {
       res.status(400).json({ error: 'label (string) or bbox is required' });
       return;
@@ -2218,10 +2220,28 @@ export function createHttpServer(
       res.status(400).json({ error: 'value (string) is required' });
       return;
     }
+    // Phase F: in_iframe wins when set — bbox/label fall through to
+    // selectOptionInIframe regardless. The iframe path supports
+    // label-based resolution only for v1 (native <select> only).
+    if (hasIframeHost && !label) {
+      res.status(400).json({
+        error: 'label is required when in_iframe is provided'
+              + ' (iframe path resolves selects by label only in v1)',
+      });
+      return;
+    }
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const result = hasBbox
+      const result = hasIframeHost
+        ? await selectOptionInIframe(page.getRawPage(), {
+            iframeHost: inIframe,
+            label,
+            value,
+            fuzzy: fuzzy !== false,
+            timeout: typeof timeout === 'number' ? timeout : undefined,
+          })
+        : hasBbox
         ? await selectOptionByVisionBbox(page.getRawPage(), {
             bbox: {
               x0: Number(bbox.x0), y0: Number(bbox.y0),

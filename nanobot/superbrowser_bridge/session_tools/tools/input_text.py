@@ -728,7 +728,13 @@ class BrowserFixTextAtTool(Tool):
 )
 class BrowserTypeTool(Tool):
     name = "browser_type"
-    description = "Type text into an input field by its [index] number."
+    description = (
+        "Type text into an input field by its [index] number. "
+        "Note: [index] refers to elements in the TOP-LEVEL document only. "
+        "For inputs inside an <iframe> (quizzes, calculators, embedded "
+        "forms), use browser_type_at(vision_index=V_n) — its atomic "
+        "JS descends into same-origin iframes automatically."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state

@@ -32,6 +32,42 @@ _ATOMIC_FIX_TEXT_JS = """
   let el = document.elementFromPoint(x, y);
   if (!el) return {ok: false, reason: 'no_element'};
 
+  // Phase H: same-origin iframe descent. When the top-level
+  // elementFromPoint returns an <iframe>, the actual input we want to
+  // type into lives inside that frame's contentDocument. Translate
+  // (x, y) into frame-local coords and re-query inside the frame.
+  // Mirrors the Phase A descent in clickInBbox (page.ts).
+  //
+  // Cross-origin iframes throw on contentDocument access — bail
+  // silently and let the existing not_input path surface a clean
+  // failure; brain can fall back to
+  // browser_click_selector(in_iframe, ...) + browser_type sequence.
+  //
+  // Cap depth at 3 for iframe-in-iframe nests.
+  let _frameDepth = 0;
+  // Track the (x, y) offset accumulated as we descend so the
+  // wrapper-descent below sees coords in the same frame as `el`.
+  let _localX = x, _localY = y;
+  while (el && el.tagName && el.tagName.toLowerCase() === 'iframe'
+         && _frameDepth < 3) {
+    const _ir = el.getBoundingClientRect();
+    const _nextX = _localX - _ir.left;
+    const _nextY = _localY - _ir.top;
+    let _innerDoc = null;
+    try { _innerDoc = el.contentDocument; } catch (_) {}
+    if (!_innerDoc) break;
+    const _inner = _innerDoc.elementFromPoint(_nextX, _nextY);
+    if (!_inner || _inner === _innerDoc.documentElement
+         || _inner === _innerDoc.body) break;
+    el = _inner;
+    _localX = _nextX;
+    _localY = _nextY;
+    _frameDepth += 1;
+  }
+  // Phase H uses _localX/_localY for the wrapper-descent geometry
+  // check below — bbox containment must be in the same frame as `el`.
+  const _checkX = _localX, _checkY = _localY;
+
   // Wrapper-descent: when elementFromPoint hits a styled wrapper rather
   // than the real <input> (petfinder's #findAPetLocation, Google Maps'
   // #searchboxinput, MUI Autocomplete, plenty of Tailwind designs),
@@ -53,7 +89,14 @@ _ATOMIC_FIX_TEXT_JS = """
     for (const c of candidates) {
       const r = c.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) continue;
-      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      // Phase H: when we descended into an iframe, `el` and its
+      // candidates report rects in iframe-local coords; the original
+      // (x, y) is viewport-relative. Compare against `_checkX/_checkY`
+      // which tracks the same frame as `el`. For top-level (no
+      // descent), `_checkX === x` and `_checkY === y`, so behaviour
+      // is unchanged.
+      if (_checkX < r.left || _checkX > r.right
+          || _checkY < r.top || _checkY > r.bottom) continue;
       const a = r.width * r.height;
       if (a < bestArea) { best = c; bestArea = a; }
     }

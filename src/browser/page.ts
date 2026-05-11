@@ -959,6 +959,14 @@ export class PageWrapper {
      *  pass it back via browser_click_selector(in_iframe=…) without
      *  running an inspection script first. */
     iframe_host_selector?: string;
+    /** Phase G: the snapped element is a native HTML `<select>`. CDP
+     *  click on a native select doesn't open the dropdown in headless
+     *  Chromium — the bridge surfaces a hint pointing at
+     *  browser_select_option(..., in_iframe=...) so the brain doesn't
+     *  burn turns clicking the select repeatedly. The click STILL
+     *  dispatches (hint-only policy) — value-set via dispatchClick
+     *  transfers focus, which the brain may need for Tab navigation. */
+    native_select?: boolean;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -1348,6 +1356,12 @@ export class PageWrapper {
                                     || iframeChain.length > 0)
               ? iframeHostSelector || undefined
               : undefined,
+            // Phase G: surface native <select> so the bridge can hint
+            // the brain to use browser_select_option instead. Native
+            // dropdowns don't open via CDP Input.dispatchMouseEvent in
+            // headless Chromium — the click here only transfers focus.
+            native_select: interactive.tagName.toLowerCase() === 'select'
+              ? true : undefined,
           };
           } /* end if (labelMatch) */
           // labelMatch=false: fall through to Phase 2 grid-scan below.
@@ -1470,6 +1484,9 @@ export class PageWrapper {
             target: describe(best),
             targetXpath: xpathOf(best),
             isAutocompleteOption: isAutocompleteOptionEl(best),
+            // Phase G: surface native <select> on the grid-scan path too.
+            native_select: best.tagName.toLowerCase() === 'select'
+              ? true : undefined,
           };
         }
         // 3. Hard fallback: click the raw centre anyway. snapped=false
@@ -1791,6 +1808,7 @@ export class PageWrapper {
     rect: { x: number; y: number; w: number; h: number };
     iframe_host: string;
     frame_url: string;
+    native_select?: boolean;
   }> {
     // Step 1+2: resolve host element + matching Frame.
     const hostHandle = await this.page.$(hostSelector);
@@ -1836,6 +1854,10 @@ export class PageWrapper {
       return {
         x: r.x, y: r.y, w: r.width, h: r.height,
         cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+        // Phase G: surface the inner element's tag so the caller can
+        // flag native <select> clicks (which don't open dropdowns via
+        // CDP — bridge directs the brain at browser_select_option).
+        tag: chosen.tagName.toLowerCase(),
       };
     }, selector);
     if (inner && '__syntaxError' in inner) {
@@ -1884,6 +1906,9 @@ export class PageWrapper {
       x, y, rect,
       iframe_host: hostSelector,
       frame_url: frame.url(),
+      // Phase G: surface inner tag so the bridge can hint the brain
+      // at browser_select_option when the target is a native <select>.
+      native_select: inner.tag === 'select' ? true : undefined,
     };
   }
 
@@ -3583,6 +3608,7 @@ export class PageWrapper {
     targetXpath?: string;
     warning?: string;
     iframe_chain?: string[];
+    native_select?: boolean;
   }> {
     const cx = Math.round((bbox.x0 + bbox.x1) / 2);
     const cy = Math.round((bbox.y0 + bbox.y1) / 2);
@@ -3719,6 +3745,9 @@ export class PageWrapper {
       targetXpath: snap.targetXpath,
       warning: 'target_in_iframe_resolved',
       iframe_chain: [`x-origin:${frameUrl.slice(0, 80)}`],
+      // Phase G: surface native <select> via the snap.tag field we
+      // captured in the frame.evaluate above.
+      native_select: snap.tag === 'select' ? true : undefined,
     };
   }
 

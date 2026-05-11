@@ -1782,6 +1782,328 @@ export async function selectOptionByLabel(
 }
 
 /**
+ * Phase F — iframe-scoped select_option. Resolves the host iframe by
+ * CSS selector in the main document, gets its `contentFrame()`, then
+ * runs a focused trigger picker + native `<select>` value-set inside
+ * `frame.evaluate()`. Works for same-origin AND cross-origin OOPIFs
+ * because `contentFrame()` returns a Puppeteer Frame for both (the
+ * Frame API tunnels evaluate calls through the OOPIF's CDP target).
+ *
+ * Scope of v1 (sufficient for coolmath4kids quizzes + most iframe
+ * forms): NATIVE `<select>` elements only. ARIA combobox / listbox
+ * dropdowns inside iframes are not yet supported and return a
+ * structured `iframe_aria_combobox_unsupported` reason — the brain
+ * should fall back to `browser_click_selector(in_iframe, ...)` on
+ * the trigger then on the option.
+ *
+ * Trigger resolution paths, in priority order:
+ *   1. <label for="X"> with text matching `label` → element #X
+ *   2. <label>Label <select/></label> — wrapping label
+ *   3. <select aria-label="Label"> — explicit accessible name
+ *   4. <select aria-labelledby="…"> resolved against frame ids
+ *   5. <select> immediately preceded by a text-bearing element whose
+ *      text matches `label` (compact form layouts: <div>Label</div>
+ *      <select/>)
+ *
+ * No popup-open / option-click logic — native <select> doesn't need
+ * a UI to open. We set `.value` directly using the prototype's value
+ * setter (React-safe via `_valueTracker` reset, mirroring
+ * `_ATOMIC_FIX_TEXT_JS`), then dispatch `input` + `change` so
+ * framework-controlled inputs react.
+ */
+export async function selectOptionInIframe(
+  page: Page,
+  opts: {
+    iframeHost: string;
+    label: string;
+    value: string;
+    fuzzy?: boolean;
+    timeout?: number;
+  },
+): Promise<SelectOptionByLabelResult> {
+  const start = Date.now();
+  const hostHandle = await page.$(opts.iframeHost);
+  if (!hostHandle) {
+    return {
+      ok: false,
+      reason: 'iframe_host_not_found',
+      took_ms: Date.now() - start,
+    };
+  }
+  const frame = await hostHandle.contentFrame();
+  await hostHandle.dispose();
+  if (!frame) {
+    return {
+      ok: false,
+      reason: 'iframe_contentframe_null',
+      took_ms: Date.now() - start,
+    };
+  }
+
+  // Frame-local trigger picker + value-set in a single round-trip.
+  // Everything runs inside the iframe's document context so we don't
+  // need to track frame offsets here — `select.value = ...` and the
+  // event dispatches operate on the inner document directly.
+  const result = await frame.evaluate(
+    (args: { lbl: string; val: string; fuzzy: boolean }) => {
+      const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+      const lower = (s: string) => norm(s).toLowerCase();
+      const target = lower(args.lbl);
+      if (!target) {
+        return {
+          ok: false as const,
+          reason: 'empty_label' as const,
+        };
+      }
+
+      const isVisible = (el: HTMLElement): boolean => {
+        if (el.tagName === 'SELECT') return true;
+        if (el.offsetParent === null) return false;
+        const cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        return true;
+      };
+
+      const matches = (text: string): boolean => {
+        const t = lower(text);
+        if (!t) return false;
+        if (t === target) return true;
+        if (args.fuzzy) {
+          if (t.includes(target)) return true;
+          if (target.includes(t) && t.length >= 3) return true;
+        }
+        return false;
+      };
+
+      // 1. <label for="X"> → element #X
+      let foundSelect: HTMLSelectElement | null = null;
+      let foundVia = '';
+      for (const lab of Array.from(
+        document.querySelectorAll<HTMLLabelElement>('label[for]'),
+      )) {
+        if (!matches(lab.textContent || '')) continue;
+        const ctrl = document.getElementById(lab.htmlFor);
+        if (!ctrl) continue;
+        if (ctrl.tagName.toLowerCase() !== 'select') continue;
+        if (!isVisible(ctrl as HTMLElement)) continue;
+        foundSelect = ctrl as HTMLSelectElement;
+        foundVia = 'label_for';
+        break;
+      }
+
+      // 2. <label>Label<select/></label> — wrapping label.
+      if (!foundSelect) {
+        for (const lab of Array.from(
+          document.querySelectorAll<HTMLLabelElement>('label'),
+        )) {
+          // Skip <label for=...> already-handled cases.
+          if (lab.hasAttribute('for')) continue;
+          const sel = lab.querySelector<HTMLSelectElement>('select');
+          if (!sel || !isVisible(sel)) continue;
+          // Take label text MINUS the select's option text (the inner
+          // select contributes its currentText to label.textContent).
+          const labText = (lab.textContent || '').replace(
+            sel.textContent || '',
+            '',
+          );
+          if (!matches(labText)) continue;
+          foundSelect = sel;
+          foundVia = 'wrap_label';
+          break;
+        }
+      }
+
+      // 3. <select aria-label="...">
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select[aria-label]'),
+        )) {
+          if (!isVisible(sel)) continue;
+          if (matches(sel.getAttribute('aria-label') || '')) {
+            foundSelect = sel;
+            foundVia = 'aria_label';
+            break;
+          }
+        }
+      }
+
+      // 4. <select aria-labelledby="id1 id2"> → join referenced texts.
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>(
+            'select[aria-labelledby]',
+          ),
+        )) {
+          if (!isVisible(sel)) continue;
+          const ids = (sel.getAttribute('aria-labelledby') || '')
+            .split(/\s+/)
+            .filter(Boolean);
+          const joined = ids
+            .map((id) => document.getElementById(id)?.textContent || '')
+            .join(' ');
+          if (matches(joined)) {
+            foundSelect = sel;
+            foundVia = 'aria_labelledby';
+            break;
+          }
+        }
+      }
+
+      // 5. Preceding text near a <select>. Walk previousElementSibling
+      //    of the select OR its parent, scanning up to 3 hops.
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select'),
+        )) {
+          if (!isVisible(sel)) continue;
+          const scan = (start: Element | null): boolean => {
+            let cur = start;
+            for (let i = 0; i < 3 && cur; i++) {
+              if (cur instanceof HTMLElement) {
+                if (matches(cur.textContent || '')) return true;
+              }
+              cur = cur.previousElementSibling;
+            }
+            return false;
+          };
+          if (scan(sel.previousElementSibling)
+              || scan(sel.parentElement?.previousElementSibling ?? null)) {
+            foundSelect = sel;
+            foundVia = 'preceding_text';
+            break;
+          }
+        }
+      }
+
+      if (!foundSelect) {
+        // Collect candidate <select>s for diagnostics.
+        const candidates: string[] = [];
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select'),
+        )) {
+          if (!isVisible(sel)) continue;
+          const al = sel.getAttribute('aria-label') || '';
+          const nm = sel.getAttribute('name') || '';
+          const id = sel.id ? `#${sel.id}` : '';
+          candidates.push(
+            `select${id}${nm ? `[name="${nm}"]` : ''}`
+            + (al ? ` aria-label="${al.slice(0, 40)}"` : ''),
+          );
+          if (candidates.length >= 5) break;
+        }
+        return {
+          ok: false as const,
+          reason: 'trigger_not_found_in_iframe' as const,
+          candidates,
+        };
+      }
+
+      // Resolve the option: exact value match, then exact text, then
+      // fuzzy text contains.
+      let optionValue: string | null = null;
+      let pickedText: string | null = null;
+      const valLc = lower(args.val);
+      for (const opt of Array.from(foundSelect.options)) {
+        if (opt.value === args.val) {
+          optionValue = opt.value;
+          pickedText = opt.text || opt.value;
+          break;
+        }
+      }
+      if (optionValue == null) {
+        for (const opt of Array.from(foundSelect.options)) {
+          if (lower(opt.text) === valLc) {
+            optionValue = opt.value;
+            pickedText = opt.text;
+            break;
+          }
+        }
+      }
+      if (optionValue == null && args.fuzzy) {
+        for (const opt of Array.from(foundSelect.options)) {
+          if (lower(opt.text).includes(valLc)
+              || valLc.includes(lower(opt.text))) {
+            optionValue = opt.value;
+            pickedText = opt.text;
+            break;
+          }
+        }
+      }
+      if (optionValue == null) {
+        const options = Array.from(foundSelect.options).map(
+          (o) => `${o.value}:${(o.text || '').trim().slice(0, 30)}`,
+        );
+        return {
+          ok: false as const,
+          reason: 'option_not_found_in_iframe' as const,
+          available_options: options.slice(0, 20),
+        };
+      }
+
+      // Set value via the React-safe prototype setter, mirroring
+      // _ATOMIC_FIX_TEXT_JS. Resets `_valueTracker` so controlled
+      // inputs don't short-circuit the synthetic onChange.
+      try {
+        const proto = HTMLSelectElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        const tracker = (foundSelect as unknown as
+          { _valueTracker?: { setValue?: (v: string) => void } })._valueTracker;
+        if (tracker && typeof tracker.setValue === 'function') {
+          try { tracker.setValue(''); } catch (_) { /* ignore */ }
+        }
+        if (desc?.set) {
+          desc.set.call(foundSelect, optionValue);
+        } else {
+          foundSelect.value = optionValue;
+        }
+        foundSelect.dispatchEvent(new Event('input', { bubbles: true }));
+        foundSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (e) {
+        return {
+          ok: false as const,
+          reason: 'value_set_exception' as const,
+          error: String(e).slice(0, 120),
+        };
+      }
+
+      // Verify.
+      const verified = foundSelect.value === optionValue;
+      const id = foundSelect.id ? `#${foundSelect.id}` : '';
+      const nm = foundSelect.getAttribute('name') || '';
+      const triggerSelector =
+        id || (nm ? `select[name="${nm}"]` : 'select');
+      return {
+        ok: verified,
+        picked_text: pickedText || optionValue,
+        trigger_selector: triggerSelector,
+        selected_index: foundSelect.selectedIndex,
+        verified,
+        found_via: foundVia,
+        reason: verified ? undefined : 'value_set_did_not_stick',
+      };
+    },
+    { lbl: opts.label, val: opts.value, fuzzy: opts.fuzzy !== false },
+  );
+
+  return {
+    ...result,
+    ok: result.ok,
+    took_ms: Date.now() - start,
+    ...(result.ok
+      ? {
+          trigger_selector: result.trigger_selector,
+          picked_text: result.picked_text,
+          selected_index: result.selected_index,
+          verified: result.verified,
+        }
+      : {
+          reason: result.reason,
+          candidates: 'candidates' in result ? result.candidates : undefined,
+        }),
+  } as SelectOptionByLabelResult;
+}
+
+/**
  * Bbox-aware select_option entrypoint. Caller passes the dropdown
  * trigger's bounding box (CSS pixel coords); we snap to the
  * interactive descendant inside that bbox, gate it through the same

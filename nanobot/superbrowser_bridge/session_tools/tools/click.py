@@ -1108,6 +1108,30 @@ class BrowserClickAtTool(Tool):
                     "ancestor has pointer-events:none, the click may "
                     "have passed through to a layer behind.]"
                 )
+            # Phase G: native <select> hint. Always-on (top-level or
+            # inside an iframe). Native dropdowns don't open via CDP
+            # Input.dispatchMouseEvent — the click here only focuses
+            # the element. Brain should switch to browser_select_option
+            # which sets .value + dispatches `change` programmatically.
+            # Hint-only policy: the click still dispatched.
+            if snap.get("native_select"):
+                if host_sel:
+                    snap_note += (
+                        f" [hint:native_select host_selector={host_sel!r}"
+                        " — click landed on a <select>; native dropdowns"
+                        " don't open via CDP. Call"
+                        " browser_select_option(label=<dropdown_label>,"
+                        f" value=<option>, in_iframe={host_sel!r})"
+                        " to set the value programmatically.]"
+                    )
+                else:
+                    snap_note += (
+                        " [hint:native_select — click landed on a"
+                        " <select>; native dropdowns don't open via CDP."
+                        " Call browser_select_option(label=<dropdown_label>,"
+                        " value=<option>) to set the value"
+                        " programmatically.]"
+                    )
         else:
             snap_note = ""
 
