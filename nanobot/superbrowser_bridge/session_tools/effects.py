@@ -130,10 +130,28 @@ _ATOMIC_FIX_TEXT_JS = """
             input_type: attrInputType};
   }
   try { el.focus(); } catch (_) {}
+  // Phase H: when `el` was found inside an iframe (descent above), its
+  // prototype + event constructors come from the iframe's window, not
+  // the main frame's. Using the main-frame `HTMLInputElement.prototype`
+  // throws `TypeError: Illegal invocation` because the setter's
+  // internal type-check rejects the cross-frame receiver. Same for
+  // `new InputEvent(...)` constructed in the main frame and dispatched
+  // on an iframe-owned element. Resolve everything against
+  // `el.ownerDocument.defaultView` so cross-frame inputs work too.
+  // Falls back to the main-frame globals when ownerView is unavailable
+  // (top-level inputs behave identically to before).
+  const _ownerWin = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+  const _InputProto = _ownerWin.HTMLInputElement
+                       ? _ownerWin.HTMLInputElement.prototype
+                       : HTMLInputElement.prototype;
+  const _TextareaProto = _ownerWin.HTMLTextAreaElement
+                          ? _ownerWin.HTMLTextAreaElement.prototype
+                          : HTMLTextAreaElement.prototype;
+  const _InputEventCtor = _ownerWin.InputEvent || InputEvent;
+  const _EventCtor = _ownerWin.Event || Event;
   try {
     if (isInput) {
-      const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype
-                                       : HTMLInputElement.prototype;
+      const proto = tag === 'textarea' ? _TextareaProto : _InputProto;
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
       if (desc && desc.set) {
         // React 16+ caches the prior value in el._valueTracker. If the
@@ -147,14 +165,14 @@ _ATOMIC_FIX_TEXT_JS = """
           try { tracker.setValue(''); } catch (_) {}
         }
         desc.set.call(el, target);
-        el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: target}));
-        el.dispatchEvent(new Event('change', {bubbles: true}));
+        el.dispatchEvent(new _InputEventCtor('input', {bubbles: true, inputType: 'insertText', data: target}));
+        el.dispatchEvent(new _EventCtor('change', {bubbles: true}));
       } else {
         el.value = target;
       }
     } else if (isEditable) {
       el.innerText = target;
-      el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+      el.dispatchEvent(new _InputEventCtor('input', {bubbles: true}));
     }
   } catch (e) {
     return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag};

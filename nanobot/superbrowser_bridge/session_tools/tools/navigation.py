@@ -452,6 +452,7 @@ class BrowserOpenTool(Tool):
                 intent=intent or "observe opened page",
                 url=actual_url,
                 elements=data.get("elements"),
+                iframe_signature=data.get("iframeSignature") or "",
             )
         return caption
 
@@ -679,6 +680,7 @@ class BrowserNavigateTool(Tool):
                 intent=intent or "verify navigation succeeded",
                 url=actual_url,
                 elements=data.get("elements"),
+                iframe_signature=data.get("iframeSignature") or "",
             )
         return caption
 

@@ -39,7 +39,7 @@ def _log(msg: str) -> None:
     sys.stderr.write(f"[vision-agent] {msg}\n")
 
 
-def dom_hash_of(dom_elements: str | None) -> str:
+def dom_hash_of(dom_elements: str | None, iframe_signature: str = "") -> str:
     """SHA-256 of the DOM element listing, used as cache key.
 
     Uses the full 64-char hex to avoid cache-key collisions on pages
@@ -48,10 +48,23 @@ def dom_hash_of(dom_elements: str | None) -> str:
     A collision causes stale bboxes to be served, which manifests as
     the vision agent "hallucinating" targets that aren't really on the
     current screen.
+
+    Phase I — `iframe_signature` (optional): a per-iframe content
+    summary emitted by the TS /state handler. Outer `dom_elements`
+    misses iframe-internal mutations (a quiz question advancing inside
+    `iframe#iframe_content` doesn't change any element in the main
+    document), so without this the vision cache would return stale
+    bboxes after every in-iframe interaction. Empty string falls
+    through to legacy single-string hashing — non-iframe pages are
+    unaffected.
     """
     if not dom_elements:
         return ""
-    return hashlib.sha256(dom_elements.encode("utf-8", errors="ignore")).hexdigest()
+    payload = (
+        f"{dom_elements}\n[IFRAME_SIG]\n{iframe_signature}"
+        if iframe_signature else dom_elements
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def dom_text_hash_of(

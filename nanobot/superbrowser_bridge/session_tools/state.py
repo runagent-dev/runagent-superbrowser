@@ -1318,6 +1318,7 @@ class BrowserSessionState:
         elements_with_bounds: list[dict] | None = None,
         device_pixel_ratio: float = 1.0,
         selector_entries: list[dict] | None = None,
+        iframe_signature: str = "",
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -1352,7 +1353,14 @@ class BrowserSessionState:
             dom_text_hash_of = None  # type: ignore[assignment]
 
         if vision_agent_enabled() and get_vision_agent is not None:
-            dh = dom_hash_of(elements) if dom_hash_of else ""
+            # Phase I: mix in iframe_signature so iframe-internal
+            # mutations bust the vision cache. Empty signature is the
+            # default and preserves legacy behaviour for non-iframe
+            # pages.
+            dh = (
+                dom_hash_of(elements, iframe_signature)
+                if dom_hash_of else ""
+            )
             if dh:
                 self._last_dom_hash = dh
             # Phase 1.2: viewport-aware secondary key — left empty here

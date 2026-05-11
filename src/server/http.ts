@@ -704,11 +704,56 @@ export function createHttpServer(
         }
       }
 
+      // Phase I: same-origin iframe content signature. The element tree
+      // only walks the main document — iframe-hosted UIs (quizzes,
+      // calculators) update their inner content while the outer DOM
+      // stays identical, which would otherwise cause the vision cache
+      // (keyed on dom_hash_of(elements)) to return stale bboxes. We
+      // emit a per-iframe summary (body.innerText length + first 200
+      // chars + scroll position) so the Python bridge can mix it into
+      // its dom_hash key. Cross-origin iframes throw on
+      // contentDocument access — handled silently and skipped.
+      let iframeSignature = '';
+      try {
+        iframeSignature = await page.getRawPage().evaluate(() => {
+          const parts: string[] = [];
+          const frames = document.querySelectorAll('iframe');
+          for (let i = 0; i < Math.min(frames.length, 8); i++) {
+            const f = frames[i] as HTMLIFrameElement;
+            let inner = '';
+            try {
+              const d = f.contentDocument;
+              if (d && d.body) {
+                const txt = (d.body.innerText || '').replace(/\s+/g, ' ').trim();
+                const sy = (d.defaultView && d.defaultView.scrollY) || 0;
+                inner = `len=${txt.length} sy=${Math.round(sy)} head=${txt.slice(0, 200)}`;
+              }
+            } catch { /* cross-origin */ }
+            const r = f.getBoundingClientRect();
+            const visible = r.width > 0 && r.height > 0;
+            const id = f.id || '';
+            const aria = f.getAttribute('aria-label') || '';
+            parts.push(
+              `iframe[${i}] id=${id} aria=${aria.slice(0, 30)} `
+              + `vis=${visible ? 1 : 0} ${inner}`,
+            );
+          }
+          return parts.join('\n');
+        });
+      } catch {
+        iframeSignature = '';
+      }
+
       res.json({
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
         elements: state.elementTree.clickableElementsToString(),
+        // Phase I: same-origin iframe content summary. Python mixes
+        // this into dom_hash so iframe-internal mutations bust the
+        // vision cache. Empty string when the page has no iframes
+        // (no cache-key impact) or all iframes are cross-origin.
+        iframeSignature,
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         accessibilityTree: state.accessibilityTree,
         consoleErrors: state.consoleErrors,
