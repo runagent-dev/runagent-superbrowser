@@ -309,12 +309,32 @@ class BrowserSessionState:
         self.last_type_had_suggestions: bool = False
         self.last_type_anchor_label: str = ""
         # Most recent autocomplete-scan output (list of {text, x, y}).
-        # Stashed verbatim from `_scan_autocomplete_suggestions` so the
-        # worker_hook can map each suggestion's pixel center to a V_n
-        # bbox in the next vision response — keeps the brain on the
-        # bbox path even when the vision agent misses the
-        # `autocomplete_open` flag.
+        # Stashed verbatim from `_scan_autocomplete_suggestions`. Kept for
+        # legacy callers; the same data is also injected as synthetic V_n
+        # via inject_synthetic_bboxes() so the brain can click suggestions
+        # via browser_click_at(vision_index=V_n) without waiting for the
+        # vision agent to (maybe) catch the dropdown on the next pass.
         self.last_autocomplete_suggestions: list = []
+
+        # === SYNTHETIC V_n FROM DOM SCANS ===
+        # When the bridge runs a targeted DOM scan (autocomplete dropdown,
+        # calendar grid, modal CTAs, custom dropdown menu) and finds
+        # clickable items the vision agent missed, those items are
+        # constructed as regular BBox instances and registered here. The
+        # `vision_for_target_resolution()` accessor returns a wrapper that
+        # merges them in so `browser_click_at(vision_index=V_n)` resolves
+        # to the synthetic without us mutating the upstream BBox class.
+        #
+        # V_n is assigned in a reserved range (1000+) to avoid colliding
+        # with any vision-emitted V_n. Side-channel meta tracks origin,
+        # scan kind, anchor V_n, and TTL.
+        #
+        # Cleared on: consume_synthetic_v (post-successful click),
+        # freeze_vision_epoch (vision now sees them — usually), TTL
+        # expiry, reset_per_session.
+        self._synthetic_bboxes_by_v: dict[int, Any] = {}
+        self._synthetic_meta_by_v: dict[int, dict] = {}
+        self._next_synthetic_v: int = 1000
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
@@ -354,6 +374,11 @@ class BrowserSessionState:
         # otherwise lets the brain proceed on cached vision when the
         # prefetch hasn't landed.
         self._pending_vision_task: Optional["asyncio.Task[Any]"] = None
+        # Soft sync flag: ensure_vision_synced sets this when it allowed
+        # dispatch despite a still-in-flight prefetch. build_text_only
+        # consumes it to annotate the response with [vision_lag] so the
+        # brain knows the action may have resolved against stale vision.
+        self._vision_lag_pending: bool = False
         # Wall-clock + brain-turn stamp captured each time the screenshot
         # tool freezes a new vision epoch. Used by the freshness gate to
         # reject clicks against an epoch that's older than
@@ -366,14 +391,6 @@ class BrowserSessionState:
         # tool (click/type/click_at/scroll/navigate). Read by the
         # freshness gate to compute epoch age in turns.
         self._brain_turn_counter: int = 0
-
-        # Anti-pattern detection: maps stamped id (e.g., 'my-companion-btn')
-        # to _brain_turn_counter at the moment it was stamped via
-        # browser_eval / browser_run_script. When a follow-up
-        # browser_click_selector('#<id>') fires within MAX_STAMP_AGE
-        # turns, we emit [anti_pattern_detected] so the brain learns
-        # the stamp-then-click pattern is recognized and discouraged.
-        self._recently_stamped_ids: dict[str, int] = {}
 
     @property
     def backend(self) -> str:
@@ -452,6 +469,10 @@ class BrowserSessionState:
             except Exception:
                 pass
         self._pending_vision_task = None
+        # Drop any synthetic V_n carried over from prior session.
+        self._synthetic_bboxes_by_v = {}
+        self._synthetic_meta_by_v = {}
+        self._next_synthetic_v = 1000
         self._brain_turn_counter = 0
         # Drop cross-tool element identity tracking — a new session
         # starts with no recorded last click.
@@ -514,6 +535,18 @@ class BrowserSessionState:
         emit its existing `no_vision` / `epoch_invalidated` error
         so the brain re-screenshots before clicking.
         """
+        base = self._compute_resolution_base()
+        if base is None:
+            return None
+        if not self._synthetic_bboxes_by_v:
+            return base
+        return _MergedVisionResponse(base, self._synthetic_bboxes_by_v)
+
+    def _compute_resolution_base(self) -> Any:
+        """Internal: pick the vision response the V_n resolver should
+        consult, applying the same epoch / live / invalidation logic
+        the public accessor used before synthetic V_n existed.
+        """
         if self._vision_epoch_response is not None:
             epoch_url = self._normalize_url(self._vision_epoch_url or "")
             current_url = self._normalize_url(self.current_url or "")
@@ -529,6 +562,109 @@ class BrowserSessionState:
         if self._vision_epoch_id > 0:
             return None
         return self._last_vision_response
+
+    # === Synthetic V_n helpers ==========================================
+
+    def inject_synthetic_bboxes(
+        self,
+        bboxes: list[Any],
+        *,
+        scan_kind: str,
+        anchor_v: Optional[int] = None,
+        ttl_turns: int = 3,
+    ) -> list[int]:
+        """Register DOM-scan-derived bboxes as synthetic V_n entries.
+
+        Each bbox is assigned a reserved-range V_n (>=1000) so it cannot
+        collide with vision-emitted indices. The bbox object itself
+        should already be a constructed `vision_agent.schemas.BBox` —
+        this method does not construct or validate it.
+
+        Returns the list of V_n indices assigned (parallel to `bboxes`).
+        Empty list when bboxes is empty.
+        """
+        if not bboxes:
+            return []
+        expires = self._brain_turn_counter + max(1, int(ttl_turns))
+        v_indices: list[int] = []
+        for bb in bboxes:
+            self._next_synthetic_v += 1
+            v = self._next_synthetic_v
+            self._synthetic_bboxes_by_v[v] = bb
+            self._synthetic_meta_by_v[v] = {
+                "origin": "dom_scan",
+                "scan_kind": scan_kind,
+                "scan_anchor_v": anchor_v,
+                "expires_at_turn": expires,
+                "injected_at_turn": self._brain_turn_counter,
+            }
+            v_indices.append(v)
+        return v_indices
+
+    def is_synthetic_v(self, v_n: int) -> bool:
+        """True when v_n was assigned by inject_synthetic_bboxes."""
+        return int(v_n) in self._synthetic_bboxes_by_v
+
+    def consume_synthetic_v(self, v_n: int) -> bool:
+        """Drop a single synthetic V_n after a successful click resolution.
+
+        Returns True when the entry existed and was removed.
+        """
+        v = int(v_n)
+        if v not in self._synthetic_bboxes_by_v:
+            return False
+        self._synthetic_bboxes_by_v.pop(v, None)
+        self._synthetic_meta_by_v.pop(v, None)
+        # If this was the last synthetic, also clear the related
+        # autocomplete-pending flag so subsequent type_at on a new field
+        # isn't blocked by a stale guard.
+        if not self._synthetic_bboxes_by_v:
+            self.last_type_had_suggestions = False
+            self.last_type_anchor_label = ""
+        return True
+
+    def clear_synthetic_bboxes(self, *, reason: str = "manual") -> int:
+        """Drop ALL synthetic V_n entries. Returns count cleared."""
+        n = len(self._synthetic_bboxes_by_v)
+        self._synthetic_bboxes_by_v = {}
+        self._synthetic_meta_by_v = {}
+        return n
+
+    def expire_stale_synthetic_bboxes(self) -> int:
+        """Drop synthetic V_n whose expires_at_turn has passed.
+
+        Called opportunistically by tool dispatch paths so stale entries
+        don't accumulate. Returns count expired.
+        """
+        if not self._synthetic_bboxes_by_v:
+            return 0
+        current = self._brain_turn_counter
+        expired: list[int] = []
+        for v, meta in self._synthetic_meta_by_v.items():
+            exp = meta.get("expires_at_turn")
+            if isinstance(exp, int) and exp <= current:
+                expired.append(v)
+        for v in expired:
+            self._synthetic_bboxes_by_v.pop(v, None)
+            self._synthetic_meta_by_v.pop(v, None)
+        return len(expired)
+
+    def synthetic_v_summary(self) -> str:
+        """Render the active synthetic V_n list for captions / messages.
+
+        Format: one line per entry, "  V<n> '<label>'  (kind=<scan_kind>)".
+        Empty string when no synthetics active.
+        """
+        if not self._synthetic_bboxes_by_v:
+            return ""
+        rows: list[str] = []
+        for v in sorted(self._synthetic_bboxes_by_v.keys()):
+            bb = self._synthetic_bboxes_by_v[v]
+            meta = self._synthetic_meta_by_v.get(v, {})
+            label = (getattr(bb, "label", "") or "")[:60]
+            kind = meta.get("scan_kind", "?")
+            rows.append(f"  V{v} {label!r}  (kind={kind})")
+        return "\n".join(rows)
 
     def record_cursor_failure(
         self, *, strategy: str, target: str, reason: str,
@@ -561,18 +697,20 @@ class BrowserSessionState:
         return "\n".join(rows)
 
     async def ensure_vision_synced(self, *, reason: str = "pre_action") -> "str | None":
-        """Phase 1.1 hard sync gate. Block until the most recent vision
-        prefetch lands. Returns None on success (caller proceeds), or a
-        structured error string the caller should return as its tool
-        result so the brain re-tries on a fresh state.
+        """Soft sync gate. By default, blocks up to VISION_SOFT_SYNC_TIMEOUT_MS
+        (1500ms) for an in-flight prefetch; on timeout it sets
+        `_vision_lag_pending` and returns None so the tool dispatches anyway.
+        The next response carries a `[vision_lag]` annotation so the brain
+        knows the action may have resolved against slightly-stale vision.
 
-        Skipped entirely when VISION_HARD_SYNC=0 — preserves the legacy
-        soft-budget behavior for rollback.
-
-        Page-type-aware timeout: if VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES
-        is a JSON dict and the last vision response's page_type matches
-        a key, that timeout (ms) is used instead of the global default.
-        Useful for slow form/search pages where 8s isn't enough.
+        Env knobs:
+          VISION_HARD_SYNC=0           — disable the gate entirely.
+          VISION_PROCEED_ON_LAG=0      — restore legacy hard-block behavior
+                                         (returns `[vision_unavailable]`).
+          VISION_SOFT_SYNC_TIMEOUT_MS  — soft wait window (default 1500).
+          VISION_HARD_SYNC_TIMEOUT_MS  — legacy hard-block window (only
+                                         used when proceed-on-lag is off).
+          VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES — per-page-type ms overrides.
         """
         if os.environ.get("VISION_HARD_SYNC", "1") in ("0", "false", "no", "False"):
             return None
@@ -590,6 +728,23 @@ class BrowserSessionState:
                     timeout_ms = int(overrides[page_type])
         except Exception:
             timeout_ms = None
+
+        proceed_on_lag = os.environ.get("VISION_PROCEED_ON_LAG", "1") not in (
+            "0", "false", "no", "False",
+        )
+        if proceed_on_lag:
+            soft_ms = timeout_ms
+            if soft_ms is None:
+                try:
+                    soft_ms = int(os.environ.get("VISION_SOFT_SYNC_TIMEOUT_MS") or "1500")
+                except ValueError:
+                    soft_ms = 1500
+            await _await_vision_required(task, timeout_ms=soft_ms)
+            if not task.done():
+                self._vision_lag_pending = True
+            return None
+
+        # Legacy hard-block path — opt in via VISION_PROCEED_ON_LAG=0.
         await _await_vision_required(task, timeout_ms=timeout_ms)
         if not task.done():
             return (
@@ -705,91 +860,6 @@ class BrowserSessionState:
         # Wall-clock for the click-pending-screenshot guard.
         import time as _t
         self.last_screenshot_at = _t.time()
-
-    # --- stamp-id anti-pattern detection ----------------------------------
-    #
-    # The brain has been observed inventing this workaround when click_at
-    # fails repeatedly:
-    #     browser_eval(`document.querySelectorAll(...)[N].id = 'my-id'`)
-    #     browser_click_selector('#my-id')
-    # That bypasses the cursor ladder, stamps a synthetic id onto an
-    # element via eval (isTrusted=false adjacent), and then clicks via
-    # selector. It's bot-detectable on hardened sites and a sign the
-    # brain is fighting the click tools instead of using them properly.
-    # We watch for it at runtime and emit a one-shot [anti_pattern]
-    # advisory the next time the brain reaches for a selector that
-    # matches a recently-stamped id.
-
-    _STAMP_ID_PATTERN = None  # lazy-init compiled regex (per-class cache)
-    _STAMP_MAX_AGE_TURNS = 4
-
-    def record_stamped_ids_from_script(self, script: str) -> None:
-        """Scan a script for `.id = 'X'` or `setAttribute('id', 'X')`
-        and remember X with the current brain_turn_counter. Always
-        runs eviction (even on empty script) so stale stamps don't
-        outlive their MAX_STAMP_AGE window when called from
-        check_anti_pattern_selector's call sites.
-        """
-        cls = type(self)
-        # Always evict stale entries first — keeps the window honest
-        # regardless of how this method is reached.
-        cutoff = self._brain_turn_counter - cls._STAMP_MAX_AGE_TURNS
-        if self._recently_stamped_ids:
-            self._recently_stamped_ids = {
-                k: v for k, v in self._recently_stamped_ids.items()
-                if v >= cutoff
-            }
-        if not script:
-            return
-        import re
-        if cls._STAMP_ID_PATTERN is None:
-            cls._STAMP_ID_PATTERN = re.compile(
-                r"""\.id\s*=\s*['"]([\w\-]+)['"]"""
-                r"""|setAttribute\(\s*['"]id['"]\s*,\s*['"]([\w\-]+)['"]"""
-            )
-        for m in cls._STAMP_ID_PATTERN.finditer(script):
-            stamped = m.group(1) or m.group(2)
-            if stamped:
-                self._recently_stamped_ids[stamped] = self._brain_turn_counter
-
-    def check_anti_pattern_selector(self, selector: str) -> str | None:
-        """If `selector` is an id-selector (`#<id>`) AND <id> was stamped
-        via eval / run_script within the last _STAMP_MAX_AGE_TURNS turns,
-        return an advisory string. Else None. Only fires on an EXACT
-        id-selector head — `#foo .bar` won't trip on a stamped `foo`
-        because the brain is targeting a descendant, which suggests it
-        had a reason. The pure `#stamped-id` case is the smoking gun.
-        """
-        s = (selector or "").strip()
-        if not s.startswith("#"):
-            return None
-        # Extract candidate id: everything between `#` and the next
-        # combinator / pseudo / attribute char. `#foo`, `#foo:hover`,
-        # `#foo[disabled]`, `#foo > .bar` all extract `foo`.
-        candidate = s[1:]
-        for sep in (" ", ">", "+", "~", ":", "[", ".", "#"):
-            if sep in candidate:
-                candidate = candidate.split(sep, 1)[0]
-        if not candidate or candidate not in self._recently_stamped_ids:
-            return None
-        # Inline staleness check so the advisory never fires past the
-        # MAX_AGE window even if no eval/run_script call has come
-        # through to trigger a fresh eviction pass.
-        stamped_at = self._recently_stamped_ids[candidate]
-        if self._brain_turn_counter - stamped_at > type(self)._STAMP_MAX_AGE_TURNS:
-            del self._recently_stamped_ids[candidate]
-            return None
-        return (
-            f"\n[anti_pattern_detected] id='{candidate}' was stamped via "
-            f"browser_eval / browser_run_script in the last few actions "
-            f"and you're now clicking it via selector. This pattern is "
-            f"bot-detectable on hardened sites and a sign you're working "
-            f"around click_at(V_n) / click([N]) instead of fixing the "
-            f"underlying issue. Next time: re-screenshot to refresh the "
-            f"V_n vision pass and use browser_click_at on the bbox, or "
-            f"target the element via its existing CSS hooks (data-*, "
-            f"aria-label, role) rather than a custom id you stamped."
-        )
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:
@@ -975,9 +1045,8 @@ class BrowserSessionState:
                 "page. Switch tactic: call browser_screenshot to "
                 "re-observe, then pick a different [V_n]/[index], try a "
                 "different role (e.g., the form's submit button instead "
-                "of the input), try browser_click_selector with a stable "
-                "CSS hook, or browser_wait_for content you expect to "
-                "appear. Do NOT retry this exact target, and do NOT "
+                "of the input), or browser_wait_for content you expect "
+                "to appear. Do NOT retry this exact target, and do NOT "
                 "synthesize clicks via browser_run_script — JS clicks "
                 "are isTrusted=false and bot-detected."
             )
@@ -1625,6 +1694,14 @@ class BrowserSessionState:
                 "browser_run_script; JS clicks are isTrusted=false and "
                 "frequently rejected by WAF-protected sites.]"
             )
+        if self._vision_lag_pending:
+            self._vision_lag_pending = False
+            result += (
+                "\n[vision_lag] Vision prefetch was lagging when this action "
+                "dispatched. If the result looks off (clicked the wrong "
+                "element, filled the wrong input), call browser_screenshot "
+                "and retry."
+            )
         return result
 
     # How old a cached vision response can be before we stop piggybacking
@@ -1661,3 +1738,45 @@ class BrowserSessionState:
             return "[CACHED VISION — bboxes still valid; use vision_index=V_n to click]\n" + resp.as_brain_text()
         except Exception:
             return ""
+
+
+class _MergedVisionResponse:
+    """View over a VisionResponse that merges in synthetic (DOM-scan) V_n.
+
+    Wraps a real `vision_agent.schemas.VisionResponse` and intercepts
+    `get_bbox(v_n)` so that V_n in the reserved synthetic range (>=1000,
+    assigned by `BrowserSessionState.inject_synthetic_bboxes`) resolves
+    to the side-channel bbox map rather than the response's ranked list.
+
+    All other attribute access falls through to the wrapped response via
+    `__getattr__`, so callers that read `image_width`, `image_height`,
+    `dpr`, `flags`, etc. behave identically. `bboxes` is overridden to
+    include synthetics for iteration callers (e.g., the alternatives
+    hint), even though `get_bbox` is the canonical resolver.
+
+    Constructed by `vision_for_target_resolution()` only when synthetic
+    entries exist; otherwise the raw response is returned, keeping the
+    happy path zero-overhead.
+    """
+
+    __slots__ = ("_base", "_synthetic_v_map")
+
+    def __init__(self, base: Any, synthetic_v_map: dict[int, Any]):
+        self._base = base
+        # Snapshot a dict copy so a later state mutation (clear /
+        # consume) doesn't surprise the consumer mid-resolution.
+        self._synthetic_v_map = dict(synthetic_v_map)
+
+    @property
+    def bboxes(self) -> list[Any]:
+        return list(self._base.bboxes) + list(self._synthetic_v_map.values())
+
+    def get_bbox(self, vision_index_1based: int) -> Any:
+        v = int(vision_index_1based)
+        if v in self._synthetic_v_map:
+            return self._synthetic_v_map[v]
+        return self._base.get_bbox(v)
+
+    def __getattr__(self, name: str) -> Any:
+        # Called only when the attribute isn't on the wrapper itself.
+        return getattr(self._base, name)

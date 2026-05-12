@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
@@ -25,6 +26,51 @@ from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 
 
+# Enumeration anti-pattern detector. When the brain reaches for
+# `browser_eval` to walk an autocomplete dropdown / option list / menu
+# / calendar grid, those items are almost always already surfaced as
+# synthetic V_n by the bridge's DOM-scan pipeline (see
+# `superbrowser_bridge.session_tools.dom_scans`). Letting the eval run
+# encourages the cascade: eval → enumerate text → run_script → JS click
+# → bot-detected. We hard-block when synthetic V_n are active and emit
+# an advisory otherwise (cold-start case where the scanner hasn't fired
+# yet — the brain may legitimately need to inspect first).
+#
+# The trigger keyword set and the `.map/.forEach/.filter/.reduce` enum
+# call are matched independently — checking both presence is cheaper
+# than crafting one mega-regex robust to quote-escape variations and
+# never hits a backtrack pathology.
+_ENUM_QSA_RE = re.compile(r"querySelectorAll\b", re.IGNORECASE)
+_ENUM_CALL_RE = re.compile(r"\.(?:map|forEach|filter|reduce)\b")
+_ENUM_KEYWORD_RE = re.compile(
+    r"(?:"
+    r"\brole\s*=\s*\\?[\"']?(?:option|menuitem|listbox|menu|gridcell|combobox)"
+    r"|\bli\b"
+    r"|autocomplete"
+    r"|suggestion"
+    r"|dropdown"
+    r"|datepicker"
+    r"|combobox"
+    r"|listbox"
+    r"|menuitem"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_enumeration_script(script: str) -> bool:
+    """True when the script enumerates dropdown/option/menu items —
+    the exact pattern the synthetic V_n pipeline should serve instead.
+    """
+    if not script:
+        return False
+    if not _ENUM_QSA_RE.search(script):
+        return False
+    if not _ENUM_CALL_RE.search(script):
+        return False
+    return bool(_ENUM_KEYWORD_RE.search(script))
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -37,14 +83,12 @@ class BrowserEvalTool(Tool):
     description = (
         "Execute JavaScript in the browser page — READ-ONLY inspection "
         "only (innerText, aria-state, getBoundingClientRect, element "
-        "counts). Do NOT use this to work around a click failure by "
-        "stamping a custom id onto an element and then clicking it via "
-        "browser_click_selector — that anti-pattern is bot-detectable on "
-        "hardened sites and a sign you're working around the issue "
-        "instead of fixing it. If click_at(V_n) / click([N]) isn't "
-        "landing, re-screenshot to refresh vision and retry, or use "
-        "browser_click_selector with a CSS attribute the page already "
-        "exposes (id, data-*, aria-label)."
+        "counts). If click_at(V_n) / click([N]) isn't landing, "
+        "re-screenshot to refresh vision and retry on the new V_n. "
+        "Synthetic V_n from DOM scans (V>=1000, surfaced in tool result "
+        "captions) are available for autocomplete suggestions, date "
+        "cells, modal CTAs, and custom dropdown items — click them via "
+        "browser_click_at(vision_index=V_n) directly."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -54,12 +98,42 @@ class BrowserEvalTool(Tool):
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
         print(f"\n>> browser_eval({script[:60]}...)")
-        # Record any `.id = 'X'` / setAttribute('id', 'X') stamps in this
-        # script so a follow-up browser_click_selector('#X') trips the
-        # stamp-id anti-pattern detector. Cheap regex scan, no false-
-        # positive on read-only scripts (those just won't contain the
-        # patterns).
-        self.s.record_stamped_ids_from_script(script)
+        # Synthetic-V_n window: any eval while synthetic V_n are active
+        # is suspect. The synthetic items came from a DOM scan that's
+        # strictly more reliable than whatever inspection the eval is
+        # about to do, AND every turn spent on eval ages the synthetic
+        # bbox (dropdowns close, coords go stale). Block the eval and
+        # redirect to the synthetic V_n.
+        #
+        # Outside the synthetic window: eval is allowed (legitimate
+        # cold-start inspection still works).
+        if (
+            os.environ.get("EVAL_SYNTHETIC_BLOCK", "1") not in ("0", "false", "no")
+            and self.s._synthetic_bboxes_by_v
+        ):
+            return (
+                "[eval_blocked:synthetic_v_active] You have synthetic "
+                "V_n bboxes from a DOM scan that are clickable RIGHT "
+                "NOW via browser_click_at(vision_index=V_n). Every turn "
+                "spent on eval ages these bboxes (dropdowns close, the "
+                "page mutates). Click one of these directly:\n"
+                f"{self.s.synthetic_v_summary()}\n"
+                "If you genuinely need to abandon the dropdown (escape "
+                "via clicking elsewhere): take a browser_screenshot "
+                "AFTER consuming or letting the synthetic V_n expire "
+                "(3 turns)."
+            )
+        # Enumeration anti-pattern (lower priority — only fires when
+        # synthetic V_n are NOT active). The brain reaching for eval to
+        # walk an autocomplete listbox / dropdown menu is suspicious in
+        # any context; in non-synthetic contexts we emit an advisory but
+        # let the script run.
+        if os.environ.get("EVAL_ENUM_BLOCK", "1") not in ("0", "false", "no"):
+            if _is_enumeration_script(script):
+                print(
+                    "  [eval_enumeration_pattern_detected: advisory] "
+                    "No synthetic V_n active to redirect to; allowing."
+                )
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
@@ -126,6 +200,31 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script({script[:80]}...)")
+        # Synthetic-V_n window: any run_script while synthetic V_n are
+        # active is suspect. The synthetic items came from a DOM scan
+        # that's strictly more reliable than whatever the script is
+        # about to do, AND every turn spent in script-land ages the
+        # synthetic bbox. Block the script and redirect to the
+        # synthetic V_n. Mirrors the eval block above. Outside the
+        # synthetic window, the existing scroll-first / cursor-first
+        # gates handle abuse.
+        if (
+            os.environ.get("RUN_SCRIPT_SYNTHETIC_BLOCK", "1") not in ("0", "false", "no")
+            and self.s._synthetic_bboxes_by_v
+        ):
+            return (
+                "[run_script_blocked:synthetic_v_active] You have "
+                "synthetic V_n bboxes from a DOM scan that are clickable "
+                "RIGHT NOW via browser_click_at(vision_index=V_n). "
+                "Every turn spent on run_script ages these bboxes "
+                "(dropdowns close, the page mutates). Click one of "
+                "these directly:\n"
+                f"{self.s.synthetic_v_summary()}\n"
+                "If you genuinely need to abandon the dropdown (escape "
+                "via clicking elsewhere): take a browser_screenshot "
+                "AFTER consuming or letting the synthetic V_n expire "
+                "(3 turns)."
+            )
         # Scroll-first gate. A page with scroll capacity remaining where
         # the brain hasn't called any scroll-class tool in the recent
         # window is the classic "hallucinated V_n on a below-fold target"
@@ -208,9 +307,11 @@ class BrowserRunScriptTool(Tool):
                     f"failed; tried={tried_str}).\n"
                     "Try in order BEFORE running mutating JS:\n"
                     "  1. browser_click_at(vision_index=V_n) on the "
-                    "target's bbox.\n"
-                    "  2. browser_click_selector(<stable-css>) if the "
-                    "target has a hook.\n"
+                    "target's bbox. Synthetic V_n (V>=1000, from DOM "
+                    "scans for autocomplete / date cells / modal CTAs / "
+                    "dropdown items) count here — click them too.\n"
+                    "  2. browser_screenshot to refresh vision, then "
+                    "retry browser_click_at on the new V_n.\n"
                     "  3. browser_type_at / browser_scroll_until.\n"
                     "  4. browser_set_slider(<selector>, value) for "
                     "slider widgets — pierces shadow DOM (Chase mds-slider, "
@@ -310,13 +411,6 @@ class BrowserRunScriptTool(Tool):
         data = r.json()
 
         self.s.actions_since_screenshot += 1
-        # Anti-pattern: record any id stamps performed by this script
-        # for the stamp-id detector. Only when the script actually
-        # succeeded — a blocked / failed script didn't actually
-        # mutate the DOM. mutates=False scripts can't change ids
-        # (sandbox blocks DOM writes) so skip them entirely.
-        if bool(mutates) and bool(data.get("success")):
-            self.s.record_stamped_ids_from_script(script)
 
         # v4 D3 — record outcome in the run_script ledger so worker_hook
         # can detect 3-of-5 failures and inject the redirect-to-vision
@@ -346,8 +440,8 @@ class BrowserRunScriptTool(Tool):
                     f"and many sites reject isTrusted=false clicks "
                     f"anyway — or (b) switch to "
                     f"browser_click_at(vision_index=V_n) / "
-                    f"browser_type_at / browser_click_selector which "
-                    f"use humanized isTrusted=true events."
+                    f"browser_type_at which use humanized "
+                    f"isTrusted=true events."
                 )
             # Fetch current elements so agent can see what's on the page and fix the script
             elements = await _fetch_elements(session_id, self.s)

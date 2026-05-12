@@ -1509,9 +1509,10 @@ class BrowserScrollWithinTool(Tool):
                 f"iter(s), scrolled {scrolled}px"
                 + (" (reversed)" if reversed_flag else "")
                 + f". matched={matched[:80]!r} selector={sel}. "
-                "Now click it with `browser_click_selector` or, easier, "
-                "use `browser_select_option(label=..., value=...)` which "
-                "handles the click for you."
+                "Take a browser_screenshot so vision emits a V_n for the "
+                "target, then `browser_click_at(vision_index=V_n)`. For "
+                "<select>-style dropdowns, `browser_select_option("
+                "label=..., value=...)` handles the click for you."
             )
         else:
             lines.append(

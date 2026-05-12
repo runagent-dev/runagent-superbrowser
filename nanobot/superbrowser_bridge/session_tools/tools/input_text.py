@@ -86,6 +86,8 @@ _AUTOCOMPLETE_SCAN_JS = """
         text: txt,
         x: Math.round(r.left + r.width / 2),
         y: Math.round(r.top + r.height / 2),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
       });
     });
   }
@@ -480,20 +482,61 @@ class BrowserTypeAtTool(Tool):
             scan = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
-        if suggestions or detected:
+        # Inject the scanned suggestions as synthetic V_n bboxes so the
+        # brain can click them directly via browser_click_at without
+        # waiting for the next vision pass to (maybe) catch them. Vision
+        # routinely misses small dropdown rows; injecting bypasses that
+        # whole class of "eval to enumerate, run_script to click" cascade.
+        injected_v: list[tuple[int, Any]] = []
+        if suggestions:
+            print(
+                f"  [synthetic inject path entered: {len(suggestions)} "
+                f"prefetched_items, anchor_v={vision_index}]"
+            )
+            try:
+                from ..dom_scans import inject_scan_as_synthetic_bboxes
+                injected_v = await inject_scan_as_synthetic_bboxes(
+                    self.s, session_id, "autocomplete",
+                    anchor_v=int(vision_index) if vision_index is not None else None,
+                    prefetched_items=suggestions,
+                )
+                print(
+                    f"  [synthetic inject returned: {len(injected_v)} entries]"
+                )
+            except Exception as exc:
+                print(f"  [autocomplete synthetic injection failed: {exc}]")
+                import traceback
+                traceback.print_exc()
+        if injected_v:
+            label_str = ", ".join(
+                f"V{v} {sr.text[:60]!r}" for v, sr in injected_v
+            )
+            caption += (
+                f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(injected_v)} "
+                f"synthetic_v=injected] The dropdown items are clickable "
+                f"V_n bboxes NOW — call browser_click_at(vision_index=V_n) "
+                f"directly on the one you want. No browser_screenshot or "
+                f"browser_wait_for needed; the V_n indices are stable "
+                f"until you click one (or 3 turns expire). Items: "
+                f"{label_str}. Do NOT browser_eval / browser_run_script "
+                f"to enumerate suggestions; the [eval_blocked:enumeration"
+                f"_pattern] guard will refuse such scripts while these "
+                f"synthetic V_n exist. Do NOT use Arrow+Enter; many sites "
+                f"won't commit the value via keyboard."
+            )
+        elif suggestions or detected:
+            # Detected an autocomplete widget but no items to inject
+            # (ARIA-only signal, or items not found by the scanner). Fall
+            # back to the old screenshot-first guidance.
             count_str = str(len(suggestions)) if suggestions else "?"
             caption += (
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is now visible. NEXT TURN: take "
-                f"a browser_screenshot — the dropdown items will be "
-                f"labelled as V_n bboxes; click the one you want via "
-                f"browser_click_at(vision_index=V_n). Any click you "
-                f"attempt before that screenshot is REFUSED (the "
-                f"current V_n / selectors are anchored to the "
-                f"pre-dropdown page). Do NOT browser_run_script / "
-                f"browser_eval to enumerate suggestions; the "
-                f"screenshot will show them. Do NOT use Arrow+Enter; "
-                f"many sites won't commit the value via keyboard."
+                f"suggestion dropdown is now visible but the bridge "
+                f"couldn't enumerate the items. NEXT TURN: take a "
+                f"browser_screenshot so vision can label them as V_n. "
+                f"Any click you attempt before that screenshot is "
+                f"REFUSED. Do NOT browser_run_script / browser_eval to "
+                f"enumerate."
             )
         if suggestions or detected:
             self.s.last_type_had_suggestions = True
@@ -852,6 +895,19 @@ class BrowserTypeTool(Tool):
         scan: dict = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
+        # Inject scanned items as synthetic V_n so click_at resolves them
+        # without waiting for vision to (maybe) catch the dropdown.
+        injected_v_idx: list[tuple[int, Any]] = []
+        if suggestions:
+            try:
+                from ..dom_scans import inject_scan_as_synthetic_bboxes
+                injected_v_idx = await inject_scan_as_synthetic_bboxes(
+                    self.s, session_id, "autocomplete",
+                    anchor_v=None,
+                    prefetched_items=suggestions,
+                )
+            except Exception as exc:
+                print(f"  [autocomplete synthetic injection failed: {exc}]")
         if suggestions or detected:
             self.s.last_type_had_suggestions = True
             self.s.last_type_anchor_label = f"[{index}]"
@@ -886,20 +942,25 @@ class BrowserTypeTool(Tool):
             )
         else:
             caption = f'Typed "{text}" into [{index}]'
-        if suggestions or detected:
+        if injected_v_idx:
+            label_str = ", ".join(
+                f"V{v} {sr.text[:60]!r}" for v, sr in injected_v_idx
+            )
+            caption += (
+                f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(injected_v_idx)} "
+                f"synthetic_v=injected] The dropdown items are clickable "
+                f"V_n bboxes NOW — call browser_click_at(vision_index=V_n) "
+                f"directly. Items: {label_str}. Do NOT browser_eval / "
+                f"browser_run_script to enumerate."
+            )
+        elif suggestions or detected:
             count_str = str(len(suggestions)) if suggestions else "?"
             caption += (
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is now visible. NEXT TURN: take "
-                f"a browser_screenshot — the dropdown items will be "
-                f"labelled as V_n bboxes; click the one you want via "
-                f"browser_click_at(vision_index=V_n). Any click you "
-                f"attempt before that screenshot is REFUSED (the "
-                f"current V_n / selectors are anchored to the "
-                f"pre-dropdown page). Do NOT browser_run_script / "
-                f"browser_eval to enumerate suggestions; the "
-                f"screenshot will show them. Do NOT use Arrow+Enter; "
-                f"many sites won't commit the value via keyboard."
+                f"suggestion dropdown is now visible but the bridge "
+                f"couldn't enumerate items. NEXT TURN: take a "
+                f"browser_screenshot so vision can label them as V_n. "
+                f"Any click before that screenshot is REFUSED."
             )
 
         # Post-type semantic verification (index-addressed variant).

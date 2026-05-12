@@ -638,7 +638,6 @@ class BrowserWorkerHook(AgentHook):
                     if (
                         last_tool in {
                             "browser_click", "browser_click_at",
-                            "browser_click_selector",
                         }
                         and self.state.current_url
                         and self.state.url_visit_counts.get(

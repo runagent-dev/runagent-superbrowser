@@ -80,7 +80,6 @@ from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
     BrowserClickAtTool,
-    BrowserClickSelectorTool,
     BrowserClickTool,
     BrowserCloseTool,
     BrowserDetectCaptchaTool,

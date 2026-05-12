@@ -122,10 +122,10 @@ class LoopDetector:
         if self._action_nudge_count == 2:
             return (
                 "[LOOP-ESCALATE: same action repeated again. Try a DIFFERENT "
-                "approach: a new selector, browser_wait_for for expected content, "
-                "reload via browser_navigate to the same URL, or try the same "
-                "target via a stable CSS selector (browser_click_selector). "
-                "Do NOT fabricate data.]"
+                "approach: browser_screenshot to refresh V_n, browser_wait_for "
+                "for expected content, reload via browser_navigate to the same "
+                "URL, or browser_scroll_until to bring a different target into "
+                "view. Do NOT fabricate data.]"
             )
         return (
             "[LOOP-CRITICAL: action has repeated many times. Switch strategy — "
@@ -157,10 +157,10 @@ class LoopDetector:
         return (
             "[STAGNATION-ESCALATE: page still unchanged. Try a CONCRETE recovery: "
             "browser_wait_for for dynamic content, reload via browser_navigate, "
-            "navigate to a different URL, or try the action via "
-            "browser_click_selector with a stable CSS hook. Do NOT fabricate data. "
-            "If this page genuinely cannot yield the answer, navigate elsewhere "
-            "or return done(success=False) with an honest reason.]"
+            "navigate to a different URL, or browser_screenshot to refresh the "
+            "V_n bbox list. Do NOT fabricate data. If this page genuinely "
+            "cannot yield the answer, navigate elsewhere or return "
+            "done(success=False) with an honest reason.]"
         )
 
     def reset_action_nudge(self) -> None:
@@ -173,7 +173,6 @@ class LoopDetector:
 _CLICK_TOOLS = frozenset({
     "browser_click",
     "browser_click_at",
-    "browser_click_selector",
     "browser_type_at",
     "browser_type",
 })

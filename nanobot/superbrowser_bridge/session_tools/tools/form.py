@@ -112,8 +112,9 @@ class BrowserSelectTool(Tool):
                 "target <select> lives inside an embedded frame (quizzes, "
                 "calculators, embedded forms). v1 supports NATIVE <select> "
                 "only — ARIA combobox/listbox dropdowns inside iframes "
-                "should be driven via browser_click_selector(in_iframe=, "
-                "...) on the trigger then the option."
+                "should be driven via browser_click_at(vision_index=V_n) "
+                "on the trigger; the resulting menu items will be surfaced "
+                "as synthetic V_n via the custom_dropdown scan."
             ),
             nullable=True,
         ),
@@ -408,7 +409,7 @@ class BrowserSelectOptionTool(Tool):
                 f"select_option/form_plan for this label. The page "
                 f"is now on a new step. Take a fresh screenshot, "
                 f"then click the next target with `browser_click_at` "
-                f"(by V_n) or `browser_click_selector` (by CSS). For "
+                f"(by V_n). For "
                 f"card-grid pickers (Brand → Model → ...), each step "
                 f"is a navigation, not a dropdown — `browser_click_at` "
                 f"on the visible card is the right tool."

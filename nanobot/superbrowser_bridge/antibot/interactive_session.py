@@ -3199,10 +3199,10 @@ class T3SessionManager:
 
         Critically: routes through `_move_cursor_smooth` so the live
         viewer's SVG arrow glides to the click target. Without this,
-        every browser_click_selector call landed instantly with no
-        cursor motion, which is most of what the agent does in
-        practice on stable selectors. T1's clickSelector uses
-        humanClick (bezier + cursor emit); this is the T3 mirror.
+        every selector-based click landed instantly with no cursor
+        motion, which was most of what the agent did in practice on
+        stable selectors. T1's clickSelector used humanClick (bezier
+        + cursor emit); this is the T3 mirror, kept for legacy callers.
         """
         s = self._get(sid)
         try:

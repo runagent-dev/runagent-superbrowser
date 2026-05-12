@@ -1729,7 +1729,15 @@ export function createHttpServer(
     }
   });
 
-  /** Click the center of a DOM-selected element. Zero vision cost; pixel-exact. */
+  /**
+   * INTERNAL endpoint — selector-based click. No longer exposed to the
+   * LLM as a tool (registry entry removed; the agent must use vision-
+   * bbox clicks via /click). Kept for internal callers:
+   *   - Puzzle solvers (puzzle_solvers/browser.py) for captcha widgets
+   *     with stable selectors (chess squares, captcha handles).
+   *   - T3 backend mirror (session_tools/http_client.py) so patchright
+   *     sessions keep parity with Puppeteer sessions.
+   */
   app.post('/session/:id/click-selector', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
@@ -1744,10 +1752,6 @@ export function createHttpServer(
         return;
       }
       const selector = normalizeIdSelector(rawSelector);
-      // Phase D: when `in_iframe` (CSS for the iframe host) is provided,
-      // resolve the inner selector inside that frame instead of the
-      // top-level document. Same call surface for the bridge — Python
-      // tool only adds the optional param.
       const result = (typeof inIframe === 'string' && inIframe.length > 0)
         ? await page.clickSelectorInIframe(
             normalizeIdSelector(inIframe), selector,
@@ -1763,8 +1767,6 @@ export function createHttpServer(
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
-        // Fresh per-index fingerprints — keeps the Python bridge's
-        // cache in sync without a follow-up /state round-trip.
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
       });
     } catch (err) {
@@ -2362,6 +2364,10 @@ export function createHttpServer(
       const newState = await page.getState({ useVision: false }).catch(() => null);
       res.json({
         ...result,
+        // Mirror `ok` to `success` so HTTP-status-only callers get the
+        // right signal. Bridge code already keys on `data.ok`; this is
+        // a no-op for it and a correctness fix for everyone else.
+        success: result.ok === true,
         elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
         effect: diffEffect(effectBefore, effectAfter),
         // Fresh fingerprints — Python's element_fingerprints cache stays

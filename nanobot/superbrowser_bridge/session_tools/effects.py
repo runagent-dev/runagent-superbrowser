@@ -41,7 +41,7 @@ _ATOMIC_FIX_TEXT_JS = """
   // Cross-origin iframes throw on contentDocument access — bail
   // silently and let the existing not_input path surface a clean
   // failure; brain can fall back to
-  // browser_click_selector(in_iframe, ...) + browser_type sequence.
+  // browser_click_at(vision_index=V_n) + browser_type_at sequence.
   //
   // Cap depth at 3 for iframe-in-iframe nests.
   let _frameDepth = 0;
@@ -269,9 +269,8 @@ def _maybe_no_effect_prefix(
         f"under you; re-observe and click the fresh [V_n]; "
         f"(b) **browser_semantic_click(target='<label>')** — atomic "
         f"fresh vision + dispatch, works across React apps; "
-        f"(c) browser_click_selector(<css>) — pixel-exact if the target "
-        f"has a stable CSS hook; "
-        f"(d) browser_rewind_to_checkpoint if the page appears frozen. "
+        f"(c) browser_scroll_until to bring a different target into "
+        f"view; (d) browser_rewind_to_checkpoint if the page appears frozen. "
         f"Do NOT synthesize clicks via browser_run_script — JS clicks are "
         f"isTrusted=false and bot-detected; the sandbox will reject them."
     )
@@ -286,7 +285,6 @@ def _maybe_no_effect_prefix(
 _CURSOR_TOOL_NAMES = frozenset({
     "browser_click",
     "browser_click_at",
-    "browser_click_selector",
     "browser_type",
     "browser_type_at",
     "browser_fix_text_at",

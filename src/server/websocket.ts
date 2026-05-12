@@ -128,6 +128,14 @@ export function attachWebSocketServer(
 
     sendEvent(ws, 'connected', { sessionId });
 
+    // Replay last known cursor position so a late-connecting viewer
+    // doesn't see a stationary cursor at (0,0) until the next tool
+    // fires. Purely cosmetic; no CDP interaction.
+    const lastCursor = inputEventBus.getLastCursor(sessionId);
+    if (lastCursor) {
+      sendEvent(ws, 'cursor_move', { x: lastCursor.x, y: lastCursor.y });
+    }
+
     // --- Start screencast for this viewer ---
     const bindingId = `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     let screencastMgr = screencasts.get(sessionId);

@@ -1423,6 +1423,34 @@ export class PageWrapper {
           if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) {
             return 1;
           }
+          // Dropdown-item lenient fallback. Vision routinely drifts on
+          // suggestion / option / menuitem labels — it abbreviates
+          // ("SF MOMA" vs "San Francisco Museum of Modern Art"), strips
+          // address context, or paraphrases. The strict substring check
+          // above then rejects the click as element_mismatch even
+          // though the bbox is on the right item. Misclick risk for
+          // these roles is low (only one dropdown / listbox is open at
+          // a time, so the bbox neighbours are sibling options whose
+          // labels would all share the same drift pattern). Accept any
+          // ≥3-char word overlap as a partial match.
+          const role = (
+            ((el as HTMLElement).getAttribute('role') || '').toLowerCase()
+          );
+          const isDropdownItem = (
+            role === 'option' || role === 'menuitem'
+            || role === 'treeitem' || role === 'listitem'
+          ) || (el as HTMLElement).tagName.toLowerCase() === 'li';
+          if (isDropdownItem) {
+            const expWords = new Set(
+              expLc.split(/\s+/).filter((t) => t.length >= 3),
+            );
+            const fullWords = new Set(
+              full.split(/\s+/).filter((t) => t.length >= 3),
+            );
+            let common = 0;
+            for (const t of expWords) if (fullWords.has(t)) common += 1;
+            if (common >= 1) return 0.7;
+          }
           return 0.05;
         };
         let best: Element | null = null;
@@ -1567,6 +1595,17 @@ export class PageWrapper {
       linear: options?.linear ?? (snap.isAutocompleteOption === true),
     };
     await dispatchClick(client, snap.x, snap.y, dispatchOpts);
+    // Microtask + double-RAF flushes the React/Vue commit phase and one
+    // paint before the caller's effect snapshot. waitForIdle alone gates
+    // only on network idle, which is already idle on most SPAs — so the
+    // call returns in <1ms and async state updates fire AFTER the
+    // captureEffect, producing mutation_delta=0 even though the click
+    // landed. Adds ~32ms on idle pages; far cheaper than waitForVisualStable.
+    try {
+      await this.page.evaluate(() => new Promise<void>((r) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      }));
+    } catch { /* page closed mid-click */ }
     await this.waitForIdle(1000).catch(() => {});
     return snap;
   }
