@@ -45,6 +45,7 @@ from .navigation import (
     BrowserNavigateTool,
     BrowserOpenTool,
     BrowserRewindToCheckpointTool,
+    BrowserScrollToBboxTool,
     BrowserScrollTool,
     BrowserScrollUntilTool,
     BrowserScrollWithinTool,

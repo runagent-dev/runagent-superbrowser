@@ -26,6 +26,7 @@ from nanobot.agent.tools.schema import (
 
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
+from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 
 
 @tool_parameters(
@@ -113,8 +114,9 @@ class BrowserSelectTool(Tool):
                 "calculators, embedded forms). v1 supports NATIVE <select> "
                 "only — ARIA combobox/listbox dropdowns inside iframes "
                 "should be driven via browser_click_at(vision_index=V_n) "
-                "on the trigger; the resulting menu items will be surfaced "
-                "as synthetic V_n via the custom_dropdown scan."
+                "on the trigger; after the menu opens, take a "
+                "browser_screenshot so vision labels each menu item and "
+                "click the V_n you want."
             ),
             nullable=True,
         ),
@@ -330,6 +332,7 @@ class BrowserSelectOptionTool(Tool):
         print(f"   [select_option] FAIL reason={reason or '?'}{cand_preview}")
 
         msg_parts = [f"[select_option_failed] reason={reason or 'unknown'} label={label!r} value={value!r}"]
+        _ambiguous_needs_vision = False
         if reason == "ambiguous_trigger":
             # Multiple candidates with similar scores. The TS picker
             # surfaces them as `candidates` (shape: tag<role>['text']
@@ -344,10 +347,45 @@ class BrowserSelectOptionTool(Tool):
             )
         elif reason == "ambiguous_option":
             shown = ", ".join(repr(c) for c in candidates[:5])
-            msg_parts.append(
-                f"Multiple options match {value!r} at the same tier. "
-                f"Use a more specific value. Top candidates: {shown}"
+            # Literal duplicates ('HP', 'HP') mean the dropdown DOM has
+            # multiple identically-labelled options (e.g. a 'Popular'
+            # section + alphabetical section both containing the value).
+            # Text matching can't disambiguate — defer to vision +
+            # visual position via V_n. Handled by the deterministic
+            # recovery path below.
+            has_literal_duplicates = bool(
+                candidates
+                and len(candidates) > 1
+                and len({
+                    c.strip().lower() for c in candidates
+                    if isinstance(c, str)
+                }) < len(candidates)
             )
+            if has_literal_duplicates:
+                msg_parts.append(
+                    f"Multiple options match {value!r} EXACTLY "
+                    f"(candidates: {shown}). The dropdown has duplicate "
+                    f"option labels — text-matching can't distinguish "
+                    f"them. Refreshing vision so you can pick by "
+                    f"VISUAL POSITION via V_n; see [matching_v_n] "
+                    f"below."
+                )
+                # Mark for vision-refresh + V_n surfacing at end of
+                # failure path. Avoids restructuring the whole
+                # msg_parts builder.
+                _ambiguous_needs_vision = True
+            else:
+                msg_parts.append(
+                    f"Multiple options match {value!r} at the same "
+                    f"tier. Top candidates: {shown}. Try a more "
+                    f"specific value, or call "
+                    f"browser_scroll_within(target_text={value!r}) "
+                    f"if the right option is below the visible fold of "
+                    f"the dropdown, then browser_screenshot and "
+                    f"browser_click_at(vision_index=V_n) on the right "
+                    f"one."
+                )
+                _ambiguous_needs_vision = False
         elif reason == "popup_on_navigated_page":
             msg_parts.append(
                 "The trigger opened a listbox but the page also "
@@ -425,7 +463,7 @@ class BrowserSelectOptionTool(Tool):
                 f"inspect the page shape, or (c) re-screenshot — the "
                 f"page may have transitioned to a different stage."
             )
-        if candidates and reason not in ("trigger_navigated",):
+        if candidates and reason not in ("trigger_navigated",) and not _ambiguous_needs_vision:
             shown = ", ".join(repr(c) for c in candidates[:15])
             msg_parts.append(f"candidates: {shown}")
             msg_parts.append(
@@ -436,6 +474,7 @@ class BrowserSelectOptionTool(Tool):
         elif (
             reason
             and reason not in ("trigger_not_found", "trigger_navigated", "no_popup_detected")
+            and not _ambiguous_needs_vision
         ):
             msg_parts.append(
                 "No options were collected. The listbox may use a non-ARIA "
@@ -484,6 +523,295 @@ class BrowserSelectOptionTool(Tool):
             )
         self.s.log_activity(f"select_option({label}, FAIL)", (reason or "")[:60])
         self.s.record_step("browser_select_option", f"{label}={value}", f"FAIL:{reason or '?'}")
+
+        # Deterministic ambiguous_option recovery. The TS matcher found
+        # multiple options with identical labels (e.g. 'HP' under
+        # "Popular brands" + 'HP' in the alphabetical list) — but the
+        # candidates may not all be visible in the current viewport of
+        # the dropdown popup.
+        #
+        # Strategy: PIXEL-SCROLL the popup in steps of ~half its
+        # viewport, refreshing vision after each step and scanning the
+        # bboxes for matching labels. Stop as soon as one or more
+        # matches appear in vision (or after MAX_ITERS exhausts the
+        # popup). Pixel scrolling is more reliable than text-based
+        # scroll-until: it doesn't depend on the TS matcher correctly
+        # identifying when the target text is VISUALLY visible (which
+        # can false-positive when the text is in DOM but outside the
+        # popup's clipped scroll viewport).
+        if _ambiguous_needs_vision:
+            MAX_ITERS = 5
+            matching: list[tuple[int, str, list[int] | None]] = []
+            needle = value.strip().lower()
+            try:
+                for iteration in range(MAX_ITERS + 1):
+                    # Refresh vision and scan current viewport for the
+                    # value label. First iteration scans the initial
+                    # screenshot (no scroll yet) — handles the case
+                    # where all matches are already visible.
+                    try:
+                        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+                        _ = await _append_fresh_vision(
+                            _vision_task, "", state=self.s,
+                        )
+                    except Exception as ve:
+                        print(f"   [select_option:vision_refresh iter={iteration} failed] {ve}")
+
+                    resp = self.s.vision_for_target_resolution()
+                    if resp is not None:
+                        for v_n, bb in enumerate(
+                            getattr(resp, "bboxes", []) or [], 1,
+                        ):
+                            lbl = (getattr(bb, "label", "") or "").strip()
+                            if not lbl:
+                                continue
+                            ll = lbl.lower()
+                            if ll == needle or ll.startswith(needle) or needle in ll:
+                                matching.append((
+                                    v_n, lbl[:60],
+                                    list(getattr(bb, "box_2d", []) or []) or None,
+                                ))
+                            if len(matching) >= 12:
+                                break
+
+                    # Stop as soon as vision sees the value somewhere.
+                    # The brain picks visually from the displayed V_n.
+                    if matching:
+                        break
+                    if iteration >= MAX_ITERS:
+                        break
+
+                    # Pixel-scroll the open popup. amount='page' ≈ 85%
+                    # of the container's clientHeight — bigger steps so
+                    # we cover the full popup in fewer iterations. The
+                    # smaller MAX_ITERS=5 budget * 0.85 ratio reaches
+                    # ~4.25 viewports of total scroll, enough for
+                    # 200-300 row brand pickers. Auto-detects the popup
+                    # container via the expanded signal stack in
+                    # page.ts:scrollWithin.
+                    try:
+                        sw_payload = {
+                            "direction": "down",
+                            "amount": "page",
+                        }
+                        sw_r = await _request_with_backoff(
+                            "POST",
+                            f"{SUPERBROWSER_URL}/session/{session_id}/scroll-within",
+                            json=sw_payload,
+                            timeout=10.0,
+                        )
+                        if sw_r.status_code == 200:
+                            sw_body = sw_r.json() or {}
+                            sw_outcome = (sw_body.get("outcome") or {})
+                            sw_px = sw_outcome.get("scrolledPx", 0)
+                            sw_reason = sw_outcome.get("reason", "")
+                            print(
+                                f"   [select_option:pixel_scroll iter={iteration + 1}]"
+                                f" scrolledPx={sw_px} reason={sw_reason}"
+                            )
+                            # If the popup couldn't be found or it hit
+                            # its bottom, no point scrolling further.
+                            if sw_reason in ("no_container", "page_end"):
+                                break
+                            if sw_px == 0:
+                                # Didn't move — likely hit the end even
+                                # if the reason wasn't reported.
+                                break
+                    except Exception as sw_exc:
+                        print(
+                            f"   [select_option:pixel_scroll iter={iteration + 1}"
+                            f" failed] {sw_exc}"
+                        )
+                        break
+
+                # DOM-DIRECT FALLBACK. If vision saw 0 matches across
+                # all scroll iterations, fall back to a direct DOM
+                # query for option elements whose text contains the
+                # value. The DOM is authoritative — vision can miss
+                # rows (small font, low contrast, beyond Gemini's
+                # labeling budget), but DOM doesn't. After finding the
+                # elements, scrollIntoView the FIRST one and run vision
+                # one more time so the brain still gets a V_n it can
+                # click. If vision STILL misses, surface the DOM-direct
+                # bounds so the user sees exactly what's there.
+                if not matching:
+                    try:
+                        eval_script = (
+                            "(() => {"
+                            " const v = " + repr(value.strip().lower()) + ";"
+                            " const sels = ['[role=\"option\"]', "
+                            "'[role=\"menuitem\"]', "
+                            "'[role=\"menuitemcheckbox\"]', "
+                            "'[role=\"menuitemradio\"]'];"
+                            " const hits = [];"
+                            " const seen = new Set();"
+                            " for (const sel of sels) {"
+                            "  for (const el of document.querySelectorAll(sel)) {"
+                            "   if (seen.has(el)) continue; seen.add(el);"
+                            "   const t = (el.innerText || el.textContent || '').trim();"
+                            "   if (!t) continue;"
+                            "   const tl = t.toLowerCase();"
+                            "   if (tl === v || tl.startsWith(v) || tl.includes(v)) {"
+                            "    const r = el.getBoundingClientRect();"
+                            "    const cs = window.getComputedStyle(el);"
+                            "    const visible = r.width > 0 && r.height > 0"
+                            "      && cs.visibility !== 'hidden'"
+                            "      && cs.display !== 'none';"
+                            "    hits.push({"
+                            "     text: t.slice(0, 80),"
+                            "     x: Math.round(r.left + r.width/2),"
+                            "     y: Math.round(r.top + r.height/2),"
+                            "     w: Math.round(r.width),"
+                            "     h: Math.round(r.height),"
+                            "     visible: visible,"
+                            "     in_viewport: r.top >= 0 && r.bottom <= window.innerHeight,"
+                            "    });"
+                            "   }"
+                            "   if (hits.length >= 10) break;"
+                            "  }"
+                            "  if (hits.length >= 10) break;"
+                            " }"
+                            " return hits;"
+                            "})()"
+                        )
+                        ev_r = await _request_with_backoff(
+                            "POST",
+                            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                            json={"script": eval_script},
+                            timeout=8.0,
+                        )
+                        if ev_r.status_code == 200:
+                            ev_body = ev_r.json() or {}
+                            dom_hits = ev_body.get("result") or []
+                            if isinstance(dom_hits, list) and dom_hits:
+                                print(
+                                    f"   [select_option:dom_fallback] found "
+                                    f"{len(dom_hits)} DOM-direct matches "
+                                    f"({sum(1 for h in dom_hits if h.get('in_viewport'))} "
+                                    f"in viewport)"
+                                )
+                                # Step A: scroll the first NON-visible match
+                                # into view. block:'center' so vision has
+                                # context above and below.
+                                first_off_screen = next(
+                                    (h for h in dom_hits if not h.get("in_viewport")),
+                                    None,
+                                )
+                                if first_off_screen:
+                                    scroll_script = (
+                                        "(() => {"
+                                        " const v = " + repr(value.strip().lower()) + ";"
+                                        " const sels = ['[role=\"option\"]', "
+                                        "'[role=\"menuitem\"]', "
+                                        "'[role=\"menuitemcheckbox\"]', "
+                                        "'[role=\"menuitemradio\"]'];"
+                                        " for (const sel of sels) {"
+                                        "  for (const el of document.querySelectorAll(sel)) {"
+                                        "   const t = (el.innerText || el.textContent || '').trim().toLowerCase();"
+                                        "   if (t === v || t.startsWith(v) || t.includes(v)) {"
+                                        "    try { el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch(e) {}"
+                                        "    return true;"
+                                        "   }"
+                                        "  }"
+                                        " }"
+                                        " return false;"
+                                        "})()"
+                                    )
+                                    await _request_with_backoff(
+                                        "POST",
+                                        f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+                                        json={"script": scroll_script},
+                                        timeout=5.0,
+                                    )
+                                    # Settle then re-vision
+                                    await asyncio.sleep(0.3)
+                                    try:
+                                        _vt2 = _schedule_vision_prefetch(self.s, session_id)
+                                        _ = await _append_fresh_vision(_vt2, "", state=self.s)
+                                    except Exception:
+                                        pass
+                                    resp2 = self.s.vision_for_target_resolution()
+                                    if resp2 is not None:
+                                        for v_n, bb in enumerate(
+                                            getattr(resp2, "bboxes", []) or [], 1,
+                                        ):
+                                            lbl = (getattr(bb, "label", "") or "").strip()
+                                            if not lbl:
+                                                continue
+                                            ll = lbl.lower()
+                                            if ll == needle or ll.startswith(needle) or needle in ll:
+                                                matching.append((
+                                                    v_n, lbl[:60],
+                                                    list(getattr(bb, "box_2d", []) or []) or None,
+                                                ))
+                                            if len(matching) >= 12:
+                                                break
+                                # If even after scrollIntoView vision missed
+                                # the matches, at least surface the DOM
+                                # truth so the brain has a concrete target.
+                                if not matching:
+                                    rows = []
+                                    for h in dom_hits[:8]:
+                                        vis = "visible" if h.get("in_viewport") else "scrolled-off"
+                                        rows.append(
+                                            f"  '{h.get('text','')}'"
+                                            f" at ({h.get('x',0)},{h.get('y',0)})"
+                                            f" size={h.get('w',0)}x{h.get('h',0)}"
+                                            f" [{vis}]"
+                                        )
+                                    msg_parts.append(
+                                        f"[matching_dom count={len(dom_hits)}] "
+                                        f"DOM-direct query found these option "
+                                        f"elements with text containing "
+                                        f"{value!r} (vision didn't label them "
+                                        f"as V_n):\n" + "\n".join(rows)
+                                        + "\nThe first match was scrolled into "
+                                        "view; call browser_screenshot to let "
+                                        "vision retry labelling it, then "
+                                        "browser_click_at(vision_index=V_n)."
+                                    )
+                    except Exception as exc:
+                        print(f"   [select_option:dom_fallback failed] {exc}")
+
+                if matching:
+                    # Sort by visual position (top-to-bottom by ymin,
+                    # then left-to-right by xmin).
+                    def _pos(item: tuple[int, str, list[int] | None]) -> tuple[int, int]:
+                        b = item[2] or [0, 0, 0, 0]
+                        return (int(b[0] or 0), int(b[1] or 0))
+                    matching.sort(key=_pos)
+                    rows = []
+                    for v_n, lbl, _ in matching:
+                        rows.append(f"  V{v_n} {lbl!r}")
+                    msg_parts.append(
+                        f"[matching_v_n count={len(matching)}] "
+                        f"vision labelled these as candidates after "
+                        f"pixel-scrolling the popup (top-to-bottom):\n"
+                        + "\n".join(rows)
+                        + "\nCall browser_click_at(vision_index=V_n) "
+                        "on the one whose visual position / section "
+                        "header matches your intent."
+                    )
+                elif not any("[matching_dom" in p for p in msg_parts):
+                    # Neither vision NOR DOM-direct found matches.
+                    msg_parts.append(
+                        "[matching_v_n count=0] Pixel-scrolled the popup "
+                        f"{MAX_ITERS}× and ran a DOM-direct query — "
+                        f"neither vision nor DOM saw an option matching "
+                        f"{value!r}. Possible causes: dropdown closed "
+                        "mid-flight, popup container not auto-detected, "
+                        "or option text differs from the value you "
+                        "passed (try a more specific value or take "
+                        "browser_screenshot + browser_get_markdown to "
+                        "inspect the dropdown options)."
+                    )
+            except Exception as exc:
+                msg_parts.append(
+                    f"[matching_v_n_error] pixel-scroll recovery failed: "
+                    f"{exc}. Call browser_screenshot then "
+                    f"browser_click_at(vision_index=V_n) manually."
+                )
+
         return "\n".join(msg_parts)
 
 

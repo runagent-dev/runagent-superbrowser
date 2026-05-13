@@ -101,7 +101,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ must go to this site https://www.bestbuy.com/ .Check the specifications of the best-selling HP FHD laptop with 16 GB RAM and core i7 running on Windows 11. Use browser tools."""
+        """ must go to this site https://www.coolmath4kids.com/ . Complete a multiplication quiz on https://www.coolmath4kids.com/, covering multiplication facts for 11-12. The quiz should consist of 10 questions, with unlimited time allowed for each. The goal is to achieve a perfect score of 10 out of 10. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

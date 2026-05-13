@@ -482,9 +482,9 @@ class BrowserWorkerHook(AgentHook):
         # content bboxes were emitted.
         #
         # Note: if the vision agent misses the popup (no flag), the
-        # click-pending-screenshot guard in click.py still forces a
-        # re-screenshot before any click; once vision sees the dropdown
-        # the brain can pick V_n straight from the screenshot.
+        # brain still falls through to the post-type AUTOCOMPLETE_OPEN
+        # caption in input_text.py — same recovery: re-screenshot, then
+        # click the V_n vision labels.
         if os.environ.get("WORKER_AUTOCOMPLETE_HINT", "1") not in ("0", "false", "no"):
             try:
                 last_resp = getattr(self.state, "_last_vision_response", None)

@@ -1662,6 +1662,46 @@ export function createHttpServer(
     }
   });
 
+  /**
+   * Scroll a bbox into view. Picks the right surface (page or inner
+   * popup container) based on whether the bbox center is inside an
+   * open listbox / menu / dialog. Used by:
+   *   - `browser_scroll_to_bbox` (brain-facing) for explicit re-aim
+   *   - `bbox_click` auto-scroll: when the click target is below the
+   *     fold, the click tool calls this once before dispatching so
+   *     dropdown options below the popup's clipped region are
+   *     reachable without the brain calling browser_scroll_within
+   *     first.
+   */
+  app.post('/session/:id/scroll-to-bbox', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { bbox } = req.body ?? {};
+      if (!bbox
+          || typeof bbox.x0 !== 'number'
+          || typeof bbox.y0 !== 'number'
+          || typeof bbox.x1 !== 'number'
+          || typeof bbox.y1 !== 'number') {
+        res.status(400).json({
+          error: 'bbox is required and must be {x0,y0,x1,y1} in CSS pixels',
+        });
+        return;
+      }
+      const result = await page.scrollBboxIntoView(bbox);
+      res.json({
+        success: true,
+        scrolled: result.scrolled,
+        container_kind: result.containerKind,
+        delta_y: result.deltaY,
+        new_bbox: result.newBbox,
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Drag from one point to another. Useful for slider CAPTCHAs and puzzle pieces. */
   app.post('/session/:id/drag', async (req, res) => {
     const page = getSession(req.params.id);

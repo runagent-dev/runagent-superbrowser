@@ -1030,18 +1030,13 @@ class BrowserCloseTool(Tool):
 class BrowserScrollUntilTool(Tool):
     name = "browser_scroll_until"
     description = (
-        "Closed-loop scan. Walks the page in small steps toward "
-        "`target_text` (substring or regex) / `target_role`, returning "
-        "a TRACE of every interactive label that entered the viewport "
-        "along the way. Auto-reverses by default if the first direction "
-        "hits the page boundary without a match — so the brain doesn't "
-        "have to remember to scroll back. Prefer this over "
-        "`browser_scroll` whenever you know what you're looking for: "
-        "the trace IS the ground truth — if it doesn't list your "
-        "target after a `reversed_no_match`, the label is not on this "
-        "page (try a synonym or `browser_get_markdown`). Cheap (DOM "
-        "polling, no screenshot per step). Defaults: cadence='fine' "
-        "when target_text is set, auto_reverse=true, emit_trace=true."
+        "[DEPRECATED — use browser_scroll_to_bbox once vision has "
+        "labelled the target, or browser_scroll(pixels) for pixel-step] "
+        "Closed-loop text-scan. Walks the page in small steps toward "
+        "`target_text` / `target_role`. Fails on virtual lists, "
+        "collapsed sections, cross-origin iframes, and multi-node text. "
+        "Kept as an internal fallback; do NOT use as a primary scroll "
+        "tool."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1401,16 +1396,17 @@ class BrowserScrollUntilTool(Tool):
 class BrowserScrollWithinTool(Tool):
     name = "browser_scroll_within"
     description = (
-        "Scroll INSIDE a popup/listbox/menu/modal — NOT the page. Use "
-        "this when a dropdown is open and the option you want sits "
-        "below the visible portion of its menu (long option list, "
-        "scrollable popup). Page-level scroll won't move a popup's "
-        "internal scroll. With `target_text`, walks the container in "
-        "fine steps until that option enters view. Without "
-        "`container_selector`, auto-detects the most recently opened "
-        "popup. Note: `browser_select_option` already does this "
-        "internally — only reach for this tool when you're driving the "
-        "dropdown manually with `browser_click_at`."
+        "Scroll INSIDE an open popup / listbox / menu / modal — NOT the "
+        "page. Use this when a dropdown is open and the option you want "
+        "is BELOW the visible portion of the menu (so it has no V_n "
+        "yet). Without `container_selector`, the server auto-detects "
+        "the most recently opened popup (`[role=\"listbox|menu|"
+        "dialog\"]`, Headless UI, Radix). Pass `container_selector` "
+        "only as an override when auto-detect picks the wrong popup. "
+        "With `target_text`, walks the container in fine steps until "
+        "that option enters view; without it, scrolls by `amount`. "
+        "After scrolling, call `browser_screenshot` so vision labels "
+        "the newly-revealed options, then `browser_click_at(V_n)`."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1437,10 +1433,12 @@ class BrowserScrollWithinTool(Tool):
         payload: dict[str, Any] = {
             "direction": direction or "down",
         }
-        if target_text and target_text.strip():
-            payload["targetText"] = target_text.strip()
+        # Pass containerSelector only when set — empty/missing triggers
+        # the TS-side popup auto-detect in page.ts:scrollWithin.
         if container_selector and container_selector.strip():
             payload["containerSelector"] = container_selector.strip()
+        if target_text and target_text.strip():
+            payload["targetText"] = target_text.strip()
         if amount is not None:
             # Accept "page" / "half" or an integer pixel count.
             if isinstance(amount, str) and amount in ("page", "half"):
@@ -1566,6 +1564,120 @@ class BrowserScrollWithinTool(Tool):
         return await _append_fresh_vision(
             _vision_task, "\n".join(lines),
             state=self.s,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        vision_index=IntegerSchema(
+            description="1-based V_n of the bbox to bring into view.",
+        ),
+        required=["session_id", "vision_index"],
+    )
+)
+class BrowserScrollToBboxTool(Tool):
+    name = "browser_scroll_to_bbox"
+    description = (
+        "Scroll a vision-labelled element into view. Picks the right "
+        "surface automatically: if the bbox is inside an open dropdown "
+        "popup, scrolls the popup's internal container; otherwise "
+        "scrolls the page. Use this when a V_n you want to click is "
+        "off-screen.\n\n"
+        "Note: `browser_click_at(vision_index=V_n)` already auto-scrolls "
+        "before clicking, so you usually do NOT need to call this "
+        "before a click. Reach for it when you want to see a labelled "
+        "section before deciding what to click."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        vision_index: int,
+        **kw: Any,
+    ) -> Any:
+        gate = await _feedback_gate("browser_scroll_to_bbox")
+        if gate:
+            return gate
+
+        if not isinstance(vision_index, int):
+            try:
+                vision_index = int(str(vision_index).strip())
+            except (TypeError, ValueError):
+                return (
+                    "[scroll_to_bbox_failed:bad_vision_index] "
+                    "vision_index must be an integer (the V_n)."
+                )
+
+        resp = self.s.vision_for_target_resolution()
+        if resp is None:
+            return (
+                "[scroll_to_bbox_failed:no_vision] No recent vision "
+                "response to resolve V_n against. Call "
+                "browser_screenshot first."
+            )
+        bbox = resp.get_bbox(int(vision_index))
+        if bbox is None:
+            return (
+                f"[scroll_to_bbox_failed:bad_vision_index] V{vision_index} "
+                f"is out of range (only {len(resp.bboxes)} bboxes in "
+                f"the last vision response)."
+            )
+
+        iw, ih = resp.image_width, resp.image_height
+        if iw <= 0 or ih <= 0:
+            return (
+                "[scroll_to_bbox_failed:no_image_dims] Vision response "
+                "lacks source image dimensions; cannot denormalize bbox."
+            )
+        dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+        x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+        payload = {"bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+
+        print(f"\n>> browser_scroll_to_bbox(V{vision_index})")
+        try:
+            r = await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/scroll-to-bbox",
+                json=payload,
+                timeout=10.0,
+            )
+        except Exception as exc:
+            return f"[scroll_to_bbox_failed] request error: {exc}"
+
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            return f"[scroll_to_bbox_failed] HTTP {r.status_code}: {err}"
+
+        data = r.json()
+        kind = data.get("container_kind", "?")
+        delta = data.get("delta_y", 0)
+        scrolled = bool(data.get("scrolled"))
+        bbox_label = (getattr(bbox, "label", "") or "")[:60]
+        if not scrolled and kind == "already_visible":
+            caption = (
+                f"V{vision_index} {bbox_label!r} is already fully on "
+                f"screen. No scroll needed."
+            )
+        else:
+            caption = (
+                f"Scrolled V{vision_index} {bbox_label!r} into view via "
+                f"{kind} container (delta_y={delta}px)."
+            )
+        self.s.record_step("browser_scroll_to_bbox", f"V{vision_index}", caption)
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task, caption, state=self.s,
         )
 
 

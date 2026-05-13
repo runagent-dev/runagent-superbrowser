@@ -133,7 +133,12 @@ class InputEventBus extends EventEmitter {
   ): void {
     const rx = Math.round(x);
     const ry = Math.round(y);
-    this.lastCursor.set(sessionId, { x: rx, y: ry });
+    // Deliberately NOT updating lastCursor here. emitClickTarget paints
+    // a transient crosshair at the resolved target; it is not a "cursor
+    // moved here" event. Updating lastCursor would mislead the next
+    // humanClick into thinking the real cursor is already at the target
+    // and skipping its approach sweep — defeating the bezier path and
+    // making the cursor appear to teleport between clicks.
     this.emit('click_target', {
       sessionId,
       x: rx,
@@ -170,10 +175,12 @@ class InputEventBus extends EventEmitter {
    * dispatch (`clickSelector` default, autocomplete in `clickInBbox`,
    * and the Tier 2 Puppeteer fallback in `clickElement`).
    *
-   * Defaults: 5 emits with ~30ms spacing (matches the 30 FPS WS
-   * throttle in `websocket.ts:213` — more emits get dropped). Total
-   * wall-clock travel ~150ms, in line with `humanClick`'s 100–200ms
-   * pre-click hesitation.
+   * Defaults: 5 emits with ~40ms spacing. The WS throttle in
+   * `websocket.ts` (CURSOR_THROTTLE_MS=30) plus a trailing-edge flush
+   * means every sweep step reaches viewers — the prior 30ms spacing
+   * landed inside the 33ms throttle window and silently dropped
+   * intermediate frames. Total wall-clock travel ~200ms, still inside
+   * `humanClick`'s 100–200ms pre-click hesitation budget.
    *
    * If no prior cursor position is recorded, starts from ~150px
    * up-and-left of the target (mirrors `humanClick`'s
@@ -186,7 +193,7 @@ class InputEventBus extends EventEmitter {
     opts?: { steps?: number; stepDelayMs?: number },
   ): Promise<void> {
     const steps = Math.max(2, opts?.steps ?? 5);
-    const stepDelay = Math.max(20, opts?.stepDelayMs ?? 30);
+    const stepDelay = Math.max(20, opts?.stepDelayMs ?? 40);
     const target = { x: Math.round(toX), y: Math.round(toY) };
     const origin = this.lastCursor.get(sessionId) ?? {
       x: target.x - 150,

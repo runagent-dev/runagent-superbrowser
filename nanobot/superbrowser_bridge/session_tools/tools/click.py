@@ -27,6 +27,11 @@ from ..formatting import _fetch_elements, _vision_alternatives_hint
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
+from ._click_core import (
+    lookup_postcondition,
+    maybe_scroll_bbox_into_view,
+    run_click_with_ladder,
+)
 
 
 @tool_parameters(
@@ -295,46 +300,6 @@ class BrowserClickTool(Tool):
                     f"click([{index}])(EPOCH_DIRTY)",
                     f"mutation_delta={mutation_delta} > {threshold}",
                 )
-            # Silent-click detection — same shape as BrowserClickAtTool's
-            # post-click verify, but in-band: zero mutations + no URL
-            # change is the canonical "click went out, page didn't react"
-            # signal. Surface as [click_silent] so the brain re-screen-
-            # shots / tries a different target instead of believing
-            # `Clicked [N]` succeeded. Cheap (no extra HTTP — the effect
-            # block is already in the response).
-            if (
-                mutation_delta == 0
-                and not url_changed_eff
-                and os.environ.get("VERIFY_AFTER_CLICK", "1") != "0"
-            ):
-                # Whitelist legitimate non-mutating clicks before emitting
-                # [click_silent]. Focus moves, native inputs, <details>
-                # toggles, and labels routinely register no DOM mutation
-                # but still represent a real interaction. Zero new HTTP —
-                # both signals are already in `data`.
-                focused_changed_eff = bool(effect.get("focused_changed"))
-                snap_target = ""
-                snap_info = data.get("snap") if isinstance(data, dict) else None
-                if isinstance(snap_info, dict):
-                    snap_target = (snap_info.get("target") or "").lower()
-                input_like = snap_target.startswith(
-                    ("input", "select", "option", "textarea",
-                     "summary", "details", "label")
-                )
-                if focused_changed_eff or input_like:
-                    self.s.log_activity(
-                        f"click([{index}])(QUIET)",
-                        f"focus={focused_changed_eff} target={snap_target[:40]}",
-                    )
-                else:
-                    verify_note = (
-                        f"\n[click_silent reason=no_effect] Click [{index}] "
-                        f"dispatched but produced zero DOM mutations and no "
-                        f"URL change. Target may be non-interactive, covered "
-                        f"by an overlay, or the page is mid-load. Call "
-                        f"browser_screenshot to re-vision before retrying."
-                    )
-                    self.s.log_activity(f"click([{index}])(SILENT)", "no_effect")
         except Exception:
             pass
         actual_url = data.get("url", self.s.current_url)
@@ -344,6 +309,30 @@ class BrowserClickTool(Tool):
         snap = data.get("snap") if isinstance(data, dict) else None
         if isinstance(snap, dict) and snap.get("snapped") is False:
             self.s.snap_miss_count += 1
+        # Shared click ladder — verify_after + js/keyboard escalation.
+        # DOM-index clicks previously only emitted [click_silent] on
+        # no-op; they now auto-recover via the same ladder bbox clicks
+        # use. Escalation uses snap.x / snap.y (resolved click coords).
+        snap_x = snap.get("x") if isinstance(snap, dict) else None
+        snap_y = snap.get("y") if isinstance(snap, dict) else None
+        try:
+            alt_x = float(snap_x) if snap_x is not None else 0.0
+            alt_y = float(snap_y) if snap_y is not None else 0.0
+        except (TypeError, ValueError):
+            alt_x = 0.0
+            alt_y = 0.0
+        postcond = lookup_postcondition(self.s, vision_index=None, x=alt_x, y=alt_y)
+        verify_note = ""
+        if alt_x > 0 and alt_y > 0:
+            verify_note = await run_click_with_ladder(
+                self.s, session_id,
+                log_target=f"[{index}]",
+                primary_response=data,
+                alt_x=alt_x,
+                alt_y=alt_y,
+                alt_bbox=None,
+                postcondition=postcond,
+            )
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
         self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
@@ -359,24 +348,22 @@ class BrowserClickTool(Tool):
         vision_index=IntegerSchema(
             description=(
                 "1-based vision bbox index (the V_n the vision agent "
-                "labelled this element). When set, the server snaps to "
-                "the interactive element inside that bbox — far more "
-                "accurate than clicking a guessed (x,y)."
+                "labelled this element). REQUIRED — every bbox click "
+                "must anchor to a labelled element. The server snaps to "
+                "the interactive element inside the bbox, eliminating "
+                "off-by-pixel misses."
             ),
-            nullable=True,
         ),
-        x=NumberSchema(description="X coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
-        y=NumberSchema(description="Y coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
-        required=["session_id"],
+        required=["session_id", "vision_index"],
     )
 )
 class BrowserClickAtTool(Tool):
     name = "browser_click_at"
     description = (
-        "Click using a vision bbox (vision_index=V_n) or raw (x,y) "
-        "coordinates. Prefer vision_index whenever the vision agent "
-        "labelled the target — the server snaps to the actual interactive "
-        "element inside the bbox, eliminating off-by-pixel misses.\n\n"
+        "Click a vision bbox by its V_n. The server snaps to the "
+        "actual interactive element inside the bbox, eliminating "
+        "off-by-pixel misses. Synthetic V_n (V>=1000, injected by "
+        "DOM scans after type/click) are clicked the same way.\n\n"
         "TOGGLE SEMANTICS: when V_n shows `active=true` (a filter chip, "
         "checkbox, or radio that's already ON), clicking it AGAIN will "
         "UN-toggle it (un-apply the filter, uncheck the box, deselect "
@@ -389,7 +376,11 @@ class BrowserClickAtTool(Tool):
         "may show `just_toggled=on` or `just_toggled=off` next to "
         "`active=` — that means YOUR last click flipped this control. "
         "If `just_toggled=on` appeared on a control whose label "
-        "doesn't match the task, re-click the same V_n to reverse it."
+        "doesn't match the task, re-click the same V_n to reverse it.\n\n"
+        "AUTO-SCROLL: when the bbox is below the fold (page or inner "
+        "popup), the tool auto-scrolls the right container before "
+        "dispatching. Do NOT pre-call browser_scroll_within for a "
+        "popup option — this tool handles it."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -399,30 +390,28 @@ class BrowserClickAtTool(Tool):
         self,
         session_id: str,
         vision_index: int | None = None,
-        x: float | None = None,
-        y: float | None = None,
         **kw: Any,
     ) -> Any:
         # Coerce vision_index — some LLMs emit "2" (string) instead of 2
         # (int). The schema declares IntegerSchema; in practice the
         # validator lets the string through and we used to silently drop
         # the parameter. Cast once here so the rest of the function sees
-        # an int (or None for the (x,y) path).
+        # an int.
         if vision_index is not None and not isinstance(vision_index, int):
             try:
                 vision_index = int(str(vision_index).strip())
             except (TypeError, ValueError):
                 vision_index = None
-        # Dispatch log — first thing we print so the terminal always
-        # reflects that the tool was called, even when a gate below
-        # rejects the click. Without this, a silent rejection looks
-        # identical to "nothing happened" from the operator's POV.
-        if vision_index is not None:
-            print(f"\n>> browser_click_at(V{vision_index})")
-        elif x is not None and y is not None:
-            print(f"\n>> browser_click_at({x}, {y})")
-        else:
-            print("\n>> browser_click_at(?)")
+        if vision_index is None:
+            print("\n>> browser_click_at(?) — rejected: no vision_index")
+            return (
+                "[click_at_failed:no_vision_index] vision_index is "
+                "required. Pass the V_n (1-based) of the bbox the "
+                "vision agent labelled for the target you want to "
+                "click. Raw (x, y) coords are no longer accepted; "
+                "every bbox click must anchor to a labelled element."
+            )
+        print(f"\n>> browser_click_at(V{vision_index})")
         # Phase 1.1: hard sync gate. Block until the in-flight vision
         # prefetch from the previous action lands — without this the
         # brain's V_n resolves against a frozen epoch but the freshness
@@ -441,46 +430,14 @@ class BrowserClickAtTool(Tool):
         self._modal_open_before_click = bool(
             getattr(_pre_flags, "modal_open", False)
         ) if _pre_flags is not None else False
-        # Build the target key BEFORE resolving the bbox, so the guard
-        # fires on intent (vision_index=V3) not on resolved coords (which
-        # could shift slightly between calls due to anti-aliasing).
-        if vision_index is not None:
-            target_key = f"click_at(V{int(vision_index)})"
-        elif x is not None and y is not None:
-            # Round to a 5px grid — micro-jitter shouldn't escape the guard.
-            target_key = f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
-        else:
-            target_key = "click_at(?)"
-        # For the (x, y) path we don't have a bbox to read is_active
-        # from, so run the dead-click guard with no toggle context here.
-        # The vision_index path defers the check until AFTER bbox
-        # resolution (line ~XYZ below) so it can pass the bbox's
-        # current is_active and trigger the toggle-aware exemption.
-        if vision_index is None:
-            dead = self.s.check_dead_click(target_key)
-            if dead:
-                print(f"  [click_at rejected: dead_click ({target_key} repeated with no effect)]")
-                self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
-                return dead
-            self.s.register_click_attempt(target_key)
-            # Surgical undo: open a pending entry for raw-coord clicks.
-            # No bbox/label info — pre_active is None, classification
-            # falls through to "toggle" then demotes to "nav" if the
-            # click ends up navigating.
-            self.s.begin_click_record(
-                tool="browser_click_at",
-                target_key=target_key,
-                vision_index=None,
-                label=f"({x},{y})",
-                box_2d=None,
-                pre_active=None,
-                expected_url_change=False,
-                is_form_submit=False,
-            )
+        # Build the target key on intent (vision_index=V3) so the
+        # dead-click guard fires on what the brain asked for, not on
+        # post-snap pixel coords which can drift between calls.
+        target_key = f"click_at(V{int(vision_index)})"
 
         payload: dict[str, Any]
         log_target: str
-        if vision_index is not None:
+        if True:
             resp = self.s.vision_for_target_resolution()
             if resp is None:
                 print("  [click_at rejected: no_vision]")
@@ -628,13 +585,28 @@ class BrowserClickAtTool(Tool):
             # adds the resolved bbox so the operator can see what
             # coordinates the cursor will actually go to.
             print(f"  → bbox=({x0},{y0},{x1},{y1})")
-        else:
-            if x is None or y is None:
-                print("  [click_at rejected: bad_args (neither vision_index nor x/y provided)]")
-                return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
-            payload = {"x": float(x), "y": float(y)}
-            log_target = f"({x},{y})"
-            # (x,y) path — top-of-function already printed the dispatch.
+
+        # Auto-scroll the bbox into view if it's below the page or
+        # popup fold. Cheap: server returns scrolled=false when the
+        # bbox is already visible, so the common case adds one HTTP
+        # round-trip (~5ms) but avoids the brain having to call
+        # browser_scroll_within for dropdown options that sit below
+        # the visible portion of the popup. New geometry is fed back
+        # into the click payload so the TS server clicks the correct
+        # post-scroll coords.
+        if isinstance(payload, dict) and isinstance(payload.get("bbox"), dict):
+            new_bbox = await maybe_scroll_bbox_into_view(
+                self.s, session_id, payload["bbox"],
+            )
+            if isinstance(new_bbox, dict):
+                payload["bbox"] = new_bbox
+                # Refresh log_target so post-dispatch messages reflect
+                # the actual click coords.
+                log_target = (
+                    f"V{vision_index}("
+                    f"{new_bbox['x0']},{new_bbox['y0']}"
+                    f"→{new_bbox['x1']},{new_bbox['y1']})"
+                )
 
         r = await _request_with_backoff(
             "POST",
@@ -908,136 +880,27 @@ class BrowserClickAtTool(Tool):
         # both tiers. The js/keyboard escalation ladder below stays t3-
         # native (mgr.click_at(strategy=...)) but a parallel HTTP-routed
         # branch handles t1 escalation against the same /click endpoint.
-        verify_note = ""
-        if os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
-            postcond = self._lookup_postcondition(vision_index, x, y)
-            if postcond is not None:
-                try:
-                    from superbrowser_bridge.antibot import interactive_session as _t3mgr
-                    from superbrowser_bridge.verify_action import verify_after, PreState
-                    mgr = _t3mgr.default() if session_id.startswith("t3-") else None
-                    pre_state = PreState(
-                        url=self.s.current_url or "",
-                        dom_hash=self.s._last_dom_hash or "",
-                    )
-                    vr = await verify_after(
-                        mgr, session_id, postcond,
-                        pre_state=pre_state,
-                        state=self.s,
-                    )
-                    if not vr.verified:
-                        # Default postcondition (dom_mutated) failing means
-                        # the click went out but NOTHING changed — page,
-                        # DOM, URL all identical. Before bothering the
-                        # brain, ESCALATE through the click ladder —
-                        # many pages reject "primary" bezier clicks but
-                        # respond to a direct `el.click()` (JS) dispatch
-                        # or to keyboard Enter. Silent failure most
-                        # often means the site's click handler has a
-                        # guard our primary click tripped (0-dwell, CSS
-                        # pointer-events masking, framework re-render).
-                        is_silent_default = (
-                            postcond.get("kind") == "dom_mutated"
-                            and not getattr(
-                                self.s._last_action_queue, "actions", None,
-                            )
-                        )
-                        escalated = False
-                        if is_silent_default and \
-                                os.environ.get("CLICK_LADDER_AUTO", "1") != "0" and \
-                                payload.get("bbox"):
-                            alt_bbox = payload.get("bbox")
-                            alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
-                            alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
-                            for alt_strategy in ("js", "keyboard"):
-                                try:
-                                    if session_id.startswith("t3-"):
-                                        # T3 path: in-process manager.
-                                        from superbrowser_bridge.antibot import (
-                                            interactive_session as _t3mgr2,
-                                        )
-                                        mgr2 = _t3mgr2.default()
-                                        alt_resp = await mgr2.click_at(
-                                            session_id, alt_x, alt_y,
-                                            bbox=alt_bbox,
-                                            strategy=alt_strategy,
-                                        )
-                                    else:
-                                        # T1 path: TS /click endpoint with
-                                        # `strategy` field. Mirrors the t3
-                                        # ladder so brain sees the same
-                                        # `[click_escalated]` advisory on
-                                        # both tiers.
-                                        alt_payload: dict[str, Any] = {
-                                            "x": alt_x, "y": alt_y,
-                                            "bbox": alt_bbox,
-                                            "strategy": alt_strategy,
-                                        }
-                                        ar = await _request_with_backoff(
-                                            "POST",
-                                            f"{SUPERBROWSER_URL}/session/{session_id}/click",
-                                            json=alt_payload,
-                                            timeout=10.0,
-                                        )
-                                        if ar.status_code != 200:
-                                            continue
-                                        alt_body = ar.json() or {}
-                                        # Treat a 200 with an `error` field
-                                        # (e.g. element_mismatch) as a
-                                        # non-success — escalation didn't
-                                        # land, try next strategy.
-                                        if alt_body.get("error"):
-                                            continue
-                                        alt_resp = {"success": True, **alt_body}
-                                    if not isinstance(alt_resp, dict) or \
-                                            not alt_resp.get("success"):
-                                        continue
-                                    # Re-verify after the escalated strategy.
-                                    vr2 = await verify_after(
-                                        mgr, session_id, postcond,
-                                        pre_state=pre_state,
-                                        state=self.s,
-                                    )
-                                    if vr2.verified:
-                                        escalated = True
-                                        verify_note = (
-                                            f"\n[click_escalated strategy={alt_strategy}] "
-                                            f"Primary click was silent; "
-                                            f"{alt_strategy} strategy landed the "
-                                            f"action."
-                                        )
-                                        break
-                                except Exception as exc:
-                                    print(
-                                        f"  [click ladder ({alt_strategy}) "
-                                        f"failed: {exc}]"
-                                    )
-                                    continue
-                        if not escalated:
-                            if is_silent_default:
-                                verify_note = (
-                                    f"\n[click_silent reason={vr.reason}] "
-                                    f"Primary + escalated (js/keyboard) "
-                                    f"clicks all landed no DOM change. "
-                                    f"Target likely non-interactive, "
-                                    f"covered by an overlay, or waiting "
-                                    f"on an async load. Call "
-                                    f"browser_screenshot to re-vision, "
-                                    f"dismiss any active blocker, or try "
-                                    f"a different target."
-                                )
-                            else:
-                                verify_note = (
-                                    f"\n[VERIFY_MISS kind={vr.kind} reason={vr.reason}] "
-                                    f"The click dispatched but the expected effect "
-                                    f"({postcond.get('kind')}) didn't land. Consider "
-                                    f"browser_plan_next_steps to re-sequence, or try "
-                                    f"a different target."
-                                )
-                    elif os.environ.get("VERIFY_DEBUG") == "1":
-                        verify_note = f"\n[verify_ok kind={vr.kind}]"
-                except Exception as exc:
-                    print(f"  [verify_action: skipped — {exc}]")
+        # Shared verification ladder. The bbox dispatch sent {"bbox": ...};
+        # extract its center for js/keyboard escalation if verify fails.
+        alt_bbox = payload.get("bbox") if isinstance(payload, dict) else None
+        if alt_bbox:
+            alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
+            alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
+        else:
+            alt_x = 0.0
+            alt_y = 0.0
+        postcond = lookup_postcondition(
+            self.s, vision_index=vision_index, x=alt_x, y=alt_y,
+        )
+        verify_note = await run_click_with_ladder(
+            self.s, session_id,
+            log_target=log_target,
+            primary_response=data,
+            alt_x=alt_x,
+            alt_y=alt_y,
+            alt_bbox=alt_bbox,
+            postcondition=postcond,
+        )
 
         self.s.record_step(
             "browser_click_at",
@@ -1069,44 +932,6 @@ class BrowserClickAtTool(Tool):
             state=self.s,
         )
 
-    def _lookup_postcondition(
-        self,
-        vision_index: int | None,
-        x: float | None,
-        y: float | None,
-    ) -> dict | None:
-        """Match the current click against the top planned action and return
-        its postcondition, or fall through to a weakest-possible
-        default that only catches "click dispatched but page didn't
-        change at all" (the canonical silent-miss signal).
-
-        A planner match is: the click's vision_index equals the top
-        action's target_vision_index, OR the click's (x, y) falls
-        inside the top action's target bbox (± 10 px slack).
-
-        The default (dom_mutated) runs when no planner postcondition
-        applies. Set VERIFY_DEFAULT=0 to disable and preserve the old
-        "no postcondition, no verification" behaviour.
-        """
-        queue = self.s._last_action_queue
-        if queue is not None and getattr(queue, "actions", None):
-            top = queue.actions[0]
-            # vision_index match (preferred)
-            if vision_index is not None and top.target_vision_index is not None:
-                if int(vision_index) == int(top.target_vision_index):
-                    return top.postcondition.to_dict()
-            # coord match (fallback)
-            if x is not None and y is not None and top.target_bbox_pixels:
-                x0, y0, x1, y1 = top.target_bbox_pixels
-                if (x0 - 10) <= float(x) <= (x1 + 10) and \
-                        (y0 - 10) <= float(y) <= (y1 + 10):
-                    return top.postcondition.to_dict()
-        # Default: "did anything change?" — dom_mutated catches the
-        # "click silently missed" case even when the planner didn't
-        # attach an explicit postcondition.
-        if os.environ.get("VERIFY_DEFAULT", "1") != "0":
-            return {"kind": "dom_mutated"}
-        return None
 
 
 @tool_parameters(

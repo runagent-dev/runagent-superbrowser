@@ -107,6 +107,7 @@ from .tools import (
     BrowserRewindToCheckpointTool,
     BrowserRunScriptTool,
     BrowserScreenshotTool,
+    BrowserScrollToBboxTool,
     BrowserScrollTool,
     BrowserScrollUntilTool,
     BrowserScrollWithinTool,

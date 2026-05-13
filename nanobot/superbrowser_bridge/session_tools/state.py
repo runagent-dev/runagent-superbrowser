@@ -480,7 +480,6 @@ class BrowserSessionState:
             F5 fix; otherwise the brain's V_n picked from page A
             resolves against page A's bbox list while the click lands
             on page B, with bboxes that no longer apply).
-
         """
         if self._vision_epoch_response is not None:
             epoch_url = self._normalize_url(self._vision_epoch_url or "")

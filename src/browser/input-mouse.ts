@@ -7,7 +7,7 @@
  */
 
 import type { CDPSession } from 'puppeteer-core';
-import { humanClick, humanDrag, humanScroll } from './humanize.js';
+import { humanClick, humanDrag, humanScroll, safeRelease } from './humanize.js';
 
 /** Modifier key bitmask (from BrowserOS keyboard.ts). */
 export const Modifiers = {
@@ -88,6 +88,11 @@ export async function dispatchClick(
     return;
   }
 
+  // Preemptive release: free any previously stuck button from a prior
+  // click path that threw between press and release. Cheap (~1ms),
+  // tolerated by CDP when unmatched.
+  await safeRelease(client, x, y, button);
+
   // Deterministic teleport click — for chord-clicks, double-clicks, or
   // internal automation paths that opt out via { linear: true }.
   await client.send('Input.dispatchMouseEvent', {
@@ -99,25 +104,41 @@ export async function dispatchClick(
 
   await sleep(delay);
 
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed',
-    x,
-    y,
-    button,
-    clickCount,
-    modifiers,
-  });
+  // Press + hold + release wrapped in try/finally. If `sleep(delay)`
+  // or the explicit release throws (CDP transient, navigation mid-
+  // click), the finally still issues a release so the button doesn't
+  // stay held — Chromium would otherwise treat subsequent moves as
+  // a drag. Modifiers/clickCount intentionally omitted from the
+  // fallback release: it's recovery, not a click continuation, so we
+  // just want the button up.
+  let pressed = false;
+  try {
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button,
+      clickCount,
+      modifiers,
+    });
+    pressed = true;
 
-  await sleep(delay);
+    await sleep(delay);
 
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased',
-    x,
-    y,
-    button,
-    clickCount,
-    modifiers,
-  });
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button,
+      clickCount,
+      modifiers,
+    });
+    pressed = false;
+  } finally {
+    if (pressed) {
+      await safeRelease(client, x, y, button);
+    }
+  }
 }
 
 /**

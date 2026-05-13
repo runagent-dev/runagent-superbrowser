@@ -431,21 +431,15 @@ class BrowserTypeAtTool(Tool):
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
 
-        # Post-type autocomplete scan (mirrors browser_type). Surfaces
-        # any visible suggestion list inline + sets the pending guard
-        # so a follow-up type into a DIFFERENT field is refused until
-        # the brain re-screenshots and clicks the visible suggestion.
+        # Post-type autocomplete scan. Surfaces any visible suggestion
+        # list inline + sets last_type_at so the dead-type guard can
+        # catch a re-type into the same field.
         scan: dict = {"suggestions": [], "detected": False}
         if changed:
             scan = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
         if suggestions or detected:
-            # Hard directive: next turn MUST be browser_screenshot, then
-            # browser_click_at(V_n) on the matching suggestion. No
-            # alternatives — eval / get_markdown / arrow-keys all fail
-            # on real autocomplete widgets (the server commits the value
-            # only on isTrusted=true click on the suggestion element).
             count_str = str(len(suggestions)) if suggestions else "?"
             sample = "; ".join(
                 ((s.get("text") or "")[:80]) for s in suggestions[:5]
@@ -454,21 +448,9 @@ class BrowserTypeAtTool(Tool):
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
                 f"suggestion dropdown is open"
                 + (f". Visible items: {sample}." if sample else ".")
-                + "\n"
-                + "REQUIRED NEXT STEPS (do exactly these, in order):\n"
-                + "  1. browser_screenshot — vision will label each "
-                + "suggestion as a V_n bbox.\n"
-                + "  2. browser_click_at(vision_index=V_n) on the V_n "
-                + "whose label matches the suggestion you want.\n"
-                + "DO NOT browser_get_markdown, browser_eval, or "
-                + "browser_keys — autocomplete widgets only commit via "
-                + "an isTrusted=true CLICK on the suggestion. Markdown "
-                + "and eval just waste turns; ArrowDown+Enter is "
-                + "rejected by most modern autocomplete components."
+                + " Call browser_screenshot, then "
+                f"browser_click_at(vision_index=V_n) on the matching V_n."
             )
-        # Stamp last_type_at — used by the dead-type guard in
-        # BrowserTypeTool to catch double-types within 12s.
-        if suggestions or detected:
             self.s.last_type_at = time.time()
 
         # Phase 2.1: notify the active form_session that this field was
@@ -847,15 +829,8 @@ class BrowserTypeTool(Tool):
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
                 f"suggestion dropdown is open"
                 + (f". Visible items: {sample}." if sample else ".")
-                + "\n"
-                + "REQUIRED NEXT STEPS (do exactly these, in order):\n"
-                + "  1. browser_screenshot — vision will label each "
-                + "suggestion as a V_n bbox.\n"
-                + "  2. browser_click_at(vision_index=V_n) on the V_n "
-                + "whose label matches the suggestion you want.\n"
-                + "DO NOT browser_get_markdown, browser_eval, or "
-                + "browser_keys — autocomplete widgets only commit via "
-                + "an isTrusted=true CLICK on the suggestion."
+                + " Call browser_screenshot, then "
+                f"browser_click_at(vision_index=V_n) on the matching V_n."
             )
 
         # Post-type semantic verification (index-addressed variant).

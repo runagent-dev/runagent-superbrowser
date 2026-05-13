@@ -163,7 +163,20 @@ export class PageWrapper {
   constructor(
     private page: Page,
     private config: BrowserConfig,
-  ) {}
+  ) {
+    // Programmatic navigation (location.href=, history.pushState that
+    // triggers a load, server redirects, meta-refresh) doesn't go
+    // through `navigate()` — but the vision page reference frame
+    // captured against the old document is now stale, and the /click
+    // handler's compareViewportShift gate will reject every legitimate
+    // click until the next /state-with-vision overwrites it. Invalidate
+    // here so the gate short-circuits via `stored==null` instead.
+    this.page.on('framenavigated', (frame) => {
+      if (frame === this.page.mainFrame()) {
+        this.lastVisionPageRef = null;
+      }
+    });
+  }
 
   /** Get the underlying puppeteer Page. */
   getRawPage(): Page {
@@ -191,6 +204,13 @@ export class PageWrapper {
       });
       return { statusCode: null, finalUrl: url, errorPage: cached };
     }
+
+    // The vision page reference frame from the previous document no
+    // longer applies — null it before goto() so the /click viewport-
+    // shift gate doesn't reject early clicks on the new page. The
+    // framenavigated hook also fires during goto(), but explicit
+    // invalidation here covers cases where goto() throws partway.
+    this.lastVisionPageRef = null;
 
     const response = await this.page.goto(url, {
       waitUntil: 'domcontentloaded',
@@ -4257,34 +4277,17 @@ export class PageWrapper {
     resolvedContainer: string;
   }> {
     // 1. Resolve the container selector. If the caller supplied one, use it.
-    //    Otherwise auto-detect.
+    //    Otherwise auto-detect — multi-signal: aria-controls of an open
+    //    trigger (strongest), known popup roles, then descendants that
+    //    look like an open dropdown by their children's roles
+    //    (menuitemcheckbox/menuitemradio/option/menuitem). For each
+    //    popup candidate, search BOTH up the ancestor chain AND down
+    //    the descendant tree for a scrollable element — many sites
+    //    (Material UI, Radix Select, Best Buy) put the overflow:auto
+    //    on a wrapper INSIDE the popup, not on the popup itself.
     let resolved = (opts.containerSelector ?? '').trim();
     if (!resolved) {
       resolved = await this.page.evaluate(() => {
-        // Heuristic: the most recently opened popup is usually the one we
-        // want. Look for visible listbox/menu/dialog/headlessui-open
-        // candidates and pick the one with the largest z-index (top of
-        // the stack), preferring those whose scrollable ancestor has
-        // overflowable content.
-        const popupSelectors = [
-          '[role="listbox"]:not([aria-hidden="true"])',
-          '[role="menu"]:not([aria-hidden="true"])',
-          '[role="dialog"]:not([aria-hidden="true"])',
-          '[data-headlessui-state="open"]',
-          '[data-state="open"]',
-        ];
-        const findScrollHost = (start: HTMLElement | null): HTMLElement | null => {
-          let cur: HTMLElement | null = start;
-          while (cur && cur !== document.body) {
-            const cs = window.getComputedStyle(cur);
-            const oy = cs.overflowY;
-            if ((oy === 'auto' || oy === 'scroll') && cur.scrollHeight > cur.clientHeight + 4) {
-              return cur;
-            }
-            cur = cur.parentElement;
-          }
-          return null;
-        };
         const isVisible = (el: HTMLElement): boolean => {
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) return false;
@@ -4292,36 +4295,131 @@ export class PageWrapper {
           if (cs.visibility === 'hidden' || cs.display === 'none') return false;
           return true;
         };
-        type Candidate = { host: HTMLElement; z: number };
+        const isScrollable = (el: HTMLElement): boolean => {
+          const cs = window.getComputedStyle(el);
+          const oy = cs.overflowY;
+          return (oy === 'auto' || oy === 'scroll')
+              && el.scrollHeight > el.clientHeight + 4;
+        };
+        // Walk UP the ancestor chain looking for the first scrollable
+        // element. Skips document.body which is page-level scroll, not
+        // popup-inner.
+        const findScrollHostUp = (start: HTMLElement | null): HTMLElement | null => {
+          let cur: HTMLElement | null = start;
+          while (cur && cur !== document.body) {
+            if (isScrollable(cur)) return cur;
+            cur = cur.parentElement;
+          }
+          return null;
+        };
+        // Walk DOWN inside `root`, BFS, looking for the first scrollable
+        // descendant. Capped at depth/breadth to avoid pathological cost
+        // on large popups. Returns the FIRST match in BFS order so the
+        // innermost wrapping scroller wins for nested layouts.
+        const findScrollHostDown = (root: HTMLElement): HTMLElement | null => {
+          const queue: HTMLElement[] = [];
+          for (const c of Array.from(root.children) as HTMLElement[]) {
+            queue.push(c);
+          }
+          let inspected = 0;
+          while (queue.length && inspected < 200) {
+            const cur = queue.shift()!;
+            inspected += 1;
+            if (isScrollable(cur)) return cur;
+            for (const c of Array.from(cur.children) as HTMLElement[]) {
+              queue.push(c);
+            }
+          }
+          return null;
+        };
+        // Resolve a popup candidate to its scroll host: try the element
+        // itself, then walk DOWN inside it (most sites — Material UI,
+        // Radix Select, Best Buy — put overflow on an inner wrapper),
+        // then walk UP for the rare case where the scrollable parent
+        // contains the popup.
+        const resolveHost = (popup: HTMLElement): HTMLElement | null => {
+          if (isScrollable(popup)) return popup;
+          const down = findScrollHostDown(popup);
+          if (down) return down;
+          return findScrollHostUp(popup);
+        };
+        type Candidate = { host: HTMLElement; popup: HTMLElement; z: number };
         const candidates: Candidate[] = [];
+        const seen = new Set<HTMLElement>();
+        const tryAdd = (popup: HTMLElement) => {
+          if (!isVisible(popup)) return;
+          if (seen.has(popup)) return;
+          seen.add(popup);
+          const host = resolveHost(popup);
+          if (!host) return;
+          const z = parseInt(window.getComputedStyle(host).zIndex || '0', 10);
+          candidates.push({ host, popup, z: isNaN(z) ? 0 : z });
+        };
+        // Signal 1 (strongest): aria-controls target of any element with
+        // aria-expanded="true". This is the canonical ARIA pattern —
+        // the open trigger names its popup by id. When the brain just
+        // clicked a dropdown trigger, this nails the right popup.
+        const expanded = Array.from(
+          document.querySelectorAll<HTMLElement>('[aria-expanded="true"][aria-controls]'),
+        );
+        for (const trig of expanded) {
+          const ctrlId = (trig.getAttribute('aria-controls') || '').trim();
+          if (!ctrlId) continue;
+          // aria-controls may be a space-separated list of IDs.
+          for (const id of ctrlId.split(/\s+/)) {
+            const target = document.getElementById(id);
+            if (target instanceof HTMLElement) tryAdd(target);
+          }
+        }
+        // Signal 2: known popup roles + framework open markers.
+        const popupSelectors = [
+          '[role="listbox"]:not([aria-hidden="true"])',
+          '[role="menu"]:not([aria-hidden="true"])',
+          '[role="dialog"]:not([aria-hidden="true"])',
+          '[data-headlessui-state="open"]',
+          '[data-state="open"]',
+          '[data-radix-popper-content-wrapper]',
+        ];
         for (const sel of popupSelectors) {
           for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
-            if (!isVisible(el)) continue;
-            // The popup itself may scroll, OR its scrollable ancestor may.
-            let host: HTMLElement | null = null;
-            const cs = window.getComputedStyle(el);
-            if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
-                && el.scrollHeight > el.clientHeight + 4) {
-              host = el;
-            } else {
-              host = findScrollHost(el);
-            }
-            if (!host) continue;
-            const z = parseInt(window.getComputedStyle(host).zIndex || '0', 10);
-            candidates.push({ host, z: isNaN(z) ? 0 : z });
+            tryAdd(el);
           }
+        }
+        // Signal 3: any visible element whose children include 2+
+        // visible option/menuitem-style entries. Catches custom
+        // dropdowns that omit ARIA on the wrapper. We promote the
+        // CLOSEST common ancestor (the option's parent) as the popup
+        // candidate — that's usually the right scroll surface or its
+        // wrapper.
+        const optionLike = Array.from(document.querySelectorAll<HTMLElement>(
+          '[role="option"], [role="menuitem"],'
+          + ' [role="menuitemcheckbox"], [role="menuitemradio"]',
+        )).filter(isVisible);
+        const byParent = new Map<HTMLElement, number>();
+        for (const opt of optionLike) {
+          const p = opt.parentElement;
+          if (!p) continue;
+          byParent.set(p, (byParent.get(p) || 0) + 1);
+        }
+        for (const [parent, n] of byParent) {
+          if (n >= 2) tryAdd(parent);
         }
         // Fallback: scrollable ancestor of focused element.
         if (candidates.length === 0 && document.activeElement
             && document.activeElement !== document.body) {
-          const host = findScrollHost(document.activeElement as HTMLElement);
-          if (host) candidates.push({ host, z: 0 });
+          const host = findScrollHostUp(document.activeElement as HTMLElement);
+          if (host) {
+            candidates.push({ host, popup: host, z: 0 });
+          }
         }
         if (candidates.length === 0) return '';
-        // Pick smallest scroll-host that contains a [role=option] if any do
-        // (more likely to be the actual menu); otherwise fall back to z-index.
+        // Prefer hosts that contain option-like children — those are the
+        // actual menu containers, not page-level scroll wrappers.
         const withOptions = candidates.filter(
-          (c) => c.host.querySelector('[role="option"], [role="menuitem"]'),
+          (c) => c.host.querySelector(
+            '[role="option"], [role="menuitem"],'
+            + ' [role="menuitemcheckbox"], [role="menuitemradio"]',
+          ),
         );
         const pool = withOptions.length ? withOptions : candidates;
         pool.sort((a, b) => {
@@ -4329,7 +4427,6 @@ export class PageWrapper {
           return a.host.scrollHeight - b.host.scrollHeight;
         });
         const winner = pool[0].host;
-        // Tag for stable reuse this turn.
         const id = `sb-scroll-host-${Math.random().toString(36).slice(2, 10)}`;
         winner.setAttribute('data-sb-scroll-host', id);
         return `[data-sb-scroll-host="${id}"]`;
@@ -4419,6 +4516,143 @@ export class PageWrapper {
       startScrollY: startY,
       resolvedContainer: resolved,
       containerSelector: resolved,
+    };
+  }
+
+  // --- Scroll a bbox into view (page or inner popup) ---
+  //
+  // Given a CSS-pixel bbox, pick the right scroll surface (the nearest
+  // scrollable popup ancestor of the element at the bbox center, or
+  // the page if no inner popup), and scroll so the bbox is fully on
+  // screen. Used by both `browser_scroll_to_bbox` and the auto-scroll
+  // step inside `bbox_click` so the brain never has to call
+  // `browser_scroll_within` to position a dropdown option before
+  // clicking it.
+  async scrollBboxIntoView(bbox: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  }): Promise<{
+    scrolled: boolean;
+    containerKind: 'page' | 'popup' | 'already_visible';
+    deltaY: number;
+    newBbox: { x0: number; y0: number; x1: number; y1: number };
+  }> {
+    const result = await this.page.evaluate((b: {
+      x0: number; y0: number; x1: number; y1: number;
+    }) => {
+      const cx = (b.x0 + b.x1) / 2;
+      const cy = (b.y0 + b.y1) / 2;
+      const findScrollHost = (start: HTMLElement | null): HTMLElement | null => {
+        let cur: HTMLElement | null = start;
+        while (cur && cur !== document.body) {
+          const cs = window.getComputedStyle(cur);
+          const oy = cs.overflowY;
+          if ((oy === 'auto' || oy === 'scroll')
+              && cur.scrollHeight > cur.clientHeight + 4) {
+            return cur;
+          }
+          cur = cur.parentElement;
+        }
+        return null;
+      };
+      // Probe the element at the bbox center. If outside the viewport,
+      // we won't get a hit — fall back to using the bbox center as a
+      // direction signal for window scroll.
+      const vw = window.innerWidth || 0;
+      const vh = window.innerHeight || 0;
+      const padding = 24;
+      const fullyInViewport = (
+        b.x0 >= 0 && b.x1 <= vw
+        && b.y0 >= 0 && b.y1 <= vh
+      );
+      if (fullyInViewport) {
+        return {
+          scrolled: false,
+          containerKind: 'already_visible' as const,
+          deltaY: 0,
+          newBbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 },
+        };
+      }
+      // Try inner popup first: look for an open listbox/menu/dialog
+      // whose rect contains the bbox center.
+      const popupSelectors = [
+        '[role="listbox"]:not([aria-hidden="true"])',
+        '[role="menu"]:not([aria-hidden="true"])',
+        '[role="dialog"]:not([aria-hidden="true"])',
+        '[data-headlessui-state="open"]',
+        '[data-state="open"]',
+      ];
+      let innerHost: HTMLElement | null = null;
+      for (const sel of popupSelectors) {
+        for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          if (cx < r.left || cx > r.right) continue;
+          // The bbox center is horizontally inside this popup — its
+          // scroll host is the right surface. (Vertical containment
+          // is intentionally skipped: the bbox may be vertically OUTSIDE
+          // the popup's current viewport, which is exactly the case we
+          // need to scroll for.)
+          const cs = window.getComputedStyle(el);
+          if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+              && el.scrollHeight > el.clientHeight + 4) {
+            innerHost = el;
+          } else {
+            innerHost = findScrollHost(el);
+          }
+          if (innerHost) break;
+        }
+        if (innerHost) break;
+      }
+      if (innerHost) {
+        const hostRect = innerHost.getBoundingClientRect();
+        // We want bbox center to be at host's vertical center.
+        const desiredCenterY = hostRect.top + hostRect.height / 2;
+        const deltaInner = Math.round(cy - desiredCenterY);
+        const beforeY = innerHost.scrollTop;
+        innerHost.scrollBy(0, deltaInner);
+        const afterY = innerHost.scrollTop;
+        const actualDelta = afterY - beforeY;
+        // Re-read bbox after inner scroll: rect shifts by -actualDelta
+        // relative to viewport since the inner container moved up by
+        // actualDelta px.
+        const newY0 = b.y0 - actualDelta;
+        const newY1 = b.y1 - actualDelta;
+        return {
+          scrolled: actualDelta !== 0,
+          containerKind: 'popup' as const,
+          deltaY: actualDelta,
+          newBbox: { x0: b.x0, y0: newY0, x1: b.x1, y1: newY1 },
+        };
+      }
+      // Fall through: page-level scroll.
+      const desiredCenterY = vh / 2;
+      const deltaPage = Math.round(cy - desiredCenterY);
+      const beforeScrollY = window.scrollY || window.pageYOffset || 0;
+      window.scrollBy(0, deltaPage);
+      const afterScrollY = window.scrollY || window.pageYOffset || 0;
+      const actualPageDelta = afterScrollY - beforeScrollY;
+      return {
+        scrolled: actualPageDelta !== 0,
+        containerKind: 'page' as const,
+        deltaY: actualPageDelta,
+        newBbox: {
+          x0: b.x0,
+          y0: b.y0 - actualPageDelta,
+          x1: b.x1,
+          y1: b.y1 - actualPageDelta,
+        },
+      };
+    }, bbox);
+    // Let layout settle before caller re-snaps for click.
+    await new Promise((r) => setTimeout(r, 120));
+    return result as {
+      scrolled: boolean;
+      containerKind: 'page' | 'popup' | 'already_visible';
+      deltaY: number;
+      newBbox: { x0: number; y0: number; x1: number; y1: number };
     };
   }
 
