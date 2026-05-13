@@ -43,43 +43,6 @@ class BrowserScreenshotTool(Tool):
         return True
 
     async def execute(self, session_id: str, intent: str | None = None, **kw: Any) -> Any:
-        # Fresh-synthetic-V_n redirect. When the brain JUST got an
-        # [AUTOCOMPLETE_OPEN] / scan caption with clickable synthetic
-        # V_n and reaches for a screenshot anyway (the "let me verify
-        # first" detour), refuse and steer it back to click_at — the
-        # synthetic items came from a DOM scan that's strictly more
-        # accurate than the next vision pass would be on small
-        # dropdown rows.
-        import os as _os_local
-        if _os_local.environ.get("SCREENSHOT_REDIRECT_TO_SYNTHETIC", "1") not in ("0", "false", "no"):
-            synth = getattr(self.s, "_synthetic_bboxes_by_v", None) or {}
-            if synth:
-                # Only redirect when the synthetic V_n are fresh (injected
-                # within the last 2 brain turns). Older synthetics may be
-                # stale and a screenshot is the right move.
-                meta = getattr(self.s, "_synthetic_meta_by_v", {}) or {}
-                fresh = any(
-                    isinstance(m.get("injected_at_turn"), int)
-                    and (self.s._brain_turn_counter - m["injected_at_turn"]) <= 1
-                    for m in meta.values()
-                )
-                if fresh:
-                    summary = self.s.synthetic_v_summary()
-                    return (
-                        "[screenshot_blocked:synthetic_v_fresh] You have "
-                        "synthetic V_n bboxes from a DOM scan that were "
-                        "just injected and are MORE accurate than a fresh "
-                        "vision pass (which routinely misses small "
-                        "dropdown rows / date cells). Click one of these "
-                        "directly via browser_click_at(vision_index=V_n) "
-                        "instead of screenshotting:\n"
-                        f"{summary}\n"
-                        "If you genuinely need to abandon the dropdown "
-                        "(escape via clicking elsewhere): take a "
-                        "browser_screenshot AFTER consuming or letting "
-                        "the synthetic V_n expire (3 turns)."
-                    )
-
         # Peek current page content so dedup keys on (url, content_hash)
         # — a reload or DOM change produces a different hash and unblocks.
         peek_hash = ""

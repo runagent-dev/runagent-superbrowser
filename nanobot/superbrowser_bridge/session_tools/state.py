@@ -46,7 +46,6 @@ class BrowserSessionState:
     # configure_budget() to switch to complexity-aware allocation.
     DEFAULT_SCREENSHOT_BUDGET = 6
     CAPTCHA_MODE_ITERATIONS = 15
-    MAX_CLICK_AT = 3
 
     def __init__(self):
         self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
@@ -58,7 +57,6 @@ class BrowserSessionState:
         self.activity_log: list[str] = []
         # Per-session (reset on each browser_open)
         self.step_counter = 0
-        self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
 
@@ -299,42 +297,6 @@ class BrowserSessionState:
         self.last_type_index: int = -1
         self.last_type_text: str = ""
         self.last_type_at: float = 0.0
-        # Set True when the post-type autocomplete scan found ≥1
-        # suggestion. `last_type_anchor_label` holds the human-readable
-        # label of the typed-into field (e.g. "V3" or "[42]"). The next
-        # type tool refuses if the target is a DIFFERENT field while
-        # this flag is set — forces the brain to commit the suggestion
-        # (click V_n) before moving on. Cleared on the next successful
-        # click of any kind, on screenshot, or on timeout (30s).
-        self.last_type_had_suggestions: bool = False
-        self.last_type_anchor_label: str = ""
-        # Most recent autocomplete-scan output (list of {text, x, y}).
-        # Stashed verbatim from `_scan_autocomplete_suggestions`. Kept for
-        # legacy callers; the same data is also injected as synthetic V_n
-        # via inject_synthetic_bboxes() so the brain can click suggestions
-        # via browser_click_at(vision_index=V_n) without waiting for the
-        # vision agent to (maybe) catch the dropdown on the next pass.
-        self.last_autocomplete_suggestions: list = []
-
-        # === SYNTHETIC V_n FROM DOM SCANS ===
-        # When the bridge runs a targeted DOM scan (autocomplete dropdown,
-        # calendar grid, modal CTAs, custom dropdown menu) and finds
-        # clickable items the vision agent missed, those items are
-        # constructed as regular BBox instances and registered here. The
-        # `vision_for_target_resolution()` accessor returns a wrapper that
-        # merges them in so `browser_click_at(vision_index=V_n)` resolves
-        # to the synthetic without us mutating the upstream BBox class.
-        #
-        # V_n is assigned in a reserved range (1000+) to avoid colliding
-        # with any vision-emitted V_n. Side-channel meta tracks origin,
-        # scan kind, anchor V_n, and TTL.
-        #
-        # Cleared on: consume_synthetic_v (post-successful click),
-        # freeze_vision_epoch (vision now sees them — usually), TTL
-        # expiry, reset_per_session.
-        self._synthetic_bboxes_by_v: dict[int, Any] = {}
-        self._synthetic_meta_by_v: dict[int, dict] = {}
-        self._next_synthetic_v: int = 1000
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
@@ -450,7 +412,6 @@ class BrowserSessionState:
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
         self.step_counter = 0
-        self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
         # Epoch from a prior session is meaningless for the new one.
@@ -469,10 +430,6 @@ class BrowserSessionState:
             except Exception:
                 pass
         self._pending_vision_task = None
-        # Drop any synthetic V_n carried over from prior session.
-        self._synthetic_bboxes_by_v = {}
-        self._synthetic_meta_by_v = {}
-        self._next_synthetic_v = 1000
         self._brain_turn_counter = 0
         # Drop cross-tool element identity tracking — a new session
         # starts with no recorded last click.
@@ -524,28 +481,6 @@ class BrowserSessionState:
             resolves against page A's bbox list while the click lands
             on page B, with bboxes that no longer apply).
 
-        Returns None when the epoch was previously frozen
-        (`_vision_epoch_id > 0`) but has since been invalidated
-        (`_vision_epoch_response is None`). This catches the
-        mid-session staleness cascade: a previous click's mutation
-        cleared the epoch, the background prefetch refreshed
-        `_last_vision_response` with new bboxes the brain has not
-        yet observed, and the brain's V_n indices were picked from
-        the OLD bbox list. Returning None forces the consumer to
-        emit its existing `no_vision` / `epoch_invalidated` error
-        so the brain re-screenshots before clicking.
-        """
-        base = self._compute_resolution_base()
-        if base is None:
-            return None
-        if not self._synthetic_bboxes_by_v:
-            return base
-        return _MergedVisionResponse(base, self._synthetic_bboxes_by_v)
-
-    def _compute_resolution_base(self) -> Any:
-        """Internal: pick the vision response the V_n resolver should
-        consult, applying the same epoch / live / invalidation logic
-        the public accessor used before synthetic V_n existed.
         """
         if self._vision_epoch_response is not None:
             epoch_url = self._normalize_url(self._vision_epoch_url or "")
@@ -555,116 +490,7 @@ class BrowserSessionState:
                 # post-mutation prefetch and matches the current page.
                 return self._last_vision_response
             return self._vision_epoch_response
-        # Epoch was previously frozen but is now None — invalidated
-        # mid-session. Refuse to fall through to a prefetch the brain
-        # hasn't seen. Allow `_vision_epoch_id == 0` (first turn /
-        # tests) to keep falling through to the live response.
-        if self._vision_epoch_id > 0:
-            return None
         return self._last_vision_response
-
-    # === Synthetic V_n helpers ==========================================
-
-    def inject_synthetic_bboxes(
-        self,
-        bboxes: list[Any],
-        *,
-        scan_kind: str,
-        anchor_v: Optional[int] = None,
-        ttl_turns: int = 3,
-    ) -> list[int]:
-        """Register DOM-scan-derived bboxes as synthetic V_n entries.
-
-        Each bbox is assigned a reserved-range V_n (>=1000) so it cannot
-        collide with vision-emitted indices. The bbox object itself
-        should already be a constructed `vision_agent.schemas.BBox` —
-        this method does not construct or validate it.
-
-        Returns the list of V_n indices assigned (parallel to `bboxes`).
-        Empty list when bboxes is empty.
-        """
-        if not bboxes:
-            return []
-        expires = self._brain_turn_counter + max(1, int(ttl_turns))
-        v_indices: list[int] = []
-        for bb in bboxes:
-            self._next_synthetic_v += 1
-            v = self._next_synthetic_v
-            self._synthetic_bboxes_by_v[v] = bb
-            self._synthetic_meta_by_v[v] = {
-                "origin": "dom_scan",
-                "scan_kind": scan_kind,
-                "scan_anchor_v": anchor_v,
-                "expires_at_turn": expires,
-                "injected_at_turn": self._brain_turn_counter,
-            }
-            v_indices.append(v)
-        return v_indices
-
-    def is_synthetic_v(self, v_n: int) -> bool:
-        """True when v_n was assigned by inject_synthetic_bboxes."""
-        return int(v_n) in self._synthetic_bboxes_by_v
-
-    def consume_synthetic_v(self, v_n: int) -> bool:
-        """Drop a single synthetic V_n after a successful click resolution.
-
-        Returns True when the entry existed and was removed.
-        """
-        v = int(v_n)
-        if v not in self._synthetic_bboxes_by_v:
-            return False
-        self._synthetic_bboxes_by_v.pop(v, None)
-        self._synthetic_meta_by_v.pop(v, None)
-        # If this was the last synthetic, also clear the related
-        # autocomplete-pending flag so subsequent type_at on a new field
-        # isn't blocked by a stale guard.
-        if not self._synthetic_bboxes_by_v:
-            self.last_type_had_suggestions = False
-            self.last_type_anchor_label = ""
-        return True
-
-    def clear_synthetic_bboxes(self, *, reason: str = "manual") -> int:
-        """Drop ALL synthetic V_n entries. Returns count cleared."""
-        n = len(self._synthetic_bboxes_by_v)
-        self._synthetic_bboxes_by_v = {}
-        self._synthetic_meta_by_v = {}
-        return n
-
-    def expire_stale_synthetic_bboxes(self) -> int:
-        """Drop synthetic V_n whose expires_at_turn has passed.
-
-        Called opportunistically by tool dispatch paths so stale entries
-        don't accumulate. Returns count expired.
-        """
-        if not self._synthetic_bboxes_by_v:
-            return 0
-        current = self._brain_turn_counter
-        expired: list[int] = []
-        for v, meta in self._synthetic_meta_by_v.items():
-            exp = meta.get("expires_at_turn")
-            if isinstance(exp, int) and exp <= current:
-                expired.append(v)
-        for v in expired:
-            self._synthetic_bboxes_by_v.pop(v, None)
-            self._synthetic_meta_by_v.pop(v, None)
-        return len(expired)
-
-    def synthetic_v_summary(self) -> str:
-        """Render the active synthetic V_n list for captions / messages.
-
-        Format: one line per entry, "  V<n> '<label>'  (kind=<scan_kind>)".
-        Empty string when no synthetics active.
-        """
-        if not self._synthetic_bboxes_by_v:
-            return ""
-        rows: list[str] = []
-        for v in sorted(self._synthetic_bboxes_by_v.keys()):
-            bb = self._synthetic_bboxes_by_v[v]
-            meta = self._synthetic_meta_by_v.get(v, {})
-            label = (getattr(bb, "label", "") or "")[:60]
-            kind = meta.get("scan_kind", "?")
-            rows.append(f"  V{v} {label!r}  (kind={kind})")
-        return "\n".join(rows)
 
     def record_cursor_failure(
         self, *, strategy: str, target: str, reason: str,
@@ -1740,43 +1566,3 @@ class BrowserSessionState:
             return ""
 
 
-class _MergedVisionResponse:
-    """View over a VisionResponse that merges in synthetic (DOM-scan) V_n.
-
-    Wraps a real `vision_agent.schemas.VisionResponse` and intercepts
-    `get_bbox(v_n)` so that V_n in the reserved synthetic range (>=1000,
-    assigned by `BrowserSessionState.inject_synthetic_bboxes`) resolves
-    to the side-channel bbox map rather than the response's ranked list.
-
-    All other attribute access falls through to the wrapped response via
-    `__getattr__`, so callers that read `image_width`, `image_height`,
-    `dpr`, `flags`, etc. behave identically. `bboxes` is overridden to
-    include synthetics for iteration callers (e.g., the alternatives
-    hint), even though `get_bbox` is the canonical resolver.
-
-    Constructed by `vision_for_target_resolution()` only when synthetic
-    entries exist; otherwise the raw response is returned, keeping the
-    happy path zero-overhead.
-    """
-
-    __slots__ = ("_base", "_synthetic_v_map")
-
-    def __init__(self, base: Any, synthetic_v_map: dict[int, Any]):
-        self._base = base
-        # Snapshot a dict copy so a later state mutation (clear /
-        # consume) doesn't surprise the consumer mid-resolution.
-        self._synthetic_v_map = dict(synthetic_v_map)
-
-    @property
-    def bboxes(self) -> list[Any]:
-        return list(self._base.bboxes) + list(self._synthetic_v_map.values())
-
-    def get_bbox(self, vision_index_1based: int) -> Any:
-        v = int(vision_index_1based)
-        if v in self._synthetic_v_map:
-            return self._synthetic_v_map[v]
-        return self._base.get_bbox(v)
-
-    def __getattr__(self, name: str) -> Any:
-        # Called only when the attribute isn't on the wrapper itself.
-        return getattr(self._base, name)

@@ -195,41 +195,6 @@ async def _scan_autocomplete_suggestions(session_id: str) -> dict:
     return empty
 
 
-def _autocomplete_pending_block(
-    state: BrowserSessionState,
-    current_target_label: str,
-) -> str | None:
-    """Refuse typing into a DIFFERENT field while a previous type's
-    autocomplete dropdown stands open and unpicked. Returns the
-    refusal string when the guard fires, else None.
-    """
-    if not state.last_type_had_suggestions:
-        return None
-    if not state.last_type_anchor_label:
-        return None
-    if state.last_type_anchor_label == current_target_label:
-        return None
-    elapsed = time.time() - state.last_type_at
-    if elapsed >= 30.0:
-        # Stale; auto-clear and pass through.
-        state.last_type_had_suggestions = False
-        state.last_type_anchor_label = ""
-        return None
-    return (
-        f"[autocomplete_pending_block] Field {state.last_type_anchor_label} "
-        f"has an open autocomplete dropdown that you opened "
-        f"{int(elapsed)}s ago by typing — and you never picked a "
-        f"suggestion. Refusing to type into {current_target_label} "
-        f"(a DIFFERENT field) while the first one is unresolved.\n"
-        f"PRIMARY FIX: take a browser_screenshot, then "
-        f"browser_click_at(vision_index=V_n) on the suggestion bbox "
-        f"that matches the value you typed. ONLY THEN type into the "
-        f"next field.\n"
-        f"If you actually want to abandon the first field: take a "
-        f"browser_screenshot first (clears this guard), then retry."
-    )
-
-
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -315,9 +280,6 @@ class BrowserTypeAtTool(Tool):
         label: str
         if vision_index is not None:
             current_label = f"V{vision_index}"
-            block = _autocomplete_pending_block(self.s, current_label)
-            if block:
-                return block
             resp = self.s.vision_for_target_resolution()
             if resp is None:
                 return (
@@ -371,9 +333,6 @@ class BrowserTypeAtTool(Tool):
             target_x = float(x)
             target_y = float(y)
             label = f"({int(target_x)},{int(target_y)})"
-            block = _autocomplete_pending_block(self.s, label)
-            if block:
-                return block
             print(f"\n>> browser_type_at(({x},{y}), text={text[:30]!r})")
         else:
             return "[type_at_failed:bad_args] Provide either vision_index or both x and y."
@@ -413,12 +372,11 @@ class BrowserTypeAtTool(Tool):
                 return (
                     f"[type_at_failed:not_input tag={tag}] at {label}. "
                     f"V_n is not a text input — the element under the "
-                    f"cursor is a <{tag}>. If this is a calendar/date "
-                    f"cell, call browser_pick_date(date='YYYY-MM-DD'). "
-                    f"If it's any other clickable target (button, "
-                    f"option, gridcell), call browser_click_at("
-                    f"vision_index={vision_index if vision_index is not None else '<V_n>'}). "
-                    f"Do not retry browser_type_at on this target."
+                    f"cursor is a <{tag}>. Call browser_click_at("
+                    f"vision_index={vision_index if vision_index is not None else '<V_n>'}) "
+                    f"instead — calendar cells, time options, buttons, "
+                    f"and gridcells all dispatch via a CDP click. Do "
+                    f"not retry browser_type_at on this target."
                 )
             return f"[type_at_failed:{reason}] at {label}. detail={result}"
 
@@ -476,78 +434,42 @@ class BrowserTypeAtTool(Tool):
         # Post-type autocomplete scan (mirrors browser_type). Surfaces
         # any visible suggestion list inline + sets the pending guard
         # so a follow-up type into a DIFFERENT field is refused until
-        # the brain commits via browser_click_at(V_n).
+        # the brain re-screenshots and clicks the visible suggestion.
         scan: dict = {"suggestions": [], "detected": False}
         if changed:
             scan = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
-        # Inject the scanned suggestions as synthetic V_n bboxes so the
-        # brain can click them directly via browser_click_at without
-        # waiting for the next vision pass to (maybe) catch them. Vision
-        # routinely misses small dropdown rows; injecting bypasses that
-        # whole class of "eval to enumerate, run_script to click" cascade.
-        injected_v: list[tuple[int, Any]] = []
-        if suggestions:
-            print(
-                f"  [synthetic inject path entered: {len(suggestions)} "
-                f"prefetched_items, anchor_v={vision_index}]"
-            )
-            try:
-                from ..dom_scans import inject_scan_as_synthetic_bboxes
-                injected_v = await inject_scan_as_synthetic_bboxes(
-                    self.s, session_id, "autocomplete",
-                    anchor_v=int(vision_index) if vision_index is not None else None,
-                    prefetched_items=suggestions,
-                )
-                print(
-                    f"  [synthetic inject returned: {len(injected_v)} entries]"
-                )
-            except Exception as exc:
-                print(f"  [autocomplete synthetic injection failed: {exc}]")
-                import traceback
-                traceback.print_exc()
-        if injected_v:
-            label_str = ", ".join(
-                f"V{v} {sr.text[:60]!r}" for v, sr in injected_v
-            )
-            caption += (
-                f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(injected_v)} "
-                f"synthetic_v=injected] The dropdown items are clickable "
-                f"V_n bboxes NOW — call browser_click_at(vision_index=V_n) "
-                f"directly on the one you want. No browser_screenshot or "
-                f"browser_wait_for needed; the V_n indices are stable "
-                f"until you click one (or 3 turns expire). Items: "
-                f"{label_str}. Do NOT browser_eval / browser_run_script "
-                f"to enumerate suggestions; the [eval_blocked:enumeration"
-                f"_pattern] guard will refuse such scripts while these "
-                f"synthetic V_n exist. Do NOT use Arrow+Enter; many sites "
-                f"won't commit the value via keyboard."
-            )
-        elif suggestions or detected:
-            # Detected an autocomplete widget but no items to inject
-            # (ARIA-only signal, or items not found by the scanner). Fall
-            # back to the old screenshot-first guidance.
+        if suggestions or detected:
+            # Hard directive: next turn MUST be browser_screenshot, then
+            # browser_click_at(V_n) on the matching suggestion. No
+            # alternatives — eval / get_markdown / arrow-keys all fail
+            # on real autocomplete widgets (the server commits the value
+            # only on isTrusted=true click on the suggestion element).
             count_str = str(len(suggestions)) if suggestions else "?"
+            sample = "; ".join(
+                ((s.get("text") or "")[:80]) for s in suggestions[:5]
+            )
             caption += (
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is now visible but the bridge "
-                f"couldn't enumerate the items. NEXT TURN: take a "
-                f"browser_screenshot so vision can label them as V_n. "
-                f"Any click you attempt before that screenshot is "
-                f"REFUSED. Do NOT browser_run_script / browser_eval to "
-                f"enumerate."
+                f"suggestion dropdown is open"
+                + (f". Visible items: {sample}." if sample else ".")
+                + "\n"
+                + "REQUIRED NEXT STEPS (do exactly these, in order):\n"
+                + "  1. browser_screenshot — vision will label each "
+                + "suggestion as a V_n bbox.\n"
+                + "  2. browser_click_at(vision_index=V_n) on the V_n "
+                + "whose label matches the suggestion you want.\n"
+                + "DO NOT browser_get_markdown, browser_eval, or "
+                + "browser_keys — autocomplete widgets only commit via "
+                + "an isTrusted=true CLICK on the suggestion. Markdown "
+                + "and eval just waste turns; ArrowDown+Enter is "
+                + "rejected by most modern autocomplete components."
             )
+        # Stamp last_type_at — used by the dead-type guard in
+        # BrowserTypeTool to catch double-types within 12s.
         if suggestions or detected:
-            self.s.last_type_had_suggestions = True
-            self.s.last_type_anchor_label = label
             self.s.last_type_at = time.time()
-            self.s.last_autocomplete_suggestions = list(suggestions)
-        else:
-            # Clean type — clear any stale pending flag.
-            self.s.last_type_had_suggestions = False
-            self.s.last_type_anchor_label = ""
-            self.s.last_autocomplete_suggestions = []
 
         # Phase 2.1: notify the active form_session that this field was
         # typed into. Promotes its FieldStatus to FILLED (or
@@ -795,11 +717,6 @@ class BrowserTypeTool(Tool):
         sync_block = await self.s.ensure_vision_synced(reason="browser_type")
         if sync_block:
             return sync_block
-        # Autocomplete-pending guard (Phase 4): block a new field while
-        # the prior type's suggestion dropdown is still unresolved.
-        block = _autocomplete_pending_block(self.s, f"[{index}]")
-        if block:
-            return block
         self.s._brain_turn_counter += 1
 
         # --- Dead-type guard --------------------------------------------
@@ -895,27 +812,6 @@ class BrowserTypeTool(Tool):
         scan: dict = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
-        # Inject scanned items as synthetic V_n so click_at resolves them
-        # without waiting for vision to (maybe) catch the dropdown.
-        injected_v_idx: list[tuple[int, Any]] = []
-        if suggestions:
-            try:
-                from ..dom_scans import inject_scan_as_synthetic_bboxes
-                injected_v_idx = await inject_scan_as_synthetic_bboxes(
-                    self.s, session_id, "autocomplete",
-                    anchor_v=None,
-                    prefetched_items=suggestions,
-                )
-            except Exception as exc:
-                print(f"  [autocomplete synthetic injection failed: {exc}]")
-        if suggestions or detected:
-            self.s.last_type_had_suggestions = True
-            self.s.last_type_anchor_label = f"[{index}]"
-            self.s.last_autocomplete_suggestions = list(suggestions)
-        else:
-            self.s.last_type_had_suggestions = False
-            self.s.last_type_anchor_label = ""
-            self.s.last_autocomplete_suggestions = []
 
         self.s.record_step(
             "browser_type",
@@ -942,25 +838,24 @@ class BrowserTypeTool(Tool):
             )
         else:
             caption = f'Typed "{text}" into [{index}]'
-        if injected_v_idx:
-            label_str = ", ".join(
-                f"V{v} {sr.text[:60]!r}" for v, sr in injected_v_idx
-            )
-            caption += (
-                f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(injected_v_idx)} "
-                f"synthetic_v=injected] The dropdown items are clickable "
-                f"V_n bboxes NOW — call browser_click_at(vision_index=V_n) "
-                f"directly. Items: {label_str}. Do NOT browser_eval / "
-                f"browser_run_script to enumerate."
-            )
-        elif suggestions or detected:
+        if suggestions or detected:
             count_str = str(len(suggestions)) if suggestions else "?"
+            sample = "; ".join(
+                ((s.get("text") or "")[:80]) for s in suggestions[:5]
+            )
             caption += (
                 f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is now visible but the bridge "
-                f"couldn't enumerate items. NEXT TURN: take a "
-                f"browser_screenshot so vision can label them as V_n. "
-                f"Any click before that screenshot is REFUSED."
+                f"suggestion dropdown is open"
+                + (f". Visible items: {sample}." if sample else ".")
+                + "\n"
+                + "REQUIRED NEXT STEPS (do exactly these, in order):\n"
+                + "  1. browser_screenshot — vision will label each "
+                + "suggestion as a V_n bbox.\n"
+                + "  2. browser_click_at(vision_index=V_n) on the V_n "
+                + "whose label matches the suggestion you want.\n"
+                + "DO NOT browser_get_markdown, browser_eval, or "
+                + "browser_keys — autocomplete widgets only commit via "
+                + "an isTrusted=true CLICK on the suggestion."
             )
 
         # Post-type semantic verification (index-addressed variant).

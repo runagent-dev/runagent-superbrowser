@@ -29,63 +29,6 @@ from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 
 
-def _click_pending_screenshot_block(
-    state: BrowserSessionState,
-    *,
-    vision_index: int | None = None,
-) -> str | None:
-    """Refuse a click when an autocomplete dropdown is open and the
-    brain hasn't taken a fresh screenshot since typing — the V_n / CSS
-    selector the brain is about to act on is anchored to the
-    pre-typing page state. Without this gate the click lands on
-    whatever happens to be at that bbox in the OLD vision response,
-    which is "the click had no effect" from the brain's perspective.
-
-    Mirrors `_autocomplete_pending_block` in input_text.py but applies
-    to clicks instead of types. Returns the refusal string when the
-    guard fires, else None.
-
-    Synthetic V_n (DOM-scan-injected, V_n >= 1000) bypass this gate:
-    they were captured AFTER the dropdown opened, so they ARE the
-    correct targets — no screenshot needed.
-    """
-    if vision_index is not None and state.is_synthetic_v(int(vision_index)):
-        return None
-    if not getattr(state, "last_type_had_suggestions", False):
-        return None
-    last_type_at = float(getattr(state, "last_type_at", 0.0) or 0.0)
-    last_shot_at = float(getattr(state, "last_screenshot_at", 0.0) or 0.0)
-    if last_shot_at >= last_type_at and last_type_at > 0.0:
-        # A screenshot was taken AFTER the type opened the dropdown —
-        # the brain has fresh vision; let the click proceed.
-        return None
-    anchor = getattr(state, "last_type_anchor_label", "") or "the input"
-    # Mention synthetic V_n explicitly if any are active, so the brain
-    # has a direct path forward without needing a screenshot.
-    synth_summary = state.synthetic_v_summary()
-    if synth_summary:
-        return (
-            f"[click_pending_screenshot] You typed into {anchor} and an "
-            f"autocomplete dropdown opened. The dropdown items are "
-            f"already surfaced as synthetic V_n you can click directly:\n"
-            f"{synth_summary}\n"
-            f"Call browser_click_at(vision_index=V_n) on the one you "
-            f"want — do NOT screenshot first, do NOT use the OLD V_n "
-            f"from the pre-typing page."
-        )
-    return (
-        f"[click_pending_screenshot] You typed into {anchor} and an "
-        f"autocomplete dropdown opened, but you have NOT taken a "
-        f"screenshot since. The V_n indices and CSS selectors you "
-        f"have right now are anchored to the page BEFORE the dropdown "
-        f"appeared, so this click would land on whatever element was "
-        f"at that bbox in the pre-dropdown page (typically a no-op "
-        f"or the wrong element). Call browser_screenshot first; the "
-        f"dropdown items will then be labelled as V_n bboxes you can "
-        f"click via browser_click_at(vision_index=V_n)."
-    )
-
-
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -162,18 +105,6 @@ class BrowserClickTool(Tool):
             is_form_submit=False,
         )
         self.s.consecutive_click_calls += 1
-        # Refuse a stale click after type opened a dropdown. The brain
-        # MUST take a screenshot first so V_n / DOM-index resolves
-        # against the post-type page state.
-        pending = _click_pending_screenshot_block(self.s)
-        if pending:
-            return pending
-        # Releases the autocomplete-pending guard set by browser_type /
-        # browser_type_at. Clicking commits a suggestion (or moves on
-        # intentionally), so type tools may proceed afterward.
-        self.s.last_type_had_suggestions = False
-        self.s.last_type_anchor_label = ""
-        self.s.last_autocomplete_suggestions = []
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
@@ -472,15 +403,35 @@ class BrowserClickAtTool(Tool):
         y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Coerce vision_index — some LLMs emit "2" (string) instead of 2
+        # (int). The schema declares IntegerSchema; in practice the
+        # validator lets the string through and we used to silently drop
+        # the parameter. Cast once here so the rest of the function sees
+        # an int (or None for the (x,y) path).
+        if vision_index is not None and not isinstance(vision_index, int):
+            try:
+                vision_index = int(str(vision_index).strip())
+            except (TypeError, ValueError):
+                vision_index = None
+        # Dispatch log — first thing we print so the terminal always
+        # reflects that the tool was called, even when a gate below
+        # rejects the click. Without this, a silent rejection looks
+        # identical to "nothing happened" from the operator's POV.
+        if vision_index is not None:
+            print(f"\n>> browser_click_at(V{vision_index})")
+        elif x is not None and y is not None:
+            print(f"\n>> browser_click_at({x}, {y})")
+        else:
+            print("\n>> browser_click_at(?)")
         # Phase 1.1: hard sync gate. Block until the in-flight vision
         # prefetch from the previous action lands — without this the
         # brain's V_n resolves against a frozen epoch but the freshness
         # gate has no fresh post-action vision to validate against.
         sync_block = await self.s.ensure_vision_synced(reason="browser_click_at")
         if sync_block:
+            print("  [click_at rejected: sync_block]")
             return sync_block
         self.s._brain_turn_counter += 1
-        self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
         # Snapshot modal_open BEFORE dispatch so the post-click scan
         # trigger can detect a fresh modal_cta_open transition (was off,
@@ -490,33 +441,6 @@ class BrowserClickAtTool(Tool):
         self._modal_open_before_click = bool(
             getattr(_pre_flags, "modal_open", False)
         ) if _pre_flags is not None else False
-        # Refuse stale click after type opened a dropdown — see helper.
-        # Synthetic V_n bypass this gate (they ARE the post-typing data).
-        pending = _click_pending_screenshot_block(
-            self.s, vision_index=vision_index,
-        )
-        if pending:
-            return pending
-        # Release the autocomplete-pending guard ONLY when this click is
-        # not itself targeting a synthetic suggestion bbox; for synthetic
-        # we keep the guard armed until either consume_synthetic_v runs
-        # (post-successful click) or the V_n expires.
-        if vision_index is None or not self.s.is_synthetic_v(int(vision_index)):
-            self.s.last_type_had_suggestions = False
-            self.s.last_type_anchor_label = ""
-            self.s.last_autocomplete_suggestions = []
-        if self.s.click_at_count > self.s.MAX_CLICK_AT:
-            return (
-                f"[BLOCKED] browser_click_at used "
-                f"{self.s.click_at_count} times in this session. The "
-                f"task is looping on clicks — call browser_screenshot "
-                f"to re-observe and pick a fresh V_n, browser_scroll_until "
-                f"to bring a different target into view, or "
-                f"browser_rewind_to_checkpoint if the page is stuck. Do "
-                f"NOT attempt browser_run_script to click — JS clicks are "
-                f"isTrusted=false and bot-detected."
-            )
-
         # Build the target key BEFORE resolving the bbox, so the guard
         # fires on intent (vision_index=V3) not on resolved coords (which
         # could shift slightly between calls due to anti-aliasing).
@@ -535,6 +459,7 @@ class BrowserClickAtTool(Tool):
         if vision_index is None:
             dead = self.s.check_dead_click(target_key)
             if dead:
+                print(f"  [click_at rejected: dead_click ({target_key} repeated with no effect)]")
                 self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
                 return dead
             self.s.register_click_attempt(target_key)
@@ -556,139 +481,23 @@ class BrowserClickAtTool(Tool):
         payload: dict[str, Any]
         log_target: str
         if vision_index is not None:
-            # Detect synthetic (DOM-scan-injected) V_n early so vision-
-            # specific gates can opt out — they were not captured by
-            # vision and have their own TTL on state._synthetic_meta_by_v.
-            _is_synth_v = self.s.is_synthetic_v(int(vision_index))
-            # HARD epoch-invalidated gate. When a previous click's
-            # mutation_delta exceeded MUTATION_DIRTY_THRESHOLD,
-            # `_vision_epoch_response` was reset to None to keep V_n
-            # indices from resolving against shifted positions. But
-            # without this gate, `vision_for_target_resolution` falls
-            # back to `_last_vision_response`, which the background
-            # prefetch may have just refreshed with NEW bboxes the
-            # brain HAS NOT SEEN — so V_n (picked from the OLD bbox
-            # list in the brain's mental model) silently resolves to
-            # a different element in the NEW bbox list.
-            #
-            # `_vision_epoch_id > 0` distinguishes "epoch was
-            # invalidated mid-session" (refuse, force re-screenshot)
-            # from "first turn ever / mock-test no screenshot taken
-            # yet" (let it fall through, original behaviour). The
-            # epoch_id increments on every freeze_vision_epoch().
-            # Synthetic V_n bypass: their coords were freshly scanned
-            # off the live DOM at injection time, not against the
-            # frozen epoch — invalidation doesn't affect them.
-            if (
-                not _is_synth_v
-                and self.s._vision_epoch_response is None
-                and getattr(self.s, "_vision_epoch_id", 0) > 0
-            ):
-                # HARD reject. Auto-recovery (refreshing vision + re-
-                # resolving V_n against the new response) is NOT safe
-                # here: V_n is a POSITIONAL index into a ranked bbox
-                # list, and re-ranking on a mutated page puts a
-                # different element at position N. A "successful"
-                # recovery would silently click the wrong element.
-                # The only correct path is to force the brain to call
-                # `browser_screenshot`, see the new bbox numbering,
-                # and re-pick V_n — even though that costs one extra
-                # turn.
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                self.s.log_activity(
-                    f"click_at(V{vision_index})(EPOCH_INVALIDATED)",
-                    f"epoch_id={getattr(self.s, '_vision_epoch_id', 0)}",
-                )
-                return (
-                    f"[click_at_failed:epoch_invalidated] V"
-                    f"{vision_index} resolves against a vision "
-                    f"snapshot that has been invalidated since you "
-                    f"saw it (a previous click changed the page "
-                    f"meaningfully — the bbox indices no longer "
-                    f"line up with the current page state). Call "
-                    f"browser_screenshot to refresh vision before "
-                    f"clicking."
-                    + (f"\n{alts}" if alts else "")
-                )
-
-            # Prefer the frozen epoch (what the brain SAW on its last
-            # screenshot), fall back to the live response only when no
-            # epoch is set yet (pre-first-screenshot path / tests).
             resp = self.s.vision_for_target_resolution()
             if resp is None:
+                print("  [click_at rejected: no_vision]")
                 return (
-                    "[click_at_failed:no_vision] No recent vision response "
-                    "to resolve vision_index against. Re-fetch state to "
-                    "trigger a fresh vision pass, or pass raw (x, y)."
+                    "[click_at_failed:no_vision] No recent vision "
+                    "response to resolve vision_index against. "
+                    "Re-fetch state to trigger a fresh vision pass, "
+                    "or pass raw (x, y)."
                 )
             bbox = resp.get_bbox(int(vision_index))
             if bbox is None:
+                print(f"  [click_at rejected: bad_vision_index V{vision_index} (only {len(resp.bboxes)} bboxes)]")
                 return (
                     f"[click_at_failed:bad_vision_index] V{vision_index} "
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
-            # Freshness gate — refuse to click when the last vision pass
-            # flagged the screenshot as stale or uncertain. The planner
-            # should re-screenshot before committing a click on a frame
-            # the model itself said it couldn't trust. Synthetic V_n
-            # bypass: they came from a fresh DOM scan, not from the
-            # vision pass that was flagged stale.
-            freshness = getattr(resp, "screenshot_freshness", "fresh")
-            if freshness != "fresh" and not _is_synth_v:
-                self.s.record_cursor_failure(
-                    strategy="click_at",
-                    target=f"V{vision_index}",
-                    reason=f"stale_vision freshness={freshness}",
-                )
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                return (
-                    f"[click_at_failed:stale_vision freshness={freshness}] "
-                    "Vision flagged the last screenshot as not fresh "
-                    "(URL/page mismatch or loading overlay). Call "
-                    "browser_screenshot to refresh vision before clicking."
-                    + (f"\n{alts}" if alts else "")
-                )
-            # Phase 1.3 turn-based age gate. Beyond
-            # VISION_MAX_AGE_TURNS mutating actions since the last
-            # screenshot, the V_n indices the brain captured no longer
-            # reliably point at the elements they did when the
-            # screenshot was taken. The brain MUST re-screenshot. Wall-
-            # clock isn't a useful proxy because a long thinking pause
-            # doesn't mutate the page; the right unit is "actions
-            # taken between epoch and now". _brain_turn_counter was
-            # bumped by ensure_vision_synced for THIS click already, so
-            # subtract 1 to count actions BEFORE this one.
-            try:
-                max_age_turns = int(
-                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
-                )
-            except ValueError:
-                max_age_turns = 1
-            if max_age_turns > 0 and not _is_synth_v:
-                age_turns = max(
-                    0,
-                    self.s._brain_turn_counter - 1
-                    - self.s._vision_epoch_turn,
-                )
-                if age_turns > max_age_turns:
-                    alts = _vision_alternatives_hint(
-                        self.s, exclude_index=int(vision_index), limit=3,
-                    )
-                    return (
-                        f"[click_at_failed:epoch_too_old age_turns="
-                        f"{age_turns} max={max_age_turns}] V"
-                        f"{vision_index} resolves against a vision "
-                        f"snapshot taken {age_turns} actions ago — the "
-                        f"page state may have shifted. Call "
-                        f"browser_screenshot to refresh the V_n "
-                        f"indices before clicking."
-                        + (f"\n{alts}" if alts else "")
-                    )
             # Blocker gate — if the scene has an active blocker layer
             # (cookie banner, modal, consent dialog) and this bbox lives
             # in a different layer, refuse. The planner must dismiss
@@ -714,79 +523,13 @@ class BrowserClickAtTool(Tool):
                     except Exception:
                         dismiss_hint = ""
                     hint = f" Dismiss '{dismiss_hint}' first." if dismiss_hint else ""
+                    print(f"  [click_at rejected: blocker_active layer={active_blocker}]")
                     return (
                         f"[click_at_failed:blocker_active layer={active_blocker}] "
                         f"A blocker layer ({active_blocker}) is on top of "
                         f"content, and V{vision_index} sits in a different "
                         f"layer ({bbox_layer}).{hint} Then re-screenshot."
                     )
-            # Confidence gate — a low-confidence bbox is Gemini's way of
-            # saying "I'm not sure this is really here". Clicking it
-            # lands on the wrong target more often than not. Threshold
-            # is tuned via VISION_MIN_CLICK_CONFIDENCE (default 0.45).
-            try:
-                min_conf = float(
-                    os.environ.get("VISION_MIN_CLICK_CONFIDENCE") or "0.45"
-                )
-            except ValueError:
-                min_conf = 0.45
-            if getattr(bbox, "confidence", 0.5) < min_conf:
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                return (
-                    f"[click_at_failed:low_confidence V{vision_index}] "
-                    f"bbox confidence={bbox.confidence:.2f} < "
-                    f"{min_conf:.2f}. Call browser_screenshot to re-run "
-                    "vision, then retry with a higher-confidence target."
-                    + (f"\n{alts}" if alts else "")
-                )
-            # B5: precondition gate. When this bbox has a parent
-            # expand-button (resolved via aria-controls during DOM
-            # enrichment) AND that parent is currently collapsed
-            # (aria_expanded='false'), refuse — clicking the child
-            # would land on something not yet rendered or already
-            # selected at group-level. Brain has to expand first.
-            if os.environ.get(
-                "BBOX_PRECONDITION_GATE", "1"
-            ) not in ("0", "false", "no"):
-                parent_v = getattr(bbox, "parent_expand_v", None)
-                if isinstance(parent_v, int) and parent_v > 0:
-                    parent_bbox = resp.get_bbox(parent_v)
-                    parent_expanded = (
-                        getattr(parent_bbox, "aria_expanded", None)
-                        if parent_bbox is not None
-                        else None
-                    )
-                    if parent_expanded == "false":
-                        parent_label = (
-                            getattr(parent_bbox, "label", "")
-                            if parent_bbox is not None
-                            else ""
-                        )
-                        my_label = (
-                            getattr(bbox, "label", "") or ""
-                        ).strip()
-                        self.s.record_cursor_failure(
-                            strategy="click_at",
-                            target=f"V{vision_index}",
-                            reason=(
-                                f"expand_parent_first V{parent_v} "
-                                f"(parent={parent_label!r})"
-                            ),
-                        )
-                        return (
-                            f"[click_at_blocked:expand_parent_first "
-                            f"V{parent_v}] V{vision_index} "
-                            f"({my_label!r}) is a child of a "
-                            f"COLLAPSED group {parent_label!r} "
-                            f"(V{parent_v}, aria_expanded=false). "
-                            f"Clicking V{vision_index} now would land "
-                            f"on a hidden / not-yet-rendered element. "
-                            f"Click V{parent_v} FIRST to expand the "
-                            f"group, then re-screenshot and retry "
-                            f"V{vision_index}."
-                        )
             # v4 C3 — bbox-aware dead-click guard. Pass the bbox's
             # CURRENT is_active so the guard recognizes a re-click as
             # a legitimate filter toggle (rather than flailing) when
@@ -810,6 +553,7 @@ class BrowserClickAtTool(Tool):
                 ),
             )
             if dead:
+                print(f"  [click_at rejected: dead_click (V{vision_index} repeated with no effect)]")
                 self.s.log_activity(
                     f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "",
                 )
@@ -872,31 +616,25 @@ class BrowserClickAtTool(Tool):
             # label → the check is skipped on the backend, which is
             # fine for raw-coord clicks further below.
             bbox_label = (getattr(bbox, "label", "") or "").strip()
-            # Pass expected_label for BOTH vision and synthetic V_n.
-            # For vision V_n: catches misclick when vision drifts.
-            # For synthetic V_n: catches the STALE-COORD case — the
-            # dropdown may close between scan and click, leaving the
-            # synthetic bbox over a different element (we've seen the
-            # date input button at the same coords as a previously-
-            # captured suggestion row). The labelMismatch check in
-            # page.ts:1413+ has a dropdown-item lenient fallback
-            # (role=option/menuitem/listitem/li → word-overlap pass)
-            # so valid synthetic clicks on the actual dropdown item
-            # are not falsely rejected; strict matching applies to
-            # non-dropdown elements (like the stale-coord date button)
-            # so wrong-element clicks ARE rejected.
+            # Pass expected_label so the TS backend can compute a
+            # labelMismatch flag in the response (logged as diagnostic).
+            # The server no longer blocks on mismatch — the click
+            # always dispatches and the brain reads the result.
             if bbox_label:
                 payload["expected_label"] = bbox_label[:120]
                 payload["label"] = bbox_label[:120]
             log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
-            synth_tag = " [synth]" if _is_synth_v else ""
-            print(f"\n>> browser_click_at(V{vision_index}){synth_tag} → bbox=({x0},{y0},{x1},{y1})")
+            # Continuation of the top-of-function dispatch print —
+            # adds the resolved bbox so the operator can see what
+            # coordinates the cursor will actually go to.
+            print(f"  → bbox=({x0},{y0},{x1},{y1})")
         else:
             if x is None or y is None:
+                print("  [click_at rejected: bad_args (neither vision_index nor x/y provided)]")
                 return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
             payload = {"x": float(x), "y": float(y)}
             log_target = f"({x},{y})"
-            print(f"\n>> browser_click_at({x}, {y})")
+            # (x,y) path — top-of-function already printed the dispatch.
 
         r = await _request_with_backoff(
             "POST",
@@ -1001,24 +739,6 @@ class BrowserClickAtTool(Tool):
                 f"click_at{log_target}(ELEM_MISMATCH)",
                 f"found={found.get('tag','?')}",
             )
-            # Stale-coord recovery for synthetic V_n. The synthetic
-            # bbox was captured at injection time; if the dropdown
-            # has closed since, the bbox now overlaps a different
-            # element which trips the element_mismatch gate. Consume
-            # the stale synthetic so the screenshot guard releases
-            # and the brain can re-screenshot OR re-trigger via type
-            # to get a fresh scan. Without this, the brain is stuck:
-            # synthetic still active → screenshot blocked → can't
-            # recover.
-            synth_recovery = ""
-            if _is_synth_v:
-                self.s.consume_synthetic_v(int(vision_index))
-                synth_recovery = (
-                    " The synthetic V_n was cleared (dropdown likely "
-                    "closed between scan and click). Re-trigger by "
-                    "typing into the same field — a fresh scan will "
-                    "produce new synthetic V_n."
-                )
             return (
                 f"[click_at_failed:element_mismatch] Vision said this "
                 f"target was '{data.get('expected_label','')}' but the "
@@ -1028,7 +748,6 @@ class BrowserClickAtTool(Tool):
                 f"role='{found.get('role','')}'> text='"
                 f"{(found.get('text') or '')[:80]}'. Call "
                 f"browser_screenshot to refresh vision."
-                + synth_recovery
                 + (f"\n{alts}" if alts else "")
             )
         # v6 F1 — invalidate frozen vision epoch on significant
@@ -1325,57 +1044,6 @@ class BrowserClickAtTool(Tool):
             log_target,
             f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
         )
-        # Consume the synthetic V_n entry if this click resolved to one.
-        # Removes the bbox from state._synthetic_bboxes_by_v so a future
-        # browser_click_at(vision_index=V_n) on the same number returns
-        # bad_vision_index (the dropdown is gone, the V_n no longer
-        # points at anything real). Also releases the autocomplete-
-        # pending guard.
-        if vision_index is not None and self.s.is_synthetic_v(int(vision_index)):
-            self.s.consume_synthetic_v(int(vision_index))
-        # Post-click DOM-scan triggers — surface dynamic UI (date cells,
-        # modal CTAs, custom dropdown menu items) as synthetic V_n so the
-        # next turn has a bbox to click without having to wait for vision
-        # to (maybe) catch them. The heuristic on `bbox.label` / `role` /
-        # effect deltas avoids running scans when nothing changed.
-        try:
-            if vision_index is not None and bbox is not None:
-                label_lc = (getattr(bbox, "label", "") or "").lower()
-                role_lc = (getattr(bbox, "role", "") or "").lower()
-                effect = (data.get("effect") or {}) if isinstance(data, dict) else {}
-                mutation_delta = int(effect.get("mutation_delta") or 0)
-                # Vision flags reflect the AFTER-click state (the
-                # post-click prefetch is what filled them). modal_open
-                # before the click was captured in self._modal_open_before_click.
-                last_resp_after = getattr(self.s, "_last_vision_response", None)
-                flags_after = getattr(last_resp_after, "flags", None) if last_resp_after else None
-                modal_now = bool(getattr(flags_after, "modal_open", False)) if flags_after else False
-                modal_before = bool(getattr(self, "_modal_open_before_click", False))
-                from ..dom_scans import inject_scan_as_synthetic_bboxes
-                if re.search(
-                    r"(date|when|check.?in|check.?out|departure|arrival|calendar|pick.?a.?date)",
-                    label_lc,
-                ):
-                    await inject_scan_as_synthetic_bboxes(
-                        self.s, session_id, "calendar_grid",
-                        anchor_v=int(vision_index),
-                    )
-                elif modal_now and not modal_before and mutation_delta > 6:
-                    await inject_scan_as_synthetic_bboxes(
-                        self.s, session_id, "modal_cta",
-                        anchor_v=int(vision_index),
-                    )
-                elif (
-                    role_lc in ("combobox", "select")
-                    or "dropdown" in label_lc
-                    or "menu" in label_lc
-                ):
-                    await inject_scan_as_synthetic_bboxes(
-                        self.s, session_id, "custom_dropdown",
-                        anchor_v=int(vision_index),
-                    )
-        except Exception as exc:
-            print(f"  [post-click scan failed: {exc}]")
         # Phase 3.3 click-hit verification: capture pre-click signals
         # so the post-click vision pass can flag a no-op click that
         # left the labeled target still visible.

@@ -15,12 +15,6 @@ from .click import (
     BrowserClickTool,
     BrowserGetRectTool,
 )
-from .datepicker import (
-    BrowserPickDateTool,
-)
-from .timepicker import (
-    BrowserPickTimeTool,
-)
 from .drag import (
     BrowserDragPathTool,
     BrowserDragSelectorsTool,
