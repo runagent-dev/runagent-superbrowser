@@ -1246,7 +1246,38 @@ export async function selectOptionByLabel(
   // every strategy is tried; that's acceptable.
   const perStrategyBudget = Math.max(600, Math.floor(timeout / strategies.length));
 
+  // Idempotency check: if a popup is ALREADY open (from a previous
+  // browser_select_option call that returned ambiguous_option, or an
+  // earlier manual click), DO NOT run any open strategy. Clicking the
+  // trigger again would toggle the popup CLOSED and we'd lose the
+  // option list. Just proceed to option-matching against the popup
+  // that's already showing.
+  const alreadyOpen = await page.evaluate((sel: string) => {
+    try {
+      const trig = document.querySelector(sel);
+      if (trig && trig.getAttribute('aria-expanded') === 'true') return true;
+    } catch { /* ignore selector errors */ }
+    // Fallback: any popup-shaped element visible on the page.
+    return document.querySelectorAll(
+      '[role="listbox"]:not([aria-hidden="true"]),'
+      + '[role="menu"]:not([aria-hidden="true"]),'
+      + '[role="dialog"]:not([aria-hidden="true"]),'
+      + '[data-headlessui-state="open"],'
+      + '[data-state="open"]',
+    ).length > 0;
+  }, trigger.selector).catch(() => false) as boolean;
+  if (alreadyOpen) {
+    popupSeen = true;
+    const tagged = await collectAndTagCandidates().catch(() => 0);
+    if (tagged > 0) rendered = true;
+    // If tagging found something we're done with the open phase.
+    // If not, fall through to the strategy loop — maybe the popup
+    // detected isn't this trigger's, in which case opening this one
+    // is the right action.
+  }
+
   for (const strategy of strategies) {
+    if (rendered) break;
     tried.push(strategy);
     try {
       await runStrategy(strategy);

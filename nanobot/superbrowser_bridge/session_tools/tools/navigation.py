@@ -1481,6 +1481,16 @@ class BrowserScrollWithinTool(Tool):
         resolved = str(outcome.get("resolvedContainer") or outcome.get("containerSelector") or "")
         reversed_flag = bool(outcome.get("reversed") or False)
 
+        # Popup-scroll guard. When the popup actually moved, DOM
+        # indices for items inside it are now stale. Flag the guard so
+        # the next DOM-index click is refused with a redirect to the
+        # bbox path. Cleared by the next browser_screenshot.
+        if scrolled > 0 or reason in ("matched", "page_end"):
+            try:
+                self.s.flag_popup_scroll(reason="scroll_within")
+            except Exception:
+                pass
+
         # Track in step history for downstream loop-detection / planning.
         self.s.record_step(
             "browser_scroll_within",

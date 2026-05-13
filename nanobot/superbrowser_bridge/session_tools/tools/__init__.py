@@ -12,6 +12,7 @@ from .captcha import (
 )
 from .click import (
     BrowserClickAtTool,
+    BrowserClickSelectorTool,
     BrowserClickTool,
     BrowserGetRectTool,
 )

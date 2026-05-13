@@ -656,7 +656,7 @@ export class PageWrapper {
                 tried,
                 error:
                   reasonStr === 'target_in_iframe'
-                    ? `Click target is inside an <iframe>; this index-based path lands on the iframe host. Use browser_click_at(vision_index=V_n) — it descends through same-origin iframes and falls back to a Frame walk for cross-origin OOPIFs. Or use browser_click_selector(selector='<inner>', in_iframe='<host_css>') to target by CSS inside the frame.`
+                    ? `Click target is inside an <iframe>; this index-based path lands on the iframe host. Use browser_click_at(vision_index=V_n) — it descends through same-origin iframes and falls back to a Frame walk for cross-origin OOPIFs. Or use browser_click_selector(selector='<inner>', in_iframe='<host_css>') to target by CSS inside the frame. If both keep missing, drop to browser_run_script(mutates=true) and reach in via page.frames(): const f = page.frames().find(fr => fr.url().includes('<host_substr>')); await f.evaluate(() => document.querySelector('<inner>').click()).`
                     : reasonStr === 'rect_shifted'
                     ? `Element shifted between probe and dispatch (${validation.overlay}px) — page is mid-render. Re-screenshot to re-acquire fresh coords.`
                     : reasonStr === 'empty_stack'

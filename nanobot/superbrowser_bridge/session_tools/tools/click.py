@@ -1,7 +1,8 @@
-"""Click tools — DOM-index, vision-bbox (V_n), and rect probe.
+"""Click tools — DOM-index, vision-bbox (V_n), CSS-selector, and rect probe.
 
 `BrowserClickTool` (DOM index), `BrowserClickAtTool` (vision-bbox / coords),
-`BrowserGetRectTool` (read-only rect probe).
+`BrowserGetRectTool` (read-only rect probe), `BrowserClickSelectorTool`
+(CSS-selector fast path, supports `in_iframe` for iframe-scoped clicks).
 """
 
 from __future__ import annotations
@@ -34,6 +35,83 @@ from ._click_core import (
 )
 
 
+# Dynamic-ID detector for `browser_click_selector`.
+#
+# React 18's `useId()` emits IDs like `:r13:` (a leading colon + base-32
+# counter + trailing colon). Radix wraps it as `radix-:r13:`, Headless
+# UI uses `headlessui-*-NN`, and some libraries stamp `__id_NNNN`. All
+# four rotate between renders — the brain captures the ID once, the
+# page re-mounts, and the selector is stale.
+#
+# `re.search` (not `re.match`) so compound selectors like
+# `.modal #radix-:r13:` are caught too. Idempotent w.r.t. escaped
+# colons (`\\?` accepts the optional backslash).
+_DYNAMIC_ID_RE = re.compile(
+    r"#(?:"
+    r"(?:[a-zA-Z_][\w-]*)?\\?:r[a-z0-9]+"
+    r"|headlessui-"
+    r"|__id_"
+    r")"
+)
+
+
+# Playwright / jQuery extension pseudo-selectors. The brain knows these
+# from training data and assumes they're CSS — but `document.querySelector`
+# throws SyntaxError on them, which the TS getRects path swallows. The
+# brain then sees "selector not found or zero-size" (indistinguishable
+# from a real missing element) and goes on a 5-tool fishing trip.
+#
+# Catching upfront with a regex turns 8 turns into 1: the brain gets a
+# clear advisory pointing it to `browser_click_at(vision_index=...)`.
+#
+# Matches:
+#   :has-text("X"), :contains("X")        — text matching
+#   :visible, :hidden                     — jQuery visibility
+#   :eq(N), :first, :last, :odd, :even    — jQuery indexing
+#   :button, :input, :checkbox, :radio,
+#   :submit, :selected, :file, :image,
+#   :password, :reset                     — jQuery form filters
+#   text=, role=, xpath=                  — Playwright engine prefixes
+#   >> (chain operator)                   — Playwright selector chain
+#
+# `:not(...)`, `:is(...)`, `:has(...)`, `:where(...)`, `:nth-child(...)`,
+# `:first-child`, `:first-of-type`, `:last-child`, etc. and other
+# STANDARD CSS pseudos are explicitly NOT in this set — they parse
+# fine in querySelector. The negative lookahead `(?![-\w])` after each
+# bare jQuery keyword rejects the standard-CSS hyphenated forms (e.g.
+# `:first-child` is CSS, `:first` alone is jQuery).
+_PLAYWRIGHT_PSEUDO_RE = re.compile(
+    r"(?:"
+    r":has-text\("
+    r"|:contains\("
+    r"|:visible(?![-\w])"
+    r"|:hidden(?![-\w])"
+    r"|:eq\("
+    r"|:first(?![-\w])"
+    r"|:last(?![-\w])"
+    r"|:odd(?![-\w])"
+    r"|:even(?![-\w])"
+    r"|:button(?![-\w])"
+    r"|:input(?![-\w])"
+    r"|:checkbox(?![-\w])"
+    r"|:radio(?![-\w])"
+    r"|:submit(?![-\w])"
+    r"|:selected(?![-\w])"
+    r"|:file(?![-\w])"
+    r"|:image(?![-\w])"
+    r"|:password(?![-\w])"
+    r"|:reset(?![-\w])"
+    r"|>>\s*text="
+    r"|>>\s*role="
+    r"|>>\s*xpath="
+    r"|(?:^|\s)text="
+    r"|(?:^|\s)role="
+    r"|(?:^|\s)xpath="
+    r")",
+    re.IGNORECASE,
+)
+
+
 @tool_parameters(
     tool_parameters_schema(
         session_id=StringSchema("Session ID"),
@@ -63,6 +141,35 @@ class BrowserClickTool(Tool):
         sync_block = await self.s.ensure_vision_synced(reason="browser_click")
         if sync_block:
             return sync_block
+        # Popup-scroll guard. After any popup-internal scroll (via
+        # browser_scroll_within or the pixel-scroll loop inside
+        # browser_select_option's auto-recovery), DOM indices for
+        # popup items are stale — the option list moved but the
+        # brain's cached [N] mapping didn't. Refuse the click and
+        # redirect to the deterministic bbox path: screenshot →
+        # fresh V_n → browser_click_at. Cleared the moment a
+        # screenshot lands; auto-expires after POPUP_SCROLL_EXPIRY_SECONDS
+        # so a brain pivoting to an unrelated task isn't permanently
+        # blocked.
+        if self.s.popup_scroll_guard_active():
+            self.s.log_activity(
+                f"click([{index}])(POPUP_SCROLL_BLOCKED)",
+                f"pending_since={self.s.popup_scroll_at:.1f}",
+            )
+            return (
+                f"[click_blocked:popup_scrolled_no_rebbox] A popup was "
+                f"just scrolled and no fresh screenshot has landed yet — "
+                f"DOM indices for popup options are STALE. The element "
+                f"at [{index}] has likely moved to a different row, or "
+                f"a different element occupies that index now. Required "
+                f"next steps:\n"
+                f"  1. browser_screenshot — vision relabels the popup "
+                f"with fresh V_n.\n"
+                f"  2. browser_click_at(vision_index=V_n) on the option "
+                f"you want.\n"
+                f"Do NOT retry browser_click([N]) on popup items — the "
+                f"index map only updates after a fresh vision pass."
+            )
         self.s._brain_turn_counter += 1
         # Cross-index flail guard. If the last two clicks timed out,
         # force a re-screenshot before dispatching another HTTP click —
@@ -815,25 +922,50 @@ class BrowserClickAtTool(Tool):
                 hops = f" depth={len(chain)}" if chain else ""
                 snap_note += f" [iframe_descent_ok{hops}]"
             elif warn == "target_in_iframe_cross_origin":
+                # Primary advice: use the deterministic selector path.
+                # `browser_click_selector(in_iframe=<host>)` routes through
+                # the TS `clickSelectorInIframe()` which uses contentFrame()
+                # + frame.evaluate() to find the element by CSS inside the
+                # iframe and dispatches a CDP click at the translated
+                # viewport coords — no need for the brain to author JS.
                 snap_note += (
                     f" [WARN:iframe_cross_origin{host_hint} — outer-doc"
                     " click cannot reach inner content (cross-origin"
-                    " SOP). Re-screenshot so vision emits a V_n inside"
-                    " the iframe, then browser_click_at on that V_n."
+                    " SOP). Call browser_click_selector(selector="
+                    f"<inner_css>, in_iframe={host_sel!r}) to target the"
+                    " element directly inside the frame."
+                    if host_sel
+                    else " [WARN:iframe_cross_origin — outer-doc click"
+                         " cannot reach inner content (cross-origin"
+                         " SOP). Call browser_click_selector with"
+                         " in_iframe=<host_css> to target inside the"
+                         " frame.]"
                 )
             elif warn == "target_in_iframe_miss":
                 snap_note += (
                     f" [WARN:iframe_miss{host_hint} — descent ran but"
                     " no clickable was found inside the bbox region."
                     " Vision bbox may be loose. Re-screenshot to get a"
-                    " tighter bbox, then browser_click_at on the new V_n."
+                    " tighter bbox, or call browser_click_selector("
+                    f"selector=<inner_css>, in_iframe={host_sel!r})."
+                    if host_sel
+                    else " [WARN:iframe_miss — descent ran but no"
+                         " clickable was found in the bbox region."
+                         " Re-screenshot or call browser_click_selector"
+                         " with in_iframe=<host_css>.]"
                 )
             elif warn == "target_in_iframe":
                 snap_note += (
                     f" [WARN:target_in_iframe{host_hint} — click landed"
-                    " on the <iframe> host, NOT inner content. Re-"
-                    "screenshot so vision emits a V_n inside the iframe,"
-                    " then browser_click_at on that V_n."
+                    " on the <iframe> host, NOT inner content. Call"
+                    f" browser_click_selector(..., in_iframe={host_sel!r})"
+                    " or re-screenshot so vision emits a V_n inside the"
+                    " iframe."
+                    if host_sel
+                    else " [WARN:target_in_iframe — click landed on the"
+                         " <iframe> host. Re-screenshot or call"
+                         " browser_click_selector with"
+                         " in_iframe=<host_css>.]"
                 )
             elif warn == "pointer_events_none_ancestor":
                 snap_note += (
@@ -841,6 +973,57 @@ class BrowserClickAtTool(Tool):
                     "ancestor has pointer-events:none, the click may "
                     "have passed through to a layer behind.]"
                 )
+
+            # Iframe-miss escalation. After two misses on the SAME
+            # (V_n, host) — i.e. the brain already tried the
+            # browser_click_selector path advised in the WARN above and
+            # it still didn't land — drop to browser_run_script as a
+            # final escape. browser_click_selector is the deterministic
+            # first step; run_script is only the last resort.
+            _iframe_miss_warnings = (
+                "target_in_iframe_cross_origin",
+                "target_in_iframe_miss",
+                "target_in_iframe",
+            )
+            if warn in _iframe_miss_warnings:
+                miss_key = f"V{int(vision_index)}|{host_sel}"
+                if self.s.iframe_miss_key == miss_key:
+                    self.s.iframe_miss_count += 1
+                else:
+                    self.s.iframe_miss_key = miss_key
+                    self.s.iframe_miss_count = 1
+                if self.s.iframe_miss_count >= self.s.MAX_IFRAME_MISSES_BEFORE_NUDGE:
+                    host_arg = (
+                        f"const f = page.frames().find(fr => "
+                        f"fr.url().includes('<substring_of_{host_sel}_url>'));"
+                        if host_sel else
+                        "const f = page.frames().find(fr => "
+                        "fr.url().includes('<host_substring>'));"
+                    )
+                    snap_note += (
+                        f" [ESCALATE:run_script iframe_misses="
+                        f"{self.s.iframe_miss_count}] "
+                        f"You've now missed V{int(vision_index)} inside"
+                        f" this iframe {self.s.iframe_miss_count} times,"
+                        f" including via browser_click_selector. Drop to"
+                        f" browser_run_script(mutates=true) and dispatch"
+                        f" the click via frame.evaluate so it runs in"
+                        f" the iframe's own JS context. Example skeleton: "
+                        f"{host_arg} await f.evaluate(() => "
+                        f"document.querySelector('<inner_button>').click()). "
+                        f"If you don't know the inner selector yet, first"
+                        f" run browser_run_script(mutates=false) with"
+                        f" f.evaluate(() => Array.from(document.querySelectorAll("
+                        f"'button,a,[role=button]')).map(el => el.outerHTML.slice(0,200))) "
+                        f"to enumerate clickable candidates."
+                    )
+            elif warn == "target_in_iframe_resolved" or warn is None:
+                # Reset on success or on non-iframe warnings — the brain
+                # has either landed the click or moved on to a different
+                # target / class of problem.
+                if self.s.iframe_miss_count:
+                    self.s.iframe_miss_count = 0
+                    self.s.iframe_miss_key = ""
             # Phase G: native <select> hint. Always-on (top-level or
             # inside an iframe). Native dropdowns don't open via CDP
             # Input.dispatchMouseEvent — the click here only focuses
@@ -1004,3 +1187,227 @@ class BrowserGetRectTool(Tool):
                 f"visible={rect['visible']} inViewport={rect['inViewport']}"
             )
         return "\n".join(lines)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        selector=StringSchema("CSS selector of the element to click"),
+        button=StringSchema("Mouse button: left|right|middle", nullable=True),
+        click_count=IntegerSchema(
+            "Number of clicks (1 for single, 2 for double)",
+            nullable=True,
+        ),
+        linear=BooleanSchema(
+            description=(
+                "If true (default), use deterministic teleport click "
+                "(pixel-exact). Set false for stealth-critical contexts "
+                "(captchas) that need Bezier humanisation."
+            ),
+            nullable=True,
+        ),
+        in_iframe=StringSchema(
+            description=(
+                "CSS selector of an <iframe> host. When provided, "
+                "`selector` is resolved INSIDE the iframe's contentFrame "
+                "instead of the top-level document. Use this when the "
+                "target lives inside an embedded frame (e.g. quizzes, "
+                "calculators, captcha widgets). Same-origin iframes work "
+                "directly; cross-origin OOPIFs use Puppeteer's Frame API."
+            ),
+            nullable=True,
+        ),
+        required=["session_id", "selector"],
+    )
+)
+class BrowserClickSelectorTool(Tool):
+    name = "browser_click_selector"
+    description = (
+        "Click the centre of a DOM element by CSS selector. Pixel-exact, "
+        "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
+        "whenever the target has a stable hook — chess squares "
+        "(.square-54), form fields (#email), buttons with data-test-id, "
+        "captcha handles. For elements inside an <iframe>, pass "
+        "in_iframe=<host_css> to scope the selector to that frame — the "
+        "server descends via contentFrame() + frame.evaluate() and "
+        "dispatches a CDP click at the translated viewport coords. Fails "
+        "fast if the selector is missing or zero-size."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    async def execute(
+        self,
+        session_id: str,
+        selector: str,
+        button: str | None = None,
+        click_count: int | None = None,
+        linear: bool | None = None,
+        in_iframe: str | None = None,
+        **kw: Any,
+    ) -> str:
+        scope_note = f" in_iframe={in_iframe!r}" if in_iframe else ""
+        print(f"\n>> browser_click_selector({selector!r}{scope_note})")
+        # Phase 1.1: hard sync gate. Wait for any in-flight vision
+        # prefetch from the previous action before dispatching.
+        sync_block = await self.s.ensure_vision_synced(
+            reason="browser_click_selector",
+        )
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
+        self.s.actions_since_screenshot += 1
+        self.s.consecutive_click_calls += 1
+
+        # Phase 1.2: dynamic-ID guard. React's `useId()` and friends
+        # generate IDs that rotate between renders (`:r13:` → `:r14:`).
+        # Selector dispatch on these silently fails or hits the wrong
+        # element by the time the click lands. Reject upstream so the
+        # brain routes to `browser_click_at(vision_index=...)` on the
+        # first call instead of wasting a round-trip on a stale ID.
+        if _DYNAMIC_ID_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="dynamic_id_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(DYNAMIC_ID_REJECTED)", "",
+            )
+            return (
+                f"[click_selector_rejected:dynamic_id] Selector "
+                f"{selector!r} uses a React-generated dynamic ID "
+                f"(useId() / radix-:rN: / headlessui-* / __id_*) that "
+                f"changes between renders. Call "
+                f"browser_click_at(vision_index=V_n) instead — the "
+                f"vision bbox is stable across re-renders."
+            )
+
+        # Phase 1.3: Playwright/jQuery pseudo-selector guard. The brain
+        # knows `:has-text("X")`, `:contains("X")`, `text=X`, `:visible`
+        # etc. from Playwright/jQuery training data and assumes they're
+        # CSS. `document.querySelector` throws SyntaxError on them, the
+        # TS getRects wrapper swallows it, and the brain sees "selector
+        # not found" — indistinguishable from a missing element. The
+        # brain then wastes 5+ turns on `browser_eval`/markdown lookups
+        # before falling through to raw coords.
+        if _PLAYWRIGHT_PSEUDO_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="playwright_pseudo_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(PLAYWRIGHT_PSEUDO_REJECTED)",
+                "",
+            )
+            return (
+                f"[click_selector_rejected:playwright_pseudo] Selector "
+                f"{selector!r} uses Playwright/jQuery extension syntax "
+                f"(:has-text, :contains, :visible, :hidden, :eq, :first, "
+                f":button, text=, role=, xpath=, >> chain, etc.) — these "
+                f"are NOT standard CSS and document.querySelector throws "
+                f"SyntaxError on them. To click an element BY ITS TEXT, "
+                f"call browser_click_at(vision_index=V_n) — vision "
+                f"already labels each visible button by its text. To "
+                f"click by stable hook, use a real CSS selector "
+                f"(`.square-54`, `#email`, `[data-testid=submit]`)."
+            )
+
+        payload: dict[str, Any] = {
+            "selector": selector,
+            "ensureVisible": True,
+        }
+        if button is not None:
+            payload["button"] = button
+        if click_count is not None:
+            payload["clickCount"] = click_count
+        if linear is not None:
+            payload["linear"] = linear
+        if in_iframe:
+            payload["in_iframe"] = in_iframe
+
+        # Surgical undo: open a pending entry. pre_active is None for
+        # selector clicks (we don't probe aria state on this path); the
+        # label safety-net in finalize_click_record still catches
+        # destructive selectors like 'button.delete' / '#submit' and
+        # classifies them irreversible. url_changed demotion in
+        # finalize handles nav cases.
+        self.s.begin_click_record(
+            tool="browser_click_selector",
+            target_key=f"click_selector({selector})",
+            vision_index=None,
+            label=selector,
+            box_2d=None,
+            pre_active=None,
+            expected_url_change=False,
+            is_form_submit=False,
+        )
+
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/click-selector",
+            json=payload,
+            timeout=15.0,
+        )
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", r.text)
+            except Exception:
+                err = r.text
+            # Record cursor failure so the script-lockout gate counts
+            # this as a tried-and-failed cursor strategy.
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason=str(err)[:120],
+            )
+            # Drop the pending undo entry — the click never landed.
+            self.s._pending_undo_entry = None
+            return f"[click_selector_failed] {err}"
+        data = r.json()
+        self.s.finalize_click_record(response=data)
+        # Auto-refresh element_fingerprints from the click response so a
+        # follow-up DOM-index click doesn't ship a stale fingerprint.
+        _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(_fp_map, dict):
+            self.s.element_fingerprints = {
+                int(k): v for k, v in _fp_map.items() if isinstance(v, str)
+            }
+        clicked = data.get("clicked", {})
+        actual_url = data.get("url", self.s.current_url)
+        if actual_url:
+            self.s.record_url(actual_url)
+        self.s.record_step(
+            "browser_click_selector",
+            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})"
+            + (f" in_iframe={in_iframe!r}" if in_iframe else ""),
+            data.get("url", ""),
+        )
+        # click_selector is a mutation — advance the observation token
+        # and schedule a vision prefetch so the next screenshot is warm.
+        self.s.advance_observation_token("click_selector")
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        caption = (
+            f"Clicked {selector} at "
+            f"({clicked.get('x','?')},{clicked.get('y','?')})"
+        )
+        if in_iframe:
+            caption += f" [iframe={in_iframe}]"
+        if data.get("elements"):
+            caption += f"\n{data['elements']}"
+        # A successful iframe-scoped click means the deterministic path
+        # worked — clear the iframe-miss counter so the next miss starts
+        # fresh from advisory-level escalation, not run_script.
+        if in_iframe and self.s.iframe_miss_count:
+            self.s.iframe_miss_count = 0
+            self.s.iframe_miss_key = ""
+        return await _append_fresh_vision(
+            _vision_task,
+            _maybe_no_effect_prefix(
+                data, "browser_click_selector", caption,
+                session_state=self.s,
+            ),
+            state=self.s,
+        )

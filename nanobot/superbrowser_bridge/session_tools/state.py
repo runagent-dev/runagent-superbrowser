@@ -163,6 +163,15 @@ class BrowserSessionState:
         # independently so two-in-a-row forces a re-screenshot.
         self.consecutive_click_timeouts: int = 0
         self.MAX_CONSECUTIVE_CLICK_TIMEOUTS = 2
+        # Iframe-miss escalation counter. Tracks consecutive iframe-
+        # failure warnings on the SAME (vision_index, iframe_host_selector)
+        # so click.py can emit a stronger "switch to browser_run_script"
+        # nudge after the brain has re-tried once and missed again. The
+        # standard re-screenshot+click_at advice ships on the first miss;
+        # the run_script escalation fires when count hits the threshold.
+        self.iframe_miss_count: int = 0
+        self.iframe_miss_key: str = ""
+        self.MAX_IFRAME_MISSES_BEFORE_NUDGE = 2
         # Telemetry: how many times the TS-side snap-to-interactive
         # failed to find a clickable descendant inside the bbox we sent.
         # Incremented whenever a click response has snap.snapped=false.
@@ -297,6 +306,19 @@ class BrowserSessionState:
         self.last_type_index: int = -1
         self.last_type_text: str = ""
         self.last_type_at: float = 0.0
+
+        # Popup-scroll guard. Set True after a scroll-within (or the
+        # pixel-scroll inside select_option's recovery) so the next
+        # DOM-index click is refused until a fresh screenshot lands.
+        # Reason: scrolling a popup moves option elements to different
+        # DOM positions in the brain's elements list. The brain's
+        # cached [N] indices no longer point at what it thinks; only a
+        # fresh vision pass (with new V_n labels) is reliable.
+        # Cleared by mark_screenshot_taken, or auto-expired after 60s
+        # so a brain that pivots to an unrelated task isn't stuck.
+        self.popup_scroll_pending: bool = False
+        self.popup_scroll_at: float = 0.0
+        self.POPUP_SCROLL_EXPIRY_SECONDS: float = 60.0
 
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
@@ -490,6 +512,41 @@ class BrowserSessionState:
                 return self._last_vision_response
             return self._vision_epoch_response
         return self._last_vision_response
+
+    def flag_popup_scroll(self, reason: str = "scroll_within") -> None:
+        """Mark that a popup-internal scroll just happened.
+
+        Triggers two safeguards on the next DOM-index click:
+          1. `BrowserClickTool` refuses with a redirect to bbox click.
+          2. element_fingerprints are cleared so the TS-side stale-index
+             guard also fires if (1) is bypassed.
+        Cleared by the next successful screenshot (mark_screenshot_taken).
+        """
+        import time as _t
+        self.popup_scroll_pending = True
+        self.popup_scroll_at = _t.time()
+        # Invalidate fingerprints — popup options' [N] indices became
+        # stale the moment the list moved.
+        try:
+            self.element_fingerprints = {}
+        except Exception:
+            pass
+
+    def popup_scroll_guard_active(self) -> bool:
+        """True when a popup-scroll guard is currently in effect.
+
+        Auto-expires after `POPUP_SCROLL_EXPIRY_SECONDS` so a brain that
+        pivots to an unrelated task isn't permanently blocked.
+        """
+        if not self.popup_scroll_pending:
+            return False
+        import time as _t
+        if (_t.time() - self.popup_scroll_at) > self.POPUP_SCROLL_EXPIRY_SECONDS:
+            # Expired — release the guard silently.
+            self.popup_scroll_pending = False
+            self.popup_scroll_at = 0.0
+            return False
+        return True
 
     def record_cursor_failure(
         self, *, strategy: str, target: str, reason: str,
@@ -685,6 +742,11 @@ class BrowserSessionState:
         # Wall-clock for the click-pending-screenshot guard.
         import time as _t
         self.last_screenshot_at = _t.time()
+        # Fresh screenshot means vision has had a chance to re-label
+        # the popup. The popup-scroll guard can release.
+        if self.popup_scroll_pending:
+            self.popup_scroll_pending = False
+            self.popup_scroll_at = 0.0
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:

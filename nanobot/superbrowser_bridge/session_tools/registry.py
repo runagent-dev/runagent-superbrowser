@@ -12,6 +12,7 @@ from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
     BrowserClickAtTool,
+    BrowserClickSelectorTool,
     BrowserClickTool,
     BrowserCloseTool,
     BrowserDetectCaptchaTool,
@@ -76,6 +77,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserScreenshotTool(state),
         BrowserClickTool(state),
         BrowserClickAtTool(state),
+        BrowserClickSelectorTool(state),   # CSS-selector click; supports in_iframe
         BrowserTypeAtTool(state),
         BrowserFixTextAtTool(state),
         BrowserTypeTool(state),
