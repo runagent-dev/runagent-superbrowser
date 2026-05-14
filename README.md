@@ -39,28 +39,57 @@ await bot.run("find me a black summer dress under $80 on zara.com, size M, ships
 
 ## Quick start
 
+### Prerequisites
+
+- **Node 20+** and **Python 3.11+**
+- **Chrome** (real, not bundled Chromium — fingerprint targets need it)
+- **Xvfb** (only if you run headful in a container — required for the hardest CF targets)
+
+### 1. Install Chrome
+
+```bash
+wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+  | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+  > /etc/apt/sources.list.d/google-chrome.list
+sudo apt update && sudo apt install -y google-chrome-stable
+# binary lands at /usr/bin/google-chrome-stable — that's what CHROME_PATH points to
+```
+
+On a server / container, also grab Xvfb for headful mode:
+
+```bash
+sudo apt install -y xvfb
+```
+
+### 2. Clone + build the TS server
+
 ```bash
 git clone https://github.com/runagent-dev/superbrowser.git
 cd superbrowser
 npm install && npm run build
-npm start
+cp .env.example .env       # then edit keys you care about
+npm start                  # runs on :3100
 ```
 
-Server runs on `:3100`. No API key needed.
+That's the whole TS side. No API key needed.
 
-For captcha-solving + tier escalation + nanobot tools:
+### 3. Python bridge (for captcha-solving, Tier 3, nanobot tools)
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-patchright install chromium
+patchright install chromium        # downloads patchright's Chromium
+playwright install-deps chromium   # apt deps Chromium needs (libnss3 etc.)
 ```
 
-Or skip both:
+### Or just Docker
 
 ```bash
 docker compose up -d
 ```
+
+The Docker image bakes Chrome, Xvfb, Node, and Python in. Mount `~/.superbrowser/profiles/` and `~/.superbrowser/cookie-jar/` as volumes if you want state to survive restarts.
 
 ---
 
