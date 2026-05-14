@@ -1472,6 +1472,21 @@ export async function selectOptionByLabel(
       };
     }
     if (exactHits.length > 1) {
+      // DOM duplicates — same option text rendered ≥2 times (e.g.
+      // mobile+desktop variants of a Best Buy filter visible at once,
+      // or two-pane layouts). Indistinguishable from the brain's
+      // perspective; pick the first DOM-order one rather than
+      // forcing a manual disambiguation round-trip.
+      const uniqTexts = new Set(exactHits.map((it) => it.txt));
+      if (uniqTexts.size === 1) {
+        const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+        exactHits[0].el.setAttribute('data-sb-opt', optTag);
+        return {
+          ok: true as const,
+          option_selector: `[data-sb-opt="${optTag}"]`,
+          picked_text: exactHits[0].txt,
+        };
+      }
       return {
         ok: false as const,
         reason: 'ambiguous_option',
@@ -1495,11 +1510,20 @@ export async function selectOptionByLabel(
       startsHits.sort((a, b) => a.txt.length - b.txt.length);
       if (startsHits.length > 1
           && startsHits[0].txt.length === startsHits[1].txt.length) {
-        return {
-          ok: false as const,
-          reason: 'ambiguous_option',
-          candidates: startsHits.map((it) => it.txt).slice(0, 10),
-        };
+        // Same-length tie. DOM duplicates (identical text) collapse
+        // to one and are picked; genuinely different shorter
+        // candidates surface for the brain to disambiguate.
+        const tiedTexts = startsHits.filter(
+          (h) => h.txt.length === startsHits[0].txt.length,
+        );
+        const uniqTexts = new Set(tiedTexts.map((it) => it.txt));
+        if (uniqTexts.size !== 1) {
+          return {
+            ok: false as const,
+            reason: 'ambiguous_option',
+            candidates: startsHits.map((it) => it.txt).slice(0, 10),
+          };
+        }
       }
       const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
       startsHits[0].el.setAttribute('data-sb-opt', optTag);
@@ -1518,11 +1542,17 @@ export async function selectOptionByLabel(
       containsHits.sort((a, b) => a.txt.length - b.txt.length);
       if (containsHits.length > 1
           && containsHits[0].txt.length === containsHits[1].txt.length) {
-        return {
-          ok: false as const,
-          reason: 'ambiguous_option',
-          candidates: containsHits.map((it) => it.txt).slice(0, 10),
-        };
+        const tiedTexts = containsHits.filter(
+          (h) => h.txt.length === containsHits[0].txt.length,
+        );
+        const uniqTexts = new Set(tiedTexts.map((it) => it.txt));
+        if (uniqTexts.size !== 1) {
+          return {
+            ok: false as const,
+            reason: 'ambiguous_option',
+            candidates: containsHits.map((it) => it.txt).slice(0, 10),
+          };
+        }
       }
       const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
       containsHits[0].el.setAttribute('data-sb-opt', optTag);
