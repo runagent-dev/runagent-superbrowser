@@ -26,6 +26,34 @@ await bot.run("find me a black summer dress under $80 on zara.com, size M, ships
 
 ---
 
+## Drive it from a chat app
+
+Plug SuperBrowser into **WhatsApp, Telegram, Discord, Slack** (also DingTalk, Lark, QQ — the SDKs are already vendored). Type a task in chat, the agent runs it in the cloud, and when it hits a captcha **your phone buzzes with a live-view link** — tap, swipe, the session resumes on the same cookies.
+
+```
+You (WhatsApp):  "book me a Khulna hotel under $40/night, check-in Apr 23"
+
+  SuperBrowser:  Searching gozayaan.com...
+                 Filtering 4-star, under $40...
+                 [hit a captcha] → tap here: https://browser.runagent.cloud/v/abc
+                                ↑ you tap once, swipe slider, done
+
+  SuperBrowser:  Found 3 hotels. Top pick: Hotel Castle Salam,
+                 $34/night, 4.2★. Want me to book?
+
+You (WhatsApp):  "yes, my card on file"
+```
+
+Wire it up in one env var:
+
+```bash
+HANDOFF_WEBHOOK_URL=https://your-bot.example.com/webhooks/handoff
+```
+
+The webhook receives `{viewUrl, captchaType, pageTitle, screenshot, caption}` — forward that to whichever messenger SDK you're using. WebSocket events (`awaiting_human`, `captcha_active`, `captcha_done`) push updates with snapshot replay so late subscribers see the same state. Cookies persist per task, so the human only solves once per site.
+
+---
+
 ## What it does
 
 - **Runs through captchas.** Cloudflare, Akamai, DataDome, PerimeterX, Kasada. Auto-pass on warm profiles, Turnstile token solvers, vision-based slider / jigsaw / rotation solvers, or hand off to a human via a live-view URL.
