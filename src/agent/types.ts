@@ -15,6 +15,7 @@ export type FailureReason =
   | 'disabled'            // has disabled attr / aria-disabled
   | 'stale_selector'      // selector no longer matches
   | 'nav_pending'         // navigation in flight, action would race
+  | 'focus_lost'          // click landed but focus moved before keystroke dispatch
   | 'unknown';
 
 export interface ActionResult {

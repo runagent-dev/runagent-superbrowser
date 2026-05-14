@@ -231,6 +231,13 @@ async def _dispatch(
     pre_state: Optional[PreState], timeout_ms: int,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Route to the per-kind checker. Returns (verified, reason, signals)."""
+    # T1 sessions only support `dom_mutated` and `none`. The other kinds
+    # rely on `t3manager.evaluate` / `t3manager.state` / blocker probes
+    # that aren't wired for t1 — fail-open here rather than threading an
+    # HTTP fallback through every kind. The silent-click hot path is
+    # already covered by the dom_mutated branch below.
+    if not session_id.startswith("t3-") and kind not in ("dom_mutated", "none"):
+        return True, "t1_kind_not_supported", {}
     if kind == "bbox_disappeared":
         rect = payload.get("widget_px") or payload.get("rect")
         if not rect or len(rect) < 4:
@@ -320,15 +327,36 @@ async def _dispatch(
     if kind == "dom_mutated":
         # We rely on BrowserSessionState's hash_page_content externally.
         # The caller passes pre_state.dom_hash; we fetch fresh content via
-        # t3's /state endpoint (same call the caller would make anyway).
+        # the session's /state endpoint (same call the caller would make
+        # anyway). t3 sessions are served by the in-process T3SessionManager;
+        # t1 sessions are fetched over HTTP from the TS server.
         before = pre_state.dom_hash if pre_state else ""
         if not before:
             return True, "no_pre_hash", {}
-        try:
-            st = await t3manager.state(session_id)
-            elements_str = (st or {}).get("elements") or ""
-        except Exception as exc:
-            return True, f"state_fetch_failed:{exc!s}"[:80], {}
+        elements_str = ""
+        if session_id.startswith("t3-") and t3manager is not None:
+            try:
+                st = await t3manager.state(session_id)
+                elements_str = (st or {}).get("elements") or ""
+            except Exception as exc:
+                return True, f"state_fetch_failed:{exc!s}"[:80], {}
+        else:
+            # T1 fallback — fetch via HTTP /state without vision (cheap).
+            # Local import to avoid a module-level circular dep.
+            try:
+                from .session_tools.http_client import (
+                    SUPERBROWSER_URL, _request_with_backoff,
+                )
+                r = await _request_with_backoff(
+                    "GET",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "false"},
+                    timeout=5.0,
+                )
+                if r.status_code == 200:
+                    elements_str = (r.json() or {}).get("elements") or ""
+            except Exception as exc:
+                return True, f"state_fetch_failed:{exc!s}"[:80], {}
         # Re-hash via BrowserSessionState's utility to stay in sync with
         # its keying. Import locally to avoid a module-level cycle.
         try:

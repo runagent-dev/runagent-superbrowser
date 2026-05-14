@@ -963,6 +963,18 @@ export async function selectOptionByLabel(
   // with `data-sb-opt-candidate`. Returns the count tagged so the
   // wait loop knows when it can stop. The pickAttempt and listbox-
   // scroll helpers below all read this single tag.
+  //
+  // Popup-scoping (added 2026-05-10): when the open dropdown lives in
+  // a recognisable container — ARIA listbox/menu/dialog, library
+  // state attrs (Headless UI / Radix / data-state="open"), or a
+  // newly-mounted container near the trigger — restrict candidate
+  // tagging to descendants of that container. Without this scope the
+  // DOM-diff fallback below was vacuuming up homepage buttons whose
+  // pre-visible tag had been lost across a React re-render (SpotHero
+  // homepage time picker returned 'Use current location' / 'View All
+  // Stadiums' as candidates). Falls back to whole-document search
+  // when no root can be identified — preserves the existing happy
+  // path for ARIA-clean dropdowns.
   const collectAndTagCandidates = (): Promise<number> => page.evaluate(
     (args: { sels: string[]; triggerSel: string }) => {
       const { sels, triggerSel } = args;
@@ -978,16 +990,126 @@ export async function selectOptionByLabel(
         return true;
       };
       const triggerEl = triggerSel ? document.querySelector(triggerSel) : null;
+
+      // ----- popup-root detection -----
+      // Cascade A → B → C, first hit wins.
+      let popupRoot: Element | null = null;
+
+      // A1. aria-controls on the trigger points at the popup id.
+      if (triggerEl) {
+        const controlsId = triggerEl.getAttribute('aria-controls');
+        if (controlsId) {
+          const ctrl = document.getElementById(controlsId);
+          if (ctrl && isVisible(ctrl as HTMLElement)) popupRoot = ctrl;
+        }
+      }
+
+      // A2. ARIA role-based popups visible somewhere on the page.
+      if (!popupRoot) {
+        const ariaPopupSelectors = [
+          '[role="listbox"]:not([aria-hidden="true"])',
+          '[role="menu"]:not([aria-hidden="true"])',
+          '[role="dialog"]:not([aria-hidden="true"])',
+          '[role="grid"]:not([aria-hidden="true"])',
+          '[role="tree"]:not([aria-hidden="true"])',
+        ];
+        for (const sel of ariaPopupSelectors) {
+          let found: Element | null = null;
+          try {
+            for (const c of Array.from(document.querySelectorAll(sel))) {
+              if (!isVisible(c as HTMLElement)) continue;
+              if (c === triggerEl) continue;
+              if (triggerEl && c.contains(triggerEl)) continue;
+              found = c; break;
+            }
+          } catch { /* selector unsupported — skip */ }
+          if (found) { popupRoot = found; break; }
+        }
+      }
+
+      // B. Library state attrs — Headless UI / Radix / generic `data-state`.
+      if (!popupRoot) {
+        const libSelectors = [
+          '[data-headlessui-state~="open"]',
+          '[data-state="open"]',
+          '[data-radix-popper-content-wrapper]',
+          '[data-floating-ui-portal]',
+        ];
+        for (const sel of libSelectors) {
+          let found: Element | null = null;
+          try {
+            for (const c of Array.from(document.querySelectorAll(sel))) {
+              if (!isVisible(c as HTMLElement)) continue;
+              if (c === triggerEl) continue;
+              if (triggerEl && c.contains(triggerEl)) continue;
+              found = c; break;
+            }
+          } catch { /* skip */ }
+          if (found) { popupRoot = found; break; }
+        }
+      }
+
+      // C. Geometric/diff fallback — find the newly-mounted container
+      //    closest to the trigger that contains option-shaped children.
+      //    Required for SpotHero-style custom pickers that emit no
+      //    ARIA roles and no library state attrs.
+      if (!popupRoot && triggerEl) {
+        const triggerRect = (triggerEl as HTMLElement).getBoundingClientRect();
+        const triggerCx = triggerRect.left + triggerRect.width / 2;
+        const triggerCy = triggerRect.top + triggerRect.height / 2;
+        const MAX_DISTANCE = 800;
+        const containerCandidates = Array.from(document.querySelectorAll<HTMLElement>(
+          'div, section, ul, [class*="popper"], [class*="menu"], '
+          + '[class*="dropdown"], [class*="picker"], [class*="modal"], '
+          + '[class*="popover"], [class*="overlay"]',
+        ));
+        let bestRoot: Element | null = null;
+        let bestArea = Infinity;
+        for (const c of containerCandidates) {
+          if (!isVisible(c)) continue;
+          if (c.hasAttribute('data-sb-pre-visible')) continue;
+          // Skip elements that contain the trigger — they're the page
+          // layout itself, not a freshly opened popup.
+          if (c.contains(triggerEl)) continue;
+          const r = c.getBoundingClientRect();
+          if (r.width < 100 || r.height < 60) continue;
+          const ccx = r.left + r.width / 2;
+          const ccy = r.top + r.height / 2;
+          const dist = Math.hypot(ccx - triggerCx, ccy - triggerCy);
+          if (dist > MAX_DISTANCE) continue;
+          // Must contain newly-mounted interactive children — that's
+          // what makes it a popup vs. a long-standing layout box.
+          const newChildren = c.querySelectorAll(
+            'button:not([data-sb-pre-visible]), '
+            + '[role="option"]:not([data-sb-pre-visible]), '
+            + '[role="menuitem"]:not([data-sb-pre-visible]), '
+            + 'li:not([data-sb-pre-visible]), '
+            + 'a:not([data-sb-pre-visible])',
+          );
+          if (newChildren.length < 1) continue;
+          // Prefer the SMALLEST qualifying container — tighter scope.
+          const area = r.width * r.height;
+          if (area < bestArea) { bestArea = area; bestRoot = c; }
+        }
+        if (bestRoot) popupRoot = bestRoot;
+      }
+
       const tagSet = (el: Element): void => {
         if (el === triggerEl) return;
         if (triggerEl && triggerEl.contains(el)) return;
+        // Hard-reject anything outside the popup root when we found
+        // one. This is the actual fix — homepage buttons get filtered
+        // out even if their pre-visible tag was lost across a re-render.
+        if (popupRoot && !popupRoot.contains(el)) return;
         (el as HTMLElement).setAttribute('data-sb-opt-candidate', '1');
       };
+
+      const searchRoot: ParentNode = popupRoot ?? document;
 
       // 1. Standard role-based selectors (preferred when present).
       for (const s of sels) {
         try {
-          for (const el of Array.from(document.querySelectorAll(s))) {
+          for (const el of Array.from(searchRoot.querySelectorAll(s))) {
             if (isVisible(el as HTMLElement)) tagSet(el);
           }
         } catch { /* skip bad selector */ }
@@ -1029,7 +1151,8 @@ export async function selectOptionByLabel(
       // Candidate pool — broaden beyond the pre-snapshot set: anything
       // that became visible AFTER tagging may be a new option even if
       // it's a freshly-mounted div outside our pre-tagged scope.
-      const pool = document.querySelectorAll<HTMLElement>(
+      // Scope to popupRoot when known to keep candidates tight.
+      const pool = (popupRoot ?? document).querySelectorAll<HTMLElement>(
         'li, button, a, [role], [data-value], [data-option-value], div, span',
       );
       let added = 0;
@@ -1037,7 +1160,11 @@ export async function selectOptionByLabel(
       for (const el of Array.from(pool)) {
         if (added >= cap) break;
         if (el.hasAttribute('data-sb-opt-candidate')) continue;
-        if (el.hasAttribute('data-sb-pre-visible')) continue;  // was visible BEFORE click
+        // pre-visible filter: redundant inside a confirmed popupRoot
+        // (anything inside a freshly-opened popup is by construction
+        // newly visible) but harmless and protects us when the popup
+        // root mounts a previously-hidden subtree.
+        if (el.hasAttribute('data-sb-pre-visible')) continue;
         if (!isVisible(el)) continue;
         if (!isOptionShaped(el)) continue;
         if (el === triggerEl) continue;
@@ -1119,7 +1246,38 @@ export async function selectOptionByLabel(
   // every strategy is tried; that's acceptable.
   const perStrategyBudget = Math.max(600, Math.floor(timeout / strategies.length));
 
+  // Idempotency check: if a popup is ALREADY open (from a previous
+  // browser_select_option call that returned ambiguous_option, or an
+  // earlier manual click), DO NOT run any open strategy. Clicking the
+  // trigger again would toggle the popup CLOSED and we'd lose the
+  // option list. Just proceed to option-matching against the popup
+  // that's already showing.
+  const alreadyOpen = await page.evaluate((sel: string) => {
+    try {
+      const trig = document.querySelector(sel);
+      if (trig && trig.getAttribute('aria-expanded') === 'true') return true;
+    } catch { /* ignore selector errors */ }
+    // Fallback: any popup-shaped element visible on the page.
+    return document.querySelectorAll(
+      '[role="listbox"]:not([aria-hidden="true"]),'
+      + '[role="menu"]:not([aria-hidden="true"]),'
+      + '[role="dialog"]:not([aria-hidden="true"]),'
+      + '[data-headlessui-state="open"],'
+      + '[data-state="open"]',
+    ).length > 0;
+  }, trigger.selector).catch(() => false) as boolean;
+  if (alreadyOpen) {
+    popupSeen = true;
+    const tagged = await collectAndTagCandidates().catch(() => 0);
+    if (tagged > 0) rendered = true;
+    // If tagging found something we're done with the open phase.
+    // If not, fall through to the strategy loop — maybe the popup
+    // detected isn't this trigger's, in which case opening this one
+    // is the right action.
+  }
+
   for (const strategy of strategies) {
+    if (rendered) break;
     tried.push(strategy);
     try {
       await runStrategy(strategy);
@@ -1314,6 +1472,21 @@ export async function selectOptionByLabel(
       };
     }
     if (exactHits.length > 1) {
+      // DOM duplicates — same option text rendered ≥2 times (e.g.
+      // mobile+desktop variants of a Best Buy filter visible at once,
+      // or two-pane layouts). Indistinguishable from the brain's
+      // perspective; pick the first DOM-order one rather than
+      // forcing a manual disambiguation round-trip.
+      const uniqTexts = new Set(exactHits.map((it) => it.txt));
+      if (uniqTexts.size === 1) {
+        const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
+        exactHits[0].el.setAttribute('data-sb-opt', optTag);
+        return {
+          ok: true as const,
+          option_selector: `[data-sb-opt="${optTag}"]`,
+          picked_text: exactHits[0].txt,
+        };
+      }
       return {
         ok: false as const,
         reason: 'ambiguous_option',
@@ -1337,11 +1510,20 @@ export async function selectOptionByLabel(
       startsHits.sort((a, b) => a.txt.length - b.txt.length);
       if (startsHits.length > 1
           && startsHits[0].txt.length === startsHits[1].txt.length) {
-        return {
-          ok: false as const,
-          reason: 'ambiguous_option',
-          candidates: startsHits.map((it) => it.txt).slice(0, 10),
-        };
+        // Same-length tie. DOM duplicates (identical text) collapse
+        // to one and are picked; genuinely different shorter
+        // candidates surface for the brain to disambiguate.
+        const tiedTexts = startsHits.filter(
+          (h) => h.txt.length === startsHits[0].txt.length,
+        );
+        const uniqTexts = new Set(tiedTexts.map((it) => it.txt));
+        if (uniqTexts.size !== 1) {
+          return {
+            ok: false as const,
+            reason: 'ambiguous_option',
+            candidates: startsHits.map((it) => it.txt).slice(0, 10),
+          };
+        }
       }
       const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
       startsHits[0].el.setAttribute('data-sb-opt', optTag);
@@ -1360,11 +1542,17 @@ export async function selectOptionByLabel(
       containsHits.sort((a, b) => a.txt.length - b.txt.length);
       if (containsHits.length > 1
           && containsHits[0].txt.length === containsHits[1].txt.length) {
-        return {
-          ok: false as const,
-          reason: 'ambiguous_option',
-          candidates: containsHits.map((it) => it.txt).slice(0, 10),
-        };
+        const tiedTexts = containsHits.filter(
+          (h) => h.txt.length === containsHits[0].txt.length,
+        );
+        const uniqTexts = new Set(tiedTexts.map((it) => it.txt));
+        if (uniqTexts.size !== 1) {
+          return {
+            ok: false as const,
+            reason: 'ambiguous_option',
+            candidates: containsHits.map((it) => it.txt).slice(0, 10),
+          };
+        }
       }
       const optTag = `sb-opt-${Math.random().toString(36).slice(2, 10)}`;
       containsHits[0].el.setAttribute('data-sb-opt', optTag);
@@ -1652,6 +1840,328 @@ export async function selectOptionByLabel(
     verified_focus_target: verify.focusTag || undefined,
     took_ms: Date.now() - start,
   };
+}
+
+/**
+ * Phase F — iframe-scoped select_option. Resolves the host iframe by
+ * CSS selector in the main document, gets its `contentFrame()`, then
+ * runs a focused trigger picker + native `<select>` value-set inside
+ * `frame.evaluate()`. Works for same-origin AND cross-origin OOPIFs
+ * because `contentFrame()` returns a Puppeteer Frame for both (the
+ * Frame API tunnels evaluate calls through the OOPIF's CDP target).
+ *
+ * Scope of v1 (sufficient for coolmath4kids quizzes + most iframe
+ * forms): NATIVE `<select>` elements only. ARIA combobox / listbox
+ * dropdowns inside iframes are not yet supported and return a
+ * structured `iframe_aria_combobox_unsupported` reason — the brain
+ * should fall back to `browser_click_selector(in_iframe, ...)` on
+ * the trigger then on the option.
+ *
+ * Trigger resolution paths, in priority order:
+ *   1. <label for="X"> with text matching `label` → element #X
+ *   2. <label>Label <select/></label> — wrapping label
+ *   3. <select aria-label="Label"> — explicit accessible name
+ *   4. <select aria-labelledby="…"> resolved against frame ids
+ *   5. <select> immediately preceded by a text-bearing element whose
+ *      text matches `label` (compact form layouts: <div>Label</div>
+ *      <select/>)
+ *
+ * No popup-open / option-click logic — native <select> doesn't need
+ * a UI to open. We set `.value` directly using the prototype's value
+ * setter (React-safe via `_valueTracker` reset, mirroring
+ * `_ATOMIC_FIX_TEXT_JS`), then dispatch `input` + `change` so
+ * framework-controlled inputs react.
+ */
+export async function selectOptionInIframe(
+  page: Page,
+  opts: {
+    iframeHost: string;
+    label: string;
+    value: string;
+    fuzzy?: boolean;
+    timeout?: number;
+  },
+): Promise<SelectOptionByLabelResult> {
+  const start = Date.now();
+  const hostHandle = await page.$(opts.iframeHost);
+  if (!hostHandle) {
+    return {
+      ok: false,
+      reason: 'iframe_host_not_found',
+      took_ms: Date.now() - start,
+    };
+  }
+  const frame = await hostHandle.contentFrame();
+  await hostHandle.dispose();
+  if (!frame) {
+    return {
+      ok: false,
+      reason: 'iframe_contentframe_null',
+      took_ms: Date.now() - start,
+    };
+  }
+
+  // Frame-local trigger picker + value-set in a single round-trip.
+  // Everything runs inside the iframe's document context so we don't
+  // need to track frame offsets here — `select.value = ...` and the
+  // event dispatches operate on the inner document directly.
+  const result = await frame.evaluate(
+    (args: { lbl: string; val: string; fuzzy: boolean }) => {
+      const norm = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+      const lower = (s: string) => norm(s).toLowerCase();
+      const target = lower(args.lbl);
+      if (!target) {
+        return {
+          ok: false as const,
+          reason: 'empty_label' as const,
+        };
+      }
+
+      const isVisible = (el: HTMLElement): boolean => {
+        if (el.tagName === 'SELECT') return true;
+        if (el.offsetParent === null) return false;
+        const cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        return true;
+      };
+
+      const matches = (text: string): boolean => {
+        const t = lower(text);
+        if (!t) return false;
+        if (t === target) return true;
+        if (args.fuzzy) {
+          if (t.includes(target)) return true;
+          if (target.includes(t) && t.length >= 3) return true;
+        }
+        return false;
+      };
+
+      // 1. <label for="X"> → element #X
+      let foundSelect: HTMLSelectElement | null = null;
+      let foundVia = '';
+      for (const lab of Array.from(
+        document.querySelectorAll<HTMLLabelElement>('label[for]'),
+      )) {
+        if (!matches(lab.textContent || '')) continue;
+        const ctrl = document.getElementById(lab.htmlFor);
+        if (!ctrl) continue;
+        if (ctrl.tagName.toLowerCase() !== 'select') continue;
+        if (!isVisible(ctrl as HTMLElement)) continue;
+        foundSelect = ctrl as HTMLSelectElement;
+        foundVia = 'label_for';
+        break;
+      }
+
+      // 2. <label>Label<select/></label> — wrapping label.
+      if (!foundSelect) {
+        for (const lab of Array.from(
+          document.querySelectorAll<HTMLLabelElement>('label'),
+        )) {
+          // Skip <label for=...> already-handled cases.
+          if (lab.hasAttribute('for')) continue;
+          const sel = lab.querySelector<HTMLSelectElement>('select');
+          if (!sel || !isVisible(sel)) continue;
+          // Take label text MINUS the select's option text (the inner
+          // select contributes its currentText to label.textContent).
+          const labText = (lab.textContent || '').replace(
+            sel.textContent || '',
+            '',
+          );
+          if (!matches(labText)) continue;
+          foundSelect = sel;
+          foundVia = 'wrap_label';
+          break;
+        }
+      }
+
+      // 3. <select aria-label="...">
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select[aria-label]'),
+        )) {
+          if (!isVisible(sel)) continue;
+          if (matches(sel.getAttribute('aria-label') || '')) {
+            foundSelect = sel;
+            foundVia = 'aria_label';
+            break;
+          }
+        }
+      }
+
+      // 4. <select aria-labelledby="id1 id2"> → join referenced texts.
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>(
+            'select[aria-labelledby]',
+          ),
+        )) {
+          if (!isVisible(sel)) continue;
+          const ids = (sel.getAttribute('aria-labelledby') || '')
+            .split(/\s+/)
+            .filter(Boolean);
+          const joined = ids
+            .map((id) => document.getElementById(id)?.textContent || '')
+            .join(' ');
+          if (matches(joined)) {
+            foundSelect = sel;
+            foundVia = 'aria_labelledby';
+            break;
+          }
+        }
+      }
+
+      // 5. Preceding text near a <select>. Walk previousElementSibling
+      //    of the select OR its parent, scanning up to 3 hops.
+      if (!foundSelect) {
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select'),
+        )) {
+          if (!isVisible(sel)) continue;
+          const scan = (start: Element | null): boolean => {
+            let cur = start;
+            for (let i = 0; i < 3 && cur; i++) {
+              if (cur instanceof HTMLElement) {
+                if (matches(cur.textContent || '')) return true;
+              }
+              cur = cur.previousElementSibling;
+            }
+            return false;
+          };
+          if (scan(sel.previousElementSibling)
+              || scan(sel.parentElement?.previousElementSibling ?? null)) {
+            foundSelect = sel;
+            foundVia = 'preceding_text';
+            break;
+          }
+        }
+      }
+
+      if (!foundSelect) {
+        // Collect candidate <select>s for diagnostics.
+        const candidates: string[] = [];
+        for (const sel of Array.from(
+          document.querySelectorAll<HTMLSelectElement>('select'),
+        )) {
+          if (!isVisible(sel)) continue;
+          const al = sel.getAttribute('aria-label') || '';
+          const nm = sel.getAttribute('name') || '';
+          const id = sel.id ? `#${sel.id}` : '';
+          candidates.push(
+            `select${id}${nm ? `[name="${nm}"]` : ''}`
+            + (al ? ` aria-label="${al.slice(0, 40)}"` : ''),
+          );
+          if (candidates.length >= 5) break;
+        }
+        return {
+          ok: false as const,
+          reason: 'trigger_not_found_in_iframe' as const,
+          candidates,
+        };
+      }
+
+      // Resolve the option: exact value match, then exact text, then
+      // fuzzy text contains.
+      let optionValue: string | null = null;
+      let pickedText: string | null = null;
+      const valLc = lower(args.val);
+      for (const opt of Array.from(foundSelect.options)) {
+        if (opt.value === args.val) {
+          optionValue = opt.value;
+          pickedText = opt.text || opt.value;
+          break;
+        }
+      }
+      if (optionValue == null) {
+        for (const opt of Array.from(foundSelect.options)) {
+          if (lower(opt.text) === valLc) {
+            optionValue = opt.value;
+            pickedText = opt.text;
+            break;
+          }
+        }
+      }
+      if (optionValue == null && args.fuzzy) {
+        for (const opt of Array.from(foundSelect.options)) {
+          if (lower(opt.text).includes(valLc)
+              || valLc.includes(lower(opt.text))) {
+            optionValue = opt.value;
+            pickedText = opt.text;
+            break;
+          }
+        }
+      }
+      if (optionValue == null) {
+        const options = Array.from(foundSelect.options).map(
+          (o) => `${o.value}:${(o.text || '').trim().slice(0, 30)}`,
+        );
+        return {
+          ok: false as const,
+          reason: 'option_not_found_in_iframe' as const,
+          available_options: options.slice(0, 20),
+        };
+      }
+
+      // Set value via the React-safe prototype setter, mirroring
+      // _ATOMIC_FIX_TEXT_JS. Resets `_valueTracker` so controlled
+      // inputs don't short-circuit the synthetic onChange.
+      try {
+        const proto = HTMLSelectElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        const tracker = (foundSelect as unknown as
+          { _valueTracker?: { setValue?: (v: string) => void } })._valueTracker;
+        if (tracker && typeof tracker.setValue === 'function') {
+          try { tracker.setValue(''); } catch (_) { /* ignore */ }
+        }
+        if (desc?.set) {
+          desc.set.call(foundSelect, optionValue);
+        } else {
+          foundSelect.value = optionValue;
+        }
+        foundSelect.dispatchEvent(new Event('input', { bubbles: true }));
+        foundSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (e) {
+        return {
+          ok: false as const,
+          reason: 'value_set_exception' as const,
+          error: String(e).slice(0, 120),
+        };
+      }
+
+      // Verify.
+      const verified = foundSelect.value === optionValue;
+      const id = foundSelect.id ? `#${foundSelect.id}` : '';
+      const nm = foundSelect.getAttribute('name') || '';
+      const triggerSelector =
+        id || (nm ? `select[name="${nm}"]` : 'select');
+      return {
+        ok: verified,
+        picked_text: pickedText || optionValue,
+        trigger_selector: triggerSelector,
+        selected_index: foundSelect.selectedIndex,
+        verified,
+        found_via: foundVia,
+        reason: verified ? undefined : 'value_set_did_not_stick',
+      };
+    },
+    { lbl: opts.label, val: opts.value, fuzzy: opts.fuzzy !== false },
+  );
+
+  return {
+    ...result,
+    ok: result.ok,
+    took_ms: Date.now() - start,
+    ...(result.ok
+      ? {
+          trigger_selector: result.trigger_selector,
+          picked_text: result.picked_text,
+          selected_index: result.selected_index,
+          verified: result.verified,
+        }
+      : {
+          reason: result.reason,
+          candidates: 'candidates' in result ? result.candidates : undefined,
+        }),
+  } as SelectOptionByLabelResult;
 }
 
 /**

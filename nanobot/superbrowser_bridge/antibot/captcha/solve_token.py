@@ -60,9 +60,24 @@ async def _solve_2captcha(
                 "pageurl": page_url, "json": 1,
             },
         )
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            print(
+                f"  [2captcha] in.php non-JSON HTTP {r.status_code}: "
+                f"{(r.text or '')[:200]}"
+            )
+            return None
         if data.get("status") != 1:
-            logger.debug("2captcha submit failed: %s", data)
+            # Surface the API error string so the operator sees
+            # ERROR_KEY_DOES_NOT_EXIST / ERROR_ZERO_BALANCE / etc.
+            # without having to enable DEBUG logging. These are
+            # ALL terminal — retrying with the same key won't help.
+            print(
+                f"  [2captcha] submit refused: status={data.get('status')} "
+                f"request={data.get('request')!r} "
+                f"error_text={data.get('error_text')!r}"
+            )
             return None
         task_id = data.get("request")
         start = asyncio.get_event_loop().time()
@@ -76,8 +91,12 @@ async def _solve_2captcha(
             if d.get("status") == 1:
                 return d.get("request")
             if d.get("request") not in ("CAPCHA_NOT_READY", "CAPCHA_NOT_READY"):
-                # Terminal error
-                logger.debug("2captcha terminal: %s", d)
+                # Terminal error — surface to operator.
+                print(
+                    f"  [2captcha] poll terminal: status={d.get('status')} "
+                    f"request={d.get('request')!r} "
+                    f"error_text={d.get('error_text')!r}"
+                )
                 return None
     return None
 

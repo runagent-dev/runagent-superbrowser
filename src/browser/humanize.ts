@@ -17,6 +17,31 @@ export interface HumanizeContext {
 }
 
 /**
+ * Always-succeeds mouseReleased dispatch. Swallows any CDP error so
+ * try/finally cleanup paths can't themselves throw and mask the real
+ * error. Pair with a `pressed` flag in the caller so we only release
+ * a button we actually pressed — Chromium ignores unmatched releases
+ * but emitting them on every click would be noisy.
+ *
+ * Exported so `input-mouse.ts` can reuse it on its linear/teleport
+ * click path, which has the same press→sleep→release shape.
+ */
+export async function safeRelease(
+  client: CDPSession,
+  x: number,
+  y: number,
+  button: 'left' | 'right' | 'middle' = 'left',
+): Promise<void> {
+  await client.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x,
+    y,
+    button,
+    clickCount: 1,
+  }).catch(() => {});
+}
+
+/**
  * Move the mouse along a Bezier curve from current position to target.
  * Much more human-like than instant teleport.
  */
@@ -92,10 +117,37 @@ export async function humanClick(
     sessionId?: string;
   },
 ): Promise<void> {
-  const fromX = options?.fromX ?? x + randomOffset(200);
-  const fromY = options?.fromY ?? y + randomOffset(150);
+  // Resolve start position from the LAST KNOWN cursor coord — the
+  // bezier should sweep from where the cursor actually is, not from
+  // a synthetic point 200px away. Falling back to the synthetic
+  // offset on every click caused two visible bugs:
+  //
+  //   1. The first frame of every click teleported the cursor to a
+  //      random point ~200px from the target — sometimes off-screen,
+  //      which the viewer rendered as "cursor disappeared".
+  //   2. The cursor's apparent path between two clicks looked like
+  //      teleport-back-then-sweep, which the user described as the
+  //      cursor going into "deep sleep" between actions.
+  //
+  // The synthetic offset is only used when no prior cursor state
+  // exists (first click of a session). Explicit `fromX/fromY` in
+  // options still wins so callers (drag setup, captcha mini-flows)
+  // can pin a specific origin when they need to.
   const button = options?.button || 'left';
   const ctx: HumanizeContext | undefined = options?.sessionId ? { sessionId: options.sessionId } : undefined;
+  const lastKnown = options?.sessionId
+    ? inputEventBus.getLastCursor(options.sessionId)
+    : undefined;
+  const fromX = options?.fromX ?? lastKnown?.x ?? (x + randomOffset(200));
+  const fromY = options?.fromY ?? lastKnown?.y ?? (y + randomOffset(150));
+
+  // Preemptive release: if a prior click leaked a held button (CDP
+  // transient between press and release, navigation mid-click, frame
+  // detach), Chromium would route this click's mouseMoved events as
+  // drag operations and the click itself would never fire. CDP
+  // tolerates unmatched releases, so this is a ~1ms no-op on clean
+  // state but recovers from a stuck button.
+  await safeRelease(client, fromX, fromY, button);
 
   // Move mouse naturally
   await humanMouseMove(client, fromX, fromY, x, y, undefined, ctx);
@@ -107,26 +159,30 @@ export async function humanClick(
   const jitterX = x + gaussianOffset(2);
   const jitterY = y + gaussianOffset(2);
 
-  // Press
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed',
-    x: jitterX,
-    y: jitterY,
-    button,
-    clickCount: 1,
-  });
+  // Press + hold + release wrapped in try/finally — if the hold sleep
+  // or any subsequent await throws (CDP transient, frame detach, mid-
+  // click navigation), the finally still releases the virtual mouse
+  // button. Without this, a held button stays pressed across clicks
+  // and Chromium interprets all later moves as a drag — observable
+  // as "cursor stuck in deep sleep, clicks don't register".
+  let pressed = false;
+  try {
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: jitterX,
+      y: jitterY,
+      button,
+      clickCount: 1,
+    });
+    pressed = true;
 
-  // Hold for a human duration
-  await sleep(50 + Math.random() * 80);
-
-  // Release
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased',
-    x: jitterX,
-    y: jitterY,
-    button,
-    clickCount: 1,
-  });
+    // Hold for a human duration
+    await sleep(50 + Math.random() * 80);
+  } finally {
+    if (pressed) {
+      await safeRelease(client, jitterX, jitterY, button);
+    }
+  }
 }
 
 /**
@@ -285,60 +341,94 @@ export async function humanDrag(
   const dist = distance(fromX, fromY, toX, toY);
   const arcMag = options?.arc ?? 0.12;
 
-  // Approach the handle first (move without button down)
-  await humanMouseMove(client, fromX + randomOffset(8), fromY + randomOffset(8), fromX, fromY);
+  // Approach the handle first (move without button down). Sweep from
+  // the real last cursor position when known — otherwise the cursor
+  // would teleport to (fromX±8, fromY±8) on every drag, making the
+  // approach invisible to the live viewer and breaking the sync
+  // between cursor overlay and real CDP position.
+  const dragCtx: HumanizeContext | undefined = options?.sessionId
+    ? { sessionId: options.sessionId }
+    : undefined;
+  const dragLastKnown = options?.sessionId
+    ? inputEventBus.getLastCursor(options.sessionId)
+    : undefined;
+  const approachX = dragLastKnown?.x ?? (fromX + randomOffset(8));
+  const approachY = dragLastKnown?.y ?? (fromY + randomOffset(8));
+  await humanMouseMove(client, approachX, approachY, fromX, fromY, undefined, dragCtx);
 
   // Press — small jitter tolerable here, handle usually has a grab region
   const pressX = fromX + randomOffset(1);
   const pressY = fromY + randomOffset(1);
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed',
-    x: pressX,
-    y: pressY,
-    button: 'left',
-    clickCount: 1,
-  });
-  await sleep(pressDwell);
-
-  // If overshoot requested, pick an intermediate target 5-15% past the real target.
-  const overshootFrac = options?.overshoot ? 0.05 + Math.random() * 0.1 : 0;
-  const overshootX = toX + (toX - fromX) * overshootFrac;
-  const overshootY = toY + (toY - fromY) * overshootFrac;
-
-  // Primary drag leg: from press point to (possibly overshot) target
-  await dragAlongPath(
-    client,
-    pressX,
-    pressY,
-    overshootFrac ? overshootX : toX,
-    overshootFrac ? overshootY : toY,
-    { steps: options?.steps, arc: arcMag, microPauseChance },
-  );
-
-  // Overshoot correction: drift back to the true target with a gentler curve
-  if (overshootFrac) {
-    await dragAlongPath(client, overshootX, overshootY, toX, toY, {
-      steps: 6 + Math.floor(Math.random() * 4),
-      arc: 0.04,
-      microPauseChance: 0,
+  let pressed = false;
+  // Track the last successfully-dispatched mouse position; on a mid-
+  // drag exception this is where the release lands so the cursor
+  // doesn't snap to (toX, toY) for a drag that never completed.
+  let lastX = pressX;
+  let lastY = pressY;
+  try {
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: pressX,
+      y: pressY,
+      button: 'left',
+      clickCount: 1,
     });
+    pressed = true;
+    await sleep(pressDwell);
+
+    // If overshoot requested, pick an intermediate target 5-15% past the real target.
+    const overshootFrac = options?.overshoot ? 0.05 + Math.random() * 0.1 : 0;
+    const overshootX = toX + (toX - fromX) * overshootFrac;
+    const overshootY = toY + (toY - fromY) * overshootFrac;
+
+    // Primary drag leg: from press point to (possibly overshot) target
+    await dragAlongPath(
+      client,
+      pressX,
+      pressY,
+      overshootFrac ? overshootX : toX,
+      overshootFrac ? overshootY : toY,
+      { steps: options?.steps, arc: arcMag, microPauseChance },
+    );
+    lastX = overshootFrac ? overshootX : toX;
+    lastY = overshootFrac ? overshootY : toY;
+
+    // Overshoot correction: drift back to the true target with a gentler curve
+    if (overshootFrac) {
+      await dragAlongPath(client, overshootX, overshootY, toX, toY, {
+        steps: 6 + Math.floor(Math.random() * 4),
+        arc: 0.04,
+        microPauseChance: 0,
+      });
+      lastX = toX;
+      lastY = toY;
+    }
+
+    // Settle dwell at target (hand "stabilizes" before release)
+    await sleep(releaseDwell);
+
+    // Release at EXACT target — slider validators check the release point
+    // to within 1-2px, so no jitter here.
+    await client.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: toX,
+      y: toY,
+      button: 'left',
+      clickCount: 1,
+    });
+    pressed = false;
+
+    // Brief post-release pause before next action (humans don't instantly act)
+    await sleep(60 + Math.random() * 80);
+  } finally {
+    // If the explicit release above never ran (exception in the drag
+    // path, sleep, or CDP send), release at the last known cursor
+    // position so the virtual mouse button doesn't stay held across
+    // future tool calls.
+    if (pressed) {
+      await safeRelease(client, lastX, lastY, 'left');
+    }
   }
-
-  // Settle dwell at target (hand "stabilizes" before release)
-  await sleep(releaseDwell);
-
-  // Release at EXACT target — slider validators check the release point
-  // to within 1-2px, so no jitter here.
-  await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased',
-    x: toX,
-    y: toY,
-    button: 'left',
-    clickCount: 1,
-  });
-
-  // Brief post-release pause before next action (humans don't instantly act)
-  await sleep(60 + Math.random() * 80);
   void dist; // reserved for future duration-adaptive timing
 }
 

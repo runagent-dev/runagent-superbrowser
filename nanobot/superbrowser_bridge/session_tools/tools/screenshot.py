@@ -101,6 +101,9 @@ class BrowserScreenshotTool(Tool):
                 intent=intent or "observe page",
                 url=actual_url,
                 elements=data.get("elements"),
+                # Phase I: pass iframe content signature for cache key
+                # so iframe-internal mutations don't return stale vision.
+                iframe_signature=data.get("iframeSignature") or "",
                 elements_with_bounds=overlay_elements,
                 device_pixel_ratio=dpr,
                 # v2-C: full selectorEntries (with attributes + text)

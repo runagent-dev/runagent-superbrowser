@@ -871,11 +871,9 @@ def tactic_penalty_summary(domain: str, min_count: int = 2) -> list[tuple[str, i
 TACTIC_ALTERNATIVES: dict[str, str] = {
     # Semantic-target tools are listed FIRST because they're atomic
     # (fresh vision + dispatch in one turn) and skip the V-index drift
-    # tax that's been biting click_at specifically. Selector-based
-    # tools are the second-choice fallback when semantic matching
-    # can't find the target.
-    "browser_click_at": "browser_semantic_click(target='<what to click>') — atomic fresh vision + dispatch, no V-index drift; OR browser_click_selector(<css>)",
-    "browser_click": "browser_semantic_click(target='<what to click>') or browser_click_selector(<css>)",
+    # tax that's been biting click_at specifically.
+    "browser_click_at": "browser_semantic_click(target='<what to click>') — atomic fresh vision + dispatch, no V-index drift",
+    "browser_click": "browser_semantic_click(target='<what to click>')",
     "browser_type_at": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
     "browser_type": "browser_semantic_type(target='<field description>', text='<text>') or browser_run_script(mutates=true) with helpers.reactSetValue",
     "browser_keys": "browser_run_script(mutates=true) calling helpers.reactSetValue then dispatching submit",

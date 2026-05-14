@@ -56,9 +56,24 @@ const bindings = new Map<string, Set<SessionBinding>>();
 
 // --- Screencast streaming ---
 const screencasts = new Map<string, ScreencastManager>();
-/** Per-session throttle for cursor_move broadcasts (30 FPS = 33ms). */
+/**
+ * Per-session throttle state for cursor_move broadcasts.
+ *
+ * `lastCursorBroadcast` stores the timestamp of the last broadcast so
+ * fast bursts don't flood viewers. `pendingCursor` holds the latest
+ * suppressed event with a setTimeout that flushes on the trailing edge,
+ * so the FINAL coord of any cluster always reaches the viewer (without
+ * this, a 5-step sweep with one in-window event would lose every step
+ * after the first AND lose the final settle coord). Throttle is 30ms
+ * so the 40ms-spaced sweep steps clear it cleanly while still capping
+ * burst rate at ~33 FPS.
+ */
 const lastCursorBroadcast = new Map<string, number>();
-const CURSOR_THROTTLE_MS = 33;
+const pendingCursor = new Map<
+  string,
+  { x: number; y: number; timer: NodeJS.Timeout }
+>();
+const CURSOR_THROTTLE_MS = 30;
 
 export function attachWebSocketServer(
   httpServer: HttpServer,
@@ -128,6 +143,14 @@ export function attachWebSocketServer(
 
     sendEvent(ws, 'connected', { sessionId });
 
+    // Replay last known cursor position so a late-connecting viewer
+    // doesn't see a stationary cursor at (0,0) until the next tool
+    // fires. Purely cosmetic; no CDP interaction.
+    const lastCursor = inputEventBus.getLastCursor(sessionId);
+    if (lastCursor) {
+      sendEvent(ws, 'cursor_move', { x: lastCursor.x, y: lastCursor.y });
+    }
+
     // --- Start screencast for this viewer ---
     const bindingId = `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     let screencastMgr = screencasts.get(sessionId);
@@ -189,7 +212,21 @@ export function attachWebSocketServer(
       const set = bindings.get(sessionId);
       if (set) {
         set.delete(binding);
-        if (set.size === 0) bindings.delete(sessionId);
+        if (set.size === 0) {
+          bindings.delete(sessionId);
+          // Last viewer disconnected — drop the per-session cursor
+          // state used by emitSweep so the map doesn't grow unbounded
+          // across the process lifetime. Also clear any pending
+          // trailing-edge flush so a closed session doesn't leak a
+          // setTimeout into the next epoch.
+          inputEventBus.clearSession(sessionId);
+          lastCursorBroadcast.delete(sessionId);
+          const pending = pendingCursor.get(sessionId);
+          if (pending) {
+            clearTimeout(pending.timer);
+            pendingCursor.delete(sessionId);
+          }
+        }
       }
       feedbackBus.off('event', onFeedback);
       // Remove this viewer from screencast — stops CDP stream if last viewer.
@@ -209,11 +246,37 @@ export function attachWebSocketServer(
   // Subscribe once globally. Each event carries a sessionId, so we route
   // to the correct session's viewers via broadcastToSession.
   inputEventBus.on('mouse_move', (evt: MouseMoveEvent) => {
-    // Throttle to ~30 FPS per session to avoid overwhelming WS clients.
+    // Leading-edge broadcast + trailing-edge flush. The plain drop-on-
+    // throttle approach silently lost intermediate AND final frames of
+    // bursts — the cursor on the viewer froze partway through a sweep.
+    // With trailing flush, the latest coord in a cluster is always
+    // delivered after the throttle window expires.
     const last = lastCursorBroadcast.get(evt.sessionId) ?? 0;
-    if (evt.ts - last < CURSOR_THROTTLE_MS) return;
-    lastCursorBroadcast.set(evt.sessionId, evt.ts);
-    broadcastToSession(wss, evt.sessionId, 'cursor_move', { x: evt.x, y: evt.y });
+    const gap = evt.ts - last;
+    if (gap >= CURSOR_THROTTLE_MS) {
+      // Outside window — broadcast immediately, drop any pending flush.
+      const pending = pendingCursor.get(evt.sessionId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingCursor.delete(evt.sessionId);
+      }
+      lastCursorBroadcast.set(evt.sessionId, evt.ts);
+      broadcastToSession(wss, evt.sessionId, 'cursor_move', { x: evt.x, y: evt.y });
+      return;
+    }
+    // Inside window — replace any pending flush with this latest coord.
+    const existing = pendingCursor.get(evt.sessionId);
+    if (existing) clearTimeout(existing.timer);
+    const sid = evt.sessionId;
+    const remaining = Math.max(1, CURSOR_THROTTLE_MS - gap);
+    const timer = setTimeout(() => {
+      const p = pendingCursor.get(sid);
+      if (!p) return;
+      pendingCursor.delete(sid);
+      lastCursorBroadcast.set(sid, Date.now());
+      broadcastToSession(wss, sid, 'cursor_move', { x: p.x, y: p.y });
+    }, remaining);
+    pendingCursor.set(sid, { x: evt.x, y: evt.y, timer });
   });
 
   inputEventBus.on('keystroke', (evt: KeystrokeEvent) => {

@@ -21,7 +21,7 @@ import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
-import { selectOptionByLabel, selectOptionByVisionBbox } from '../browser/elements.js';
+import { selectOptionByLabel, selectOptionByVisionBbox, selectOptionInIframe } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
 import { renderCaptchaViewHtml } from './captcha-ui-html.js';
@@ -31,6 +31,11 @@ import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
 import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot } from './effect.js';
+import {
+  waitForTargetStable,
+  capturePageRef,
+  compareViewportShift,
+} from '../browser/page-readiness.js';
 
 /** Session with TTL tracking. */
 interface ManagedSession {
@@ -672,6 +677,22 @@ export function createHttpServer(
         includeCursorElements: req.query.cursor === 'true',
       });
 
+      // When this /state call is producing a screenshot for the brain
+      // (useVision=true), capture the page reference frame
+      // (scrollY/scrollHeight/viewport dims) right after getState so
+      // the /click handler can detect a layout shift between this
+      // capture and a subsequent click. We only update when vision is
+      // requested — the brain's mental model is anchored to the last
+      // screenshot, not to side-channel /state probes.
+      if (useVision) {
+        try {
+          const ref = await capturePageRef(page.getRawPage());
+          page.setVisionPageRef(ref);
+        } catch {
+          /* best-effort — never block /state on a ref capture failure */
+        }
+      }
+
       // Fetch device pixel ratio so the client can scale CSS bounds to
       // device pixels when drawing bbox overlays on the screenshot.
       let devicePixelRatio = 1;
@@ -683,11 +704,108 @@ export function createHttpServer(
         }
       }
 
+      // Phase I: same-origin iframe content signature. Includes:
+      //   - body.innerText length + first 200 chars + scrollY (catches
+      //     question-text changes, layout updates, new screens)
+      //   - input/textarea/select values + checked/selectedIndex state
+      //     (catches typing into iframe inputs — values are NOT in
+      //     innerText, so without this typing "44" into #userAnswer
+      //     leaves the signature unchanged and the vision cache stays
+      //     stale)
+      //   - active element id/tag (focus changes affect what
+      //     browser_keys will target next)
+      // Cross-origin iframes throw on contentDocument access — handled
+      // silently and skipped (empty contribution for those).
+      let iframeSignature = '';
+      try {
+        iframeSignature = await page.getRawPage().evaluate(() => {
+          const parts: string[] = [];
+          const frames = document.querySelectorAll('iframe');
+          for (let i = 0; i < Math.min(frames.length, 8); i++) {
+            const f = frames[i] as HTMLIFrameElement;
+            let inner = '';
+            try {
+              const d = f.contentDocument;
+              if (d && d.body) {
+                const txt = (d.body.innerText || '').replace(/\s+/g, ' ').trim();
+                const sy = (d.defaultView && d.defaultView.scrollY) || 0;
+                // Phase I': capture form field values. innerText does
+                // NOT include <input>/<textarea>/<select> values, so
+                // typing into iframe inputs is invisible to the outer
+                // signature without this. Cap at 30 fields and 50 chars
+                // each to keep the signature compact.
+                const fields = d.querySelectorAll('input,textarea,select');
+                const fvParts: string[] = [];
+                for (let j = 0; j < Math.min(fields.length, 30); j++) {
+                  const fe = fields[j] as HTMLInputElement
+                                       | HTMLTextAreaElement
+                                       | HTMLSelectElement;
+                  const tag = fe.tagName.toLowerCase();
+                  const id = fe.id ? `#${fe.id}` : `[${j}]`;
+                  let val = '';
+                  try {
+                    if (tag === 'select') {
+                      val = (fe as HTMLSelectElement).value || '';
+                    } else if (tag === 'input') {
+                      const inp = fe as HTMLInputElement;
+                      const t = (inp.type || 'text').toLowerCase();
+                      if (t === 'checkbox' || t === 'radio') {
+                        val = inp.checked ? '1' : '0';
+                      } else {
+                        val = inp.value || '';
+                      }
+                    } else {
+                      val = (fe as HTMLTextAreaElement).value || '';
+                    }
+                  } catch { val = ''; }
+                  // Only include non-empty values + every <select>
+                  // (so a default-select still appears) to keep size
+                  // bounded.
+                  if (val || tag === 'select') {
+                    fvParts.push(`${tag}${id}=${val.slice(0, 50)}`);
+                  }
+                }
+                const fv = fvParts.join('|');
+                // Active element marker — focus state inside the
+                // iframe. Affects whether browser_keys will hit the
+                // right field.
+                let activeMarker = '';
+                try {
+                  const ae = d.activeElement as HTMLElement | null;
+                  if (ae && ae !== d.body && ae !== d.documentElement) {
+                    const aeId = ae.id ? `#${ae.id}` : '';
+                    activeMarker = ` active=${ae.tagName.toLowerCase()}${aeId}`;
+                  }
+                } catch { /* ignore */ }
+                inner = `len=${txt.length} sy=${Math.round(sy)}`
+                      + `${activeMarker} fv=${fv} head=${txt.slice(0, 200)}`;
+              }
+            } catch { /* cross-origin */ }
+            const r = f.getBoundingClientRect();
+            const visible = r.width > 0 && r.height > 0;
+            const id = f.id || '';
+            const aria = f.getAttribute('aria-label') || '';
+            parts.push(
+              `iframe[${i}] id=${id} aria=${aria.slice(0, 30)} `
+              + `vis=${visible ? 1 : 0} ${inner}`,
+            );
+          }
+          return parts.join('\n');
+        });
+      } catch {
+        iframeSignature = '';
+      }
+
       res.json({
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
         elements: state.elementTree.clickableElementsToString(),
+        // Phase I: same-origin iframe content summary. Python mixes
+        // this into dom_hash so iframe-internal mutations bust the
+        // vision cache. Empty string when the page has no iframes
+        // (no cache-key impact) or all iframes are cross-origin.
+        iframeSignature,
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         accessibilityTree: state.accessibilityTree,
         consoleErrors: state.consoleErrors,
@@ -716,7 +834,7 @@ export function createHttpServer(
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label } = req.body as {
+      const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label, strategy } = req.body as {
         index?: number;
         x?: number;
         y?: number;
@@ -736,6 +854,16 @@ export function createHttpServer(
          *  aligns — catches page-shift cases where the bbox centre
          *  now lies on a different element. */
         expected_label?: string;
+        /** Silent-click escalation ladder: when the bridge detected a
+         *  no-op primary click, it retries via `strategy: 'js'` (direct
+         *  el.click() in the page context — bypasses bezier sweep
+         *  guards) or `strategy: 'keyboard'` (focus + Enter — works
+         *  for buttons/links that gate on key events). Mirrors what
+         *  T3SessionManager.click_at(strategy=...) does for t3
+         *  sessions; this lets t1 sessions hit the same recovery
+         *  path. Only meaningful when bbox is provided. Falls through
+         *  to the primary path when omitted or set to 'primary'. */
+        strategy?: 'primary' | 'js' | 'keyboard';
       };
 
       if (bbox !== undefined) {
@@ -743,11 +871,166 @@ export function createHttpServer(
         // click at the snapped centre, return the resolved point so
         // the bridge can log/trace which element actually received
         // the input.
-        const snap = await page.clickInBbox(bbox, {
+        //
+        // Layer 1 — viewport-shift gate. The brain's V_n bbox is in
+        // viewport-CSS coordinates frozen at vision-capture time. If
+        // the page has scrolled or the layout has reflowed since
+        // (lazy-load, banner injection, modal open), those CSS coords
+        // now point at the wrong absolute element — labels alone
+        // can't catch this when the new occupant is the same kind
+        // of widget. Reject early so the brain re-screenshots
+        // instead of dispatching against a stale frame.
+        const stored = page.getVisionPageRef();
+        const currentRef = await capturePageRef(page.getRawPage());
+        const shift = compareViewportShift(stored, currentRef);
+        if (process.env.VIEWPORT_SHIFT_DEBUG === '1') {
+          console.log(
+            `[viewport_shift] shifted=${shift.shifted}`
+            + ` reason=${shift.reason}`
+            + ` dy=${shift.delta.scrollY}`
+            + ` dh=${shift.delta.scrollHeight}`
+            + ` dvh=${shift.delta.viewportHeight}`,
+          );
+        }
+        if (shift.shifted) {
+          res.json({
+            error: 'viewport_shifted',
+            reason: shift.reason,
+            delta: shift.delta,
+            stored: shift.stored,
+            current: shift.current,
+            expected_label,
+            bbox,
+          });
+          return;
+        }
+
+        // Layer 2 — pre-dispatch stability gate. Even on a non-shifted
+        // page, the target element itself may be mid-animation.
+        // waitForTargetStable polls in-page (one CDP roundtrip) until
+        // the captured element's rect holds still and the surrounding
+        // tree quiets. On stable, re-aim onto the element's CURRENT
+        // bounds — the LLM's bbox is a hint, not a contract. On
+        // timeout we proceed anyway; clickInBbox Phase 1/2 +
+        // post-click verify catch the rest.
+        let dispatchBbox = bbox;
+        const cx = (bbox.x0 + bbox.x1) / 2;
+        const cy = (bbox.y0 + bbox.y1) / 2;
+        const stab = await waitForTargetStable(
+          page.getRawPage(),
+          { kind: 'point', x: cx, y: cy },
+        );
+        if (stab.lastBounds && stab.lastBounds.w > 0 && stab.lastBounds.h > 0) {
+          const lb = stab.lastBounds;
+          dispatchBbox = {
+            x0: lb.x, y0: lb.y, x1: lb.x + lb.w, y1: lb.y + lb.h,
+          };
+        }
+        if (process.env.CLICK_STABILITY_DEBUG === '1') {
+          console.log(
+            `[click_stability] branch=vision_bbox stable=${stab.stable}`
+            + ` reason=${stab.reason} samples=${stab.samples}`,
+          );
+        }
+
+        // Strategy escalation: when the bridge sends `strategy: 'js'`
+        // or `strategy: 'keyboard'` (the silent-click ladder fired
+        // because the primary CDP click produced zero DOM mutations),
+        // dispatch via the alternate mechanism instead of going through
+        // clickInBbox's snap pipeline. Mirrors T3SessionManager.click_at
+        // (strategy=...) so t1 sessions get the same recovery
+        // behaviour as t3. The bridge re-runs verify_after on the
+        // response to decide if the escalation landed.
+        if (strategy === 'js' || strategy === 'keyboard') {
+          const dispatchX = (dispatchBbox.x0 + dispatchBbox.x1) / 2;
+          const dispatchY = (dispatchBbox.y0 + dispatchBbox.y1) / 2;
+          if (strategy === 'js') {
+            await page.dispatchJsClickAt(dispatchX, dispatchY);
+          } else {
+            await page.dispatchKeyboardEnterAt(dispatchX, dispatchY);
+          }
+          await settleForEffect(page.getRawPage());
+          const effectAfterAlt = await captureEffect(page.getRawPage());
+          const newStateAlt = await page.getState({
+            useVision: false, includeConsole: true,
+          });
+          res.json({
+            success: true,
+            url: newStateAlt.url,
+            title: newStateAlt.title,
+            elements: newStateAlt.elementTree.clickableElementsToString(),
+            consoleErrors: newStateAlt.consoleErrors,
+            pendingDialogs: newStateAlt.pendingDialogs,
+            snap: { x: dispatchX, y: dispatchY, snapped: false, target: '' },
+            strategy,
+            effect: diffEffect(effectBefore, effectAfterAlt),
+            fingerprints: fingerprintMap(
+              newStateAlt.selectorMap, newStateAlt.selectorEntries,
+            ),
+          });
+          return;
+        }
+
+        const snap = await page.clickInBbox(dispatchBbox, {
           button,
           clickCount,
           expectedLabel: expected_label,
         });
+        // Phase B fallback: clickInBbox's in-page descent (Phase A)
+        // could not resolve the click target inside the iframe.
+        // Three cases trigger this path:
+        //   - cross_origin: contentDocument blocked by SOP; the Frame
+        //     walk uses Puppeteer's Target API which CAN access OOPIFs.
+        //   - miss: same-origin but neither pinpoint nor inner grid
+        //     scan found a clickable in the bbox region. Worth retry
+        //     because Phase B's snap may pick up a candidate the
+        //     in-page scan missed (it runs inside frame.evaluate, so
+        //     same JS engine but potentially different frame state).
+        //   - legacy `target_in_iframe`: shouldn't occur now but kept
+        //     defensively.
+        // Successful frameSnap REPLACES the original snap result so
+        // the rest of the pipeline (settle / effect diff / dom_index)
+        // uses the resolved target.
+        const needsFrameFallback =
+          snap.warning === 'target_in_iframe_cross_origin'
+          || snap.warning === 'target_in_iframe_miss'
+          || snap.warning === 'target_in_iframe';
+        if (needsFrameFallback) {
+          try {
+            const frameSnap = await page.clickInIframeFrame(dispatchBbox, {
+              button,
+              clickCount,
+              expectedLabel: expected_label,
+            });
+            if (frameSnap.snapped) {
+              // Preserve iframe_host_selector from Phase A (Phase B
+              // doesn't compute it the same way).
+              const phaseAHost = (snap as { iframe_host_selector?: string })
+                .iframe_host_selector;
+              Object.assign(snap, frameSnap);
+              if (phaseAHost && !(snap as { iframe_host_selector?: string })
+                  .iframe_host_selector) {
+                (snap as { iframe_host_selector?: string })
+                  .iframe_host_selector = phaseAHost;
+              }
+            } else if (frameSnap.warning) {
+              snap.warning = frameSnap.warning;
+            }
+          } catch (e) {
+            console.warn('[click] clickInIframeFrame fallback failed:',
+              (e as Error).message);
+          }
+        }
+        // labelMismatch is no longer a hard block — historically we
+        // returned element_mismatch here and skipped dispatch, but that
+        // caused silent rejections when the brain's expected_label was
+        // slightly off (paraphrased autocomplete suggestion, stale
+        // label from a prior screenshot, etc.). The bbox-snap above
+        // already picked the best element under the bbox by area; we
+        // trust that and dispatch. The labelMismatch flag is still
+        // surfaced in `snap` for the bridge to log as a diagnostic so
+        // the brain can read what was actually clicked vs what it
+        // expected.
         await settleForEffect(page.getRawPage());
         const effectAfter = await captureEffect(page.getRawPage());
         const newState = await page.getState({ useVision: false, includeConsole: true });
@@ -867,11 +1150,30 @@ export function createHttpServer(
                 XPathResult.FIRST_ORDERED_NODE_TYPE, null,
               ).singleNodeValue;
               if (!node || !(node instanceof HTMLElement)) return null;
-              // Scroll into view first so off-screen targets get a real
-              // viewport rect — clickInBbox needs viewport coords.
-              try {
-                node.scrollIntoView({ block: 'center', behavior: 'instant' });
-              } catch { /* ignore — older engines */ }
+              // Scroll into view ONLY when the element isn't already
+              // visible. The previous `block: 'center'` re-centred on
+              // every click — even when the element was already a few
+              // pixels off-centre — shifting the viewport 100-400px
+              // each call. That broke the brain's V_n bboxes (which
+              // are in viewport CSS coords) for every NEXT click,
+              // because the element under coords (cx,cy) was now a
+              // different absolute element. `'nearest'` only scrolls
+              // when at least one edge is outside the viewport, and
+              // scrolls the minimum amount to bring the element in.
+              const r0 = node.getBoundingClientRect();
+              const inView = (
+                r0.top >= 0 && r0.bottom <= window.innerHeight
+                && r0.left >= 0 && r0.right <= window.innerWidth
+              );
+              if (!inView) {
+                try {
+                  node.scrollIntoView({
+                    block: 'nearest',
+                    inline: 'nearest',
+                    behavior: 'instant',
+                  });
+                } catch { /* ignore — older engines */ }
+              }
               const r = node.getBoundingClientRect();
               return {
                 x: r.left, y: r.top, w: r.width, h: r.height,
@@ -893,14 +1195,56 @@ export function createHttpServer(
               || ''
             ).slice(0, 80).trim();
 
+            // Pre-dispatch stability gate. The live bounds we just
+            // queried are a single sample taken one tick ago; on
+            // heavy-rendering sites the element may still be mid-
+            // animation. Polling in-page until the rect quiets — and
+            // the surrounding tree's mutation counter quiets — turns
+            // a coordinate race into a 150-600ms wait. On timeout we
+            // still dispatch with the most recent bounds (strictly
+            // fresher than `live`), trusting clickInBbox Phase 1/2
+            // and post-click verify to catch the residual misses.
+            let dispatchBounds = live;
+            const stab = await waitForTargetStable(
+              page.getRawPage(),
+              { kind: 'xpath', xpath: element.xpath },
+            );
+            if (
+              stab.lastBounds
+              && stab.lastBounds.w > 0
+              && stab.lastBounds.h > 0
+            ) {
+              dispatchBounds = {
+                x: stab.lastBounds.x,
+                y: stab.lastBounds.y,
+                w: stab.lastBounds.w,
+                h: stab.lastBounds.h,
+                tag: live.tag,
+              };
+            }
+            if (process.env.CLICK_STABILITY_DEBUG === '1') {
+              console.log(
+                `[click_stability] branch=dom_index xpath=${element.xpath}`
+                + ` stable=${stab.stable} reason=${stab.reason}`
+                + ` samples=${stab.samples}`,
+              );
+            }
+
             const snap = await page.clickInBbox(
               {
-                x0: live.x, y0: live.y,
-                x1: live.x + live.w, y1: live.y + live.h,
+                x0: dispatchBounds.x, y0: dispatchBounds.y,
+                x1: dispatchBounds.x + dispatchBounds.w,
+                y1: dispatchBounds.y + dispatchBounds.h,
               },
               { button, clickCount, expectedLabel: expectedLabel || undefined },
             );
 
+            // labelMismatch is no longer a hard block (mirrors the
+            // vision-bbox branch above). The snap already picked the
+            // best candidate by area; we dispatch and surface the
+            // mismatch flag in the response for the bridge to log as
+            // a diagnostic. Brain reads what was actually clicked and
+            // adapts — no silent rejection.
             await settleForEffect(page.getRawPage());
             const effectAfter = await captureEffect(page.getRawPage());
             const newState = await page.getState({
@@ -1093,6 +1437,38 @@ export function createHttpServer(
         }
       }
 
+      // Pre-type value probe — gives the LLM "before X, now Y" feedback so
+      // a silent clear-failure-and-append doesn't look like a clean type.
+      // Best-effort: empty default if probe throws.
+      let pretypeValue = '';
+      try {
+        const sel = element.enhancedCssSelectorForElement();
+        pretypeValue = await page.getRawPage().evaluate((s: string) => {
+          const el = document.querySelector(s);
+          if (!el) return '';
+          const valEl = el as unknown as { value?: string };
+          if (typeof valEl.value === 'string') return valEl.value || '';
+          if ((el as HTMLElement).isContentEditable) {
+            return (el as HTMLElement).innerText || '';
+          }
+          return '';
+        }, sel);
+      } catch (_e) { /* probe is best-effort */ }
+
+      // Skip-match short-circuit: field already matches target, no work
+      // needed (mirrors the t3 contract at interactive_session.py:2889-2897).
+      if (pretypeValue === text && pretypeValue !== '') {
+        const newState = await page.getState({ useVision: false, includeConsole: true });
+        res.json({
+          success: true,
+          elements: newState.elementTree.clickableElementsToString(),
+          effect: { url_changed: false, mutation_delta: 0, focused_changed: false },
+          pretype_action: 'skip_match',
+          pretype_value: pretypeValue,
+        });
+        return;
+      }
+
       const r = await page.typeText(element, text, clear !== false);
       if (!r.success) {
         res.status(400).json({
@@ -1107,10 +1483,16 @@ export function createHttpServer(
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false, includeConsole: true });
+
+      // Empty before → typed_into_empty; non-empty before → cleared_and_typed.
+      const pretypeAction = pretypeValue ? 'cleared_and_typed' : 'typed_into_empty';
+
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         effect: diffEffect(effectBefore, effectAfter),
+        pretype_action: pretypeAction,
+        pretype_value: pretypeValue,
       });
     } catch (err) {
       handleError(res, err);
@@ -1280,6 +1662,46 @@ export function createHttpServer(
     }
   });
 
+  /**
+   * Scroll a bbox into view. Picks the right surface (page or inner
+   * popup container) based on whether the bbox center is inside an
+   * open listbox / menu / dialog. Used by:
+   *   - `browser_scroll_to_bbox` (brain-facing) for explicit re-aim
+   *   - `bbox_click` auto-scroll: when the click target is below the
+   *     fold, the click tool calls this once before dispatching so
+   *     dropdown options below the popup's clipped region are
+   *     reachable without the brain calling browser_scroll_within
+   *     first.
+   */
+  app.post('/session/:id/scroll-to-bbox', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+
+    try {
+      const { bbox } = req.body ?? {};
+      if (!bbox
+          || typeof bbox.x0 !== 'number'
+          || typeof bbox.y0 !== 'number'
+          || typeof bbox.x1 !== 'number'
+          || typeof bbox.y1 !== 'number') {
+        res.status(400).json({
+          error: 'bbox is required and must be {x0,y0,x1,y1} in CSS pixels',
+        });
+        return;
+      }
+      const result = await page.scrollBboxIntoView(bbox);
+      res.json({
+        success: true,
+        scrolled: result.scrolled,
+        container_kind: result.containerKind,
+        delta_y: result.deltaY,
+        new_bbox: result.newBbox,
+      });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
   /** Drag from one point to another. Useful for slider CAPTCHAs and puzzle pieces. */
   app.post('/session/:id/drag', async (req, res) => {
     const page = getSession(req.params.id);
@@ -1328,20 +1750,37 @@ export function createHttpServer(
     }
   });
 
-  /** Click the center of a DOM-selected element. Zero vision cost; pixel-exact. */
+  /**
+   * INTERNAL endpoint — selector-based click. No longer exposed to the
+   * LLM as a tool (registry entry removed; the agent must use vision-
+   * bbox clicks via /click). Kept for internal callers:
+   *   - Puzzle solvers (puzzle_solvers/browser.py) for captcha widgets
+   *     with stable selectors (chess squares, captcha handles).
+   *   - T3 backend mirror (session_tools/http_client.py) so patchright
+   *     sessions keep parity with Puppeteer sessions.
+   */
   app.post('/session/:id/click-selector', async (req, res) => {
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { selector, button, clickCount, linear, ensureVisible } = req.body ?? {};
-      if (typeof selector !== 'string' || !selector) {
+      const {
+        selector: rawSelector, button, clickCount, linear, ensureVisible,
+        in_iframe: inIframe,
+      } = req.body ?? {};
+      if (typeof rawSelector !== 'string' || !rawSelector) {
         res.status(400).json({ error: 'selector is required' });
         return;
       }
-      const result = await page.clickSelector(selector, {
-        button, clickCount, linear, ensureVisible,
-      });
+      const selector = normalizeIdSelector(rawSelector);
+      const result = (typeof inIframe === 'string' && inIframe.length > 0)
+        ? await page.clickSelectorInIframe(
+            normalizeIdSelector(inIframe), selector,
+            { button, clickCount, linear },
+          )
+        : await page.clickSelector(selector, {
+            button, clickCount, linear, ensureVisible,
+          });
       const newState = await page.getState({ useVision: false });
       res.json({
         success: true,
@@ -1349,8 +1788,6 @@ export function createHttpServer(
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
-        // Fresh per-index fingerprints — keeps the Python bridge's
-        // cache in sync without a follow-up /state round-trip.
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
       });
     } catch (err) {
@@ -1780,6 +2217,7 @@ export function createHttpServer(
       label, value, fuzzy, timeout,
       extra_option_selectors,
       bbox, expected_label,
+      in_iframe: inIframe,
     } = req.body || {};
     // Either label OR bbox must be supplied. When bbox is present we
     // dispatch to the vision-bbox path which sidesteps DOM-text
@@ -1789,6 +2227,7 @@ export function createHttpServer(
       && typeof bbox.x0 === 'number' && typeof bbox.y0 === 'number'
       && typeof bbox.x1 === 'number' && typeof bbox.y1 === 'number'
     );
+    const hasIframeHost = typeof inIframe === 'string' && inIframe.length > 0;
     if (!hasBbox && (typeof label !== 'string' || !label.trim())) {
       res.status(400).json({ error: 'label (string) or bbox is required' });
       return;
@@ -1797,10 +2236,28 @@ export function createHttpServer(
       res.status(400).json({ error: 'value (string) is required' });
       return;
     }
+    // Phase F: in_iframe wins when set — bbox/label fall through to
+    // selectOptionInIframe regardless. The iframe path supports
+    // label-based resolution only for v1 (native <select> only).
+    if (hasIframeHost && !label) {
+      res.status(400).json({
+        error: 'label is required when in_iframe is provided'
+              + ' (iframe path resolves selects by label only in v1)',
+      });
+      return;
+    }
 
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
-      const result = hasBbox
+      const result = hasIframeHost
+        ? await selectOptionInIframe(page.getRawPage(), {
+            iframeHost: inIframe,
+            label,
+            value,
+            fuzzy: fuzzy !== false,
+            timeout: typeof timeout === 'number' ? timeout : undefined,
+          })
+        : hasBbox
         ? await selectOptionByVisionBbox(page.getRawPage(), {
             bbox: {
               x0: Number(bbox.x0), y0: Number(bbox.y0),
@@ -1824,6 +2281,10 @@ export function createHttpServer(
       const newState = await page.getState({ useVision: false }).catch(() => null);
       res.json({
         ...result,
+        // Mirror `ok` to `success` so HTTP-status-only callers get the
+        // right signal. Bridge code already keys on `data.ok`; this is
+        // a no-op for it and a correctness fix for everyone else.
+        success: result.ok === true,
         elements: newState ? newState.elementTree.clickableElementsToString() : undefined,
         effect: diffEffect(effectBefore, effectAfter),
         // Fresh fingerprints — Python's element_fingerprints cache stays
@@ -2327,4 +2788,23 @@ function handleError(res: express.Response, err: unknown): void {
     const code = msg.includes('Too many requests') ? 429 : 500;
     res.status(code).json({ error: msg });
   }
+}
+
+/**
+ * Repair brain-emitted CSS selectors with unescaped React `useId()` IDs.
+ *
+ * React 18's `useId()` produces IDs like `:r13:`. In CSS these must be
+ * backslash-escaped (`\:`) or `document.querySelector` parses the colons
+ * as pseudo-classes and the call silently matches nothing — the exact
+ * shape of the "radix selector failed for no reason" bug.
+ *
+ * Idempotent: the regex requires the `:` to immediately follow `#` or an
+ * ID prefix (no backslash in between), so already-escaped selectors like
+ * `#radix-\:r13\:` pass through unchanged.
+ */
+export function normalizeIdSelector(sel: string): string {
+  return sel.replace(
+    /#([a-zA-Z_][\w-]*)?(:r[a-z0-9]+:?)/g,
+    (_m, prefix, idTail) => `#${prefix ?? ''}${idTail.replace(/:/g, '\\:')}`,
+  );
 }

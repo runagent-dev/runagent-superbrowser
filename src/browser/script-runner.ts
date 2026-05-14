@@ -334,7 +334,27 @@ export async function runPuppeteerScript(
       duration: Date.now() - startTime,
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    let message = err instanceof Error ? err.message : String(err);
+    // DOM-access-outside-page.evaluate is the most common script
+    // mistake — the script body runs in Node.js context, so
+    // `document`, `window`, `navigator`, `location` only exist
+    // inside `await page.evaluate(() => { ... })`. Rewrite the bare
+    // ReferenceError into actionable guidance so the brain doesn't
+    // burn turns puzzling over "is not defined".
+    const domMissing = /\b(document|window|navigator|location)\s+is\s+not\s+defined\b/.exec(
+      message,
+    );
+    if (domMissing) {
+      const symbol = domMissing[1];
+      message = (
+        `[run_script_failed:dom_not_available] Your script referenced `
+        + `${symbol} at the top level, but browser_run_script bodies `
+        + `execute in Node.js context — DOM globals only exist inside `
+        + `\`await page.evaluate(() => { ... })\`. Wrap any code that `
+        + `uses ${symbol}/document/window in page.evaluate. Original `
+        + `error: ${message}`
+      );
+    }
     // Surface `[blocked_op:…]` as a structured field so the Python
     // bridge can rewrite the error into a uniform "use a cursor tool"
     // message without string-matching inside the error payload.

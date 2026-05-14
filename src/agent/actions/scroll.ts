@@ -144,14 +144,37 @@ export const scrollWithinAction = new Action({
           + 'is open, or pass an explicit container_selector.',
       };
     }
-    const summary = result.found
-      ? `Scrolled within ${result.resolvedContainer} → matched "${result.matchedText ?? ''}"`
-      : `Scrolled within ${result.resolvedContainer}: ${result.reason} `
-        + `(scrolled ${result.scrolledPx}px)`;
+    if (result.found) {
+      return {
+        success: true,
+        extractedContent:
+          `Scrolled within ${result.resolvedContainer} → matched "${result.matchedText ?? ''}"`,
+        includeInMemory: true,
+      };
+    }
+    // Without target_text, terminal reasons like page_end / page_start /
+    // max_iterations just mean "scrolled what you asked"; treat as success.
+    // WITH target_text, those reasons mean target wasn't found — surface
+    // as failure so the brain doesn't proceed to click on a wrong option.
+    const hadTarget = (opts.target_text ?? '').trim().length > 0;
+    if (!hadTarget && (result.reason === 'page_end'
+        || result.reason === 'page_start'
+        || result.reason === 'max_iterations')) {
+      return {
+        success: true,
+        extractedContent:
+          `Scrolled within ${result.resolvedContainer} (${result.reason}, `
+          + `${result.scrolledPx}px)`,
+        includeInMemory: true,
+      };
+    }
     return {
-      success: true,
-      extractedContent: summary,
-      includeInMemory: true,
+      success: false,
+      error:
+        `scroll_within(${JSON.stringify((opts.target_text ?? '').slice(0, 60))}) `
+        + `inside ${result.resolvedContainer} ended with reason=${result.reason} `
+        + `after scrolling ${result.scrolledPx}px. Target not found in this `
+        + `container — try a synonym, opposite direction, or close+re-open the popup.`,
     };
   },
 });
@@ -201,36 +224,103 @@ export const scrollToTextAction = new Action({
     const { text, nth } = input as { text: string; nth?: number };
     const occurrence = nth || 1;
 
-    const found = await page.getRawPage().evaluate((searchText: string, n: number) => {
-      const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null,
-      );
-      let count = 0;
-      let node: Node | null;
-      while ((node = walker.nextNode())) {
-        if (node.textContent && node.textContent.includes(searchText)) {
-          count++;
-          if (count === n) {
-            const el = node.parentElement;
-            if (el) {
-              el.scrollIntoView({ block: 'center', behavior: 'instant' });
-              return true;
+    const result = await page.getRawPage().evaluate(
+      (searchText: string, n: number) => {
+        const norm = (s: string) =>
+          s.replace(/\s+/g, ' ').trim().toLowerCase();
+        const needle = norm(searchText);
+        if (!needle) return { found: false as const, reason: 'empty_text' };
+
+        // Pass 1: text-node walker — case-folded, whitespace-collapsed.
+        const walker = document.createTreeWalker(
+          document.body, NodeFilter.SHOW_TEXT, null,
+        );
+        let count = 0;
+        let matched: HTMLElement | null = null;
+        let node: Node | null;
+        while ((node = walker.nextNode())) {
+          if (norm(node.textContent || '').includes(needle)) {
+            count++;
+            if (count === n) { matched = node.parentElement; break; }
+          }
+        }
+
+        // Pass 2: parent innerText walker — catches multi-textnode splits
+        // like <span>Sign</span> <span>In</span> for "Sign In", and skips
+        // hidden subtrees automatically.
+        if (!matched) {
+          count = 0;
+          const els = document.body.querySelectorAll<HTMLElement>('*');
+          for (const el of els) {
+            const tc = norm(el.textContent || '');
+            if (!tc.includes(needle.slice(0, 3))) continue;
+            if (norm(el.innerText || '').includes(needle)) {
+              let deepest = el;
+              for (const c of Array.from(el.querySelectorAll<HTMLElement>('*'))) {
+                if (norm(c.innerText || '').includes(needle)) deepest = c;
+              }
+              count++;
+              if (count === n) { matched = deepest; break; }
             }
           }
         }
-      }
-      return false;
-    }, text, occurrence);
+        if (!matched) return { found: false as const, reason: 'not_found' };
 
-    if (!found) {
+        // Pre/post geometry: scrollIntoView is silently a no-op inside
+        // collapsed <details>, hidden tabs, or non-scrollable ancestors.
+        const beforeY = window.scrollY;
+        const beforeRect = matched.getBoundingClientRect();
+        const beforeInView = beforeRect.top >= 0
+          && beforeRect.bottom <= window.innerHeight
+          && beforeRect.width > 0 && beforeRect.height > 0;
+        try {
+          matched.scrollIntoView({ block: 'center', behavior: 'instant' });
+        } catch { /* older engines */ }
+        const afterY = window.scrollY;
+        const afterRect = matched.getBoundingClientRect();
+        const afterInView = afterRect.top >= 0
+          && afterRect.bottom <= window.innerHeight
+          && afterRect.width > 0 && afterRect.height > 0;
+        const movedPx = Math.abs(afterY - beforeY)
+          + Math.abs(afterRect.top - beforeRect.top);
+
+        if (afterInView || movedPx > 1) {
+          return {
+            found: true as const,
+            moved: movedPx,
+            already_in_view: beforeInView && movedPx < 2,
+            text: (matched.innerText || matched.textContent || '').trim().slice(0, 80),
+          };
+        }
+        return { found: false as const, reason: 'scroll_no_op' };
+      },
+      text, occurrence,
+    );
+
+    if (!result.found) {
+      const reason = (result as { reason: string }).reason;
+      if (reason === 'scroll_no_op') {
+        return {
+          success: false,
+          error:
+            `Text "${text}" was located but scrollIntoView did not bring `
+            + `it into view — the element is likely inside a collapsed `
+            + `<details>, a hidden tab, or a non-scrollable container. `
+            + `Open the parent disclosure first, or use scroll_within `
+            + `with container_selector.`,
+        };
+      }
       return {
         success: false,
         error: `Text "${text}" (occurrence ${occurrence}) not found on page`,
       };
     }
+    const r = result as { moved: number; already_in_view: boolean; text: string };
     return {
       success: true,
-      extractedContent: `Scrolled to "${text}" (occurrence ${occurrence})`,
+      extractedContent:
+        `Scrolled to "${text}" (occurrence ${occurrence}) — moved ${r.moved}px`
+        + `${r.already_in_view ? ' (already in view)' : ''}, matched: ${r.text}`,
       includeInMemory: true,
     };
   },

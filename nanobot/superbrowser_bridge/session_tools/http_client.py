@@ -125,6 +125,16 @@ async def _t3_dispatch_from_http(
             md = await mgr.get_markdown(sid)
             return _T3Response({"content": md})
 
+        if verb == "click-selector" or verb == "click_selector":
+            data = await mgr.click_selector(
+                sid,
+                str(body.get("selector", "")),
+                button=str(body.get("button") or "left"),
+                click_count=int(body.get("clickCount") or 1),
+                ensure_visible=bool(body.get("ensureVisible", True)),
+            )
+            return _T3Response(data)
+
         if verb == "click":
             if "bbox" in body or ("x" in body and "y" in body):
                 x = float(body.get("x", body.get("bbox", {}).get("x0", 0)))
@@ -198,6 +208,60 @@ async def _t3_dispatch_from_http(
                 percent=body.get("percent"),
             )
             return _T3Response(data)
+
+        if verb == "scroll-until" or verb == "scroll_until":
+            # Lean port of T1's scrollUntil. Cadence presets collapse
+            # to a single step_ratio; the navigation tool's payload
+            # may already include stepRatio, otherwise we map cadence.
+            cad = (body.get("cadence") or "").lower()
+            cadence_map = {"fine": 0.30, "medium": 0.55, "coarse": 0.85}
+            step_ratio = body.get("stepRatio")
+            if not isinstance(step_ratio, (int, float)):
+                step_ratio = cadence_map.get(cad, 0.55)
+            data = await mgr.scroll_until(
+                sid,
+                target_text=body.get("targetText"),
+                target_role=body.get("targetRole"),
+                direction=body.get("direction") or "down",
+                max_iterations=int(body.get("maxIterations") or 10),
+                step_ratio=float(step_ratio),
+                auto_reverse=bool(body.get("autoReverse", True)),
+                container_selector=body.get("containerSelector"),
+            )
+            # Match T1's response shape: {success, outcome, scrollInfo}.
+            # navigation.py:browser_scroll_until reads outcome + scrollInfo
+            # to update telemetry — without scrollInfo, reached_bottom
+            # tracking would silently break.
+            try:
+                st = await mgr.state(sid, use_vision=False, include_screenshot=False)
+                scroll_info = st.get("scrollInfo") or {}
+            except Exception:
+                scroll_info = {}
+            return _T3Response({
+                "success": bool(data.get("found")),
+                "outcome": data,
+                "scrollInfo": scroll_info,
+            })
+
+        if verb == "scroll-within" or verb == "scroll_within":
+            data = await mgr.scroll_within(
+                sid,
+                container_selector=body.get("containerSelector"),
+                direction=body.get("direction") or "down",
+                amount=body.get("amount", "page"),
+                target_text=body.get("targetText"),
+                max_iterations=int(body.get("maxIterations") or 12),
+            )
+            try:
+                st = await mgr.state(sid, use_vision=False, include_screenshot=False)
+                scroll_info = st.get("scrollInfo") or {}
+            except Exception:
+                scroll_info = {}
+            return _T3Response({
+                "success": bool(data.get("found")) or data.get("reason") != "no_container",
+                "outcome": data,
+                "scrollInfo": scroll_info,
+            })
 
         if verb == "drag":
             data = await mgr.drag(

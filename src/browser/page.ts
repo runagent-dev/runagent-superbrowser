@@ -12,6 +12,7 @@ import { buildDomTree, type PageState, type DialogInfo, type DOMElementNode } fr
 import { getAccessibilitySnapshot } from './accessibility.js';
 import { dispatchClick, dispatchHover, dispatchDrag, dispatchScroll } from './input-mouse.js';
 import { humanClick } from './humanize.js';
+import { SHADOW_DOM_HELPERS_SRC } from './slider-helpers.js';
 import { typeText as cdpTypeText, pressKeyCombo, clearField, dispatchKey } from './input-keyboard.js';
 import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
@@ -25,9 +26,11 @@ import {
   waitForVisualStable,
   detectErrorPage,
   type ErrorPage,
+  type PageRef,
 } from './page-readiness.js';
 import { feedbackBus } from '../agent/feedback-bus.js';
 import { inputEventBus } from './input-events.js';
+import { BadRequest } from './errors.js';
 
 /**
  * Structured result of a tool invocation at the browser layer. Designed so
@@ -131,10 +134,49 @@ export class PageWrapper {
    *  live view via InputEventBus. */
   public sessionId?: string;
 
+  /**
+   * Page reference frame (scrollY, scrollHeight, viewport dims) at the
+   * moment the LAST vision-capable /state was served. The /click
+   * handler reads this to detect "page has shifted since the brain saw
+   * the screenshot" — when shifted, the V_n bbox the brain captured
+   * resolves against a stale frame and the click would land on a
+   * neighbour. See `compareViewportShift` in `page-readiness.ts`.
+   *
+   * Updated only when the brain actually receives a screenshot
+   * (useVision=true); a no-vision /state probe doesn't reset this so
+   * the brain's visual mental model stays the source of truth.
+   */
+  private lastVisionPageRef: PageRef | null = null;
+
+  /** Read what the page reference frame was when the brain last got a
+   *  screenshot. Returns null until the first vision capture. */
+  public getVisionPageRef(): PageRef | null {
+    return this.lastVisionPageRef;
+  }
+
+  /** Update the stored vision page reference. Called by the /state
+   *  handler immediately after the screenshot is built. */
+  public setVisionPageRef(ref: PageRef): void {
+    this.lastVisionPageRef = ref;
+  }
+
   constructor(
     private page: Page,
     private config: BrowserConfig,
-  ) {}
+  ) {
+    // Programmatic navigation (location.href=, history.pushState that
+    // triggers a load, server redirects, meta-refresh) doesn't go
+    // through `navigate()` — but the vision page reference frame
+    // captured against the old document is now stale, and the /click
+    // handler's compareViewportShift gate will reject every legitimate
+    // click until the next /state-with-vision overwrites it. Invalidate
+    // here so the gate short-circuits via `stored==null` instead.
+    this.page.on('framenavigated', (frame) => {
+      if (frame === this.page.mainFrame()) {
+        this.lastVisionPageRef = null;
+      }
+    });
+  }
 
   /** Get the underlying puppeteer Page. */
   getRawPage(): Page {
@@ -162,6 +204,13 @@ export class PageWrapper {
       });
       return { statusCode: null, finalUrl: url, errorPage: cached };
     }
+
+    // The vision page reference frame from the previous document no
+    // longer applies — null it before goto() so the /click viewport-
+    // shift gate doesn't reject early clicks on the new page. The
+    // framenavigated hook also fires during goto(), but explicit
+    // invalidation here covers cases where goto() throws partway.
+    this.lastVisionPageRef = null;
 
     const response = await this.page.goto(url, {
       waitUntil: 'domcontentloaded',
@@ -607,7 +656,7 @@ export class PageWrapper {
                 tried,
                 error:
                   reasonStr === 'target_in_iframe'
-                    ? `Click target is inside an <iframe>; CDP coords land on the iframe host, not the inner element. Switch to selectors scoped to the iframe document, or browser_click_at(vision_index=V_n) which snaps inside.`
+                    ? `Click target is inside an <iframe>; this index-based path lands on the iframe host. Use browser_click_at(vision_index=V_n) — it descends through same-origin iframes and falls back to a Frame walk for cross-origin OOPIFs. Or use browser_click_selector(selector='<inner>', in_iframe='<host_css>') to target by CSS inside the frame. If both keep missing, drop to browser_run_script(mutates=true) and reach in via page.frames(): const f = page.frames().find(fr => fr.url().includes('<host_substr>')); await f.evaluate(() => document.querySelector('<inner>').click()).`
                     : reasonStr === 'rect_shifted'
                     ? `Element shifted between probe and dispatch (${validation.overlay}px) — page is mid-render. Re-screenshot to re-acquire fresh coords.`
                     : reasonStr === 'empty_stack'
@@ -657,6 +706,11 @@ export class PageWrapper {
       if (p2.rect) {
         const cx = Math.round(p2.rect.x + p2.rect.w / 2);
         const cy = Math.round(p2.rect.y + p2.rect.h / 2);
+        // Cosmetic sweep — Puppeteer.click bypasses our humanize.ts
+        // pipeline, so the overlay never sees mouse_move events.
+        if (this.sessionId) {
+          await inputEventBus.emitSweep(this.sessionId, cx, cy);
+        }
         this._emitClickTargetForElement(cx, cy, p2.rect, selector);
       }
       await this.page.click(selector);
@@ -704,7 +758,22 @@ export class PageWrapper {
           );
           const el = result.singleNodeValue as HTMLElement;
           if (el) {
-            el.scrollIntoView({ block: 'center' });
+            // Only scroll when actually off-screen. `block: 'center'`
+            // would re-centre even a fully-visible element, shifting
+            // the viewport and invalidating the brain's pre-click
+            // V_n bboxes for the next call.
+            const r = el.getBoundingClientRect();
+            const inView = (
+              r.top >= 0 && r.bottom <= window.innerHeight
+              && r.left >= 0 && r.right <= window.innerWidth
+            );
+            if (!inView) {
+              el.scrollIntoView({
+                block: 'nearest',
+                inline: 'nearest',
+                behavior: 'instant',
+              });
+            }
             el.click();
           }
         }, element.xpath);
@@ -766,6 +835,59 @@ export class PageWrapper {
   }
 
   /**
+   * Silent-click escalation: dispatch a JS-level `el.click()` on the
+   * element under (x, y). Bypasses the bezier sweep (which can dismiss
+   * autocomplete popups via mouseout on intermediate siblings) and any
+   * site-side guard that gates on bezier-style mouse movement (some
+   * frameworks short-circuit click handlers when the preceding mousemove
+   * trail looks "too natural"). Used by the click ladder when the
+   * primary CDP dispatch produced zero DOM mutations.
+   *
+   * The dispatched event is `isTrusted=false` — bot-aware sites may
+   * silently reject it, but in practice many handlers don't bother
+   * checking and a JS click DOES produce the expected mutation.
+   */
+  async dispatchJsClickAt(x: number, y: number): Promise<void> {
+    if (this.sessionId) {
+      inputEventBus.emitClickTarget(this.sessionId, x, y, false);
+    }
+    await this.page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y);
+        if (el && typeof (el as HTMLElement).click === 'function') {
+          (el as HTMLElement).click();
+        }
+      },
+      { x, y },
+    );
+    await this.waitForIdle(1000).catch(() => {});
+  }
+
+  /**
+   * Silent-click escalation: focus the element under (x, y), then
+   * press Enter via CDP. Last-resort recovery for buttons/links that
+   * accept keyboard activation but gated their click handler in a way
+   * that swallows synthetic mouse events. The keyboard event is
+   * trusted (CDP-dispatched).
+   */
+  async dispatchKeyboardEnterAt(x: number, y: number): Promise<void> {
+    if (this.sessionId) {
+      inputEventBus.emitClickTarget(this.sessionId, x, y, false);
+    }
+    await this.page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y) as HTMLElement | null;
+        if (el && typeof el.focus === 'function') {
+          try { el.focus(); } catch { /* tabindex -1 / non-focusable: ignore */ }
+        }
+      },
+      { x, y },
+    );
+    await this.page.keyboard.press('Enter');
+    await this.waitForIdle(1000).catch(() => {});
+  }
+
+  /**
    * Click inside a vision-supplied bbox — pinpoint mode.
    *
    * Design: trust Gemini's bbox. The click lands on the geometric
@@ -794,16 +916,30 @@ export class PageWrapper {
        *  Phase 1 falls through to Phase 2 grid-scan instead of
        *  trusting the centre element. */
       expectedLabel?: string;
+      /** Force a deterministic teleport click — no bezier sweep, no
+       *  pre-click hover. Caller wins over the auto-detected
+       *  isAutocompleteOption path. */
+      linear?: boolean;
     },
   ): Promise<{
     x: number;
     y: number;
     snapped: boolean;
     target?: string;
-    /** A2: advisory flag when the snapped element is inside an iframe
-     *  ('target_in_iframe') or has a pointer-events:none ancestor
-     *  ('pointer_events_none_ancestor'). The click still dispatches —
-     *  the bridge surfaces this so the brain can react. */
+    /** Advisory flag for the bridge. Variants:
+     *  - 'target_in_iframe_resolved': same-origin iframe descent
+     *    found the inner interactive element; click landed on the
+     *    real target. Informational, not an error.
+     *  - 'target_in_iframe_cross_origin': contentDocument was blocked
+     *    by same-origin policy; the in-page snap could not descend.
+     *    The /click handler falls back to Puppeteer Frame walk
+     *    (clickInIframeFrame).
+     *  - 'target_in_iframe': legacy — descent attempted but stopped
+     *    without finding an inner SEL match. Click landed on iframe
+     *    host; the bridge should escalate.
+     *  - 'pointer_events_none_ancestor': an ancestor has
+     *    pointer-events:none; click may have passed through to a
+     *    layer behind. */
     warning?: string;
     /** Xpath of the snapped interactive element — the /click handler
      *  uses it to look up the corresponding selectorMap index, so the
@@ -811,6 +947,46 @@ export class PageWrapper {
      *  tool dead-click guard can recognize that V_n and [N] resolve
      *  to the same DOM element. */
     targetXpath?: string;
+    /** Set when expectedLabel was provided AND Phase 2 grid-scan
+     *  could not find any candidate matching that label. The caller
+     *  must NOT dispatch a click — surface a structured mismatch so
+     *  the brain re-screenshots. Closes the silent-misclick gap on
+     *  filter-shift cases where a stale bbox now overlaps a
+     *  same-shape neighbour with a different label. */
+    labelMismatch?: boolean;
+    /** When `labelMismatch` is true, describes the wrong-label
+     *  element currently occupying the bbox. The /click handler
+     *  packs this into the `element_mismatch` response shape that
+     *  the Python bridge already knows how to surface. */
+    found?: { tag: string; role: string; text: string };
+    /** Set when the snapped element looks like an autocomplete /
+     *  typeahead suggestion (role=option inside listbox/combobox/
+     *  menu, or descendant of an aria-haspopup="listbox" ancestor).
+     *  These dropdowns close on the bezier sweep's mouseout/blur
+     *  events from intermediate neighbors, so the dispatcher uses
+     *  a `linear:true` teleport click instead — mouse jumps to the
+     *  exact target with no in-between hovers. */
+    isAutocompleteOption?: boolean;
+    /** Phase A: xpaths of the iframe host elements that the snap
+     *  descended through to reach the inner target. Empty/undefined
+     *  when the snap stayed in the top-level document. Bridge logs
+     *  it for telemetry; tests can assert that descent occurred. */
+    iframe_chain?: string[];
+    /** Phase A: a stable CSS selector for the host iframe (best-guess
+     *  from id / aria-label / name, falling back to `iframe`). Set
+     *  whenever the snap touched an iframe — on success, miss, or
+     *  cross-origin failure. The bridge surfaces it so the brain can
+     *  pass it back via browser_click_selector(in_iframe=…) without
+     *  running an inspection script first. */
+    iframe_host_selector?: string;
+    /** Phase G: the snapped element is a native HTML `<select>`. CDP
+     *  click on a native select doesn't open the dropdown in headless
+     *  Chromium — the bridge surfaces a hint pointing at
+     *  browser_select_option(..., in_iframe=...) so the brain doesn't
+     *  burn turns clicking the select repeatedly. The click STILL
+     *  dispatches (hint-only policy) — value-set via dispatchClick
+     *  transfers focus, which the brain may need for Tab navigation. */
+    native_select?: boolean;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -822,8 +998,46 @@ export class PageWrapper {
         const SEL = 'a,button,input,select,textarea,'
           + '[role="button"],[role="link"],[role="checkbox"],'
           + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
-        const cx = Math.round((b.x0 + b.x1) / 2);
-        const cy = Math.round((b.y0 + b.y1) / 2);
+        // Autocomplete / typeahead dropdown detector. Real-world
+        // autocompletes (Google search bar, Booking.com destination
+        // search, Yelp service search ["nail trimming" → suggestions])
+        // close the popup on mouseout/blur fired by neighbours. The
+        // bezier mouse path sweeps across siblings on its way to the
+        // target, dismissing the dropdown before the click lands.
+        // When this returns true, clickInBbox switches to a
+        // teleport-click (linear:true) so the cursor jumps straight
+        // to the target with no intermediate hovers.
+        const isAutocompleteOptionEl = (el: Element | null): boolean => {
+          if (!el) return false;
+          // Direct role-option signal.
+          const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+          if (role === 'option' || role === 'menuitem') return true;
+          // Walk up to 6 ancestors looking for popup signals. 6 is
+          // enough to clear typical wrapping like
+          //   .suggestion > .row > .label-wrap → host listbox.
+          let walker: Element | null = el;
+          for (let depth = 0; walker && depth < 6; depth += 1) {
+            const r = (walker.getAttribute && walker.getAttribute('role') || '').toLowerCase();
+            if (r === 'listbox' || r === 'combobox' || r === 'menu') return true;
+            const haspopup = walker.getAttribute && walker.getAttribute('aria-haspopup');
+            if (haspopup === 'listbox' || haspopup === 'menu' || haspopup === 'true') return true;
+            const autocomplete = walker.getAttribute && walker.getAttribute('aria-autocomplete');
+            if (autocomplete === 'list' || autocomplete === 'both') return true;
+            // Headless UI / Radix popup state.
+            const ds = walker.getAttribute && walker.getAttribute('data-state');
+            if (ds === 'open' && (walker.getAttribute('data-radix-popper-content-wrapper') !== null
+              || (walker.getAttribute('class') || '').toLowerCase().includes('popover'))) {
+              return true;
+            }
+            walker = walker.parentElement;
+          }
+          return false;
+        };
+        // `let` so Phase A's iframe descent can update these to the
+        // inner element's viewport coords. Phase 2 (grid scan) doesn't
+        // reuse them — it operates directly off `b.x0..b.y1`.
+        let cx = Math.round((b.x0 + b.x1) / 2);
+        let cy = Math.round((b.y0 + b.y1) / 2);
         const describe = (el: Element): string => {
           const tag = el.tagName.toLowerCase();
           const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : '';
@@ -862,10 +1076,206 @@ export class PageWrapper {
           (el) => el !== document.documentElement && el !== document.body,
         );
         if (centreEl) {
-          // Look for an interactive ancestor ONLY to label the target
-          // nicely in the UI overlay. The click coordinates stay at the
-          // bbox centre — we don't move them.
-          const interactive = (centreEl as Element).closest(SEL) || centreEl;
+          // Find the most specific clickable element under the cursor.
+          // First pass: walk the elementsFromPoint stack (front-to-back
+          // z-order) looking for a SEL match — this finds an interactive
+          // child element whose bounds the cursor is actually over (e.g.
+          // <li><button>X</button></li> with the bezel sitting on the
+          // button surface).
+          let interactive: Element | null = null;
+          for (const el of centreStack) {
+            if (el === document.documentElement || el === document.body) break;
+            try {
+              if ((el as Element).matches(SEL)) { interactive = el as Element; break; }
+            } catch { /* ignore */ }
+          }
+          // Second pass: walk UP from the front-most non-body element
+          // looking for an interactive ancestor (the original Phase 1
+          // behaviour — handles cases where the ancestor wraps the
+          // interactive semantics).
+          if (!interactive) {
+            interactive = (centreEl as Element).closest(SEL) || centreEl;
+          }
+          // Third pass — DESCEND. Real-world dropdowns are
+          // <li#suggestion-N><button>X</button></li> where the bbox
+          // covers the li (visible row) but the click handler lives on
+          // the inner button, and the bbox centre often falls on
+          // padding outside the button's rect. If `interactive` is a
+          // wrapper (li, div, [role=option]) and contains a smaller,
+          // more specific clickable child whose rect overlaps the bbox,
+          // click the child's centre instead.
+          const CHILD_SEL = 'button,a,input,[role="button"],[role="option"],'
+            + '[role="menuitem"],[role="link"],[role="tab"],[onclick]';
+          let descendant: Element | null = null;
+          let descendantArea = 0;
+          try {
+            const interRect = (interactive as HTMLElement).getBoundingClientRect();
+            const interArea = Math.max(1, interRect.width * interRect.height);
+            const kids = (interactive as Element).querySelectorAll(CHILD_SEL);
+            for (const k of Array.from(kids)) {
+              if (k === interactive) continue;
+              const kr = (k as HTMLElement).getBoundingClientRect();
+              if (kr.width <= 0 || kr.height <= 0) continue;
+              // Skip children that are essentially the parent (>= 95%
+              // of parent area) — wrappers, not clickable kernels.
+              if (kr.width * kr.height >= interArea * 0.95) continue;
+              // Overlap with the bbox.
+              const ix = Math.max(0, Math.min(kr.right, b.x1) - Math.max(kr.left, b.x0));
+              const iy = Math.max(0, Math.min(kr.bottom, b.y1) - Math.max(kr.top, b.y0));
+              const overlap = ix * iy;
+              if (overlap <= 0) continue;
+              if (overlap > descendantArea) {
+                descendantArea = overlap;
+                descendant = k as Element;
+              }
+            }
+          } catch { /* ignore */ }
+          if (descendant) {
+            interactive = descendant;
+          }
+          // === Phase A: same-origin iframe descent ===
+          // When `interactive` IS an iframe, the centre coords land on
+          // the iframe's BORDER from the outer document's perspective
+          // — CDP click at (cx,cy) hits the host, not the inner
+          // button. Descend into iframe.contentDocument and re-snap.
+          //
+          // Three failure modes get distinct signals:
+          //   - contentDocument throws or is null  → cross-origin or
+          //     unloaded; flag for Phase B Frame walk.
+          //   - innerCentre missing at pinpoint    → run an in-iframe
+          //     grid scan (vision bbox often loose for iframe targets;
+          //     centre lands on padding while the link is offset).
+          //   - inner grid scan also empty         → flag iframe_miss
+          //     so Phase B fallback fires in http.ts.
+          //
+          // Caps descent at depth 3 to handle iframes-inside-iframes
+          // without infinite loops.
+          let iframeChain: string[] = [];
+          let iframeDescentFailed = false;
+          let iframeDescentMissed = false;   // contentDocument ok but no inner clickable
+          let iframeHostSelector = '';        // best-guess CSS for the host (for bridge hint)
+          let descentDepth = 0;
+          while (interactive
+                 && interactive.tagName.toLowerCase() === 'iframe'
+                 && descentDepth < 3) {
+            const iframeEl = interactive as HTMLIFrameElement;
+            const ir = iframeEl.getBoundingClientRect();
+            const localCx = cx - ir.left;
+            const localCy = cy - ir.top;
+            // Capture a host selector for the bridge advisory. Prefer
+            // [id] / [aria-label] / [name] (stable hooks the brain
+            // can pass back via in_iframe). Falls back to tag+nth.
+            if (!iframeHostSelector) {
+              const id = (iframeEl as HTMLElement).id;
+              const ariaLabel = iframeEl.getAttribute('aria-label');
+              const name = iframeEl.getAttribute('name');
+              if (id) iframeHostSelector = `iframe#${id}`;
+              else if (ariaLabel) iframeHostSelector = `iframe[aria-label="${ariaLabel}"]`;
+              else if (name) iframeHostSelector = `iframe[name="${name}"]`;
+              else iframeHostSelector = 'iframe';
+            }
+            let innerDoc: Document | null = null;
+            try { innerDoc = iframeEl.contentDocument; } catch { /* x-origin */ }
+            if (!innerDoc) { iframeDescentFailed = true; break; }
+
+            // Pinpoint inside iframe (frame-local elementsFromPoint).
+            let innerStack: Element[] = [];
+            try {
+              innerStack = innerDoc.elementsFromPoint(localCx, localCy);
+            } catch { innerStack = []; }
+            let innerCentre = innerStack.find(
+              (el) => el !== innerDoc!.documentElement && el !== innerDoc!.body,
+            );
+
+            // If pinpoint missed (centre lands on iframe scrollbar /
+            // padding / loose-bbox whitespace), run a 5×5 grid scan
+            // INSIDE the iframe. Translates the outer bbox into
+            // iframe-local coords first. Picks the largest interactive
+            // whose iframe-local rect overlaps the bbox — same shape
+            // as Phase 2 grid scan at the top level.
+            let innerInteractive: Element | null = null;
+            if (!innerCentre) {
+              const localB = {
+                x0: b.x0 - ir.left, y0: b.y0 - ir.top,
+                x1: b.x1 - ir.left, y1: b.y1 - ir.top,
+              };
+              let best: Element | null = null;
+              let bestArea = 0;
+              for (let i = 1; i < 5; i++) {
+                for (let j = 1; j < 5; j++) {
+                  const px = localB.x0 + ((localB.x1 - localB.x0) * i) / 5;
+                  const py = localB.y0 + ((localB.y1 - localB.y0) * j) / 5;
+                  let stack: Element[] = [];
+                  try {
+                    stack = innerDoc.elementsFromPoint(px, py);
+                  } catch { stack = []; }
+                  for (const el of stack) {
+                    const hit = (el as Element).closest(SEL);
+                    if (!hit) continue;
+                    const r = (hit as HTMLElement).getBoundingClientRect();
+                    const ix = Math.max(0, Math.min(r.right, localB.x1) - Math.max(r.left, localB.x0));
+                    const iy = Math.max(0, Math.min(r.bottom, localB.y1) - Math.max(r.top, localB.y0));
+                    const area = ix * iy;
+                    if (area > bestArea) {
+                      bestArea = area;
+                      best = hit;
+                    }
+                  }
+                }
+              }
+              if (best) {
+                innerInteractive = best;
+                innerCentre = best;
+              } else {
+                // Inner grid scan also empty — bbox doesn't overlap any
+                // clickable inside this iframe. Flag for Phase B.
+                iframeDescentMissed = true;
+                break;
+              }
+            }
+
+            // Pinpoint succeeded. Walk the stack for the best SEL match
+            // (front-to-back z-order), then fall back to closest(SEL).
+            if (!innerInteractive) {
+              for (const el of innerStack) {
+                if (el === innerDoc.documentElement || el === innerDoc.body) break;
+                try {
+                  if ((el as Element).matches(SEL)) {
+                    innerInteractive = el as Element;
+                    break;
+                  }
+                } catch { /* ignore */ }
+              }
+              if (!innerInteractive) {
+                innerInteractive = (innerCentre as Element).closest(SEL) || innerCentre;
+              }
+            }
+            iframeChain.push(xpathOf(iframeEl));
+            // Recompute viewport (cx,cy) from the inner element's
+            // frame-local rect. ir.left/ir.top = host viewport offset;
+            // innerRect is iframe-local coords, so we add them.
+            const innerRect = (innerInteractive as HTMLElement).getBoundingClientRect();
+            cx = Math.round(ir.left + innerRect.left + innerRect.width / 2);
+            cy = Math.round(ir.top + innerRect.top + innerRect.height / 2);
+            // Phase J: pre-focus iframe inputs. The upcoming CDP click
+            // transfers focus on most pages, but cross-frame focus is
+            // unreliable in headless Chromium — sometimes a click on
+            // an iframe input leaves focus on the OUTER document.body,
+            // and a follow-up `browser_keys` then types into the void.
+            // Set focus explicitly here so the keystroke target is
+            // committed before the click dispatches. Skip <select>
+            // (CDP click can't drive the native dropdown anyway; Phase
+            // G's hint redirects to browser_select_option).
+            const _innerTag = innerInteractive.tagName.toLowerCase();
+            if (_innerTag === 'input' || _innerTag === 'textarea'
+                || (innerInteractive as HTMLElement).isContentEditable) {
+              try { (innerInteractive as HTMLElement).focus(); } catch (_) { /* x-frame edge */ }
+            }
+            interactive = innerInteractive;
+            descentDepth += 1;
+          }
+          const descended = iframeChain.length > 0;
+          // === end Phase A ===
           // v6 F2: label-match check. When vision provided an
           // expectedLabel, verify the snapped element's text/aria-label
           // aligns. After a page shift, the bbox centre may now hit a
@@ -904,7 +1314,32 @@ export class PageWrapper {
           // them so the brain can react.
           let warning: string | undefined;
           if (interactive.tagName.toLowerCase() === 'iframe') {
-            warning = 'target_in_iframe';
+            // Phase A descent could not produce an inner clickable.
+            // Three signals so the bridge / http.ts can route correctly:
+            //  - cross_origin: contentDocument blocked by SOP. Phase B
+            //    Frame walk applies (it can still access cross-origin
+            //    frames via Puppeteer's Target API).
+            //  - miss: contentDocument accessible BUT neither pinpoint
+            //    nor inner grid scan found a clickable overlapping the
+            //    bbox. Either the bbox is loose (covers padding only)
+            //    or the iframe has no clickable in this region.
+            //    Phase B still worth trying — its broader scan may
+            //    find a candidate.
+            //  - legacy `target_in_iframe`: should not fire now (the
+            //    descent loop always sets one of the above flags) —
+            //    kept for backward-compat with any callers that pattern-
+            //    match the legacy substring.
+            warning = iframeDescentFailed
+              ? 'target_in_iframe_cross_origin'
+              : (iframeDescentMissed
+                  ? 'target_in_iframe_miss'
+                  : 'target_in_iframe');
+          } else if (descended) {
+            // Phase A: same-origin descent succeeded — click is about
+            // to land on the real inner element. Informational only;
+            // existing callers that branch on `warning` won't match
+            // any of the legacy strings.
+            warning = 'target_in_iframe_resolved';
           } else {
             // Walk up to body looking for pointer-events:none on
             // ancestors. A leaf with pointer-events:none doesn't
@@ -923,13 +1358,44 @@ export class PageWrapper {
               depth += 1;
             }
           }
+          // When we descended into a smaller clickable child, click
+          // the child's centre — the bbox centre may have been on
+          // padding outside the child's rect, which would dispatch
+          // the click on a non-handler. For wrapper elements the
+          // bbox centre is still right.
+          //
+          // Phase A: if iframe descent succeeded, cx/cy ALREADY point
+          // at the inner element's viewport coords — don't let the
+          // (outer-doc) descendant search override them.
+          let dispatchX = cx;
+          let dispatchY = cy;
+          if (descendant && !descended) {
+            const dr = (descendant as HTMLElement).getBoundingClientRect();
+            dispatchX = Math.round(dr.left + dr.width / 2);
+            dispatchY = Math.round(dr.top + dr.height / 2);
+          }
           return {
-            x: cx,
-            y: cy,
+            x: dispatchX,
+            y: dispatchY,
             snapped: true,
             target: describe(interactive),
             warning,
             targetXpath: xpathOf(interactive),
+            isAutocompleteOption: isAutocompleteOptionEl(interactive),
+            iframe_chain: descended ? iframeChain : undefined,
+            // Bridge surfaces this so brain can pass it back via
+            // browser_click_selector(in_iframe=<host_selector>) without
+            // having to run a separate inspection script.
+            iframe_host_selector: (iframeDescentFailed || iframeDescentMissed
+                                    || iframeChain.length > 0)
+              ? iframeHostSelector || undefined
+              : undefined,
+            // Phase G: surface native <select> so the bridge can hint
+            // the brain to use browser_select_option instead. Native
+            // dropdowns don't open via CDP Input.dispatchMouseEvent in
+            // headless Chromium — the click here only transfers focus.
+            native_select: interactive.tagName.toLowerCase() === 'select'
+              ? true : undefined,
           };
           } /* end if (labelMatch) */
           // labelMatch=false: fall through to Phase 2 grid-scan below.
@@ -939,16 +1405,19 @@ export class PageWrapper {
           // bbox centre). Grid-scan can find an alternate interactive
           // whose rect overlaps the bbox AND whose label aligns.
         }
-        // 2. Centre fell on empty space — bbox is probably loose or
-        //    off-page. Grid-scan fallback: pick the interactive element
-        //    whose rect overlaps the bbox most, click its own centre.
-        //    Chevron tiebreaker: when two grid hits have similar area
-        //    (within 30%) and one carries expand/collapse semantics
-        //    (aria-expanded, aria-haspopup, single chevron char,
-        //    aria-label matching expand/collapse/toggle/more), bias
-        //    toward the chevron. Only fires on row-shaped bboxes
-        //    (≥60×24) — for a small bbox the bbox itself IS the
-        //    chevron, no bias needed.
+        // 2. Centre fell on empty space OR Phase 1 label-match
+        //    failed — pick the interactive whose rect overlaps the
+        //    bbox most. Chevron tiebreaker biases toward expand/
+        //    collapse semantics on row-shaped bboxes.
+        //
+        //    Filter-shift fix: when expectedLabel is provided, weight
+        //    candidates by labelMatchScore (1.0 match, 0.05 mismatch,
+        //    0.1 unlabelled). Without this, a stale bbox that now
+        //    overlaps a same-shape neighbour silently snaps to the
+        //    neighbour. With it, only a label-matching candidate wins
+        //    on overlap; if no candidate matches the label, we report
+        //    `labelMismatch=true` and the caller skips dispatch so the
+        //    brain re-screenshots instead of misclicking.
         const isRowBbox = (b.x1 - b.x0) >= 60 && (b.y1 - b.y0) >= 24;
         const CHEVRON_CHARS = '▼▶◀▲►◄⌃⌄⋮+−×⨯›';
         const chevronScoreOf = (el: Element): number => {
@@ -961,9 +1430,53 @@ export class PageWrapper {
           if (/(expand|collapse|toggle|more)/.test(al)) return 1;
           return 0;
         };
+        const labelActive = args.expectedLabel.length >= 3;
+        const expLc = args.expectedLabel.toLowerCase().trim();
+        const labelScoreOf = (el: Element): number => {
+          if (!labelActive) return 1;
+          const full = (
+            ((el as HTMLElement).textContent || '') + ' '
+            + ((el as HTMLElement).getAttribute('aria-label') || '') + ' '
+            + ((el as HTMLElement).getAttribute('title') || '')
+          ).toLowerCase().replace(/\s+/g, ' ').trim();
+          if (!full) return 0.1;
+          if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) {
+            return 1;
+          }
+          // Dropdown-item lenient fallback. Vision routinely drifts on
+          // suggestion / option / menuitem labels — it abbreviates
+          // ("SF MOMA" vs "San Francisco Museum of Modern Art"), strips
+          // address context, or paraphrases. The strict substring check
+          // above then rejects the click as element_mismatch even
+          // though the bbox is on the right item. Misclick risk for
+          // these roles is low (only one dropdown / listbox is open at
+          // a time, so the bbox neighbours are sibling options whose
+          // labels would all share the same drift pattern). Accept any
+          // ≥3-char word overlap as a partial match.
+          const role = (
+            ((el as HTMLElement).getAttribute('role') || '').toLowerCase()
+          );
+          const isDropdownItem = (
+            role === 'option' || role === 'menuitem'
+            || role === 'treeitem' || role === 'listitem'
+          ) || (el as HTMLElement).tagName.toLowerCase() === 'li';
+          if (isDropdownItem) {
+            const expWords = new Set(
+              expLc.split(/\s+/).filter((t) => t.length >= 3),
+            );
+            const fullWords = new Set(
+              full.split(/\s+/).filter((t) => t.length >= 3),
+            );
+            let common = 0;
+            for (const t of expWords) if (fullWords.has(t)) common += 1;
+            if (common >= 1) return 0.7;
+          }
+          return 0.05;
+        };
         let best: Element | null = null;
         let bestArea = 0;
         let bestComposite = 0;
+        let bestLabelScore = 0;
         for (let i = 1; i < 5; i++) {
           for (let j = 1; j < 5; j++) {
             const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
@@ -979,23 +1492,52 @@ export class PageWrapper {
               const area = ix * iy;
               if (area <= 0) continue;
               const cs = isRowBbox ? chevronScoreOf(hit) : 0;
+              const ls = labelScoreOf(hit);
               // Composite scoring: area dominates, chevron only nudges
-              // when this candidate is within 30% of the current best.
-              // For a clean single winner the existing largest-area
-              // logic is unchanged.
+              // when this candidate is within 30% of the current best
+              // (preserves existing single-winner behaviour). Then the
+              // label score multiplies the whole thing — when active,
+              // a 1.0 match beats any 0.05 mismatch unless the
+              // mismatch has 20× the area, which never happens for
+              // sibling checkboxes.
               const within30 = bestArea > 0 && area > bestArea * 0.7;
-              const composite = cs > 0 && within30
+              const baseScore = cs > 0 && within30
                 ? area + bestArea * 0.5 * cs
                 : area;
+              const composite = baseScore * ls;
               if (composite > bestComposite) {
                 bestComposite = composite;
                 bestArea = area;
+                bestLabelScore = ls;
                 best = hit;
               }
             }
           }
         }
         if (best) {
+          // Label-mismatch escape hatch: if the best candidate failed
+          // label-match (ls < 0.5 means 0.05 or 0.1 — i.e. mismatch or
+          // unlabelled when a label was expected), surface labelMismatch
+          // so the caller skips dispatch. This converts a silent
+          // misclick into a structured signal the bridge already
+          // surfaces as `element_mismatch`.
+          if (labelActive && bestLabelScore < 0.5) {
+            const r = best.getBoundingClientRect();
+            return {
+              x: Math.round(r.left + r.width / 2),
+              y: Math.round(r.top + r.height / 2),
+              snapped: false,
+              target: describe(best),
+              targetXpath: xpathOf(best),
+              labelMismatch: true,
+              found: {
+                tag: best.tagName.toLowerCase(),
+                role: ((best as HTMLElement).getAttribute('role') || ''),
+                text: ((best as HTMLElement).textContent || '')
+                  .replace(/\s+/g, ' ').trim().slice(0, 120),
+              },
+            };
+          }
           const r = best.getBoundingClientRect();
           return {
             x: Math.round(r.left + r.width / 2),
@@ -1003,6 +1545,10 @@ export class PageWrapper {
             snapped: true,
             target: describe(best),
             targetXpath: xpathOf(best),
+            isAutocompleteOption: isAutocompleteOptionEl(best),
+            // Phase G: surface native <select> on the grid-scan path too.
+            native_select: best.tagName.toLowerCase() === 'select'
+              ? true : undefined,
           };
         }
         // 3. Hard fallback: click the raw centre anyway. snapped=false
@@ -1013,9 +1559,36 @@ export class PageWrapper {
       { b: bbox, expectedLabel },
     );
 
+    // Label-mismatch escape: Phase 2 grid-scan found no candidate
+    // matching expectedLabel. Skip dispatch and let the caller surface
+    // a structured mismatch (the bridge then forces the brain to
+    // re-screenshot instead of clicking the wrong neighbour).
+    //
+    // IMPORTANT: this check MUST run BEFORE the click-burst emit
+    // below. Otherwise the live viewer sees the crosshair flash and
+    // the operator assumes a click happened, when in fact dispatch
+    // was skipped — that was the long-standing "burst but page
+    // doesn't change" bug. Burst is only emitted on the actual-
+    // dispatch path now.
+    if (snap.labelMismatch) {
+      return snap;
+    }
+
     // Broadcast resolved target to live viewers BEFORE the click so the
     // crosshair appears in the same frame the click lands.
     if (this.sessionId) {
+      // Cosmetic sweep for the linear branch — when dispatchClick
+      // teleports (autocomplete or caller-supplied linear=true), no
+      // CDP mouseMoved events fire and the live-view cursor jumps
+      // without intermediate frames. emitSweep updates ONLY the WS
+      // overlay (no CDP), so it's safe even for autocomplete (where
+      // real intermediate hovers would dismiss the dropdown).
+      const willBeLinear =
+        options?.linear === true
+        || (options?.linear == null && snap.isAutocompleteOption === true);
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, snap.x, snap.y);
+      }
       inputEventBus.emitClickTarget(
         this.sessionId,
         snap.x,
@@ -1027,7 +1600,32 @@ export class PageWrapper {
     }
 
     const client = await this.getCDPSession();
-    await dispatchClick(client, snap.x, snap.y, { ...options, sessionId: this.sessionId });
+    // Autocomplete suggestions: switch to a teleport click so the
+    // mouse jumps straight to the target with no in-between hovers.
+    // The bezier sweep otherwise crosses neighbouring options whose
+    // mouseout/blur handlers dismiss the dropdown before the click
+    // lands — the user types "nail trimming", a suggestion appears,
+    // the bezier pass over earlier suggestions closes the popup,
+    // and the click then falls onto whatever's behind. Caller-
+    // supplied `linear` always wins so this only kicks in when the
+    // tool didn't already make a choice.
+    const dispatchOpts = {
+      ...options,
+      sessionId: this.sessionId,
+      linear: options?.linear ?? (snap.isAutocompleteOption === true),
+    };
+    await dispatchClick(client, snap.x, snap.y, dispatchOpts);
+    // Microtask + double-RAF flushes the React/Vue commit phase and one
+    // paint before the caller's effect snapshot. waitForIdle alone gates
+    // only on network idle, which is already idle on most SPAs — so the
+    // call returns in <1ms and async state updates fire AFTER the
+    // captureEffect, producing mutation_delta=0 even though the click
+    // landed. Adds ~32ms on idle pages; far cheaper than waitForVisualStable.
+    try {
+      await this.page.evaluate(() => new Promise<void>((r) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      }));
+    } catch { /* page closed mid-click */ }
     await this.waitForIdle(1000).catch(() => {});
     return snap;
   }
@@ -1077,11 +1675,49 @@ export class PageWrapper {
     x: number; y: number; w: number; h: number;
     cx: number; cy: number;
     visible: boolean; inViewport: boolean;
-  } | null>> {
+  } | { __syntaxError: true; message: string } | null>> {
     return await this.page.evaluate(
       (sels: string[], ensure: boolean) => {
         return sels.map((sel) => {
-          const el = document.querySelector(sel) as HTMLElement | null;
+          // Multi-selector resolution: walk querySelectorAll and pick the
+          // first VISIBLE match. Plain querySelector returns the first
+          // element in DOM order regardless of visibility — when a page
+          // has a hidden listbox <li> earlier in the DOM (closed dropdown
+          // still in tree), that's what gets picked, the rect is zero-
+          // size, and clickSelector throws "selector not found or zero-
+          // size" even though a visible match exists later.
+          //
+          // SyntaxError is reported separately so callers can
+          // distinguish "invalid CSS" from "valid CSS, no match" —
+          // the Python bridge rejects Playwright/jQuery extensions
+          // (`:has-text`, `:contains`, etc.) upfront, but any other
+          // malformed selector still surfaces a useful error here
+          // instead of being mislabelled as a missing element.
+          let nodeList: NodeListOf<Element>;
+          try { nodeList = document.querySelectorAll(sel); }
+          catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (err instanceof DOMException && err.name === 'SyntaxError') {
+              return { __syntaxError: true as const, message: msg };
+            }
+            return null;
+          }
+          if (nodeList.length === 0) return null;
+          let el: HTMLElement | null = null;
+          for (const c of Array.from(nodeList)) {
+            const he = c as HTMLElement;
+            const r = he.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+            const cs = window.getComputedStyle(he);
+            if (cs.display === 'none' || cs.visibility === 'hidden'
+                || cs.opacity === '0') continue;
+            el = he;
+            break;
+          }
+          // Fallback to first match — preserves the existing zero-size
+          // error path for callers (clickSelector throws when nothing
+          // visible was found).
+          if (!el) el = nodeList[0] as HTMLElement;
           if (!el) return null;
           if (ensure) {
             const pre = el.getBoundingClientRect();
@@ -1118,23 +1754,273 @@ export class PageWrapper {
     },
   ): Promise<{ x: number; y: number; rect: { x: number; y: number; w: number; h: number } }> {
     const [rect] = await this.getRects([selector], { ensureVisible: opts?.ensureVisible ?? true });
+    if (rect && '__syntaxError' in rect) {
+      throw new BadRequest(
+        `clickSelector: invalid CSS syntax in selector ${selector}: ${rect.message}`,
+      );
+    }
     if (!rect || !rect.visible) {
-      throw new Error(`clickSelector: selector not found or zero-size: ${selector}`);
+      throw new BadRequest(`clickSelector: selector not found or zero-size: ${selector}`);
     }
     const x = Math.round(rect.cx);
     const y = Math.round(rect.cy);
+
+    // Coverage check — same shape as the A1 preclick validator in
+    // clickElement, mirroring the labelMismatch escape in clickInBbox.
+    // MUST run BEFORE the crosshair emit, otherwise the live viewer
+    // flashes a green target while we abort dispatch — that's the
+    // exact "burst but page doesn't change" bug clickInBbox already
+    // fixed at line 1244 (return-before-emit on labelMismatch).
+    //
+    // We accept either an exact match (`top === expected`) or an
+    // expected-contains-top relationship (the click bubbles up — this
+    // covers the legitimate `<label for><input/></label>` case where
+    // the input occludes its label centre). Any other top element is
+    // an overlay or wrong frame; abort with a structured 400 so the
+    // bridge can surface the reason.
+    if (process.env.SUPERBROWSER_PRECLICK_VALIDATE !== '0') {
+      const validation = await this.page.evaluate(
+        (args: { sel: string; cx: number; cy: number }) => {
+          const expected = document.querySelector(args.sel) as HTMLElement | null;
+          if (!expected) return { ok: false as const, reason: 'no_expected' as const };
+          let stack: Element[] = [];
+          try { stack = document.elementsFromPoint(args.cx, args.cy); } catch { stack = []; }
+          if (stack.length === 0) {
+            return { ok: false as const, reason: 'empty_stack' as const };
+          }
+          const top = stack[0] as HTMLElement;
+          if (top === expected || expected.contains(top)) {
+            return { ok: true as const };
+          }
+          if (top.tagName.toLowerCase() === 'iframe') {
+            return { ok: false as const, reason: 'target_in_iframe' as const };
+          }
+          const overlayTag = top.tagName.toLowerCase();
+          const overlayId = top.id ? `#${top.id}` : '';
+          const overlayCls = (top.className && typeof top.className === 'string')
+            ? `.${top.className.split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
+            : '';
+          return {
+            ok: false as const,
+            reason: 'covered_by_overlay' as const,
+            overlay: `${overlayTag}${overlayId}${overlayCls}`,
+          };
+        },
+        { sel: selector, cx: x, cy: y },
+      );
+      if (!validation.ok) {
+        const detail = ('overlay' in validation && validation.overlay)
+          ? ` by ${validation.overlay}` : '';
+        throw new BadRequest(
+          `clickSelector: target validation failed (${validation.reason}${detail}) for selector: ${selector}`,
+        );
+      }
+    }
+
+    // Cosmetic cursor sweep — the live-view overlay only animates when
+    // mouse_move bus events arrive, and the deterministic dispatch
+    // below skips humanClick (no Bezier sweep). Emit a short
+    // interpolated travel so the cursor doesn't appear to teleport.
+    // No effect on CDP — purely overlay.
+    //
+    // GATE on `linear` to avoid double-sweep when the caller opts INTO
+    // humanization (`linear: false`). `humanClick` starts its Bezier
+    // path from a RANDOM offset of the target (humanize.ts:95-96), not
+    // from lastCursor — so emitting our linear sweep first would land
+    // the cursor at the target, then humanClick would jump it back to
+    // a random nearby point and re-sweep. Visible jitter. When `linear`
+    // is true (the default for selector clicks), humanClick is skipped
+    // and our sweep is the only animation the overlay sees.
+    const willBeLinear = opts?.linear ?? true;
     if (this.sessionId) {
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, x, y);
+      }
       inputEventBus.emitClickTarget(this.sessionId, x, y, true, undefined, selector);
     }
     const client = await this.getCDPSession();
     await dispatchClick(client, x, y, {
       button: opts?.button,
       clickCount: opts?.clickCount,
-      linear: opts?.linear ?? true,  // selector-based default: deterministic
+      linear: willBeLinear,
       sessionId: this.sessionId,
     });
     await this.waitForIdle(1000).catch(() => {});
     return { x, y, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } };
+  }
+
+  /**
+   * Phase D — selector click scoped to an <iframe>. The brain calls
+   * `browser_click_selector(selector='button.start', in_iframe='#quiz')`
+   * when the target lives inside an embedded frame. Resolution path:
+   *
+   *  1. Resolve the iframe host element in the main document via
+   *     page.$(`hostSelector`). 400 if missing.
+   *  2. Walk page.frames() to find the matching Puppeteer Frame for
+   *     that host (URL-match / boundingBox containment).
+   *  3. Run `frame.evaluate(querySelector + getBoundingClientRect)`
+   *     to get the inner element's frame-local rect. 400 if missing.
+   *  4. Translate frame-local centre → viewport coords using the host
+   *     iframe's bounding box (works for same-origin AND cross-origin
+   *     OOPIFs because the host element is always reachable from the
+   *     parent document).
+   *  5. Dispatch a CDP click at the viewport coords. Chromium's
+   *     compositor routes hit-tests through the OOPIF.
+   */
+  async clickSelectorInIframe(
+    hostSelector: string,
+    selector: string,
+    opts?: {
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+      linear?: boolean;
+    },
+  ): Promise<{
+    x: number;
+    y: number;
+    rect: { x: number; y: number; w: number; h: number };
+    iframe_host: string;
+    frame_url: string;
+    native_select?: boolean;
+    focused_iframe_input?: boolean;
+  }> {
+    // Step 1+2: resolve host element + matching Frame.
+    const hostHandle = await this.page.$(hostSelector);
+    if (!hostHandle) {
+      throw new BadRequest(
+        `clickSelectorInIframe: iframe host not found: ${hostSelector}`,
+      );
+    }
+    const hostBox = await hostHandle.boundingBox();
+    if (!hostBox || hostBox.width <= 0 || hostBox.height <= 0) {
+      await hostHandle.dispose();
+      throw new BadRequest(
+        `clickSelectorInIframe: iframe host zero-size or off-page: ${hostSelector}`,
+      );
+    }
+    const frame = await hostHandle.contentFrame();
+    await hostHandle.dispose();
+    if (!frame) {
+      throw new BadRequest(
+        `clickSelectorInIframe: contentFrame() returned null for ${hostSelector}`
+        + ' — the host may be a sandboxed iframe with srcdoc/about:blank.',
+      );
+    }
+
+    // Step 3: frame-local selector resolution.
+    const inner = await frame.evaluate((sel: string) => {
+      // Visibility-aware querySelector: walk querySelectorAll and pick
+      // the first non-zero-rect match. Mirrors the top-level getRects
+      // resilience (page.ts:1485) so a closed-listbox sibling earlier
+      // in DOM order doesn't shadow the visible target.
+      let chosen: Element | null = null;
+      try {
+        const list = document.querySelectorAll(sel);
+        for (const el of Array.from(list)) {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { chosen = el; break; }
+        }
+      } catch (e) {
+        return { __syntaxError: true as const, message: (e as Error).message };
+      }
+      if (!chosen) return null;
+      const r = (chosen as HTMLElement).getBoundingClientRect();
+      return {
+        x: r.x, y: r.y, w: r.width, h: r.height,
+        cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+        // Phase G: surface the inner element's tag so the caller can
+        // flag native <select> clicks (which don't open dropdowns via
+        // CDP — bridge directs the brain at browser_select_option).
+        tag: chosen.tagName.toLowerCase(),
+      };
+    }, selector);
+    if (inner && '__syntaxError' in inner) {
+      throw new BadRequest(
+        `clickSelectorInIframe: invalid CSS in inner selector ${selector}: ${inner.message}`,
+      );
+    }
+    if (!inner) {
+      throw new BadRequest(
+        `clickSelectorInIframe: inner selector not found or zero-size: ${selector}`
+        + ` (inside ${hostSelector})`,
+      );
+    }
+
+    // Step 4: translate frame-local centre → viewport coords.
+    const x = Math.round(hostBox.x + inner.cx);
+    const y = Math.round(hostBox.y + inner.cy);
+    const rect = {
+      x: Math.round(hostBox.x + inner.x),
+      y: Math.round(hostBox.y + inner.y),
+      w: Math.round(inner.w),
+      h: Math.round(inner.h),
+    };
+
+    const willBeLinear = opts?.linear ?? true;
+    if (this.sessionId) {
+      if (willBeLinear) {
+        await inputEventBus.emitSweep(this.sessionId, x, y);
+      }
+      inputEventBus.emitClickTarget(
+        this.sessionId, x, y, true, undefined,
+        `${hostSelector} >> ${selector}`,
+      );
+    }
+
+    // Step 5: CDP click at viewport coords.
+    const client = await this.getCDPSession();
+    await dispatchClick(client, x, y, {
+      button: opts?.button,
+      clickCount: opts?.clickCount,
+      linear: willBeLinear,
+      sessionId: this.sessionId,
+    });
+    await this.waitForIdle(1000).catch(() => {});
+
+    // Phase J: explicit focus for iframe inputs. CDP
+    // Input.dispatchMouseEvent at viewport coords reliably routes the
+    // hit-test through the compositor to the iframe element, but the
+    // FOCUS transfer for cross-frame inputs is not always carried
+    // along — Chromium occasionally leaves focus on the outer
+    // document.body. When the very next call is `browser_keys` (the
+    // typical sequence for filling iframe inputs), keys silently fly
+    // into document.body instead of the input.
+    //
+    // Force focus inside the iframe for text-bearing targets. Skip
+    // <select> (focus is set by CDP click and explicit focus may
+    // open the native dropdown which CDP can't drive anyway), skip
+    // buttons / links (no keyboard input expected).
+    const focusableTag =
+      inner.tag === 'input' || inner.tag === 'textarea';
+    if (focusableTag) {
+      try {
+        await frame.evaluate((sel: string) => {
+          const list = document.querySelectorAll(sel);
+          for (const el of Array.from(list)) {
+            const r = (el as HTMLElement).getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              try { (el as HTMLElement).focus(); } catch (_) { /* ignore */ }
+              break;
+            }
+          }
+        }, selector);
+      } catch {
+        /* best-effort — never block on focus transfer */
+      }
+    }
+
+    return {
+      x, y, rect,
+      iframe_host: hostSelector,
+      frame_url: frame.url(),
+      // Phase G: surface inner tag so the bridge can hint the brain
+      // at browser_select_option when the target is a native <select>.
+      native_select: inner.tag === 'select' ? true : undefined,
+      // Phase J: indicate that we explicitly focused an iframe-internal
+      // input. The bridge can surface this so the brain knows the
+      // next `browser_keys` will reliably land in the right field.
+      focused_iframe_input: focusableTag ? true : undefined,
+    };
   }
 
   async dragSelectors(
@@ -1156,6 +2042,16 @@ export class PageWrapper {
       [fromSelector, toSelector],
       { ensureVisible: true },
     );
+    if (fromRect && '__syntaxError' in fromRect) {
+      throw new Error(
+        `dragSelectors: invalid CSS syntax in fromSelector ${fromSelector}: ${fromRect.message}`,
+      );
+    }
+    if (toRect && '__syntaxError' in toRect) {
+      throw new Error(
+        `dragSelectors: invalid CSS syntax in toSelector ${toSelector}: ${toRect.message}`,
+      );
+    }
     if (!fromRect || !fromRect.visible) {
       throw new Error(`dragSelectors: fromSelector not found: ${fromSelector}`);
     }
@@ -1183,13 +2079,27 @@ export class PageWrapper {
       } catch { return ''; }
     };
 
+    // Cosmetic cursor sweeps for the linear path — same rationale as
+    // clickSelector: when `linear: true`, the dispatch teleports and
+    // emits no `mouse_move` bus events, so the overlay shows no
+    // intermediate frames. Gated on linear to avoid double-sweep when
+    // humanClick/humanDrag is running its own Bezier animation.
     const tryClickClick = async (): Promise<void> => {
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, fx, fy);
+      }
       await dispatchClick(client, fx, fy, { linear, sessionId: this.sessionId });
       await new Promise((r) => setTimeout(r, opts?.holdMs ?? 120));
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, tx, ty);
+      }
       await dispatchClick(client, tx, ty, { linear, sessionId: this.sessionId });
       await this.waitForIdle(600).catch(() => {});
     };
     const tryDrag = async (): Promise<void> => {
+      if (linear && this.sessionId) {
+        await inputEventBus.emitSweep(this.sessionId, fx, fy);
+      }
       await dispatchDrag(client, fx, fy, tx, ty, {
         linear, steps: opts?.steps, sessionId: this.sessionId,
       });
@@ -1333,15 +2243,25 @@ export class PageWrapper {
         : toAbs(value as number);
 
       // String-based evaluate to avoid esbuild __name helper injection
-      // when the TS source is loaded via tsx watch.
-      const src = `(function(sel, target){
-        var first = document.querySelector(sel);
+      // when the TS source is loaded via tsx watch. Uses shadow-DOM-
+      // piercing helpers so custom elements (mds-slider on chase.com,
+      // any Lit/React widget that hosts a native range input inside an
+      // open shadow root) resolve. After setting .value we ALSO fire
+      // input/change on the shadow host so widget-level listeners
+      // recompute — the inner-input event doesn't always escape.
+      const src = SHADOW_DOM_HELPERS_SRC + `;(function(sel, target){
+        var first = __sb_queryDeep(document, sel);
         if (!first) return { ok: false, reason: 'not-found' };
         var els = [first];
         if (Array.isArray(target)) {
+          // Look in the same root as 'first' for sibling range inputs.
+          var rootScope = first.getRootNode ? first.getRootNode() : document;
           var parent = first.parentElement;
           if (parent) {
-            var sibs = Array.prototype.slice.call(parent.querySelectorAll('input[type="range"]'));
+            var sibs = __sb_queryAllDeep(parent, 'input[type="range"]');
+            if (sibs.length < 2 && rootScope && rootScope !== document) {
+              sibs = __sb_queryAllDeep(rootScope, 'input[type="range"]');
+            }
             if (sibs.length >= 2) els = sibs.slice(0, 2);
           }
         }
@@ -1361,6 +2281,7 @@ export class PageWrapper {
           if (setter) setter.call(el, String(v)); else el.value = String(v);
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
+          __sb_dispatchHostSignal(el, ['input','change']);
         }
         var after = els.map(function(e){ return parseFloat(e.value); });
         return { ok: true, before: before, after: after };
@@ -1387,8 +2308,8 @@ export class PageWrapper {
         && (method === 'auto' || method === 'keyboard')) {
       const target = Array.isArray(value) ? toAbs(value[0]) : toAbs(value);
       // Need current value + viewport rect to focus.
-      const stateSrc = `(function(sel){
-        var el = document.querySelector(sel);
+      const stateSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
         var r = el.getBoundingClientRect();
         var aNow = el.getAttribute('aria-valuenow');
@@ -1426,8 +2347,8 @@ export class PageWrapper {
             if (i % 25 === 24) await new Promise((r) => setTimeout(r, 8));
           }
         }
-        const afterSrc = `(function(sel){
-          var el = document.querySelector(sel);
+        const afterSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+          var el = __sb_queryDeep(document, sel);
           if (!el) return null;
           var aNow = el.getAttribute('aria-valuenow');
           if (aNow != null) return parseFloat(aNow);
@@ -1455,10 +2376,20 @@ export class PageWrapper {
                 ? (value - min) / Math.max(1e-9, (max - min))
                 : 0.5))
         : (as === 'ratio' ? value[0] : 0.5);
-      const rectSrc = `(function(sel){
-        var el = document.querySelector(sel);
+      const rectSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
+        // closest() walks light-DOM ancestors only; for shadow-rooted
+        // sliders the track is usually a sibling/parent in the same root,
+        // so closest still resolves it. If not, fall back to the host.
         var track = el.closest('[role="slider"],[class*="slider" i],[class*="track" i]') || el;
+        if (track === el) {
+          var rootScope = el.getRootNode ? el.getRootNode() : null;
+          if (rootScope && rootScope.host) {
+            var hostTrack = rootScope.host.closest && rootScope.host.closest('[role="slider"],[class*="slider" i],[class*="track" i]');
+            if (hostTrack) track = hostTrack;
+          }
+        }
         var tr = track.getBoundingClientRect();
         var hr = el.getBoundingClientRect();
         return {
@@ -1490,8 +2421,8 @@ export class PageWrapper {
       });
       await this.waitForIdle(400).catch(() => {});
       // Best-effort read-back (range input exposes .value; others may not).
-      const afterSrc2 = `(function(sel){
-        var el = document.querySelector(sel);
+      const afterSrc2 = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+        var el = __sb_queryDeep(document, sel);
         if (!el) return null;
         var aNow = el.getAttribute('aria-valuenow');
         if (aNow != null) return parseFloat(aNow);
@@ -1531,8 +2462,8 @@ export class PageWrapper {
     const main = this.page.mainFrame();
     const sorted = [main, ...frames.filter((f) => f !== main)];
     const framesSearched: string[] = [];
-    const probeSrc = `(function(sel){
-      var el = document.querySelector(sel);
+    const probeSrc = SHADOW_DOM_HELPERS_SRC + `;(function(sel){
+      var el = __sb_queryDeep(document, sel);
       if (!el) return null;
       var tag = el.tagName.toLowerCase();
       var type = (el.type || '').toLowerCase();
@@ -1618,7 +2549,7 @@ export class PageWrapper {
     bbox: { x: number; y: number; w: number; h: number };
     label: string;
   }>> {
-    const scanSrc = `(function(){
+    const scanSrc = SHADOW_DOM_HELPERS_SRC + `;(function(){
       try {
         var out = [];
         // Heuristic selector: native range, ARIA sliders, and elements
@@ -1633,7 +2564,7 @@ export class PageWrapper {
           '[class*="slider-handle" i]',
           '[data-handle]',
         ].join(',');
-        var found = Array.prototype.slice.call(document.querySelectorAll(sel));
+        var found = __sb_queryAllDeep(document, sel);
         var seen = new Set();
         for (var i = 0; i < found.length; i++) {
           var el = found[i];
@@ -1652,33 +2583,31 @@ export class PageWrapper {
           if (tag === 'input' && type === 'range') kind = 'range-input';
           else if (role === 'slider' || el.hasAttribute('aria-valuenow')) kind = 'aria-slider';
 
-          // Find the nearest row-level label (same textContent scanner
-          // we use in dragSliderUntil). Looks up to 120px above/below.
+          // Find the nearest row-level label across light DOM + shadow
+          // roots. Looks up to 120px above/below the handle row.
           var hcy = r.top + r.height / 2;
           var ytol = Math.max(r.height * 4, 80);
           var label = '';
           var bestDy = Infinity;
-          var walker = document.createTreeWalker(
-            document.body || document.documentElement,
-            NodeFilter.SHOW_ELEMENT, null);
-          var cand;
-          while ((cand = walker.nextNode())) {
-            if (cand === el || cand.contains(el)) continue;
-            var cr = cand.getBoundingClientRect();
-            if (!cr || cr.width === 0 || cr.height === 0) continue;
-            if (cr.height > 80) continue;
+          var elRef = el;
+          __sb_walkDeepElements(document.body || document.documentElement, function(cand) {
+            if (cand === elRef) return;
+            try { if (cand.contains && cand.contains(elRef)) return; } catch(e){}
+            var cr = cand.getBoundingClientRect ? cand.getBoundingClientRect() : null;
+            if (!cr || cr.width === 0 || cr.height === 0) return;
+            if (cr.height > 80) return;
             var text = (cand.textContent || '').replace(/\\s+/g, ' ').trim();
-            if (!text || text.length > 200 || text.length < 3) continue;
+            if (!text || text.length > 200 || text.length < 3) return;
             var ccy = cr.top + cr.height / 2;
             var dy = Math.abs(ccy - hcy);
-            if (dy > ytol) continue;
+            if (dy > ytol) return;
             // Prefer labels that contain a letter (skip pure "25" tick marks).
-            if (!/[A-Za-z]/.test(text)) continue;
+            if (!/[A-Za-z]/.test(text)) return;
             if (dy < bestDy) {
               bestDy = dy;
               label = text;
             }
-          }
+          });
 
           out.push({
             kind: kind,
@@ -1700,16 +2629,9 @@ export class PageWrapper {
     const main = this.page.mainFrame();
     const ordered = [main, ...frames.filter((f) => f !== main)];
     for (const frame of ordered) {
-      let offX = 0, offY = 0;
-      if (frame !== main) {
-        try {
-          const fe = await frame.frameElement();
-          if (fe) {
-            const box = await fe.boundingBox();
-            if (box) { offX = box.x; offY = box.y; }
-          }
-        } catch { /* skip */ }
-      }
+      const off = await this.getFrameOffset(frame);
+      const offX = off.x;
+      const offY = off.y;
       try {
         const hits = (await frame.evaluate(scanSrc)) as
           Array<{ kind: 'range-input' | 'aria-slider' | 'custom';
@@ -1791,35 +2713,29 @@ export class PageWrapper {
     // textContent concatenates descendants into one string. Filters
     // (height <= 80, textContent <= 300) keep us on row-sized elements
     // and reject large ancestors (body, main) that would match anything.
-    const scanSrc = (handleCyLocal: number, yTolerance: number) => `(function(pat, hcy, ytol){
+    const scanSrc = (handleCyLocal: number, yTolerance: number) => SHADOW_DOM_HELPERS_SRC + `;(function(pat, hcy, ytol){
       try {
         var re = new RegExp(pat);
         var best = null;
-        var walker = document.createTreeWalker(
-          document.body || document.documentElement,
-          NodeFilter.SHOW_ELEMENT,
-          null
-        );
-        var el;
-        while ((el = walker.nextNode())) {
-          var r = el.getBoundingClientRect();
-          if (!r || r.width === 0 || r.height === 0) continue;
-          if (r.height > 80) continue;
+        __sb_walkDeepElements(document.body || document.documentElement, function(el) {
+          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!r || r.width === 0 || r.height === 0) return;
+          if (r.height > 80) return;
           var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-          if (!text || text.length > 300) continue;
+          if (!text || text.length > 300) return;
           var m = re.exec(text);
-          if (!m) continue;
+          if (!m) return;
           var num = parseFloat(m[1]);
-          if (!isFinite(num)) continue;
+          if (!isFinite(num)) return;
           var cy = r.top + r.height / 2;
           var dy = Math.abs(cy - hcy);
-          if (dy > ytol) continue;
+          if (dy > ytol) return;
           var area = r.width * r.height;
           if (best === null || dy < best.dy || (dy === best.dy && area < best.area)) {
             best = { dy: dy, area: area, value: num, text: text,
                      x: r.left, y: r.top, w: r.width, h: r.height };
           }
-        }
+        });
         return best ? { value: best.value, text: best.text,
                         x: best.x, y: best.y, w: best.w, h: best.h } : null;
       } catch (e) { return null; }
@@ -1835,17 +2751,8 @@ export class PageWrapper {
     }> => {
       const frames = this.page.frames();
       for (const frame of frames) {
-        let offX = 0, offY = 0;
-        if (frame !== this.page.mainFrame()) {
-          try {
-            const fe = await frame.frameElement();
-            if (fe) {
-              const box = await fe.boundingBox();
-              if (box) { offX = box.x; offY = box.y; }
-            }
-          } catch { /* skip */ }
-        }
-        const localCy = handleCy - offY;
+        const off = await this.getFrameOffset(frame);
+        const localCy = handleCy - off.y;
         // Only scan frames whose viewport could contain the handle row.
         // (Handles the case of mini-iframes unrelated to the slider.)
         try {
@@ -1871,24 +2778,20 @@ export class PageWrapper {
       // element-walk + textContent logic as the main scanner, so the
       // LLM sees what labels ARE on the row (e.g. "Age Range: 25 to 75")
       // and can adjust the regex accordingly.
-      const sampleSrc = `(function(hcy, ytol){
+      const sampleSrc = SHADOW_DOM_HELPERS_SRC + `;(function(hcy, ytol){
         try {
           var out = [];
-          var walker = document.createTreeWalker(
-            document.body || document.documentElement,
-            NodeFilter.SHOW_ELEMENT, null);
-          var el;
-          while ((el = walker.nextNode())) {
-            var r = el.getBoundingClientRect();
-            if (!r || r.width === 0 || r.height === 0) continue;
-            if (r.height > 80) continue;
+          __sb_walkDeepElements(document.body || document.documentElement, function(el) {
+            var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!r || r.width === 0 || r.height === 0) return;
+            if (r.height > 80) return;
             var text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-            if (!text || text.length > 300) continue;
+            if (!text || text.length > 300) return;
             var cy = r.top + r.height / 2;
-            if (Math.abs(cy - hcy) > ytol) continue;
+            if (Math.abs(cy - hcy) > ytol) return;
             out.push(text);
-            if (out.length >= 10) break;
-          }
+            if (out.length >= 10) return false;
+          });
           return out;
         } catch(e) { return []; }
       })(${handleCy}, ${yTolerance})`;
@@ -2033,15 +2936,286 @@ export class PageWrapper {
     frame: import('puppeteer-core').Frame,
   ): Promise<{ x: number; y: number }> {
     if (frame === this.page.mainFrame()) return { x: 0, y: 0 };
+    // Primary: ask Puppeteer for the frame's host element. Works for
+    // same-origin and most cross-origin frames.
     try {
       const handle = await frame.frameElement();
-      if (!handle) return { x: 0, y: 0 };
-      const box = await handle.boundingBox();
-      if (!box) return { x: 0, y: 0 };
-      return { x: box.x, y: box.y };
+      if (handle) {
+        const box = await handle.boundingBox();
+        if (box) return { x: box.x, y: box.y };
+      }
     } catch {
-      return { x: 0, y: 0 };
+      /* fall through to URL-match fallback */
     }
+    // Fallback: scan the parent frame for an <iframe> whose .src matches
+    // this frame's url. Cross-origin iframes can throw on frameElement()
+    // but the host iframe element is always reachable from the parent
+    // frame's DOM. Returning {0,0} silently lands drag coords in the
+    // wrong place — surface a warning when both paths fail.
+    try {
+      const parent = frame.parentFrame() ?? this.page.mainFrame();
+      const url = frame.url();
+      const offset = await parent.evaluate((targetUrl: string) => {
+        const iframes = Array.prototype.slice.call(
+          document.querySelectorAll('iframe'),
+        ) as HTMLIFrameElement[];
+        for (const f of iframes) {
+          if (f.src === targetUrl || (f.contentWindow && f.contentWindow.location && f.contentWindow.location.href === targetUrl)) {
+            const r = f.getBoundingClientRect();
+            return { x: r.x, y: r.y };
+          }
+        }
+        return null;
+      }, url);
+      if (offset) return offset;
+    } catch {
+      /* swallow */
+    }
+    console.warn(
+      `[page.getFrameOffset] could not resolve offset for frame ${frame.url()}; using (0,0)`,
+    );
+    return { x: 0, y: 0 };
+  }
+
+  /**
+   * Phase B helper — find the Puppeteer Frame whose host iframe
+   * contains the given viewport coords, returning the frame plus the
+   * coords translated into iframe-local space. Used by
+   * `clickInIframeFrame` when in-page descent (Phase A) hit a cross-
+   * origin iframe boundary. Walks `page.frames()` skipping the main
+   * frame; for each non-main frame, resolves its host bounding box via
+   * `frameElement().boundingBox()` (works for same-origin AND most
+   * cross-origin iframes — see `getFrameOffset`'s URL-match fallback).
+   * Picks the deepest match (innermost iframe wins on nested cases).
+   */
+  private async findFrameForIframeAt(
+    vx: number,
+    vy: number,
+  ): Promise<{
+    frame: import('puppeteer-core').Frame;
+    localX: number;
+    localY: number;
+    hostBox: { x: number; y: number; w: number; h: number };
+  } | null> {
+    let best: {
+      frame: import('puppeteer-core').Frame;
+      localX: number;
+      localY: number;
+      hostBox: { x: number; y: number; w: number; h: number };
+      area: number;
+    } | null = null;
+    for (const frame of this.page.frames()) {
+      if (frame === this.page.mainFrame()) continue;
+      let box: { x: number; y: number; width: number; height: number } | null = null;
+      try {
+        const handle = await frame.frameElement();
+        if (handle) box = await handle.boundingBox();
+      } catch {
+        /* x-origin frameElement may throw; fall through */
+      }
+      if (!box) {
+        // Use getFrameOffset's URL-match fallback for x-origin frames
+        // whose frameElement() throws — gives us {x,y} but not w/h, so
+        // we skip nested iframe disambiguation in that case.
+        const off = await this.getFrameOffset(frame);
+        if (off.x === 0 && off.y === 0) continue;
+        box = { x: off.x, y: off.y, width: 1, height: 1 };
+      }
+      if (vx < box.x || vx > box.x + box.width
+       || vy < box.y || vy > box.y + box.height) continue;
+      const area = Math.max(1, box.width * box.height);
+      if (!best || area < best.area) {
+        // Smaller area = deeper / more specific match (iframe nested
+        // inside another iframe). Prefer the innermost.
+        best = {
+          frame,
+          localX: vx - box.x,
+          localY: vy - box.y,
+          hostBox: { x: box.x, y: box.y, w: box.width, h: box.height },
+          area,
+        };
+      }
+    }
+    if (!best) return null;
+    return {
+      frame: best.frame,
+      localX: best.localX,
+      localY: best.localY,
+      hostBox: best.hostBox,
+    };
+  }
+
+  /**
+   * Phase B — server-side cross-origin OOPIF click fallback. Invoked
+   * by the /click handler when `clickInBbox` returns
+   * `warning === 'target_in_iframe_cross_origin'` (Phase A's in-page
+   * descent could not access `iframe.contentDocument` due to SOP).
+   *
+   * Strategy: walk `page.frames()` to find the iframe hosting the
+   * bbox center. Run a frame-local snap inside `frame.evaluate()` to
+   * find the inner interactive element. Dispatch the CDP click at
+   * the recomputed viewport coords — Chromium's compositor routes it
+   * to the OOPIF for most cases. On dispatch failure (zero DOM
+   * mutation), the existing js/keyboard escalation ladder in the
+   * /click handler picks up the recovery path.
+   */
+  async clickInIframeFrame(
+    bbox: { x0: number; y0: number; x1: number; y1: number },
+    options?: {
+      button?: 'left' | 'right' | 'middle';
+      clickCount?: number;
+      expectedLabel?: string;
+      linear?: boolean;
+    },
+  ): Promise<{
+    x: number;
+    y: number;
+    snapped: boolean;
+    target?: string;
+    targetXpath?: string;
+    warning?: string;
+    iframe_chain?: string[];
+    native_select?: boolean;
+  }> {
+    const cx = Math.round((bbox.x0 + bbox.x1) / 2);
+    const cy = Math.round((bbox.y0 + bbox.y1) / 2);
+    const found = await this.findFrameForIframeAt(cx, cy);
+    if (!found) {
+      return { x: cx, y: cy, snapped: false, warning: 'iframe_not_resolved' };
+    }
+    const { frame, localX, localY, hostBox } = found;
+
+    // Frame-local snap. Two-stage: pinpoint at the bbox centre, then
+    // 5×5 grid scan inside the bbox if pinpoint misses. The grid scan
+    // is critical for iframe targets — vision bboxes for iframe
+    // content are often loose (cover whitespace + the actual button),
+    // so the centre lands on padding. Mirrors Phase 2 grid scan from
+    // the top-level snap.
+    const bboxLocal = {
+      x0: bbox.x0 - hostBox.x, y0: bbox.y0 - hostBox.y,
+      x1: bbox.x1 - hostBox.x, y1: bbox.y1 - hostBox.y,
+    };
+    const snap = await frame.evaluate(
+      (args: {
+        lx: number; ly: number;
+        b: { x0: number; y0: number; x1: number; y1: number };
+        expectedLabel: string;
+      }) => {
+        const SEL = 'a,button,input,select,textarea,'
+          + '[role="button"],[role="link"],[role="checkbox"],'
+          + '[role="tab"],[role="menuitem"],[onclick],[tabindex]';
+        const xpathOf = (el: Element): string => {
+          const parts: string[] = [];
+          let cur: Element | null = el;
+          while (cur && cur.nodeType === 1
+                 && cur !== document.documentElement.parentElement) {
+            const t = cur.tagName.toLowerCase();
+            let idx = 1;
+            let sib: Element | null = cur.previousElementSibling;
+            while (sib) {
+              if (sib.tagName.toLowerCase() === t) idx += 1;
+              sib = sib.previousElementSibling;
+            }
+            parts.unshift(`${t}[${idx}]`);
+            cur = cur.parentElement;
+          }
+          return '/' + parts.join('/');
+        };
+        const buildResult = (interactive: Element, method: string) => {
+          const r = (interactive as HTMLElement).getBoundingClientRect();
+          const tag = interactive.tagName.toLowerCase();
+          const id = (interactive as HTMLElement).id ? `#${(interactive as HTMLElement).id}` : '';
+          const txt = ((interactive as HTMLElement).textContent || '').trim().slice(0, 30);
+          return {
+            localCx: Math.round(r.left + r.width / 2),
+            localCy: Math.round(r.top + r.height / 2),
+            target: `${tag}${id}${txt ? `[${txt}]` : ''}`,
+            targetXpath: xpathOf(interactive),
+            tag,
+            method,
+          };
+        };
+        // Stage 1: pinpoint at bbox centre.
+        let stack: Element[] = [];
+        try { stack = document.elementsFromPoint(args.lx, args.ly); } catch { stack = []; }
+        const centre = stack.find(
+          (el) => el !== document.documentElement && el !== document.body,
+        );
+        if (centre) {
+          let interactive: Element | null = null;
+          for (const el of stack) {
+            if (el === document.documentElement || el === document.body) break;
+            try {
+              if ((el as Element).matches(SEL)) { interactive = el as Element; break; }
+            } catch { /* ignore */ }
+          }
+          if (!interactive) {
+            interactive = (centre as Element).closest(SEL) || centre;
+          }
+          return buildResult(interactive, 'pinpoint');
+        }
+        // Stage 2: 5×5 grid scan inside the bbox (frame-local coords).
+        // Picks the largest interactive whose rect overlaps the bbox.
+        let best: Element | null = null;
+        let bestArea = 0;
+        for (let i = 1; i < 5; i++) {
+          for (let j = 1; j < 5; j++) {
+            const px = args.b.x0 + ((args.b.x1 - args.b.x0) * i) / 5;
+            const py = args.b.y0 + ((args.b.y1 - args.b.y0) * j) / 5;
+            let s: Element[] = [];
+            try { s = document.elementsFromPoint(px, py); } catch { s = []; }
+            for (const el of s) {
+              const hit = (el as Element).closest(SEL);
+              if (!hit) continue;
+              const r = (hit as HTMLElement).getBoundingClientRect();
+              const ix = Math.max(0, Math.min(r.right, args.b.x1) - Math.max(r.left, args.b.x0));
+              const iy = Math.max(0, Math.min(r.bottom, args.b.y1) - Math.max(r.top, args.b.y0));
+              const area = ix * iy;
+              if (area > bestArea) { bestArea = area; best = hit; }
+            }
+          }
+        }
+        if (!best) return null;
+        return buildResult(best, 'grid_scan');
+      },
+      {
+        lx: localX,
+        ly: localY,
+        b: bboxLocal,
+        expectedLabel: options?.expectedLabel ?? '',
+      },
+    );
+    if (!snap) {
+      return { x: cx, y: cy, snapped: false, warning: 'iframe_no_target' };
+    }
+    // Translate frame-local centre back to viewport coords. Chromium's
+    // compositor uses viewport coords for hit-testing across the OOPIF
+    // boundary, so this is the right input for CDP dispatch.
+    const dispatchX = Math.round(hostBox.x + snap.localCx);
+    const dispatchY = Math.round(hostBox.y + snap.localCy);
+    const client = await this.getCDPSession();
+    await dispatchClick(client, dispatchX, dispatchY, {
+      ...options,
+      sessionId: this.sessionId,
+    });
+    await this.waitForIdle(800).catch(() => {});
+    // Best-effort xpath of the host iframe for telemetry. We don't
+    // have a direct frame.frameElement xpath helper — log the URL and
+    // a synthetic marker so the brain knows descent was the cross-
+    // origin path.
+    const frameUrl = frame.url();
+    return {
+      x: dispatchX,
+      y: dispatchY,
+      snapped: true,
+      target: snap.target,
+      targetXpath: snap.targetXpath,
+      warning: 'target_in_iframe_resolved',
+      iframe_chain: [`x-origin:${frameUrl.slice(0, 80)}`],
+      // Phase G: surface native <select> via the snap.tag field we
+      // captured in the frame.evaluate above.
+      native_select: snap.tag === 'select' ? true : undefined,
+    };
   }
 
   /**
@@ -2146,8 +3320,48 @@ export class PageWrapper {
         await dispatchClick(client, coords.x, coords.y, { sessionId: this.sessionId });
         await new Promise((r) => setTimeout(r, 100));
 
+        const focusedOk = await this.page.evaluate((sel: string) => {
+          const target = document.querySelector(sel) as HTMLElement | null;
+          const active = document.activeElement as HTMLElement | null;
+          if (!target || !active) return false;
+          return target === active
+            || target.contains(active)
+            || active.contains(target);
+        }, selector);
+        if (!focusedOk) {
+          try {
+            await this.page.evaluate((sel: string) => {
+              const el = document.querySelector(sel) as HTMLElement | null;
+              if (el) (el as HTMLElement).focus();
+            }, selector);
+            await new Promise((r) => setTimeout(r, 80));
+            const refocused = await this.page.evaluate((sel: string) => {
+              const target = document.querySelector(sel) as HTMLElement | null;
+              const active = document.activeElement as HTMLElement | null;
+              if (!target || !active) return false;
+              return target === active
+                || target.contains(active)
+                || active.contains(target);
+            }, selector);
+            if (!refocused) {
+              return {
+                success: false,
+                reason: 'focus_lost',
+                tried,
+                error: 'Click landed but focus moved before type — likely a dropdown stole focus.',
+                alternatives: [
+                  'Take a fresh screenshot and pick the input by V_n',
+                  'If an autocomplete is open, browser_click_at the suggestion you want',
+                ],
+              };
+            }
+          } catch {
+            /* best-effort — fall through to type attempt */
+          }
+        }
+
         if (clear) {
-          await clearField(client, coords.x, coords.y);
+          await clearField(client, this.page, coords.x, coords.y);
           await new Promise((r) => setTimeout(r, 50));
         }
 
@@ -3063,34 +4277,17 @@ export class PageWrapper {
     resolvedContainer: string;
   }> {
     // 1. Resolve the container selector. If the caller supplied one, use it.
-    //    Otherwise auto-detect.
+    //    Otherwise auto-detect — multi-signal: aria-controls of an open
+    //    trigger (strongest), known popup roles, then descendants that
+    //    look like an open dropdown by their children's roles
+    //    (menuitemcheckbox/menuitemradio/option/menuitem). For each
+    //    popup candidate, search BOTH up the ancestor chain AND down
+    //    the descendant tree for a scrollable element — many sites
+    //    (Material UI, Radix Select, Best Buy) put the overflow:auto
+    //    on a wrapper INSIDE the popup, not on the popup itself.
     let resolved = (opts.containerSelector ?? '').trim();
     if (!resolved) {
       resolved = await this.page.evaluate(() => {
-        // Heuristic: the most recently opened popup is usually the one we
-        // want. Look for visible listbox/menu/dialog/headlessui-open
-        // candidates and pick the one with the largest z-index (top of
-        // the stack), preferring those whose scrollable ancestor has
-        // overflowable content.
-        const popupSelectors = [
-          '[role="listbox"]:not([aria-hidden="true"])',
-          '[role="menu"]:not([aria-hidden="true"])',
-          '[role="dialog"]:not([aria-hidden="true"])',
-          '[data-headlessui-state="open"]',
-          '[data-state="open"]',
-        ];
-        const findScrollHost = (start: HTMLElement | null): HTMLElement | null => {
-          let cur: HTMLElement | null = start;
-          while (cur && cur !== document.body) {
-            const cs = window.getComputedStyle(cur);
-            const oy = cs.overflowY;
-            if ((oy === 'auto' || oy === 'scroll') && cur.scrollHeight > cur.clientHeight + 4) {
-              return cur;
-            }
-            cur = cur.parentElement;
-          }
-          return null;
-        };
         const isVisible = (el: HTMLElement): boolean => {
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) return false;
@@ -3098,36 +4295,131 @@ export class PageWrapper {
           if (cs.visibility === 'hidden' || cs.display === 'none') return false;
           return true;
         };
-        type Candidate = { host: HTMLElement; z: number };
+        const isScrollable = (el: HTMLElement): boolean => {
+          const cs = window.getComputedStyle(el);
+          const oy = cs.overflowY;
+          return (oy === 'auto' || oy === 'scroll')
+              && el.scrollHeight > el.clientHeight + 4;
+        };
+        // Walk UP the ancestor chain looking for the first scrollable
+        // element. Skips document.body which is page-level scroll, not
+        // popup-inner.
+        const findScrollHostUp = (start: HTMLElement | null): HTMLElement | null => {
+          let cur: HTMLElement | null = start;
+          while (cur && cur !== document.body) {
+            if (isScrollable(cur)) return cur;
+            cur = cur.parentElement;
+          }
+          return null;
+        };
+        // Walk DOWN inside `root`, BFS, looking for the first scrollable
+        // descendant. Capped at depth/breadth to avoid pathological cost
+        // on large popups. Returns the FIRST match in BFS order so the
+        // innermost wrapping scroller wins for nested layouts.
+        const findScrollHostDown = (root: HTMLElement): HTMLElement | null => {
+          const queue: HTMLElement[] = [];
+          for (const c of Array.from(root.children) as HTMLElement[]) {
+            queue.push(c);
+          }
+          let inspected = 0;
+          while (queue.length && inspected < 200) {
+            const cur = queue.shift()!;
+            inspected += 1;
+            if (isScrollable(cur)) return cur;
+            for (const c of Array.from(cur.children) as HTMLElement[]) {
+              queue.push(c);
+            }
+          }
+          return null;
+        };
+        // Resolve a popup candidate to its scroll host: try the element
+        // itself, then walk DOWN inside it (most sites — Material UI,
+        // Radix Select, Best Buy — put overflow on an inner wrapper),
+        // then walk UP for the rare case where the scrollable parent
+        // contains the popup.
+        const resolveHost = (popup: HTMLElement): HTMLElement | null => {
+          if (isScrollable(popup)) return popup;
+          const down = findScrollHostDown(popup);
+          if (down) return down;
+          return findScrollHostUp(popup);
+        };
+        type Candidate = { host: HTMLElement; popup: HTMLElement; z: number };
         const candidates: Candidate[] = [];
+        const seen = new Set<HTMLElement>();
+        const tryAdd = (popup: HTMLElement) => {
+          if (!isVisible(popup)) return;
+          if (seen.has(popup)) return;
+          seen.add(popup);
+          const host = resolveHost(popup);
+          if (!host) return;
+          const z = parseInt(window.getComputedStyle(host).zIndex || '0', 10);
+          candidates.push({ host, popup, z: isNaN(z) ? 0 : z });
+        };
+        // Signal 1 (strongest): aria-controls target of any element with
+        // aria-expanded="true". This is the canonical ARIA pattern —
+        // the open trigger names its popup by id. When the brain just
+        // clicked a dropdown trigger, this nails the right popup.
+        const expanded = Array.from(
+          document.querySelectorAll<HTMLElement>('[aria-expanded="true"][aria-controls]'),
+        );
+        for (const trig of expanded) {
+          const ctrlId = (trig.getAttribute('aria-controls') || '').trim();
+          if (!ctrlId) continue;
+          // aria-controls may be a space-separated list of IDs.
+          for (const id of ctrlId.split(/\s+/)) {
+            const target = document.getElementById(id);
+            if (target instanceof HTMLElement) tryAdd(target);
+          }
+        }
+        // Signal 2: known popup roles + framework open markers.
+        const popupSelectors = [
+          '[role="listbox"]:not([aria-hidden="true"])',
+          '[role="menu"]:not([aria-hidden="true"])',
+          '[role="dialog"]:not([aria-hidden="true"])',
+          '[data-headlessui-state="open"]',
+          '[data-state="open"]',
+          '[data-radix-popper-content-wrapper]',
+        ];
         for (const sel of popupSelectors) {
           for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
-            if (!isVisible(el)) continue;
-            // The popup itself may scroll, OR its scrollable ancestor may.
-            let host: HTMLElement | null = null;
-            const cs = window.getComputedStyle(el);
-            if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
-                && el.scrollHeight > el.clientHeight + 4) {
-              host = el;
-            } else {
-              host = findScrollHost(el);
-            }
-            if (!host) continue;
-            const z = parseInt(window.getComputedStyle(host).zIndex || '0', 10);
-            candidates.push({ host, z: isNaN(z) ? 0 : z });
+            tryAdd(el);
           }
+        }
+        // Signal 3: any visible element whose children include 2+
+        // visible option/menuitem-style entries. Catches custom
+        // dropdowns that omit ARIA on the wrapper. We promote the
+        // CLOSEST common ancestor (the option's parent) as the popup
+        // candidate — that's usually the right scroll surface or its
+        // wrapper.
+        const optionLike = Array.from(document.querySelectorAll<HTMLElement>(
+          '[role="option"], [role="menuitem"],'
+          + ' [role="menuitemcheckbox"], [role="menuitemradio"]',
+        )).filter(isVisible);
+        const byParent = new Map<HTMLElement, number>();
+        for (const opt of optionLike) {
+          const p = opt.parentElement;
+          if (!p) continue;
+          byParent.set(p, (byParent.get(p) || 0) + 1);
+        }
+        for (const [parent, n] of byParent) {
+          if (n >= 2) tryAdd(parent);
         }
         // Fallback: scrollable ancestor of focused element.
         if (candidates.length === 0 && document.activeElement
             && document.activeElement !== document.body) {
-          const host = findScrollHost(document.activeElement as HTMLElement);
-          if (host) candidates.push({ host, z: 0 });
+          const host = findScrollHostUp(document.activeElement as HTMLElement);
+          if (host) {
+            candidates.push({ host, popup: host, z: 0 });
+          }
         }
         if (candidates.length === 0) return '';
-        // Pick smallest scroll-host that contains a [role=option] if any do
-        // (more likely to be the actual menu); otherwise fall back to z-index.
+        // Prefer hosts that contain option-like children — those are the
+        // actual menu containers, not page-level scroll wrappers.
         const withOptions = candidates.filter(
-          (c) => c.host.querySelector('[role="option"], [role="menuitem"]'),
+          (c) => c.host.querySelector(
+            '[role="option"], [role="menuitem"],'
+            + ' [role="menuitemcheckbox"], [role="menuitemradio"]',
+          ),
         );
         const pool = withOptions.length ? withOptions : candidates;
         pool.sort((a, b) => {
@@ -3135,7 +4427,6 @@ export class PageWrapper {
           return a.host.scrollHeight - b.host.scrollHeight;
         });
         const winner = pool[0].host;
-        // Tag for stable reuse this turn.
         const id = `sb-scroll-host-${Math.random().toString(36).slice(2, 10)}`;
         winner.setAttribute('data-sb-scroll-host', id);
         return `[data-sb-scroll-host="${id}"]`;
@@ -3225,6 +4516,143 @@ export class PageWrapper {
       startScrollY: startY,
       resolvedContainer: resolved,
       containerSelector: resolved,
+    };
+  }
+
+  // --- Scroll a bbox into view (page or inner popup) ---
+  //
+  // Given a CSS-pixel bbox, pick the right scroll surface (the nearest
+  // scrollable popup ancestor of the element at the bbox center, or
+  // the page if no inner popup), and scroll so the bbox is fully on
+  // screen. Used by both `browser_scroll_to_bbox` and the auto-scroll
+  // step inside `bbox_click` so the brain never has to call
+  // `browser_scroll_within` to position a dropdown option before
+  // clicking it.
+  async scrollBboxIntoView(bbox: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  }): Promise<{
+    scrolled: boolean;
+    containerKind: 'page' | 'popup' | 'already_visible';
+    deltaY: number;
+    newBbox: { x0: number; y0: number; x1: number; y1: number };
+  }> {
+    const result = await this.page.evaluate((b: {
+      x0: number; y0: number; x1: number; y1: number;
+    }) => {
+      const cx = (b.x0 + b.x1) / 2;
+      const cy = (b.y0 + b.y1) / 2;
+      const findScrollHost = (start: HTMLElement | null): HTMLElement | null => {
+        let cur: HTMLElement | null = start;
+        while (cur && cur !== document.body) {
+          const cs = window.getComputedStyle(cur);
+          const oy = cs.overflowY;
+          if ((oy === 'auto' || oy === 'scroll')
+              && cur.scrollHeight > cur.clientHeight + 4) {
+            return cur;
+          }
+          cur = cur.parentElement;
+        }
+        return null;
+      };
+      // Probe the element at the bbox center. If outside the viewport,
+      // we won't get a hit — fall back to using the bbox center as a
+      // direction signal for window scroll.
+      const vw = window.innerWidth || 0;
+      const vh = window.innerHeight || 0;
+      const padding = 24;
+      const fullyInViewport = (
+        b.x0 >= 0 && b.x1 <= vw
+        && b.y0 >= 0 && b.y1 <= vh
+      );
+      if (fullyInViewport) {
+        return {
+          scrolled: false,
+          containerKind: 'already_visible' as const,
+          deltaY: 0,
+          newBbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 },
+        };
+      }
+      // Try inner popup first: look for an open listbox/menu/dialog
+      // whose rect contains the bbox center.
+      const popupSelectors = [
+        '[role="listbox"]:not([aria-hidden="true"])',
+        '[role="menu"]:not([aria-hidden="true"])',
+        '[role="dialog"]:not([aria-hidden="true"])',
+        '[data-headlessui-state="open"]',
+        '[data-state="open"]',
+      ];
+      let innerHost: HTMLElement | null = null;
+      for (const sel of popupSelectors) {
+        for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          if (cx < r.left || cx > r.right) continue;
+          // The bbox center is horizontally inside this popup — its
+          // scroll host is the right surface. (Vertical containment
+          // is intentionally skipped: the bbox may be vertically OUTSIDE
+          // the popup's current viewport, which is exactly the case we
+          // need to scroll for.)
+          const cs = window.getComputedStyle(el);
+          if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+              && el.scrollHeight > el.clientHeight + 4) {
+            innerHost = el;
+          } else {
+            innerHost = findScrollHost(el);
+          }
+          if (innerHost) break;
+        }
+        if (innerHost) break;
+      }
+      if (innerHost) {
+        const hostRect = innerHost.getBoundingClientRect();
+        // We want bbox center to be at host's vertical center.
+        const desiredCenterY = hostRect.top + hostRect.height / 2;
+        const deltaInner = Math.round(cy - desiredCenterY);
+        const beforeY = innerHost.scrollTop;
+        innerHost.scrollBy(0, deltaInner);
+        const afterY = innerHost.scrollTop;
+        const actualDelta = afterY - beforeY;
+        // Re-read bbox after inner scroll: rect shifts by -actualDelta
+        // relative to viewport since the inner container moved up by
+        // actualDelta px.
+        const newY0 = b.y0 - actualDelta;
+        const newY1 = b.y1 - actualDelta;
+        return {
+          scrolled: actualDelta !== 0,
+          containerKind: 'popup' as const,
+          deltaY: actualDelta,
+          newBbox: { x0: b.x0, y0: newY0, x1: b.x1, y1: newY1 },
+        };
+      }
+      // Fall through: page-level scroll.
+      const desiredCenterY = vh / 2;
+      const deltaPage = Math.round(cy - desiredCenterY);
+      const beforeScrollY = window.scrollY || window.pageYOffset || 0;
+      window.scrollBy(0, deltaPage);
+      const afterScrollY = window.scrollY || window.pageYOffset || 0;
+      const actualPageDelta = afterScrollY - beforeScrollY;
+      return {
+        scrolled: actualPageDelta !== 0,
+        containerKind: 'page' as const,
+        deltaY: actualPageDelta,
+        newBbox: {
+          x0: b.x0,
+          y0: b.y0 - actualPageDelta,
+          x1: b.x1,
+          y1: b.y1 - actualPageDelta,
+        },
+      };
+    }, bbox);
+    // Let layout settle before caller re-snaps for click.
+    await new Promise((r) => setTimeout(r, 120));
+    return result as {
+      scrolled: boolean;
+      containerKind: 'page' | 'popup' | 'already_visible';
+      deltaY: number;
+      newBbox: { x0: number; y0: number; x1: number; y1: number };
     };
   }
 

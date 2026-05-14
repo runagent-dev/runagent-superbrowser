@@ -296,15 +296,16 @@ export class BrowserEngine extends EventEmitter {
       downloadPath: this.config.downloadDir,
     });
 
-    // Block heavy resources if ad-blocking enabled
+    // Block known ad/tracker URL patterns when blockAds is enabled.
+    // 'media' and 'font' resource types are deliberately NOT blocked:
+    // many sites gate body visibility on @font-face load (FOUT-prevention
+    // CSS like `body { visibility: hidden } body.fonts-loaded { visibility:
+    // visible }`), so aborting fonts leaves the page blank until timeout.
     if (this.config.blockAds) {
       await page.setRequestInterception(true);
       page.on('request', (req) => {
-        const resourceType = req.resourceType();
         const url = req.url();
 
-        // Block common ad/tracker domains and heavy resources
-        const blockedTypes = ['media', 'font'];
         const blockedPatterns = [
           /doubleclick\.net/,
           /google-analytics\.com/,
@@ -313,11 +314,6 @@ export class BrowserEngine extends EventEmitter {
           /analytics/,
           /adservice/,
         ];
-
-        if (blockedTypes.includes(resourceType)) {
-          req.abort().catch(() => {});
-          return;
-        }
 
         if (blockedPatterns.some((p) => p.test(url))) {
           req.abort().catch(() => {});

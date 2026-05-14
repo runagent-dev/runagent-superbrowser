@@ -41,6 +41,7 @@ from .tools import (
     BrowserRunScriptTool,
     BrowserUndoLastClickTool,
     BrowserScreenshotTool,
+    BrowserScrollToBboxTool,
     BrowserScrollTool,
     BrowserScrollUntilTool,
     BrowserScrollWithinTool,
@@ -76,13 +77,15 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserScreenshotTool(state),
         BrowserClickTool(state),
         BrowserClickAtTool(state),
+        BrowserClickSelectorTool(state),   # CSS-selector click; supports in_iframe
         BrowserTypeAtTool(state),
         BrowserFixTextAtTool(state),
         BrowserTypeTool(state),
         BrowserKeysTool(state),
         BrowserScrollTool(state),
-        BrowserScrollUntilTool(state),     # kept: scroll-until-target helper
-        BrowserScrollWithinTool(state),    # in-popup/listbox scroll
+        BrowserScrollToBboxTool(state),    # scroll labelled V_n into view
+        BrowserScrollUntilTool(state),     # DEPRECATED: text-based scan (kept for legacy callers)
+        BrowserScrollWithinTool(state),    # in-popup/listbox scroll (requires container_selector)
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
         BrowserFormPlanTool(state),
@@ -91,7 +94,6 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserWaitForTool(state),
         BrowserDragTool(state),
         BrowserGetRectTool(state),         # kept: DOM rect helper
-        BrowserClickSelectorTool(state),   # kept: DOM-selector fast path
         BrowserDragSelectorsTool(state),   # kept: selector-based drag
         BrowserDragPathTool(state),        # kept: polyline drag
         BrowserSetSliderTool(state),       # kept: slider family for ChaseIRA calc

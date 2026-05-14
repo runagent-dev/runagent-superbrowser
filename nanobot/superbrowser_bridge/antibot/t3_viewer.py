@@ -51,19 +51,31 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
 <title>T3 viewer · {sid}</title>
 <style>
   :root {{
+    color-scheme: light dark;
     --bg: #0f1115; --panel: #181a20; --panel-2: #1f222a;
     --border: #2a2e38; --text: #e9ecf2; --muted: #8b93a7;
-    --accent: #4f8cff; --ok: #34d399; --warn: #ffc857; --err: #ff6b6b;
+    --accent: #4f8cff; --accent-2: #2d6a4f; --ok: #34d399;
+    --warn: #ffc857; --warn-bg: #3a2a00; --err: #ff6b6b;
   }}
-  * {{ box-sizing: border-box; }}
+  @media (prefers-color-scheme: light) {{
+    :root {{
+      --bg: #f7f8fb; --panel: #ffffff; --panel-2: #f0f2f7;
+      --border: #e1e5ee; --text: #11161f; --muted: #5c6577;
+      --warn-bg: #fff8e0;
+    }}
+  }}
+  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
   html, body {{ margin: 0; height: 100%; background: var(--bg); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; }}
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    overscroll-behavior: none; }}
   header {{
     display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    padding-top: max(10px, env(safe-area-inset-top));
     background: var(--panel); border-bottom: 1px solid var(--border);
     position: sticky; top: 0; z-index: 10;
   }}
@@ -87,6 +99,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   header .status {{ font-size: 11px; color: var(--accent); min-width: 80px; text-align: right; }}
   #screen-wrap {{
     position: relative; display: flex; justify-content: center; padding: 12px;
+    touch-action: manipulation;
   }}
   #screen {{
     max-width: 100%; height: auto;
@@ -120,6 +133,16 @@ _HTML_TEMPLATE = r"""<!doctype html>
     animation: bbox-fade 0.8s ease-out forwards;
   }}
   .click-bbox.miss {{ border-color: var(--warn); }}
+  /* Strategy chip — shows which click ladder rung landed
+     (primary/keyboard/js/parent). Helps debug fallback paths. */
+  .click-bbox .strategy-chip {{
+    position: absolute; top: -16px; right: -1px;
+    font: 9px/14px ui-monospace, SFMono-Regular, Consolas, monospace;
+    background: rgba(0,0,0,0.7); color: #fff;
+    padding: 0 4px; border-radius: 3px 3px 0 0;
+    white-space: nowrap;
+  }}
+  .click-bbox.miss .strategy-chip {{ background: rgba(120,80,0,0.85); }}
   @keyframes bbox-fade {{
     from {{ opacity: 1; }}
     to   {{ opacity: 0; }}
@@ -134,9 +157,17 @@ _HTML_TEMPLATE = r"""<!doctype html>
     border: 2px dashed rgba(79,140,255,0.6);
     border-radius: 2px; transition: opacity 0.4s ease;
   }}
-  .vision-bbox[data-role="captcha_tile"] {{ border-color: rgba(255,107,107,0.75); }}
-  .vision-bbox[data-role="slider_handle"] {{ border-color: rgba(255,200,87,0.75); }}
-  .vision-bbox[data-relevant="1"] {{ border-style: solid; border-width: 2px; }}
+  /* Role-coded colors mirror src/server/captcha-ui-html.ts so both
+     viewers feel like the same product. button=red, link=green,
+     input/checkbox=cyan, captcha+slider=amber. */
+  .vision-bbox[data-role="button"]         {{ border-color: rgba(255,107,107,0.9); }}
+  .vision-bbox[data-role="link"]           {{ border-color: rgba(150,206,180,0.9); }}
+  .vision-bbox[data-role="input"]          {{ border-color: rgba(78,205,196,0.95); }}
+  .vision-bbox[data-role="checkbox"]       {{ border-color: rgba(78,205,196,0.95); }}
+  .vision-bbox[data-role="captcha_tile"]   {{ border-color: rgba(255,200,87,0.9); }}
+  .vision-bbox[data-role="captcha_widget"] {{ border-color: rgba(255,200,87,0.9); }}
+  .vision-bbox[data-role="slider_handle"]  {{ border-color: rgba(255,200,87,0.9); }}
+  .vision-bbox[data-relevant="1"] {{ border-style: solid; border-width: 3px; }}
   .vision-bbox .vlabel {{
     position: absolute; left: 0; top: -16px;
     font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -164,6 +195,104 @@ _HTML_TEMPLATE = r"""<!doctype html>
     background: var(--panel);
     border-top: 1px solid var(--border);
   }}
+  /* Instruction banner — surfaces human-input requests (captcha hints,
+     countdown). Visibility toggled by JS when /human-input poll
+     returns a pending request. */
+  #instruct {{
+    padding: 12px 14px; background: var(--warn-bg); color: var(--warn);
+    border-bottom: 1px solid var(--border); display: none;
+    font-size: 14px; line-height: 1.4;
+  }}
+  #instruct.visible {{ display: block; }}
+  #instruct .label {{ font-weight: 600; margin-right: 6px; }}
+  #instruct .countdown {{ float: right; font-variant-numeric: tabular-nums; opacity: 0.85; }}
+  /* Status strip between screen and action bar. */
+  #status-strip {{
+    padding: 4px 14px; font-size: 12px; color: var(--muted);
+    min-height: 18px; text-align: center;
+  }}
+  #status-strip .err {{ color: var(--err); }}
+  #status-strip .ok {{ color: var(--ok); }}
+  /* Sticky bottom action bar with Type / Stuck / Done buttons. */
+  .actions {{
+    display: flex; gap: 8px; padding: 10px 14px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--border);
+    position: sticky; bottom: 0; z-index: 10;
+  }}
+  .actions button {{
+    flex: 1; min-height: 44px; /* iOS touch target */
+    padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text);
+    font-size: 15px; font-weight: 500;
+    cursor: pointer; transition: background 0.12s ease;
+  }}
+  .actions button:active {{ background: var(--border); }}
+  .actions button.primary {{
+    background: var(--accent-2); border-color: var(--accent-2); color: white;
+  }}
+  .actions button.primary:active {{ background: #1f4d39; }}
+  .actions button.warn {{ background: transparent; color: var(--muted); }}
+  .actions button.hidden {{ display: none; }}
+  /* Type modal — bottom sheet on mobile, centered on desktop. */
+  #type-modal {{
+    display: none;
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.55); backdrop-filter: blur(4px);
+    align-items: flex-end; justify-content: center;
+    z-index: 100;
+  }}
+  @media (min-width: 600px) {{
+    #type-modal {{ align-items: center; }}
+  }}
+  #type-modal.visible {{ display: flex; }}
+  #type-modal .inner {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px 14px 0 0; padding: 18px 16px;
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+    width: 100%; max-width: 480px;
+  }}
+  @media (min-width: 600px) {{
+    #type-modal .inner {{ border-radius: 14px; }}
+  }}
+  #type-modal h3 {{ margin: 0 0 10px; font-size: 16px; }}
+  #type-modal textarea {{
+    width: 100%; min-height: 84px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    font-family: inherit; font-size: 16px; /* prevents iOS zoom */
+    resize: vertical;
+  }}
+  #type-modal .row {{
+    display: flex; gap: 8px; margin-top: 12px;
+  }}
+  #type-modal .row button {{
+    flex: 1; min-height: 44px; padding: 10px;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text);
+    font-size: 15px; cursor: pointer;
+  }}
+  #type-modal .row button.primary {{
+    background: var(--accent); border-color: var(--accent); color: white;
+  }}
+  /* Success overlay — shown when a pending human-input clears. */
+  #success {{
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(15,17,21,0.94);
+    align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px;
+    z-index: 200;
+    padding: 24px;
+  }}
+  #success.visible {{ display: flex; }}
+  #success .check {{
+    width: 72px; height: 72px; border-radius: 50%;
+    background: var(--ok);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 40px; color: #003322;
+  }}
+  #success .msg {{ font-size: 17px; text-align: center; max-width: 320px; }}
 </style>
 </head>
 <body>
@@ -174,6 +303,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <button id="pause">Pause</button>
   <div class="status" id="status">connecting…</div>
 </header>
+<div id="instruct">
+  <span class="countdown" id="countdown"></span>
+  <span class="label" id="instruct-label">Action needed:</span>
+  <span id="instruct-msg">waiting…</span>
+</div>
 <div id="screen-wrap">
   <img id="screen" alt="Live browser view"/>
   <div id="cursor-overlay">
@@ -184,10 +318,48 @@ _HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 <div id="typing-indicator"></div>
+<div id="status-strip"></div>
+<div class="actions">
+  <button id="type-btn">Type…</button>
+  <button id="stuck-btn" class="warn hidden">I'm stuck</button>
+  <button id="done-btn" class="primary hidden">Done</button>
+</div>
+<div id="type-modal">
+  <div class="inner">
+    <h3>Type into the focused field</h3>
+    <textarea id="type-input" placeholder="Type text, then Send. Use Enter for newline."></textarea>
+    <div class="row">
+      <button id="type-cancel">Cancel</button>
+      <button id="type-send" class="primary">Send</button>
+    </div>
+  </div>
+</div>
+<div id="success">
+  <div class="check">✓</div>
+  <div class="msg" id="success-msg">Captcha cleared. The agent is resuming.<br>You can return to your chat.</div>
+</div>
 <script>
 (() => {{
   const SESSION_ID = {sid_json};
+  // Token is empty when TOKEN env unset. When present, it's appended
+  // to all fetch URLs and the WS URL so this page works behind the
+  // same Bearer-auth gate the TS server uses.
+  const TOKEN = {token_json};
+  // Parent T1 session id — surfaced as ?parent=<sid> when escalation
+  // happened, so this viewer can poll the TS server's human-input
+  // endpoint on behalf of the original session.
+  const PARENT_SID = {parent_json};
+  // T1 base URL — root of the TS server (port 3100 typically). Used
+  // only for the human-input GET/POST proxy. Falls back to localhost
+  // if SUPERBROWSER_PUBLIC_HOST isn't set; document the limitation
+  // for reverse-proxy deployments.
+  const T1_BASE = {t1_base_json};
   const POLL_MS = 250;
+  const HUMAN_POLL_MS = 1200;
+
+  const qsToken = TOKEN ? ('&token=' + encodeURIComponent(TOKEN)) : '';
+  const qsTokenLead = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
+  const headerToken = TOKEN ? {{ Authorization: 'Bearer ' + TOKEN }} : {{}};
 
   const $ = (id) => document.getElementById(id);
   const screen = $('screen');
@@ -195,10 +367,25 @@ _HTML_TEMPLATE = r"""<!doctype html>
   const cursorEl = $('cursor-overlay');
   const typingEl = $('typing-indicator');
   const statusEl = $('status');
+  const statusStripEl = $('status-strip');
   const urlBanner = $('url-banner');
   const pauseBtn = $('pause');
+  const instructEl = $('instruct');
+  const instructMsg = $('instruct-msg');
+  const instructLabel = $('instruct-label');
+  const countdownEl = $('countdown');
+  const doneBtn = $('done-btn');
+  const stuckBtn = $('stuck-btn');
+  const typeBtn = $('type-btn');
+  const typeModal = $('type-modal');
+  const typeInput = $('type-input');
+  const successOverlay = $('success');
 
-  let viewport = {{ width: 1366, height: 768 }};
+  // Initial guess; the actual size is read from the first screenshot's
+  // naturalWidth/naturalHeight on load. Aligned with the T3 default
+  // viewport (1280x1100) so projectPoint math is sane until the first
+  // frame lands.
+  let viewport = {{ width: 1280, height: 1100 }};
   let paused = false;
   let pollInterval = null;
   let ws = null;
@@ -207,7 +394,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   // --- Screenshot polling (fallback source) -------------------------
   function refresh() {{
     if (paused) return;
-    screen.src = '/t3/session/' + SESSION_ID + '/screenshot?_=' + Date.now();
+    screen.src = '/t3/session/' + SESSION_ID + '/screenshot?_=' + Date.now() + qsToken;
   }}
   screen.addEventListener('load', () => {{
     viewport.width = screen.naturalWidth || viewport.width;
@@ -229,6 +416,18 @@ _HTML_TEMPLATE = r"""<!doctype html>
   pauseBtn.addEventListener('click', () => {{
     paused = !paused;
     pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+  }});
+
+  // --- Visibility API: pause polling when tab is hidden -------------
+  // Saves screenshot bandwidth on backgrounded tabs. WS screencast
+  // continues if it was connected — only the polling fallback pauses.
+  document.addEventListener('visibilitychange', () => {{
+    if (document.hidden) {{
+      stopPolling();
+    }} else {{
+      if (!wsConnected) startPolling();
+      else refresh(); // immediate single fetch to fill any gap
+    }}
   }});
 
   // --- Blob-URL frame setter (CDP screencast path) ------------------
@@ -291,6 +490,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
       box.style.top = tl.y + 'px';
       box.style.width = Math.max(0, br.x - tl.x) + 'px';
       box.style.height = Math.max(0, br.y - tl.y) + 'px';
+      // Strategy chip (when emitted by interactive_session.py click
+      // ladder): tells the operator which rung landed the click.
+      if (d.strategy) {{
+        const chip = document.createElement('span');
+        chip.className = 'strategy-chip';
+        chip.textContent = d.strategy;
+        if (d.target) chip.title = d.target;
+        box.appendChild(chip);
+      }}
       screenWrap.appendChild(box);
       setTimeout(() => {{ try {{ box.remove(); }} catch (e) {{}} }}, 850);
     }}
@@ -395,7 +603,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
   function connectWS() {{
     try {{
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = proto + '//' + location.host + '/t3/session/' + SESSION_ID + '/ws';
+      const wsUrl = proto + '//' + location.host + '/t3/session/' + SESSION_ID + '/ws'
+        + qsTokenLead;
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {{
         wsConnected = true;
@@ -417,6 +626,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
             updateCursor(msg.payload.x, msg.payload.y);
             break;
           case 'click_target':
+            // Reposition the cursor SVG to the click site even if no
+            // cursor_move arrived first. Late subscribers + js/parent
+            // click strategies skip _move_cursor_smooth, so otherwise
+            // they'd see click rings with no arrow.
+            if (msg.payload && typeof msg.payload.x === 'number') {{
+              updateCursor(msg.payload.x, msg.payload.y);
+            }}
             showClickTarget(msg.payload);
             break;
           case 'vision_bboxes':
@@ -438,9 +654,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
             showNavigation(msg.payload);
             break;
           case 'drag':
-            // Render as two rapid click-targets at the endpoints.
+            // Render as two rapid click-targets at the endpoints, and
+            // glide the cursor SVG between them so the operator sees
+            // the drag direction even if no cursor_move events landed.
+            if (msg.payload && typeof msg.payload.startX === 'number') {{
+              updateCursor(msg.payload.startX, msg.payload.startY);
+            }}
             showClickTarget({{ x: msg.payload.startX, y: msg.payload.startY, snapped: true }});
-            setTimeout(() => showClickTarget({{ x: msg.payload.endX, y: msg.payload.endY, snapped: true }}), 200);
+            setTimeout(() => {{
+              if (typeof msg.payload.endX === 'number') {{
+                updateCursor(msg.payload.endX, msg.payload.endY);
+              }}
+              showClickTarget({{ x: msg.payload.endX, y: msg.payload.endY, snapped: true }});
+            }}, 200);
             break;
         }}
       }};
@@ -478,9 +704,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const x = Math.round((e.clientX - rect.left) * (natW / rect.width));
     const y = Math.round((e.clientY - rect.top) * (natH / rect.height));
     try {{
-      await fetch('/t3/session/' + SESSION_ID + '/click', {{
+      await fetch('/t3/session/' + SESSION_ID + '/click' + qsTokenLead, {{
         method: 'POST',
-        headers: {{ 'content-type': 'application/json' }},
+        headers: Object.assign({{ 'content-type': 'application/json' }}, headerToken),
         body: JSON.stringify({{ x, y }}),
       }});
       statusEl.textContent = 'tap (' + x + ',' + y + ')';
@@ -488,11 +714,229 @@ _HTML_TEMPLATE = r"""<!doctype html>
       statusEl.textContent = 'tap failed';
     }}
   }});
+
+  // --- Type modal: pipe text via /t3/session/<sid>/keys -------------
+  // The viewer already auto-focuses whatever element was clicked, so
+  // typing here lands in the field the operator just tapped. Each
+  // char is dispatched as one /keys call so the agent's
+  // emit_keystroke fires per char (mirrors the T1 pattern at
+  // captcha-ui-html.ts:684-700).
+  typeBtn.addEventListener('click', () => {{
+    typeModal.classList.add('visible');
+    setTimeout(() => typeInput.focus(), 50);
+  }});
+  $('type-cancel').addEventListener('click', () => {{
+    typeModal.classList.remove('visible');
+    typeInput.value = '';
+  }});
+  $('type-send').addEventListener('click', async () => {{
+    const text = typeInput.value;
+    typeModal.classList.remove('visible');
+    typeInput.value = '';
+    if (!text) return;
+    let sent = 0;
+    for (const ch of text) {{
+      try {{
+        await fetch('/t3/session/' + SESSION_ID + '/keys' + qsTokenLead, {{
+          method: 'POST',
+          headers: Object.assign({{ 'content-type': 'application/json' }}, headerToken),
+          body: JSON.stringify({{ keys: [ch === '\n' ? 'Enter' : ch] }}),
+        }});
+        sent++;
+      }} catch (err) {{ /* keep going on transient failures */ }}
+      await new Promise(r => setTimeout(r, 40));
+    }}
+    statusStripEl.textContent = 'typed ' + sent + ' chars';
+  }});
+
+  // --- Human-input UX (poll the TS server cross-port) ---------------
+  // Captcha challenges and other human-input requests are handled by
+  // the T1 server's HumanInputManager. The T3 viewer reaches it via
+  // T1_BASE+/session/<parent_sid>/human-input. When PARENT_SID is
+  // empty (no escalation, or the URL caller didn't pass ?parent=),
+  // the human-input UI stays hidden.
+  let pendingRequest = null;
+  let pendingSeenAt = 0;
+  let everSeenPending = false;
+  let countdownInterval = null;
+
+  function captchaTypeFromMessage(msg) {{
+    if (!msg) return null;
+    const m = msg.match(/Auto-solve exhausted for (\w+) captcha/i);
+    return m ? m[1] : null;
+  }}
+  function instructionFor(captchaType) {{
+    switch ((captchaType || '').toLowerCase()) {{
+      case 'turnstile': return 'Click the Cloudflare checkbox.';
+      case 'recaptcha': return 'Click "I\'m not a robot", then any image grid that appears.';
+      case 'hcaptcha':  return 'Click the hCaptcha checkbox, then any image grid that appears.';
+      case 'slider':    return 'Drag the slider to match the puzzle.';
+      case 'image':
+      case 'visual_puzzle': return 'Tap the image tiles that match the prompt.';
+      default: return 'Solve the challenge shown above.';
+    }}
+  }}
+  function startCountdown(timeoutMs) {{
+    const deadline = Date.now() + timeoutMs;
+    if (countdownInterval) clearInterval(countdownInterval);
+    const tick = () => {{
+      const remaining = Math.max(0, deadline - Date.now());
+      const m = Math.floor(remaining / 60000);
+      const s = Math.floor((remaining % 60000) / 1000);
+      countdownEl.textContent = (remaining > 0)
+        ? (m + ':' + String(s).padStart(2, '0'))
+        : 'expired';
+    }};
+    tick();
+    countdownInterval = setInterval(tick, 1000);
+  }}
+  function stopCountdown() {{
+    if (countdownInterval) {{ clearInterval(countdownInterval); countdownInterval = null; }}
+    countdownEl.textContent = '';
+  }}
+
+  async function pollHumanInput() {{
+    if (!PARENT_SID || !T1_BASE) return;
+    try {{
+      const r = await fetch(
+        T1_BASE + '/session/' + PARENT_SID + '/human-input',
+        {{ headers: headerToken }},
+      );
+      if (!r.ok) return;
+      const data = await r.json();
+      const newPending = data.pending;
+      if (newPending) {{
+        pendingRequest = newPending;
+        everSeenPending = true;
+        const captchaType = captchaTypeFromMessage(newPending.message);
+        instructLabel.textContent = captchaType
+          ? captchaType.toUpperCase() + ':'
+          : 'Action needed:';
+        instructMsg.textContent = instructionFor(captchaType);
+        instructEl.classList.add('visible');
+        // Reveal Done/Stuck buttons. They're hidden by default so a
+        // viewer with no human-input flow doesn't show dead buttons.
+        doneBtn.classList.remove('hidden');
+        stuckBtn.classList.remove('hidden');
+        if (!countdownInterval && newPending.id !== pendingSeenAt) {{
+          pendingSeenAt = newPending.id;
+          startCountdown(5 * 60 * 1000);
+        }}
+      }} else {{
+        if (everSeenPending && pendingRequest) {{
+          pendingRequest = null;
+          instructEl.classList.remove('visible');
+          stopCountdown();
+          successOverlay.classList.add('visible');
+          doneBtn.classList.add('hidden');
+          stuckBtn.classList.add('hidden');
+        }}
+      }}
+    }} catch (err) {{ /* network blip; keep polling */ }}
+  }}
+  if (PARENT_SID && T1_BASE) {{
+    setInterval(pollHumanInput, HUMAN_POLL_MS);
+    pollHumanInput();
+  }}
+
+  doneBtn.addEventListener('click', async () => {{
+    if (!pendingRequest) {{
+      statusStripEl.textContent = 'no pending request — already resumed?';
+      return;
+    }}
+    try {{
+      const r = await fetch(
+        T1_BASE + '/session/' + PARENT_SID + '/human-input',
+        {{
+          method: 'POST',
+          headers: Object.assign({{ 'Content-Type': 'application/json' }}, headerToken),
+          body: JSON.stringify({{ id: pendingRequest.id, data: {{ done: 'true' }} }}),
+        }},
+      );
+      if (r.ok) {{
+        statusStripEl.textContent = 'marked done; agent will resume';
+      }} else {{
+        statusStripEl.innerHTML = '<span class="err">done failed: '
+          + (await r.text()) + '</span>';
+      }}
+    }} catch (err) {{
+      statusStripEl.innerHTML = '<span class="err">done errored: ' + err + '</span>';
+    }}
+  }});
+
+  stuckBtn.addEventListener('click', async () => {{
+    if (!pendingRequest) {{
+      statusStripEl.textContent = 'no pending request to cancel';
+      return;
+    }}
+    try {{
+      const r = await fetch(
+        T1_BASE + '/session/' + PARENT_SID + '/human-input',
+        {{
+          method: 'POST',
+          headers: Object.assign({{ 'Content-Type': 'application/json' }}, headerToken),
+          body: JSON.stringify({{ id: pendingRequest.id, cancelled: true }}),
+        }},
+      );
+      if (r.ok) {{
+        statusStripEl.textContent = 'cancelled — agent will try alternative path';
+      }} else {{
+        statusStripEl.innerHTML = '<span class="err">cancel failed: '
+          + (await r.text()) + '</span>';
+      }}
+    }} catch (err) {{
+      statusStripEl.innerHTML = '<span class="err">cancel errored: ' + err + '</span>';
+    }}
+  }});
+
+  document.title = 'T3 viewer · ' + SESSION_ID.slice(0, 8);
 }})();
 </script>
 </body>
 </html>
 """
+
+
+def _t1_base_for_template() -> str:
+    """Public origin of the TS server (T1) for cross-port human-input
+    polling from the T3 viewer. Reads SUPERBROWSER_PUBLIC_HOST (set in
+    container deployments) and falls back to http://localhost:3100 for
+    local dev. Behind a reverse proxy that mounts the T1 server on a
+    non-default origin, callers must set SUPERBROWSER_PUBLIC_HOST to
+    the externally reachable URL.
+    """
+    host = os.environ.get("SUPERBROWSER_PUBLIC_HOST", "http://localhost:3100")
+    if "://" not in host:
+        host = f"http://{host}"
+    # Strip trailing slash so JS can concatenate "/session/<sid>/...".
+    return host.rstrip("/")
+
+
+def _check_token(request: web.Request) -> Optional[web.Response]:
+    """Token auth mirroring the TS server pattern at
+    src/server/websocket.ts:83-100. When TOKEN env is set, every
+    request must present `Authorization: Bearer <t>` or `?token=<t>`,
+    EXCEPT loopback origins (127.0.0.1, ::1) when
+    TOKEN_AUTH_LOOPBACK_BYPASS is not "false". Returns None on success;
+    a 401 Response on failure.
+    """
+    token = os.environ.get("TOKEN")
+    if not token:
+        return None
+    # Loopback bypass: lets local dev / curl / docker host-network
+    # callers reach the viewer without juggling the token.
+    bypass = os.environ.get("TOKEN_AUTH_LOOPBACK_BYPASS", "true") != "false"
+    if bypass:
+        peer = request.transport.get_extra_info("peername") if request.transport else None
+        peer_host = peer[0] if peer else ""
+        if peer_host in ("127.0.0.1", "::1", "::ffff:127.0.0.1") or peer_host.startswith("127."):
+            return None
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {token}":
+        return None
+    if request.query.get("token") == token:
+        return None
+    return web.Response(status=401, text="Unauthorized")
 
 
 class _Server:
@@ -516,6 +960,7 @@ class _Server:
             app.router.add_get("/t3/session/{sid}/view", self._view)
             app.router.add_get("/t3/session/{sid}/screenshot", self._screenshot)
             app.router.add_post("/t3/session/{sid}/click", self._click)
+            app.router.add_post("/t3/session/{sid}/keys", self._keys)
             app.router.add_get("/t3/session/{sid}/ws", self._ws)
             self._runner = web.AppRunner(app)
             await self._runner.setup()
@@ -532,11 +977,30 @@ class _Server:
                 await self._site.start()
 
     async def _view(self, request: web.Request) -> web.Response:
+        unauth = _check_token(request)
+        if unauth is not None:
+            return unauth
         sid = request.match_info["sid"]
-        html = _HTML_TEMPLATE.format(sid=sid, sid_json=json.dumps(sid))
+        # `?parent=<t1_sid>` lets the viewer poll the TS server's
+        # human-input endpoint on behalf of the original session that
+        # escalated. Empty when the session never had a T1 parent
+        # (started directly on T3) — the human-input UI then stays
+        # hidden in the JS.
+        parent = request.query.get("parent", "") or ""
+        token = os.environ.get("TOKEN", "") or ""
+        html = _HTML_TEMPLATE.format(
+            sid=sid,
+            sid_json=json.dumps(sid),
+            token_json=json.dumps(token),
+            parent_json=json.dumps(parent),
+            t1_base_json=json.dumps(_t1_base_for_template()),
+        )
         return web.Response(text=html, content_type="text/html")
 
     async def _screenshot(self, request: web.Request) -> web.Response:
+        unauth = _check_token(request)
+        if unauth is not None:
+            return unauth
         sid = request.match_info["sid"]
         try:
             png = await _t3.default().screenshot(sid)
@@ -551,6 +1015,9 @@ class _Server:
         )
 
     async def _click(self, request: web.Request) -> web.Response:
+        unauth = _check_token(request)
+        if unauth is not None:
+            return unauth
         sid = request.match_info["sid"]
         try:
             payload = await request.json()
@@ -568,12 +1035,51 @@ class _Server:
             )
         return web.json_response({"ok": True, "x": x, "y": y})
 
+    async def _keys(self, request: web.Request) -> web.Response:
+        """Forward keystrokes from the type modal to the live patchright
+        page. Body is `{keys: [str, ...]}` matching the shape
+        interactive_session.keys() expects. The type modal sends one
+        char per call so each keystroke also fires emit_keystroke for
+        the typing indicator.
+        """
+        unauth = _check_token(request)
+        if unauth is not None:
+            return unauth
+        sid = request.match_info["sid"]
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        keys = payload.get("keys") or []
+        if isinstance(keys, str):
+            keys = [keys]
+        if not isinstance(keys, list):
+            return web.json_response(
+                {"ok": False, "error": "keys must be a string or list of strings"},
+                status=400,
+            )
+        try:
+            result = await _t3.default().keys(sid, [str(k) for k in keys])
+        except KeyError:
+            return web.json_response({"ok": False, "error": "session not found"}, status=404)
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500,
+            )
+        return web.json_response({"ok": True, **result})
+
     async def _ws(self, request: web.Request) -> web.WebSocketResponse:
         """Subscribe the connecting client to the event bus for this
         session. Pump JSON events as text frames until either side
         disconnects. Heartbeat ping keeps idle connections alive
         through any intermediate proxy.
         """
+        # Auth check fires before the upgrade so a 401 response is a
+        # plain HTTP reply, not a half-open WS that the client has to
+        # interpret. Mirrors websocket.ts:84-100.
+        unauth = _check_token(request)
+        if unauth is not None:
+            return unauth
         sid = request.match_info["sid"]
         ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(request)
@@ -645,9 +1151,21 @@ async def ensure_started() -> str:
     return f"{host.rstrip('/')}:{srv.port}"
 
 
-def view_url(session_id: str) -> str:
+def view_url(session_id: str, *, parent: Optional[str] = None) -> str:
+    """Build the public URL of the T3 viewer for `session_id`.
+
+    `parent` (optional) is the T1 session id this T3 session escalated
+    from. When set, it's appended as `?parent=<t1_sid>` so the viewer's
+    JS knows which session to poll for human-input requests on the
+    TS server. Omit `parent` for sessions that started directly on T3.
+    """
     srv = default()
     host = os.environ.get("SUPERBROWSER_PUBLIC_HOST", "http://localhost")
     if "://" not in host:
         host = f"http://{host}"
-    return f"{host.rstrip('/')}:{srv.port}/t3/session/{session_id}/view"
+    base = f"{host.rstrip('/')}:{srv.port}/t3/session/{session_id}/view"
+    if parent:
+        # Use simple concat — session ids are URL-safe (uuid-like) so a
+        # full quote() round-trip is overkill.
+        return f"{base}?parent={parent}"
+    return base

@@ -46,7 +46,6 @@ class BrowserSessionState:
     # configure_budget() to switch to complexity-aware allocation.
     DEFAULT_SCREENSHOT_BUDGET = 6
     CAPTCHA_MODE_ITERATIONS = 15
-    MAX_CLICK_AT = 3
 
     def __init__(self):
         self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
@@ -58,7 +57,6 @@ class BrowserSessionState:
         self.activity_log: list[str] = []
         # Per-session (reset on each browser_open)
         self.step_counter = 0
-        self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
 
@@ -75,6 +73,11 @@ class BrowserSessionState:
         self.screenshotted_keys: set[tuple[str, str]] = set()
         self.last_screenshot_url: str = ""
         self.last_page_content_hash: str = ""
+        # Wall-clock seconds of the most recent successful screenshot.
+        # Used by the autocomplete-pending click guard to refuse stale
+        # V_n / selector clicks that fire before the brain re-screenshots
+        # to see the dropdown. 0.0 means "never screenshotted yet".
+        self.last_screenshot_at: float = 0.0
         self.step_history: list[dict] = []
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
@@ -160,12 +163,28 @@ class BrowserSessionState:
         # independently so two-in-a-row forces a re-screenshot.
         self.consecutive_click_timeouts: int = 0
         self.MAX_CONSECUTIVE_CLICK_TIMEOUTS = 2
+        # Iframe-miss escalation counter. Tracks consecutive iframe-
+        # failure warnings on the SAME (vision_index, iframe_host_selector)
+        # so click.py can emit a stronger "switch to browser_run_script"
+        # nudge after the brain has re-tried once and missed again. The
+        # standard re-screenshot+click_at advice ships on the first miss;
+        # the run_script escalation fires when count hits the threshold.
+        self.iframe_miss_count: int = 0
+        self.iframe_miss_key: str = ""
+        self.MAX_IFRAME_MISSES_BEFORE_NUDGE = 2
         # Telemetry: how many times the TS-side snap-to-interactive
         # failed to find a clickable descendant inside the bbox we sent.
         # Incremented whenever a click response has snap.snapped=false.
         # Reset on every screenshot. Used to surface "vision bboxes are
         # habitually wrapping non-clickable containers" hints.
         self.snap_miss_count: int = 0
+        # Per-session asyncio.Lock that serializes cursor-driven slider
+        # operations (set_slider_at, drag_slider_until). The CDP /
+        # patchright mouse cursor is session-scoped — concurrent drags
+        # clobber each other. Lazily created by the slider tools the
+        # first time they run, but pre-declared here so attribute
+        # access doesn't AttributeError before the first call.
+        self.slider_drag_lock: Optional[asyncio.Lock] = None
         # Active session ID (set by browser_open)
         self.session_id: str = ""
         # How many times has BrowserOpenTool had to refuse a redundant call?
@@ -288,6 +307,19 @@ class BrowserSessionState:
         self.last_type_text: str = ""
         self.last_type_at: float = 0.0
 
+        # Popup-scroll guard. Set True after a scroll-within (or the
+        # pixel-scroll inside select_option's recovery) so the next
+        # DOM-index click is refused until a fresh screenshot lands.
+        # Reason: scrolling a popup moves option elements to different
+        # DOM positions in the brain's elements list. The brain's
+        # cached [N] indices no longer point at what it thinks; only a
+        # fresh vision pass (with new V_n labels) is reliable.
+        # Cleared by mark_screenshot_taken, or auto-expired after 60s
+        # so a brain that pivots to an unrelated task isn't stuck.
+        self.popup_scroll_pending: bool = False
+        self.popup_scroll_at: float = 0.0
+        self.POPUP_SCROLL_EXPIRY_SECONDS: float = 60.0
+
         # Hierarchical perceive-plan-act state. Populated by the
         # screenshot tool after a vision pass; consumed by the click
         # ladder and the browser_plan_next_steps tool.
@@ -326,6 +358,11 @@ class BrowserSessionState:
         # otherwise lets the brain proceed on cached vision when the
         # prefetch hasn't landed.
         self._pending_vision_task: Optional["asyncio.Task[Any]"] = None
+        # Soft sync flag: ensure_vision_synced sets this when it allowed
+        # dispatch despite a still-in-flight prefetch. build_text_only
+        # consumes it to annotate the response with [vision_lag] so the
+        # brain knows the action may have resolved against stale vision.
+        self._vision_lag_pending: bool = False
         # Wall-clock + brain-turn stamp captured each time the screenshot
         # tool freezes a new vision epoch. Used by the freshness gate to
         # reject clicks against an epoch that's older than
@@ -397,7 +434,6 @@ class BrowserSessionState:
     def reset_per_session(self):
         """Reset per-session counters. Budget is NOT reset."""
         self.step_counter = 0
-        self.click_at_count = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
         # Epoch from a prior session is meaningless for the new one.
@@ -477,6 +513,41 @@ class BrowserSessionState:
             return self._vision_epoch_response
         return self._last_vision_response
 
+    def flag_popup_scroll(self, reason: str = "scroll_within") -> None:
+        """Mark that a popup-internal scroll just happened.
+
+        Triggers two safeguards on the next DOM-index click:
+          1. `BrowserClickTool` refuses with a redirect to bbox click.
+          2. element_fingerprints are cleared so the TS-side stale-index
+             guard also fires if (1) is bypassed.
+        Cleared by the next successful screenshot (mark_screenshot_taken).
+        """
+        import time as _t
+        self.popup_scroll_pending = True
+        self.popup_scroll_at = _t.time()
+        # Invalidate fingerprints — popup options' [N] indices became
+        # stale the moment the list moved.
+        try:
+            self.element_fingerprints = {}
+        except Exception:
+            pass
+
+    def popup_scroll_guard_active(self) -> bool:
+        """True when a popup-scroll guard is currently in effect.
+
+        Auto-expires after `POPUP_SCROLL_EXPIRY_SECONDS` so a brain that
+        pivots to an unrelated task isn't permanently blocked.
+        """
+        if not self.popup_scroll_pending:
+            return False
+        import time as _t
+        if (_t.time() - self.popup_scroll_at) > self.POPUP_SCROLL_EXPIRY_SECONDS:
+            # Expired — release the guard silently.
+            self.popup_scroll_pending = False
+            self.popup_scroll_at = 0.0
+            return False
+        return True
+
     def record_cursor_failure(
         self, *, strategy: str, target: str, reason: str,
     ) -> None:
@@ -508,18 +579,20 @@ class BrowserSessionState:
         return "\n".join(rows)
 
     async def ensure_vision_synced(self, *, reason: str = "pre_action") -> "str | None":
-        """Phase 1.1 hard sync gate. Block until the most recent vision
-        prefetch lands. Returns None on success (caller proceeds), or a
-        structured error string the caller should return as its tool
-        result so the brain re-tries on a fresh state.
+        """Soft sync gate. By default, blocks up to VISION_SOFT_SYNC_TIMEOUT_MS
+        (1500ms) for an in-flight prefetch; on timeout it sets
+        `_vision_lag_pending` and returns None so the tool dispatches anyway.
+        The next response carries a `[vision_lag]` annotation so the brain
+        knows the action may have resolved against slightly-stale vision.
 
-        Skipped entirely when VISION_HARD_SYNC=0 — preserves the legacy
-        soft-budget behavior for rollback.
-
-        Page-type-aware timeout: if VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES
-        is a JSON dict and the last vision response's page_type matches
-        a key, that timeout (ms) is used instead of the global default.
-        Useful for slow form/search pages where 8s isn't enough.
+        Env knobs:
+          VISION_HARD_SYNC=0           — disable the gate entirely.
+          VISION_PROCEED_ON_LAG=0      — restore legacy hard-block behavior
+                                         (returns `[vision_unavailable]`).
+          VISION_SOFT_SYNC_TIMEOUT_MS  — soft wait window (default 1500).
+          VISION_HARD_SYNC_TIMEOUT_MS  — legacy hard-block window (only
+                                         used when proceed-on-lag is off).
+          VISION_HARD_SYNC_PAGE_TYPE_OVERRIDES — per-page-type ms overrides.
         """
         if os.environ.get("VISION_HARD_SYNC", "1") in ("0", "false", "no", "False"):
             return None
@@ -537,6 +610,23 @@ class BrowserSessionState:
                     timeout_ms = int(overrides[page_type])
         except Exception:
             timeout_ms = None
+
+        proceed_on_lag = os.environ.get("VISION_PROCEED_ON_LAG", "1") not in (
+            "0", "false", "no", "False",
+        )
+        if proceed_on_lag:
+            soft_ms = timeout_ms
+            if soft_ms is None:
+                try:
+                    soft_ms = int(os.environ.get("VISION_SOFT_SYNC_TIMEOUT_MS") or "1500")
+                except ValueError:
+                    soft_ms = 1500
+            await _await_vision_required(task, timeout_ms=soft_ms)
+            if not task.done():
+                self._vision_lag_pending = True
+            return None
+
+        # Legacy hard-block path — opt in via VISION_PROCEED_ON_LAG=0.
         await _await_vision_required(task, timeout_ms=timeout_ms)
         if not task.done():
             return (
@@ -649,6 +739,14 @@ class BrowserSessionState:
             self.screenshotted_keys.add((norm, content_hash or ""))
         self.last_screenshot_url = norm
         self.last_page_content_hash = content_hash or ""
+        # Wall-clock for the click-pending-screenshot guard.
+        import time as _t
+        self.last_screenshot_at = _t.time()
+        # Fresh screenshot means vision has had a chance to re-label
+        # the popup. The popup-scroll guard can release.
+        if self.popup_scroll_pending:
+            self.popup_scroll_pending = False
+            self.popup_scroll_at = 0.0
 
     @staticmethod
     def hash_page_content(text: str, scroll_y: int | None = None) -> str:
@@ -834,9 +932,8 @@ class BrowserSessionState:
                 "page. Switch tactic: call browser_screenshot to "
                 "re-observe, then pick a different [V_n]/[index], try a "
                 "different role (e.g., the form's submit button instead "
-                "of the input), try browser_click_selector with a stable "
-                "CSS hook, or browser_wait_for content you expect to "
-                "appear. Do NOT retry this exact target, and do NOT "
+                "of the input), or browser_wait_for content you expect "
+                "to appear. Do NOT retry this exact target, and do NOT "
                 "synthesize clicks via browser_run_script — JS clicks "
                 "are isTrusted=false and bot-detected."
             )
@@ -1177,6 +1274,7 @@ class BrowserSessionState:
         elements_with_bounds: list[dict] | None = None,
         device_pixel_ratio: float = 1.0,
         selector_entries: list[dict] | None = None,
+        iframe_signature: str = "",
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -1211,7 +1309,14 @@ class BrowserSessionState:
             dom_text_hash_of = None  # type: ignore[assignment]
 
         if vision_agent_enabled() and get_vision_agent is not None:
-            dh = dom_hash_of(elements) if dom_hash_of else ""
+            # Phase I: mix in iframe_signature so iframe-internal
+            # mutations bust the vision cache. Empty signature is the
+            # default and preserves legacy behaviour for non-iframe
+            # pages.
+            dh = (
+                dom_hash_of(elements, iframe_signature)
+                if dom_hash_of else ""
+            )
             if dh:
                 self._last_dom_hash = dh
             # Phase 1.2: viewport-aware secondary key — left empty here
@@ -1476,6 +1581,14 @@ class BrowserSessionState:
                 "browser_run_script; JS clicks are isTrusted=false and "
                 "frequently rejected by WAF-protected sites.]"
             )
+        if self._vision_lag_pending:
+            self._vision_lag_pending = False
+            result += (
+                "\n[vision_lag] Vision prefetch was lagging when this action "
+                "dispatched. If the result looks off (clicked the wrong "
+                "element, filled the wrong input), call browser_screenshot "
+                "and retry."
+            )
         return result
 
     # How old a cached vision response can be before we stop piggybacking
@@ -1512,3 +1625,5 @@ class BrowserSessionState:
             return "[CACHED VISION — bboxes still valid; use vision_index=V_n to click]\n" + resp.as_brain_text()
         except Exception:
             return ""
+
+

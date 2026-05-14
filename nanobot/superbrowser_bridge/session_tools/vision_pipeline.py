@@ -1017,7 +1017,16 @@ def _schedule_vision_prefetch(
             agent = get_vision_agent()
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")
-            dh = dom_hash_of(elements) if dom_hash_of else ""
+            # Phase I: include iframe content signature in the cache key
+            # so iframe-internal mutations (quiz question advancing,
+            # calculator value updating) bust the vision cache.
+            # Empty signature falls through to legacy behaviour for
+            # non-iframe pages.
+            iframe_sig = data.get("iframeSignature", "") or ""
+            dh = (
+                dom_hash_of(elements, iframe_sig)
+                if dom_hash_of else ""
+            )
             # Phase 1.2: viewport-aware secondary cache-key signal so
             # the same page at different scroll positions doesn't reuse
             # bboxes captured for the previous viewport.

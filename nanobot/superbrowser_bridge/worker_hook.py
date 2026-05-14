@@ -474,6 +474,60 @@ class BrowserWorkerHook(AgentHook):
             except Exception:
                 pass
 
+        # --- Phase 3.4a: autocomplete-open nudge -----------------------
+        # When vision flags autocomplete_open, list each suggestion bbox
+        # as `Vn — 'label'` so the brain doesn't fall back to keyboard
+        # or raw (x, y). Suppress when the brain just clicked (the click
+        # may itself be the suggestion-pick) or when no clickable
+        # content bboxes were emitted.
+        #
+        # Note: if the vision agent misses the popup (no flag), the
+        # brain still falls through to the post-type AUTOCOMPLETE_OPEN
+        # caption in input_text.py — same recovery: re-screenshot, then
+        # click the V_n vision labels.
+        if os.environ.get("WORKER_AUTOCOMPLETE_HINT", "1") not in ("0", "false", "no"):
+            try:
+                last_resp = getattr(self.state, "_last_vision_response", None)
+                flags = getattr(last_resp, "flags", None) if last_resp else None
+                ac_open = bool(getattr(flags, "autocomplete_open", False)) if flags else False
+                if last_resp and ac_open:
+                    last_step_tool = ""
+                    if self.state.step_history:
+                        last_step_tool = (self.state.step_history[-1].get("tool") or "")
+                    if not last_step_tool.startswith("browser_click"):
+                        anchor = getattr(flags, "autocomplete_anchor_index", None)
+                        bboxes = list(getattr(last_resp, "bboxes", None) or [])
+                        try:
+                            ranked = sorted(bboxes, key=_replicate_bbox_rank)[:50]
+                        except Exception:
+                            ranked = bboxes[:50]
+                        sugg_lines: list[str] = []
+                        for v_n, b in enumerate(ranked, 1):
+                            if anchor is not None and v_n == anchor:
+                                continue
+                            role = (getattr(b, "role", "") or "").lower()
+                            clickable = bool(getattr(b, "clickable", False))
+                            if role == "content" and clickable:
+                                lbl = (getattr(b, "label", "") or "").strip()[:60]
+                                if lbl:
+                                    sugg_lines.append(f"  V{v_n} — {lbl!r}")
+                            if len(sugg_lines) >= 6:
+                                break
+                        if sugg_lines:
+                            anchor_str = f"V{anchor}" if anchor else "the input"
+                            guidance_parts.append(
+                                f"[AUTOCOMPLETE_OPEN anchor={anchor_str}]\n"
+                                "An autocomplete suggestion overlay is visible. "
+                                "Pick ONE suggestion bbox below via "
+                                "browser_click_at(vision_index=V_n) — DO NOT "
+                                "browser_type into this field again, DO NOT "
+                                "browser_keys ArrowDown/Enter (less reliable "
+                                "here):\n"
+                                + "\n".join(sugg_lines)
+                            )
+            except Exception:
+                pass
+
         # --- Phase 3.4: precondition reminder ---------------------------
         # When an intent-relevant bbox has a collapsed parent
         # expand-button, surface a [PRECONDITION] block so the brain
@@ -584,7 +638,6 @@ class BrowserWorkerHook(AgentHook):
                     if (
                         last_tool in {
                             "browser_click", "browser_click_at",
-                            "browser_click_selector",
                         }
                         and self.state.current_url
                         and self.state.url_visit_counts.get(

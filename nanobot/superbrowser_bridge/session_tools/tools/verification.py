@@ -96,6 +96,7 @@ class BrowserVerifyFactTool(Tool):
                 intent="verify fact against page",
                 url=data.get("url", self.s.current_url),
                 elements=data.get("elements"),
+                iframe_signature=data.get("iframeSignature") or "",
             )
         # No screenshot available — still return the caption so the caller
         # can at least reason about the textual state.

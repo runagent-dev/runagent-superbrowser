@@ -2,7 +2,7 @@
 
 `BrowserClickTool` (DOM index), `BrowserClickAtTool` (vision-bbox / coords),
 `BrowserGetRectTool` (read-only rect probe), `BrowserClickSelectorTool`
-(CSS-selector fast path).
+(CSS-selector fast path, supports `in_iframe` for iframe-scoped clicks).
 """
 
 from __future__ import annotations
@@ -28,6 +28,88 @@ from ..formatting import _fetch_elements, _vision_alternatives_hint
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
+from ._click_core import (
+    lookup_postcondition,
+    maybe_scroll_bbox_into_view,
+    run_click_with_ladder,
+)
+
+
+# Dynamic-ID detector for `browser_click_selector`.
+#
+# React 18's `useId()` emits IDs like `:r13:` (a leading colon + base-32
+# counter + trailing colon). Radix wraps it as `radix-:r13:`, Headless
+# UI uses `headlessui-*-NN`, and some libraries stamp `__id_NNNN`. All
+# four rotate between renders — the brain captures the ID once, the
+# page re-mounts, and the selector is stale.
+#
+# `re.search` (not `re.match`) so compound selectors like
+# `.modal #radix-:r13:` are caught too. Idempotent w.r.t. escaped
+# colons (`\\?` accepts the optional backslash).
+_DYNAMIC_ID_RE = re.compile(
+    r"#(?:"
+    r"(?:[a-zA-Z_][\w-]*)?\\?:r[a-z0-9]+"
+    r"|headlessui-"
+    r"|__id_"
+    r")"
+)
+
+
+# Playwright / jQuery extension pseudo-selectors. The brain knows these
+# from training data and assumes they're CSS — but `document.querySelector`
+# throws SyntaxError on them, which the TS getRects path swallows. The
+# brain then sees "selector not found or zero-size" (indistinguishable
+# from a real missing element) and goes on a 5-tool fishing trip.
+#
+# Catching upfront with a regex turns 8 turns into 1: the brain gets a
+# clear advisory pointing it to `browser_click_at(vision_index=...)`.
+#
+# Matches:
+#   :has-text("X"), :contains("X")        — text matching
+#   :visible, :hidden                     — jQuery visibility
+#   :eq(N), :first, :last, :odd, :even    — jQuery indexing
+#   :button, :input, :checkbox, :radio,
+#   :submit, :selected, :file, :image,
+#   :password, :reset                     — jQuery form filters
+#   text=, role=, xpath=                  — Playwright engine prefixes
+#   >> (chain operator)                   — Playwright selector chain
+#
+# `:not(...)`, `:is(...)`, `:has(...)`, `:where(...)`, `:nth-child(...)`,
+# `:first-child`, `:first-of-type`, `:last-child`, etc. and other
+# STANDARD CSS pseudos are explicitly NOT in this set — they parse
+# fine in querySelector. The negative lookahead `(?![-\w])` after each
+# bare jQuery keyword rejects the standard-CSS hyphenated forms (e.g.
+# `:first-child` is CSS, `:first` alone is jQuery).
+_PLAYWRIGHT_PSEUDO_RE = re.compile(
+    r"(?:"
+    r":has-text\("
+    r"|:contains\("
+    r"|:visible(?![-\w])"
+    r"|:hidden(?![-\w])"
+    r"|:eq\("
+    r"|:first(?![-\w])"
+    r"|:last(?![-\w])"
+    r"|:odd(?![-\w])"
+    r"|:even(?![-\w])"
+    r"|:button(?![-\w])"
+    r"|:input(?![-\w])"
+    r"|:checkbox(?![-\w])"
+    r"|:radio(?![-\w])"
+    r"|:submit(?![-\w])"
+    r"|:selected(?![-\w])"
+    r"|:file(?![-\w])"
+    r"|:image(?![-\w])"
+    r"|:password(?![-\w])"
+    r"|:reset(?![-\w])"
+    r"|>>\s*text="
+    r"|>>\s*role="
+    r"|>>\s*xpath="
+    r"|(?:^|\s)text="
+    r"|(?:^|\s)role="
+    r"|(?:^|\s)xpath="
+    r")",
+    re.IGNORECASE,
+)
 
 
 @tool_parameters(
@@ -59,6 +141,35 @@ class BrowserClickTool(Tool):
         sync_block = await self.s.ensure_vision_synced(reason="browser_click")
         if sync_block:
             return sync_block
+        # Popup-scroll guard. After any popup-internal scroll (via
+        # browser_scroll_within or the pixel-scroll loop inside
+        # browser_select_option's auto-recovery), DOM indices for
+        # popup items are stale — the option list moved but the
+        # brain's cached [N] mapping didn't. Refuse the click and
+        # redirect to the deterministic bbox path: screenshot →
+        # fresh V_n → browser_click_at. Cleared the moment a
+        # screenshot lands; auto-expires after POPUP_SCROLL_EXPIRY_SECONDS
+        # so a brain pivoting to an unrelated task isn't permanently
+        # blocked.
+        if self.s.popup_scroll_guard_active():
+            self.s.log_activity(
+                f"click([{index}])(POPUP_SCROLL_BLOCKED)",
+                f"pending_since={self.s.popup_scroll_at:.1f}",
+            )
+            return (
+                f"[click_blocked:popup_scrolled_no_rebbox] A popup was "
+                f"just scrolled and no fresh screenshot has landed yet — "
+                f"DOM indices for popup options are STALE. The element "
+                f"at [{index}] has likely moved to a different row, or "
+                f"a different element occupies that index now. Required "
+                f"next steps:\n"
+                f"  1. browser_screenshot — vision relabels the popup "
+                f"with fresh V_n.\n"
+                f"  2. browser_click_at(vision_index=V_n) on the option "
+                f"you want.\n"
+                f"Do NOT retry browser_click([N]) on popup items — the "
+                f"index map only updates after a fresh vision pass."
+            )
         self.s._brain_turn_counter += 1
         # Cross-index flail guard. If the last two clicks timed out,
         # force a re-screenshot before dispatching another HTTP click —
@@ -211,6 +322,44 @@ class BrowserClickTool(Tool):
         # Successful HTTP response — clear the timeout counter so the
         # flail guard doesn't trip on a future unrelated hiccup.
         self.s.consecutive_click_timeouts = 0
+        # Element-mismatch escape (mirrors BrowserClickAtTool). The
+        # backend's clickInBbox Phase 2 grid-scan refused to dispatch
+        # because the element at index [N]'s live bounds is now a
+        # different label than expected — page shifted, list re-
+        # ordered, etc. Without this check, a 200-OK with
+        # error=element_mismatch was being treated as success and the
+        # brain reported "Clicked [N]" while the page hadn't actually
+        # changed (the long-standing "burst but no nav" symptom on
+        # DOM-index click). Surface as a structured failure so the
+        # brain re-screenshots and picks again.
+        if isinstance(data, dict) and data.get("error") == "element_mismatch":
+            found = data.get("found", {}) or {}
+            self.s.snap_miss_count += 1
+            self.s.record_cursor_failure(
+                strategy="click",
+                target=f"[{index}]",
+                reason=(
+                    f"element_mismatch tag={(found.get('tag') or '?').lower()} "
+                    f"text={(found.get('text') or '')[:60]!r}"
+                ),
+            )
+            self.s.log_activity(
+                f"click([{index}])(ELEM_MISMATCH)",
+                f"found={found.get('tag','?')}",
+            )
+            await _fetch_elements(session_id, self.s)
+            return (
+                f"[click_failed:element_mismatch] DOM index [{index}] "
+                f"resolves to a <{(found.get('tag') or '?').lower()} "
+                f"role='{found.get('role','')}'> with text='"
+                f"{(found.get('text') or '')[:80]}', which doesn't "
+                f"match the expected label for [{index}]. The page "
+                f"likely re-rendered (filter applied, list re-sorted) "
+                f"and [{index}] now points at a different element. "
+                f"Re-read the elements list above and pick a current "
+                f"[index], or call browser_screenshot to refresh "
+                f"vision before retrying."
+            )
         # Surgical undo: finalize the pending entry with the response.
         # `pre_url` / `pre_dom_hash` were already captured at
         # begin_click_record time, so finalize doesn't need them passed
@@ -230,15 +379,28 @@ class BrowserClickTool(Tool):
         # will land on the wrong element. Forcing the next click to
         # require a fresh screenshot (or letting the in-flight
         # prefetch settle) catches the page-shift misclick cascade.
+        verify_note = ""
         try:
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
+            url_changed_eff = bool(effect.get("url_changed"))
             try:
+                # Default 4 (was 8): a small filter that hides 1-2
+                # checkboxes produces ~5-8 mutations, just above the
+                # old threshold. 4 was too aggressive — every accordion
+                # toggle / tab switch / chevron expand sits at 4-8
+                # mutations and invalidating the vision epoch on those
+                # surfaces [epoch_invalidated] on the brain's next
+                # legitimate click, which conditioned the brain to
+                # distrust clicks and drift toward eval/run_script.
+                # Middle ground 6 covers filter applies (>=7 mutations)
+                # but rides over light UI toggles. Override via env
+                # MUTATION_DIRTY_THRESHOLD if a specific site needs it.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "6"
                 )
             except ValueError:
-                threshold = 8
+                threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(
@@ -254,12 +416,36 @@ class BrowserClickTool(Tool):
         snap = data.get("snap") if isinstance(data, dict) else None
         if isinstance(snap, dict) and snap.get("snapped") is False:
             self.s.snap_miss_count += 1
+        # Shared click ladder — verify_after + js/keyboard escalation.
+        # DOM-index clicks previously only emitted [click_silent] on
+        # no-op; they now auto-recover via the same ladder bbox clicks
+        # use. Escalation uses snap.x / snap.y (resolved click coords).
+        snap_x = snap.get("x") if isinstance(snap, dict) else None
+        snap_y = snap.get("y") if isinstance(snap, dict) else None
+        try:
+            alt_x = float(snap_x) if snap_x is not None else 0.0
+            alt_y = float(snap_y) if snap_y is not None else 0.0
+        except (TypeError, ValueError):
+            alt_x = 0.0
+            alt_y = 0.0
+        postcond = lookup_postcondition(self.s, vision_index=None, x=alt_x, y=alt_y)
+        verify_note = ""
+        if alt_x > 0 and alt_y > 0:
+            verify_note = await run_click_with_ladder(
+                self.s, session_id,
+                log_target=f"[{index}]",
+                primary_response=data,
+                alt_x=alt_x,
+                alt_y=alt_y,
+                alt_bbox=None,
+                postcondition=postcond,
+            )
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
         self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked [{index}]"),
+            self.s.build_text_only(data, f"Clicked [{index}]") + verify_note,
         )
 
 
@@ -269,24 +455,22 @@ class BrowserClickTool(Tool):
         vision_index=IntegerSchema(
             description=(
                 "1-based vision bbox index (the V_n the vision agent "
-                "labelled this element). When set, the server snaps to "
-                "the interactive element inside that bbox — far more "
-                "accurate than clicking a guessed (x,y)."
+                "labelled this element). REQUIRED — every bbox click "
+                "must anchor to a labelled element. The server snaps to "
+                "the interactive element inside the bbox, eliminating "
+                "off-by-pixel misses."
             ),
-            nullable=True,
         ),
-        x=NumberSchema(description="X coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
-        y=NumberSchema(description="Y coordinate (CSS pixel). Ignored when vision_index is set.", nullable=True),
-        required=["session_id"],
+        required=["session_id", "vision_index"],
     )
 )
 class BrowserClickAtTool(Tool):
     name = "browser_click_at"
     description = (
-        "Click using a vision bbox (vision_index=V_n) or raw (x,y) "
-        "coordinates. Prefer vision_index whenever the vision agent "
-        "labelled the target — the server snaps to the actual interactive "
-        "element inside the bbox, eliminating off-by-pixel misses.\n\n"
+        "Click a vision bbox by its V_n. The server snaps to the "
+        "actual interactive element inside the bbox, eliminating "
+        "off-by-pixel misses. Synthetic V_n (V>=1000, injected by "
+        "DOM scans after type/click) are clicked the same way.\n\n"
         "TOGGLE SEMANTICS: when V_n shows `active=true` (a filter chip, "
         "checkbox, or radio that's already ON), clicking it AGAIN will "
         "UN-toggle it (un-apply the filter, uncheck the box, deselect "
@@ -299,7 +483,11 @@ class BrowserClickAtTool(Tool):
         "may show `just_toggled=on` or `just_toggled=off` next to "
         "`active=` — that means YOUR last click flipped this control. "
         "If `just_toggled=on` appeared on a control whose label "
-        "doesn't match the task, re-click the same V_n to reverse it."
+        "doesn't match the task, re-click the same V_n to reverse it.\n\n"
+        "AUTO-SCROLL: when the bbox is below the fold (page or inner "
+        "popup), the tool auto-scrolls the right container before "
+        "dispatching. Do NOT pre-call browser_scroll_within for a "
+        "popup option — this tool handles it."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -309,145 +497,71 @@ class BrowserClickAtTool(Tool):
         self,
         session_id: str,
         vision_index: int | None = None,
-        x: float | None = None,
-        y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Coerce vision_index — some LLMs emit "2" (string) instead of 2
+        # (int). The schema declares IntegerSchema; in practice the
+        # validator lets the string through and we used to silently drop
+        # the parameter. Cast once here so the rest of the function sees
+        # an int.
+        if vision_index is not None and not isinstance(vision_index, int):
+            try:
+                vision_index = int(str(vision_index).strip())
+            except (TypeError, ValueError):
+                vision_index = None
+        if vision_index is None:
+            print("\n>> browser_click_at(?) — rejected: no vision_index")
+            return (
+                "[click_at_failed:no_vision_index] vision_index is "
+                "required. Pass the V_n (1-based) of the bbox the "
+                "vision agent labelled for the target you want to "
+                "click. Raw (x, y) coords are no longer accepted; "
+                "every bbox click must anchor to a labelled element."
+            )
+        print(f"\n>> browser_click_at(V{vision_index})")
         # Phase 1.1: hard sync gate. Block until the in-flight vision
         # prefetch from the previous action lands — without this the
         # brain's V_n resolves against a frozen epoch but the freshness
         # gate has no fresh post-action vision to validate against.
         sync_block = await self.s.ensure_vision_synced(reason="browser_click_at")
         if sync_block:
+            print("  [click_at rejected: sync_block]")
             return sync_block
         self.s._brain_turn_counter += 1
-        self.s.click_at_count += 1
         self.s.consecutive_click_calls += 1
-        if self.s.click_at_count > self.s.MAX_CLICK_AT:
-            return (
-                f"[BLOCKED] browser_click_at used "
-                f"{self.s.click_at_count} times in this session. The "
-                f"task is looping on clicks — call browser_screenshot "
-                f"to re-observe, then try browser_click_selector with "
-                f"a stable CSS hook, or browser_rewind_to_checkpoint "
-                f"if the page is stuck. Do NOT attempt "
-                f"browser_run_script to click — JS clicks are "
-                f"isTrusted=false and bot-detected."
-            )
-
-        # Build the target key BEFORE resolving the bbox, so the guard
-        # fires on intent (vision_index=V3) not on resolved coords (which
-        # could shift slightly between calls due to anti-aliasing).
-        if vision_index is not None:
-            target_key = f"click_at(V{int(vision_index)})"
-        elif x is not None and y is not None:
-            # Round to a 5px grid — micro-jitter shouldn't escape the guard.
-            target_key = f"click_at({round(float(x)/5)*5},{round(float(y)/5)*5})"
-        else:
-            target_key = "click_at(?)"
-        # For the (x, y) path we don't have a bbox to read is_active
-        # from, so run the dead-click guard with no toggle context here.
-        # The vision_index path defers the check until AFTER bbox
-        # resolution (line ~XYZ below) so it can pass the bbox's
-        # current is_active and trigger the toggle-aware exemption.
-        if vision_index is None:
-            dead = self.s.check_dead_click(target_key)
-            if dead:
-                self.s.log_activity(f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "")
-                return dead
-            self.s.register_click_attempt(target_key)
-            # Surgical undo: open a pending entry for raw-coord clicks.
-            # No bbox/label info — pre_active is None, classification
-            # falls through to "toggle" then demotes to "nav" if the
-            # click ends up navigating.
-            self.s.begin_click_record(
-                tool="browser_click_at",
-                target_key=target_key,
-                vision_index=None,
-                label=f"({x},{y})",
-                box_2d=None,
-                pre_active=None,
-                expected_url_change=False,
-                is_form_submit=False,
-            )
+        # Snapshot modal_open BEFORE dispatch so the post-click scan
+        # trigger can detect a fresh modal_cta_open transition (was off,
+        # is now on) and not double-fire when a modal was already up.
+        _pre_last = getattr(self.s, "_last_vision_response", None)
+        _pre_flags = getattr(_pre_last, "flags", None) if _pre_last else None
+        self._modal_open_before_click = bool(
+            getattr(_pre_flags, "modal_open", False)
+        ) if _pre_flags is not None else False
+        # Build the target key on intent (vision_index=V3) so the
+        # dead-click guard fires on what the brain asked for, not on
+        # post-snap pixel coords which can drift between calls.
+        target_key = f"click_at(V{int(vision_index)})"
 
         payload: dict[str, Any]
         log_target: str
-        if vision_index is not None:
-            # Prefer the frozen epoch (what the brain SAW on its last
-            # screenshot), fall back to the live response only when no
-            # epoch is set yet (pre-first-screenshot path / tests).
+        if True:
             resp = self.s.vision_for_target_resolution()
             if resp is None:
+                print("  [click_at rejected: no_vision]")
                 return (
-                    "[click_at_failed:no_vision] No recent vision response "
-                    "to resolve vision_index against. Re-fetch state to "
-                    "trigger a fresh vision pass, or pass raw (x, y)."
+                    "[click_at_failed:no_vision] No recent vision "
+                    "response to resolve vision_index against. "
+                    "Re-fetch state to trigger a fresh vision pass, "
+                    "or pass raw (x, y)."
                 )
             bbox = resp.get_bbox(int(vision_index))
             if bbox is None:
+                print(f"  [click_at rejected: bad_vision_index V{vision_index} (only {len(resp.bboxes)} bboxes)]")
                 return (
                     f"[click_at_failed:bad_vision_index] V{vision_index} "
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
-            # Freshness gate — refuse to click when the last vision pass
-            # flagged the screenshot as stale or uncertain. The planner
-            # should re-screenshot before committing a click on a frame
-            # the model itself said it couldn't trust.
-            freshness = getattr(resp, "screenshot_freshness", "fresh")
-            if freshness != "fresh":
-                self.s.record_cursor_failure(
-                    strategy="click_at",
-                    target=f"V{vision_index}",
-                    reason=f"stale_vision freshness={freshness}",
-                )
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                return (
-                    f"[click_at_failed:stale_vision freshness={freshness}] "
-                    "Vision flagged the last screenshot as not fresh "
-                    "(URL/page mismatch or loading overlay). Call "
-                    "browser_screenshot to refresh vision before clicking."
-                    + (f"\n{alts}" if alts else "")
-                )
-            # Phase 1.3 turn-based age gate. Beyond
-            # VISION_MAX_AGE_TURNS mutating actions since the last
-            # screenshot, the V_n indices the brain captured no longer
-            # reliably point at the elements they did when the
-            # screenshot was taken. The brain MUST re-screenshot. Wall-
-            # clock isn't a useful proxy because a long thinking pause
-            # doesn't mutate the page; the right unit is "actions
-            # taken between epoch and now". _brain_turn_counter was
-            # bumped by ensure_vision_synced for THIS click already, so
-            # subtract 1 to count actions BEFORE this one.
-            try:
-                max_age_turns = int(
-                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
-                )
-            except ValueError:
-                max_age_turns = 1
-            if max_age_turns > 0:
-                age_turns = max(
-                    0,
-                    self.s._brain_turn_counter - 1
-                    - self.s._vision_epoch_turn,
-                )
-                if age_turns > max_age_turns:
-                    alts = _vision_alternatives_hint(
-                        self.s, exclude_index=int(vision_index), limit=3,
-                    )
-                    return (
-                        f"[click_at_failed:epoch_too_old age_turns="
-                        f"{age_turns} max={max_age_turns}] V"
-                        f"{vision_index} resolves against a vision "
-                        f"snapshot taken {age_turns} actions ago — the "
-                        f"page state may have shifted. Call "
-                        f"browser_screenshot to refresh the V_n "
-                        f"indices before clicking."
-                        + (f"\n{alts}" if alts else "")
-                    )
             # Blocker gate — if the scene has an active blocker layer
             # (cookie banner, modal, consent dialog) and this bbox lives
             # in a different layer, refuse. The planner must dismiss
@@ -473,79 +587,13 @@ class BrowserClickAtTool(Tool):
                     except Exception:
                         dismiss_hint = ""
                     hint = f" Dismiss '{dismiss_hint}' first." if dismiss_hint else ""
+                    print(f"  [click_at rejected: blocker_active layer={active_blocker}]")
                     return (
                         f"[click_at_failed:blocker_active layer={active_blocker}] "
                         f"A blocker layer ({active_blocker}) is on top of "
                         f"content, and V{vision_index} sits in a different "
                         f"layer ({bbox_layer}).{hint} Then re-screenshot."
                     )
-            # Confidence gate — a low-confidence bbox is Gemini's way of
-            # saying "I'm not sure this is really here". Clicking it
-            # lands on the wrong target more often than not. Threshold
-            # is tuned via VISION_MIN_CLICK_CONFIDENCE (default 0.45).
-            try:
-                min_conf = float(
-                    os.environ.get("VISION_MIN_CLICK_CONFIDENCE") or "0.45"
-                )
-            except ValueError:
-                min_conf = 0.45
-            if getattr(bbox, "confidence", 0.5) < min_conf:
-                alts = _vision_alternatives_hint(
-                    self.s, exclude_index=int(vision_index), limit=3,
-                )
-                return (
-                    f"[click_at_failed:low_confidence V{vision_index}] "
-                    f"bbox confidence={bbox.confidence:.2f} < "
-                    f"{min_conf:.2f}. Call browser_screenshot to re-run "
-                    "vision, then retry with a higher-confidence target."
-                    + (f"\n{alts}" if alts else "")
-                )
-            # B5: precondition gate. When this bbox has a parent
-            # expand-button (resolved via aria-controls during DOM
-            # enrichment) AND that parent is currently collapsed
-            # (aria_expanded='false'), refuse — clicking the child
-            # would land on something not yet rendered or already
-            # selected at group-level. Brain has to expand first.
-            if os.environ.get(
-                "BBOX_PRECONDITION_GATE", "1"
-            ) not in ("0", "false", "no"):
-                parent_v = getattr(bbox, "parent_expand_v", None)
-                if isinstance(parent_v, int) and parent_v > 0:
-                    parent_bbox = resp.get_bbox(parent_v)
-                    parent_expanded = (
-                        getattr(parent_bbox, "aria_expanded", None)
-                        if parent_bbox is not None
-                        else None
-                    )
-                    if parent_expanded == "false":
-                        parent_label = (
-                            getattr(parent_bbox, "label", "")
-                            if parent_bbox is not None
-                            else ""
-                        )
-                        my_label = (
-                            getattr(bbox, "label", "") or ""
-                        ).strip()
-                        self.s.record_cursor_failure(
-                            strategy="click_at",
-                            target=f"V{vision_index}",
-                            reason=(
-                                f"expand_parent_first V{parent_v} "
-                                f"(parent={parent_label!r})"
-                            ),
-                        )
-                        return (
-                            f"[click_at_blocked:expand_parent_first "
-                            f"V{parent_v}] V{vision_index} "
-                            f"({my_label!r}) is a child of a "
-                            f"COLLAPSED group {parent_label!r} "
-                            f"(V{parent_v}, aria_expanded=false). "
-                            f"Clicking V{vision_index} now would land "
-                            f"on a hidden / not-yet-rendered element. "
-                            f"Click V{parent_v} FIRST to expand the "
-                            f"group, then re-screenshot and retry "
-                            f"V{vision_index}."
-                        )
             # v4 C3 — bbox-aware dead-click guard. Pass the bbox's
             # CURRENT is_active so the guard recognizes a re-click as
             # a legitimate filter toggle (rather than flailing) when
@@ -569,6 +617,7 @@ class BrowserClickAtTool(Tool):
                 ),
             )
             if dead:
+                print(f"  [click_at rejected: dead_click (V{vision_index} repeated with no effect)]")
                 self.s.log_activity(
                     f"click_at{target_key}(DEAD_CLICK_BLOCKED)", "",
                 )
@@ -631,17 +680,40 @@ class BrowserClickAtTool(Tool):
             # label → the check is skipped on the backend, which is
             # fine for raw-coord clicks further below.
             bbox_label = (getattr(bbox, "label", "") or "").strip()
+            # Pass expected_label so the TS backend can compute a
+            # labelMismatch flag in the response (logged as diagnostic).
+            # The server no longer blocks on mismatch — the click
+            # always dispatches and the brain reads the result.
             if bbox_label:
                 payload["expected_label"] = bbox_label[:120]
                 payload["label"] = bbox_label[:120]
             log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
-            print(f"\n>> browser_click_at(V{vision_index}) → bbox=({x0},{y0},{x1},{y1})")
-        else:
-            if x is None or y is None:
-                return "[click_at_failed:bad_args] Provide either vision_index or both x and y."
-            payload = {"x": float(x), "y": float(y)}
-            log_target = f"({x},{y})"
-            print(f"\n>> browser_click_at({x}, {y})")
+            # Continuation of the top-of-function dispatch print —
+            # adds the resolved bbox so the operator can see what
+            # coordinates the cursor will actually go to.
+            print(f"  → bbox=({x0},{y0},{x1},{y1})")
+
+        # Auto-scroll the bbox into view if it's below the page or
+        # popup fold. Cheap: server returns scrolled=false when the
+        # bbox is already visible, so the common case adds one HTTP
+        # round-trip (~5ms) but avoids the brain having to call
+        # browser_scroll_within for dropdown options that sit below
+        # the visible portion of the popup. New geometry is fed back
+        # into the click payload so the TS server clicks the correct
+        # post-scroll coords.
+        if isinstance(payload, dict) and isinstance(payload.get("bbox"), dict):
+            new_bbox = await maybe_scroll_bbox_into_view(
+                self.s, session_id, payload["bbox"],
+            )
+            if isinstance(new_bbox, dict):
+                payload["bbox"] = new_bbox
+                # Refresh log_target so post-dispatch messages reflect
+                # the actual click coords.
+                log_target = (
+                    f"V{vision_index}("
+                    f"{new_bbox['x0']},{new_bbox['y0']}"
+                    f"→{new_bbox['x1']},{new_bbox['y1']})"
+                )
 
         r = await _request_with_backoff(
             "POST",
@@ -660,6 +732,79 @@ class BrowserClickAtTool(Tool):
             return f"[low_reward_band] {err}"
         r.raise_for_status()
         data = r.json()
+        # Diagnostic: surface the TS-side outcome so cursor/action-not-
+        # happening cases are debuggable without DevTools. Prints the
+        # snap state (snapped/labelMismatch/element_mismatch) so we can
+        # see when the click was SKIPPED server-side (no cursor emit,
+        # no dispatch). Loud only on anomalies; silent on plain success.
+        if isinstance(data, dict):
+            snap_dbg = data.get("snap") or data.get("clicked") or {}
+            err_dbg = data.get("error")
+            # Both element_mismatch source paths in http.ts construct
+            # the response from `snap.labelMismatch` — i.e. an
+            # element_mismatch error IS a labelMismatch under the hood.
+            label_mismatch = bool(snap_dbg.get("labelMismatch")) or (
+                err_dbg == "element_mismatch"
+            )
+            snapped = snap_dbg.get("snapped")
+            effect = (data.get("effect") or {})
+            mutation_delta = effect.get("mutation_delta", "?")
+            if err_dbg or label_mismatch or snapped is False:
+                expected_label_dbg = data.get("expected_label", "")
+                found_dbg = data.get("found") or {}
+                found_text = (found_dbg.get("text") or "")[:60]
+                found_tag = found_dbg.get("tag", "")
+                found_role = found_dbg.get("role", "")
+                print(
+                    f"  [click_response: err={err_dbg!r} "
+                    f"label_mismatch={label_mismatch} "
+                    f"snapped={snapped} mutation_delta={mutation_delta}]"
+                )
+                if err_dbg == "element_mismatch":
+                    print(
+                        f"    [mismatch_detail expected={expected_label_dbg!r} "
+                        f"found_tag={found_tag!r} found_role={found_role!r} "
+                        f"found_text={found_text!r}]"
+                    )
+            else:
+                print(
+                    f"  [click_ok: snapped={snapped} "
+                    f"mutation_delta={mutation_delta} "
+                    f"target={snap_dbg.get('target', '?')[:60]}]"
+                )
+        # Viewport-shift guard. The TS handler compared the page's
+        # current scrollY/scrollHeight/viewport dims to what they were
+        # when the brain last received a screenshot. A shift means
+        # the V_n bbox is in a stale reference frame — clicking it
+        # would land on whatever happens to be at those CSS coords
+        # NOW, which is a different absolute element than the brain
+        # picked. Hard-invalidate the frozen epoch and surface a
+        # structured signal so the brain re-screenshots before
+        # retrying. This catches the case where the page reflowed
+        # globally (lazy-load, banner, modal) and labels alone can't
+        # disambiguate same-kind neighbours under the bbox.
+        if isinstance(data, dict) and data.get("error") == "viewport_shifted":
+            self.s._vision_epoch_response = None
+            delta = data.get("delta", {}) or {}
+            reason = data.get("reason", "shift")
+            dy = delta.get("scrollY", 0)
+            dh = delta.get("scrollHeight", 0)
+            dvh = delta.get("viewportHeight", 0)
+            self.s.log_activity(
+                f"click_at{log_target}(VIEWPORT_SHIFTED)",
+                f"reason={reason} dy={dy} dh={dh} dvh={dvh}",
+            )
+            return (
+                f"[click_at_failed:viewport_shifted reason={reason}] The "
+                f"page has shifted since your last screenshot "
+                f"(scrollY delta={dy}px, scrollHeight delta={dh}px"
+                + (f", viewportHeight delta={dvh}px" if dvh else "")
+                + "). Your V_n bboxes are anchored to a stale "
+                f"reference frame, so clicking one would land on "
+                f"whatever element happens to be at those CSS coords "
+                f"now (likely a same-kind neighbour). Call "
+                f"browser_screenshot to refresh vision before clicking."
+            )
         # Element-mismatch guard (P1.4). The T3 backend compared the
         # element at the click target to the vision label we sent and
         # decided they don't match. Don't dispatch — return an
@@ -697,11 +842,16 @@ class BrowserClickAtTool(Tool):
             effect = (data or {}).get("effect") or {}
             mutation_delta = int(effect.get("mutation_delta") or 0)
             try:
+                # See browser_click for the 4-vs-6-vs-8 rationale.
+                # Light toggles (tabs, chevrons, accordions) sit at
+                # 4-6 mutations; 6 covers filter re-renders (>=7)
+                # without surfacing [epoch_invalidated] on legitimate
+                # UI state changes.
                 threshold = int(
-                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "8"
+                    os.environ.get("MUTATION_DIRTY_THRESHOLD") or "6"
                 )
             except ValueError:
-                threshold = 8
+                threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
                 self.s.log_activity(
@@ -744,18 +894,78 @@ class BrowserClickAtTool(Tool):
                 f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
                 if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
             )
-            # A2: surface clickInBbox warnings so the brain can react.
-            # The click still dispatched; this is advisory — but on
-            # 'target_in_iframe' the click reliably hits the iframe
-            # host instead of inner content, so the brain should
-            # plan around it (e.g., switch to selector inside the
-            # iframe document).
+            # Surface clickInBbox warnings so the brain can react.
+            # Variants (Phase A/B):
+            #   - target_in_iframe_resolved: descent worked, click
+            #     landed on the inner element. Short success note.
+            #   - target_in_iframe_cross_origin: SOP blocked
+            #     contentDocument access; Phase B Frame walk also
+            #     failed. Brain should use in_iframe parameter.
+            #   - target_in_iframe_miss: same-origin BUT neither
+            #     pinpoint nor inner grid scan found a clickable in
+            #     the bbox region. Vision bbox is probably loose or
+            #     pointing at a non-interactive area.
+            #   - target_in_iframe: legacy fallback (should not fire).
+            #   - pointer_events_none_ancestor: existing pe:none case.
+            #
+            # iframe_host_selector (when set) is a stable CSS the
+            # brain can pass back as in_iframe=<...> without first
+            # running an inspection script. We always include it in
+            # the WARN advisories so the recovery action is obvious.
             warn = snap.get("warning")
-            if warn == "target_in_iframe":
+            chain = snap.get("iframe_chain") or []
+            host_sel = snap.get("iframe_host_selector") or ""
+            host_hint = (
+                f" host_selector={host_sel!r}" if host_sel else ""
+            )
+            if warn == "target_in_iframe_resolved":
+                hops = f" depth={len(chain)}" if chain else ""
+                snap_note += f" [iframe_descent_ok{hops}]"
+            elif warn == "target_in_iframe_cross_origin":
+                # Primary advice: use the deterministic selector path.
+                # `browser_click_selector(in_iframe=<host>)` routes through
+                # the TS `clickSelectorInIframe()` which uses contentFrame()
+                # + frame.evaluate() to find the element by CSS inside the
+                # iframe and dispatches a CDP click at the translated
+                # viewport coords — no need for the brain to author JS.
                 snap_note += (
-                    " [WARN:target_in_iframe — click landed on the "
-                    "<iframe> host, NOT inner content. Inner-doc "
-                    "selectors require iframe-scoped tooling.]"
+                    f" [WARN:iframe_cross_origin{host_hint} — outer-doc"
+                    " click cannot reach inner content (cross-origin"
+                    " SOP). Call browser_click_selector(selector="
+                    f"<inner_css>, in_iframe={host_sel!r}) to target the"
+                    " element directly inside the frame."
+                    if host_sel
+                    else " [WARN:iframe_cross_origin — outer-doc click"
+                         " cannot reach inner content (cross-origin"
+                         " SOP). Call browser_click_selector with"
+                         " in_iframe=<host_css> to target inside the"
+                         " frame.]"
+                )
+            elif warn == "target_in_iframe_miss":
+                snap_note += (
+                    f" [WARN:iframe_miss{host_hint} — descent ran but"
+                    " no clickable was found inside the bbox region."
+                    " Vision bbox may be loose. Re-screenshot to get a"
+                    " tighter bbox, or call browser_click_selector("
+                    f"selector=<inner_css>, in_iframe={host_sel!r})."
+                    if host_sel
+                    else " [WARN:iframe_miss — descent ran but no"
+                         " clickable was found in the bbox region."
+                         " Re-screenshot or call browser_click_selector"
+                         " with in_iframe=<host_css>.]"
+                )
+            elif warn == "target_in_iframe":
+                snap_note += (
+                    f" [WARN:target_in_iframe{host_hint} — click landed"
+                    " on the <iframe> host, NOT inner content. Call"
+                    f" browser_click_selector(..., in_iframe={host_sel!r})"
+                    " or re-screenshot so vision emits a V_n inside the"
+                    " iframe."
+                    if host_sel
+                    else " [WARN:target_in_iframe — click landed on the"
+                         " <iframe> host. Re-screenshot or call"
+                         " browser_click_selector with"
+                         " in_iframe=<host_css>.]"
                 )
             elif warn == "pointer_events_none_ancestor":
                 snap_note += (
@@ -763,115 +973,117 @@ class BrowserClickAtTool(Tool):
                     "ancestor has pointer-events:none, the click may "
                     "have passed through to a layer behind.]"
                 )
+
+            # Iframe-miss escalation. After two misses on the SAME
+            # (V_n, host) — i.e. the brain already tried the
+            # browser_click_selector path advised in the WARN above and
+            # it still didn't land — drop to browser_run_script as a
+            # final escape. browser_click_selector is the deterministic
+            # first step; run_script is only the last resort.
+            _iframe_miss_warnings = (
+                "target_in_iframe_cross_origin",
+                "target_in_iframe_miss",
+                "target_in_iframe",
+            )
+            if warn in _iframe_miss_warnings:
+                miss_key = f"V{int(vision_index)}|{host_sel}"
+                if self.s.iframe_miss_key == miss_key:
+                    self.s.iframe_miss_count += 1
+                else:
+                    self.s.iframe_miss_key = miss_key
+                    self.s.iframe_miss_count = 1
+                if self.s.iframe_miss_count >= self.s.MAX_IFRAME_MISSES_BEFORE_NUDGE:
+                    host_arg = (
+                        f"const f = page.frames().find(fr => "
+                        f"fr.url().includes('<substring_of_{host_sel}_url>'));"
+                        if host_sel else
+                        "const f = page.frames().find(fr => "
+                        "fr.url().includes('<host_substring>'));"
+                    )
+                    snap_note += (
+                        f" [ESCALATE:run_script iframe_misses="
+                        f"{self.s.iframe_miss_count}] "
+                        f"You've now missed V{int(vision_index)} inside"
+                        f" this iframe {self.s.iframe_miss_count} times,"
+                        f" including via browser_click_selector. Drop to"
+                        f" browser_run_script(mutates=true) and dispatch"
+                        f" the click via frame.evaluate so it runs in"
+                        f" the iframe's own JS context. Example skeleton: "
+                        f"{host_arg} await f.evaluate(() => "
+                        f"document.querySelector('<inner_button>').click()). "
+                        f"If you don't know the inner selector yet, first"
+                        f" run browser_run_script(mutates=false) with"
+                        f" f.evaluate(() => Array.from(document.querySelectorAll("
+                        f"'button,a,[role=button]')).map(el => el.outerHTML.slice(0,200))) "
+                        f"to enumerate clickable candidates."
+                    )
+            elif warn == "target_in_iframe_resolved" or warn is None:
+                # Reset on success or on non-iframe warnings — the brain
+                # has either landed the click or moved on to a different
+                # target / class of problem.
+                if self.s.iframe_miss_count:
+                    self.s.iframe_miss_count = 0
+                    self.s.iframe_miss_key = ""
+            # Phase G: native <select> hint. Always-on (top-level or
+            # inside an iframe). Native dropdowns don't open via CDP
+            # Input.dispatchMouseEvent — the click here only focuses
+            # the element. Brain should switch to browser_select_option
+            # which sets .value + dispatches `change` programmatically.
+            # Hint-only policy: the click still dispatched.
+            if snap.get("native_select"):
+                if host_sel:
+                    snap_note += (
+                        f" [hint:native_select host_selector={host_sel!r}"
+                        " — click landed on a <select>; native dropdowns"
+                        " don't open via CDP. Call"
+                        " browser_select_option(label=<dropdown_label>,"
+                        f" value=<option>, in_iframe={host_sel!r})"
+                        " to set the value programmatically.]"
+                    )
+                else:
+                    snap_note += (
+                        " [hint:native_select — click landed on a"
+                        " <select>; native dropdowns don't open via CDP."
+                        " Call browser_select_option(label=<dropdown_label>,"
+                        " value=<option>) to set the value"
+                        " programmatically.]"
+                    )
         else:
             snap_note = ""
 
         # Post-click verification — look up the postcondition the planner
         # attached to this target (by vision_index or by coord match)
-        # and run it via verify_action. Runs only for t3 sessions and
-        # when VERIFY_AFTER_CLICK is enabled (default on). A miss is
-        # reported in the caption so the brain can decide to retry with
-        # a different strategy or call browser_plan_next_steps.
-        verify_note = ""
-        if session_id.startswith("t3-") and \
-                os.environ.get("VERIFY_AFTER_CLICK", "1") != "0":
-            postcond = self._lookup_postcondition(vision_index, x, y)
-            if postcond is not None:
-                try:
-                    from superbrowser_bridge.antibot import interactive_session as _t3mgr
-                    from superbrowser_bridge.verify_action import verify_after, PreState
-                    mgr = _t3mgr.default()
-                    vr = await verify_after(
-                        mgr, session_id, postcond,
-                        pre_state=PreState(url=self.s.current_url or ""),
-                        state=self.s,
-                    )
-                    if not vr.verified:
-                        # Default postcondition (dom_mutated) failing means
-                        # the click went out but NOTHING changed — page,
-                        # DOM, URL all identical. Before bothering the
-                        # brain, ESCALATE through the click ladder —
-                        # many pages reject "primary" bezier clicks but
-                        # respond to a direct `el.click()` (JS) dispatch
-                        # or to keyboard Enter. Silent failure most
-                        # often means the site's click handler has a
-                        # guard our primary click tripped (0-dwell, CSS
-                        # pointer-events masking, framework re-render).
-                        is_silent_default = (
-                            postcond.get("kind") == "dom_mutated"
-                            and not getattr(
-                                self.s._last_action_queue, "actions", None,
-                            )
-                        )
-                        escalated = False
-                        if is_silent_default and \
-                                os.environ.get("CLICK_LADDER_AUTO", "1") != "0" and \
-                                payload.get("bbox"):
-                            for alt_strategy in ("js", "keyboard"):
-                                try:
-                                    from superbrowser_bridge.antibot import (
-                                        interactive_session as _t3mgr2,
-                                    )
-                                    mgr2 = _t3mgr2.default()
-                                    alt_bbox = payload.get("bbox")
-                                    alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
-                                    alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
-                                    alt_resp = await mgr2.click_at(
-                                        session_id, alt_x, alt_y,
-                                        bbox=alt_bbox,
-                                        strategy=alt_strategy,
-                                    )
-                                    if not isinstance(alt_resp, dict) or \
-                                            not alt_resp.get("success"):
-                                        continue
-                                    # Re-verify after the escalated strategy.
-                                    vr2 = await verify_after(
-                                        mgr, session_id, postcond,
-                                        pre_state=PreState(
-                                            url=self.s.current_url or "",
-                                        ),
-                                        state=self.s,
-                                    )
-                                    if vr2.verified:
-                                        escalated = True
-                                        verify_note = (
-                                            f"\n[click_escalated strategy={alt_strategy}] "
-                                            f"Primary click was silent; "
-                                            f"{alt_strategy} strategy landed the "
-                                            f"action."
-                                        )
-                                        break
-                                except Exception as exc:
-                                    print(
-                                        f"  [click ladder ({alt_strategy}) "
-                                        f"failed: {exc}]"
-                                    )
-                                    continue
-                        if not escalated:
-                            if is_silent_default:
-                                verify_note = (
-                                    f"\n[click_silent reason={vr.reason}] "
-                                    f"Primary + escalated (js/keyboard) "
-                                    f"clicks all landed no DOM change. "
-                                    f"Target likely non-interactive, "
-                                    f"covered by an overlay, or waiting "
-                                    f"on an async load. Call "
-                                    f"browser_screenshot to re-vision, "
-                                    f"dismiss any active blocker, or try "
-                                    f"a different target."
-                                )
-                            else:
-                                verify_note = (
-                                    f"\n[VERIFY_MISS kind={vr.kind} reason={vr.reason}] "
-                                    f"The click dispatched but the expected effect "
-                                    f"({postcond.get('kind')}) didn't land. Consider "
-                                    f"browser_plan_next_steps to re-sequence, or try "
-                                    f"a different target."
-                                )
-                    elif os.environ.get("VERIFY_DEBUG") == "1":
-                        verify_note = f"\n[verify_ok kind={vr.kind}]"
-                except Exception as exc:
-                    print(f"  [verify_action: skipped — {exc}]")
+        # and run it via verify_action. Runs on BOTH t1 and t3 sessions
+        # when VERIFY_AFTER_CLICK is enabled (default on). The t3-only
+        # gate that used to live here was the root cause of t1's
+        # "phantom click" symptom — t1 silently treated dispatched but
+        # ineffective clicks as success. verify_action.py routes the
+        # state read through HTTP /state for t1 sessions and through
+        # T3SessionManager for t3 sessions, so the same check works on
+        # both tiers. The js/keyboard escalation ladder below stays t3-
+        # native (mgr.click_at(strategy=...)) but a parallel HTTP-routed
+        # branch handles t1 escalation against the same /click endpoint.
+        # Shared verification ladder. The bbox dispatch sent {"bbox": ...};
+        # extract its center for js/keyboard escalation if verify fails.
+        alt_bbox = payload.get("bbox") if isinstance(payload, dict) else None
+        if alt_bbox:
+            alt_x = (alt_bbox["x0"] + alt_bbox["x1"]) / 2
+            alt_y = (alt_bbox["y0"] + alt_bbox["y1"]) / 2
+        else:
+            alt_x = 0.0
+            alt_y = 0.0
+        postcond = lookup_postcondition(
+            self.s, vision_index=vision_index, x=alt_x, y=alt_y,
+        )
+        verify_note = await run_click_with_ladder(
+            self.s, session_id,
+            log_target=log_target,
+            primary_response=data,
+            alt_x=alt_x,
+            alt_y=alt_y,
+            alt_bbox=alt_bbox,
+            postcondition=postcond,
+        )
 
         self.s.record_step(
             "browser_click_at",
@@ -903,44 +1115,6 @@ class BrowserClickAtTool(Tool):
             state=self.s,
         )
 
-    def _lookup_postcondition(
-        self,
-        vision_index: int | None,
-        x: float | None,
-        y: float | None,
-    ) -> dict | None:
-        """Match the current click against the top planned action and return
-        its postcondition, or fall through to a weakest-possible
-        default that only catches "click dispatched but page didn't
-        change at all" (the canonical silent-miss signal).
-
-        A planner match is: the click's vision_index equals the top
-        action's target_vision_index, OR the click's (x, y) falls
-        inside the top action's target bbox (± 10 px slack).
-
-        The default (dom_mutated) runs when no planner postcondition
-        applies. Set VERIFY_DEFAULT=0 to disable and preserve the old
-        "no postcondition, no verification" behaviour.
-        """
-        queue = self.s._last_action_queue
-        if queue is not None and getattr(queue, "actions", None):
-            top = queue.actions[0]
-            # vision_index match (preferred)
-            if vision_index is not None and top.target_vision_index is not None:
-                if int(vision_index) == int(top.target_vision_index):
-                    return top.postcondition.to_dict()
-            # coord match (fallback)
-            if x is not None and y is not None and top.target_bbox_pixels:
-                x0, y0, x1, y1 = top.target_bbox_pixels
-                if (x0 - 10) <= float(x) <= (x1 + 10) and \
-                        (y0 - 10) <= float(y) <= (y1 + 10):
-                    return top.postcondition.to_dict()
-        # Default: "did anything change?" — dom_mutated catches the
-        # "click silently missed" case even when the planner didn't
-        # attach an explicit postcondition.
-        if os.environ.get("VERIFY_DEFAULT", "1") != "0":
-            return {"kind": "dom_mutated"}
-        return None
 
 
 @tool_parameters(
@@ -966,8 +1140,8 @@ class BrowserGetRectTool(Tool):
     description = (
         "Return getBoundingClientRect() for one or more CSS selectors. "
         "Pixel-exact, zero vision cost. Use to derive coordinates before "
-        "calling browser_click_selector / browser_drag_selectors. "
-        "Selectors ride as a JSON string (no ArraySchema in this layer)."
+        "calling browser_drag_selectors. Selectors ride as a JSON string "
+        "(no ArraySchema in this layer)."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1020,11 +1194,26 @@ class BrowserGetRectTool(Tool):
         session_id=StringSchema("Session ID"),
         selector=StringSchema("CSS selector of the element to click"),
         button=StringSchema("Mouse button: left|right|middle", nullable=True),
-        click_count=IntegerSchema("Number of clicks (1 for single, 2 for double)", nullable=True),
+        click_count=IntegerSchema(
+            "Number of clicks (1 for single, 2 for double)",
+            nullable=True,
+        ),
         linear=BooleanSchema(
             description=(
-                "If true (default), use deterministic teleport click (pixel-exact). "
-                "Set false for stealth-critical contexts (captchas) that need Bezier humanisation."
+                "If true (default), use deterministic teleport click "
+                "(pixel-exact). Set false for stealth-critical contexts "
+                "(captchas) that need Bezier humanisation."
+            ),
+            nullable=True,
+        ),
+        in_iframe=StringSchema(
+            description=(
+                "CSS selector of an <iframe> host. When provided, "
+                "`selector` is resolved INSIDE the iframe's contentFrame "
+                "instead of the top-level document. Use this when the "
+                "target lives inside an embedded frame (e.g. quizzes, "
+                "calculators, captcha widgets). Same-origin iframes work "
+                "directly; cross-origin OOPIFs use Puppeteer's Frame API."
             ),
             nullable=True,
         ),
@@ -1038,7 +1227,11 @@ class BrowserClickSelectorTool(Tool):
         "zero Gemini cost. PREFER OVER browser_click_at(vision_index=...) "
         "whenever the target has a stable hook — chess squares "
         "(.square-54), form fields (#email), buttons with data-test-id, "
-        "captcha handles. Fails fast if the selector is missing or zero-size."
+        "captcha handles. For elements inside an <iframe>, pass "
+        "in_iframe=<host_css> to scope the selector to that frame — the "
+        "server descends via contentFrame() + frame.evaluate() and "
+        "dispatches a CDP click at the translated viewport coords. Fails "
+        "fast if the selector is missing or zero-size."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -1051,30 +1244,96 @@ class BrowserClickSelectorTool(Tool):
         button: str | None = None,
         click_count: int | None = None,
         linear: bool | None = None,
+        in_iframe: str | None = None,
         **kw: Any,
     ) -> str:
-        print(f"\n>> browser_click_selector({selector!r})")
-        # Phase 1.1: hard sync gate.
-        sync_block = await self.s.ensure_vision_synced(reason="browser_click_selector")
+        scope_note = f" in_iframe={in_iframe!r}" if in_iframe else ""
+        print(f"\n>> browser_click_selector({selector!r}{scope_note})")
+        # Phase 1.1: hard sync gate. Wait for any in-flight vision
+        # prefetch from the previous action before dispatching.
+        sync_block = await self.s.ensure_vision_synced(
+            reason="browser_click_selector",
+        )
         if sync_block:
             return sync_block
         self.s._brain_turn_counter += 1
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls += 1
 
-        payload: dict[str, Any] = {"selector": selector, "ensureVisible": True}
+        # Phase 1.2: dynamic-ID guard. React's `useId()` and friends
+        # generate IDs that rotate between renders (`:r13:` → `:r14:`).
+        # Selector dispatch on these silently fails or hits the wrong
+        # element by the time the click lands. Reject upstream so the
+        # brain routes to `browser_click_at(vision_index=...)` on the
+        # first call instead of wasting a round-trip on a stale ID.
+        if _DYNAMIC_ID_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="dynamic_id_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(DYNAMIC_ID_REJECTED)", "",
+            )
+            return (
+                f"[click_selector_rejected:dynamic_id] Selector "
+                f"{selector!r} uses a React-generated dynamic ID "
+                f"(useId() / radix-:rN: / headlessui-* / __id_*) that "
+                f"changes between renders. Call "
+                f"browser_click_at(vision_index=V_n) instead — the "
+                f"vision bbox is stable across re-renders."
+            )
+
+        # Phase 1.3: Playwright/jQuery pseudo-selector guard. The brain
+        # knows `:has-text("X")`, `:contains("X")`, `text=X`, `:visible`
+        # etc. from Playwright/jQuery training data and assumes they're
+        # CSS. `document.querySelector` throws SyntaxError on them, the
+        # TS getRects wrapper swallows it, and the brain sees "selector
+        # not found" — indistinguishable from a missing element. The
+        # brain then wastes 5+ turns on `browser_eval`/markdown lookups
+        # before falling through to raw coords.
+        if _PLAYWRIGHT_PSEUDO_RE.search(selector):
+            self.s.record_cursor_failure(
+                strategy="click_selector",
+                target=selector,
+                reason="playwright_pseudo_pattern",
+            )
+            self.s.log_activity(
+                f"click_selector({selector})(PLAYWRIGHT_PSEUDO_REJECTED)",
+                "",
+            )
+            return (
+                f"[click_selector_rejected:playwright_pseudo] Selector "
+                f"{selector!r} uses Playwright/jQuery extension syntax "
+                f"(:has-text, :contains, :visible, :hidden, :eq, :first, "
+                f":button, text=, role=, xpath=, >> chain, etc.) — these "
+                f"are NOT standard CSS and document.querySelector throws "
+                f"SyntaxError on them. To click an element BY ITS TEXT, "
+                f"call browser_click_at(vision_index=V_n) — vision "
+                f"already labels each visible button by its text. To "
+                f"click by stable hook, use a real CSS selector "
+                f"(`.square-54`, `#email`, `[data-testid=submit]`)."
+            )
+
+        payload: dict[str, Any] = {
+            "selector": selector,
+            "ensureVisible": True,
+        }
         if button is not None:
             payload["button"] = button
         if click_count is not None:
             payload["clickCount"] = click_count
         if linear is not None:
             payload["linear"] = linear
+        if in_iframe:
+            payload["in_iframe"] = in_iframe
 
         # Surgical undo: open a pending entry. pre_active is None for
         # selector clicks (we don't probe aria state on this path); the
-        # label safety-net regex still catches destructive selectors
-        # like 'button.delete' / '#submit' and classifies them
-        # irreversible. url_changed demotion in finalize handles nav.
+        # label safety-net in finalize_click_record still catches
+        # destructive selectors like 'button.delete' / '#submit' and
+        # classifies them irreversible. url_changed demotion in
+        # finalize handles nav cases.
         self.s.begin_click_record(
             tool="browser_click_selector",
             target_key=f"click_selector({selector})",
@@ -1097,8 +1356,8 @@ class BrowserClickSelectorTool(Tool):
                 err = r.json().get("error", r.text)
             except Exception:
                 err = r.text
-            # Phase 3.1: record cursor failure so the script lockout
-            # gate counts this as a tried-and-failed cursor strategy.
+            # Record cursor failure so the script-lockout gate counts
+            # this as a tried-and-failed cursor strategy.
             self.s.record_cursor_failure(
                 strategy="click_selector",
                 target=selector,
@@ -1109,16 +1368,21 @@ class BrowserClickSelectorTool(Tool):
             return f"[click_selector_failed] {err}"
         data = r.json()
         self.s.finalize_click_record(response=data)
-        # Auto-refresh element_fingerprints from the click response. (B6)
+        # Auto-refresh element_fingerprints from the click response so a
+        # follow-up DOM-index click doesn't ship a stale fingerprint.
         _fp_map = data.get("fingerprints") if isinstance(data, dict) else None
         if isinstance(_fp_map, dict):
             self.s.element_fingerprints = {
                 int(k): v for k, v in _fp_map.items() if isinstance(v, str)
             }
         clicked = data.get("clicked", {})
+        actual_url = data.get("url", self.s.current_url)
+        if actual_url:
+            self.s.record_url(actual_url)
         self.s.record_step(
             "browser_click_selector",
-            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})",
+            f"{selector} @ ({clicked.get('x','?')},{clicked.get('y','?')})"
+            + (f" in_iframe={in_iframe!r}" if in_iframe else ""),
             data.get("url", ""),
         )
         # click_selector is a mutation — advance the observation token
@@ -1129,8 +1393,16 @@ class BrowserClickSelectorTool(Tool):
             f"Clicked {selector} at "
             f"({clicked.get('x','?')},{clicked.get('y','?')})"
         )
+        if in_iframe:
+            caption += f" [iframe={in_iframe}]"
         if data.get("elements"):
             caption += f"\n{data['elements']}"
+        # A successful iframe-scoped click means the deterministic path
+        # worked — clear the iframe-miss counter so the next miss starts
+        # fresh from advisory-level escalation, not run_script.
+        if in_iframe and self.s.iframe_miss_count:
+            self.s.iframe_miss_count = 0
+            self.s.iframe_miss_key = ""
         return await _append_fresh_vision(
             _vision_task,
             _maybe_no_effect_prefix(

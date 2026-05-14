@@ -29,8 +29,84 @@ BLOCKED_BROWSER_OPEN_HARD_STOP = 3
 _ATOMIC_FIX_TEXT_JS = """
 (() => {
   const x = __TARGET_X__, y = __TARGET_Y__, target = __TARGET_TEXT__;
-  const el = document.elementFromPoint(x, y);
+  let el = document.elementFromPoint(x, y);
   if (!el) return {ok: false, reason: 'no_element'};
+
+  // Phase H: same-origin iframe descent. When the top-level
+  // elementFromPoint returns an <iframe>, the actual input we want to
+  // type into lives inside that frame's contentDocument. Translate
+  // (x, y) into frame-local coords and re-query inside the frame.
+  // Mirrors the Phase A descent in clickInBbox (page.ts).
+  //
+  // Cross-origin iframes throw on contentDocument access — bail
+  // silently and let the existing not_input path surface a clean
+  // failure; brain can fall back to
+  // browser_click_at(vision_index=V_n) + browser_type_at sequence.
+  //
+  // Cap depth at 3 for iframe-in-iframe nests.
+  let _frameDepth = 0;
+  // Track the (x, y) offset accumulated as we descend so the
+  // wrapper-descent below sees coords in the same frame as `el`.
+  let _localX = x, _localY = y;
+  while (el && el.tagName && el.tagName.toLowerCase() === 'iframe'
+         && _frameDepth < 3) {
+    const _ir = el.getBoundingClientRect();
+    const _nextX = _localX - _ir.left;
+    const _nextY = _localY - _ir.top;
+    let _innerDoc = null;
+    try { _innerDoc = el.contentDocument; } catch (_) {}
+    if (!_innerDoc) break;
+    const _inner = _innerDoc.elementFromPoint(_nextX, _nextY);
+    if (!_inner || _inner === _innerDoc.documentElement
+         || _inner === _innerDoc.body) break;
+    el = _inner;
+    _localX = _nextX;
+    _localY = _nextY;
+    _frameDepth += 1;
+  }
+  // Phase H uses _localX/_localY for the wrapper-descent geometry
+  // check below — bbox containment must be in the same frame as `el`.
+  const _checkX = _localX, _checkY = _localY;
+
+  // Wrapper-descent: when elementFromPoint hits a styled wrapper rather
+  // than the real <input> (petfinder's #findAPetLocation, Google Maps'
+  // #searchboxinput, MUI Autocomplete, plenty of Tailwind designs),
+  // descend into a usable descendant before bailing.
+  //   Pass A — descendant whose bounding box CONTAINS (x, y); pick the
+  //            smallest (innermost) one. Conservative — geometry-scoped.
+  //   Pass B — single-input wrapper fallback (exactly one descendant,
+  //            visible). Bounded — never picks from a list of options.
+  const isUsable = (n) => {
+    if (!n) return false;
+    const t = n.tagName ? n.tagName.toLowerCase() : '';
+    return t === 'input' || t === 'textarea' || !!n.isContentEditable;
+  };
+  if (!isUsable(el)) {
+    const candidates = el.querySelectorAll(
+      'input, textarea, [contenteditable=""], [contenteditable="true"]'
+    );
+    let best = null, bestArea = Infinity;
+    for (const c of candidates) {
+      const r = c.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      // Phase H: when we descended into an iframe, `el` and its
+      // candidates report rects in iframe-local coords; the original
+      // (x, y) is viewport-relative. Compare against `_checkX/_checkY`
+      // which tracks the same frame as `el`. For top-level (no
+      // descent), `_checkX === x` and `_checkY === y`, so behaviour
+      // is unchanged.
+      if (_checkX < r.left || _checkX > r.right
+          || _checkY < r.top || _checkY > r.bottom) continue;
+      const a = r.width * r.height;
+      if (a < bestArea) { best = c; bestArea = a; }
+    }
+    if (!best && candidates.length === 1) {
+      const r = candidates[0].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) best = candidates[0];
+    }
+    if (best) el = best;
+  }
+
   const tag = el.tagName.toLowerCase();
   const isInput = tag === 'input' || tag === 'textarea';
   const isEditable = !!el.isContentEditable;
@@ -54,21 +130,49 @@ _ATOMIC_FIX_TEXT_JS = """
             input_type: attrInputType};
   }
   try { el.focus(); } catch (_) {}
+  // Phase H: when `el` was found inside an iframe (descent above), its
+  // prototype + event constructors come from the iframe's window, not
+  // the main frame's. Using the main-frame `HTMLInputElement.prototype`
+  // throws `TypeError: Illegal invocation` because the setter's
+  // internal type-check rejects the cross-frame receiver. Same for
+  // `new InputEvent(...)` constructed in the main frame and dispatched
+  // on an iframe-owned element. Resolve everything against
+  // `el.ownerDocument.defaultView` so cross-frame inputs work too.
+  // Falls back to the main-frame globals when ownerView is unavailable
+  // (top-level inputs behave identically to before).
+  const _ownerWin = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+  const _InputProto = _ownerWin.HTMLInputElement
+                       ? _ownerWin.HTMLInputElement.prototype
+                       : HTMLInputElement.prototype;
+  const _TextareaProto = _ownerWin.HTMLTextAreaElement
+                          ? _ownerWin.HTMLTextAreaElement.prototype
+                          : HTMLTextAreaElement.prototype;
+  const _InputEventCtor = _ownerWin.InputEvent || InputEvent;
+  const _EventCtor = _ownerWin.Event || Event;
   try {
     if (isInput) {
-      const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype
-                                       : HTMLInputElement.prototype;
+      const proto = tag === 'textarea' ? _TextareaProto : _InputProto;
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
       if (desc && desc.set) {
+        // React 16+ caches the prior value in el._valueTracker. If the
+        // tracker matches el.value at dispatch time, React short-circuits
+        // its synthetic onChange and the framework never sees the typed
+        // text — autocomplete/search loops on controlled inputs (e.g.
+        // Google Maps' search box) silently break. Resetting the tracker
+        // forces a non-match. No-op on non-React inputs.
+        const tracker = el._valueTracker;
+        if (tracker && typeof tracker.setValue === 'function') {
+          try { tracker.setValue(''); } catch (_) {}
+        }
         desc.set.call(el, target);
-        el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: target}));
-        el.dispatchEvent(new Event('change', {bubbles: true}));
+        el.dispatchEvent(new _InputEventCtor('input', {bubbles: true, inputType: 'insertText', data: target}));
+        el.dispatchEvent(new _EventCtor('change', {bubbles: true}));
       } else {
         el.value = target;
       }
     } else if (isEditable) {
       el.innerText = target;
-      el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+      el.dispatchEvent(new _InputEventCtor('input', {bubbles: true}));
     }
   } catch (e) {
     return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag};
@@ -165,9 +269,8 @@ def _maybe_no_effect_prefix(
         f"under you; re-observe and click the fresh [V_n]; "
         f"(b) **browser_semantic_click(target='<label>')** — atomic "
         f"fresh vision + dispatch, works across React apps; "
-        f"(c) browser_click_selector(<css>) — pixel-exact if the target "
-        f"has a stable CSS hook; "
-        f"(d) browser_rewind_to_checkpoint if the page appears frozen. "
+        f"(c) browser_scroll_until to bring a different target into "
+        f"view; (d) browser_rewind_to_checkpoint if the page appears frozen. "
         f"Do NOT synthesize clicks via browser_run_script — JS clicks are "
         f"isTrusted=false and bot-detected; the sandbox will reject them."
     )
@@ -182,7 +285,6 @@ def _maybe_no_effect_prefix(
 _CURSOR_TOOL_NAMES = frozenset({
     "browser_click",
     "browser_click_at",
-    "browser_click_selector",
     "browser_type",
     "browser_type_at",
     "browser_fix_text_at",
