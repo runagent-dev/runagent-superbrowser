@@ -88,7 +88,8 @@ _FAILURE_RE = re.compile(
     r"|click_loop_detected|VERIFY_MISS|low_reward_band"
     r"|DOMAIN_PINNED|CAPTCHA DETECTED|transient_rate_limit|t3_open_failed"
     r"|human_handoff_timeout|browser_ask_user_t3_error"
-    r"|CF_INTERSTITIAL_STUCK|CF_INTERSTITIAL_PENDING)\b"
+    r"|CF_INTERSTITIAL_STUCK|CF_INTERSTITIAL_PENDING"
+    r"|no_effect:[a-zA-Z_]+)\b"
     r"|\bFAILED\b|\bdead_click\b|\blabel_mismatch=True\b"
     r"|HTTP\s+(401|403|404|429|451|503)\b",
 )
@@ -123,7 +124,7 @@ def _classify_failure(match: "re.Match[str]") -> str:
         "click_loop_detected",
         "click_at rejected",
         "low_reward_band",
-    ) or "dead_click" in full or "label_mismatch" in full:
+    ) or "dead_click" in full or "label_mismatch" in full or token.startswith("no_effect:"):
         return "stale_selector"
     if token == "VERIFY_MISS":
         return "postcondition_miss"
@@ -399,6 +400,11 @@ def _collapse_failed_tool_messages(
     return collapsed
 
 
+_STATE_URL_TITLE_RE = re.compile(
+    r"\[SESSION_STATE\s+session_id=\S+\s+url=(\S+)\s+title=([^\]]*)\]",
+)
+
+
 def _collapse_stale_state_blocks(
     messages: list[dict[str, Any]],
     *,
@@ -414,13 +420,21 @@ def _collapse_stale_state_blocks(
     Keep the most recent ``keep_last_n`` messages' state blocks
     verbatim; in older messages, replace each [SESSION_STATE ...]
     block with a single-line marker ``[state from prior turn evicted]``.
-    The surrounding text in the message (captions, vision V_n lists,
-    tool-specific result content) is preserved.
+
+    EXCEPTION (stuck-signal preservation): also keep older state blocks
+    that share the same (url, title) as the most-recent block. This is
+    the "I clicked 5 times and the page hasn't changed" signal — if we
+    collapse those duplicates, the brain only sees one current-state
+    block and loses the temporal context that nothing is happening.
+    Once the page actually transitions (different url or title), the
+    older same-state blocks become genuinely stale and the next pass
+    will collapse them on the iteration after.
 
     Mutates message content strings in place. Returns the number of
     state blocks replaced.
     """
     state_msg_indices: list[int] = []
+    state_keys: dict[int, tuple[str, str]] = {}
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if msg.get("role") not in ("tool", "user"):
@@ -428,10 +442,21 @@ def _collapse_stale_state_blocks(
         text = _message_text(msg)
         if "[SESSION_STATE " in text:
             state_msg_indices.append(i)
+            m = _STATE_URL_TITLE_RE.search(text)
+            if m:
+                state_keys[i] = (m.group(1), m.group(2).strip())
     if len(state_msg_indices) <= keep_last_n:
         return 0
 
-    to_strip = state_msg_indices[keep_last_n:]
+    # Preserve any state block whose (url, title) matches the most-recent
+    # block — those carry the "we're still stuck on the same page" signal.
+    preserve: set[int] = set(state_msg_indices[:keep_last_n])
+    most_recent_key = state_keys.get(state_msg_indices[0]) if state_msg_indices else None
+    if most_recent_key:
+        for idx in state_msg_indices[keep_last_n:]:
+            if state_keys.get(idx) == most_recent_key:
+                preserve.add(idx)
+    to_strip = [i for i in state_msg_indices[keep_last_n:] if i not in preserve]
     n_stripped = 0
     replacement = "[state from prior turn evicted]"
     for i in to_strip:

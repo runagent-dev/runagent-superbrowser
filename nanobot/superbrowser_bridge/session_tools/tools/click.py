@@ -440,12 +440,52 @@ class BrowserClickTool(Tool):
                 alt_bbox=None,
                 postcondition=postcond,
             )
+        # Mirror of the no-effect / label-mismatch surfacing in
+        # browser_click_at — DOM-index clicks share the same silent-miss
+        # failure mode (label_mismatch=True / snapped=False / no DOM
+        # mutation) but the diagnostic was previously stderr-only. See
+        # browser_click_at for the rationale.
+        no_effect_caption = f"Clicked [{index}]"
+        record_suffix = ""
+        _escalation_succeeded = "[click_escalated strategy=" in (verify_note or "")
+        if not _escalation_succeeded:
+            _label_mismatch_flag = bool(snap.get("labelMismatch")) if isinstance(snap, dict) else False
+            _snapped_flag = snap.get("snapped") if isinstance(snap, dict) else None
+            no_effect_caption = _maybe_no_effect_prefix(
+                data, "browser_click", no_effect_caption,
+                session_state=self.s,
+            )
+            _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
+            if not _tagged_no_effect and (_label_mismatch_flag or _snapped_flag is False):
+                no_effect_caption = (
+                    f"[no_effect:browser_click] click on [{index}] "
+                    f"snapped to a different element than expected "
+                    f"(label_mismatch={_label_mismatch_flag} "
+                    f"snapped={_snapped_flag}). The DOM index may be "
+                    f"stale (page re-rendered, list re-sorted). Call "
+                    f"browser_screenshot or browser_list_elements to "
+                    f"refresh; DO NOT retry [{index}].\n"
+                    f"{no_effect_caption}"
+                )
+                _tagged_no_effect = True
+            if _tagged_no_effect:
+                record_suffix = " [no_effect]"
+                try:
+                    from nanobot.vision_agent.client import get_vision_agent
+                    await get_vision_agent()._cache.bust_session(session_id)
+                except Exception:
+                    pass
+
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
-        self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
+        self.s.record_step(
+            "browser_click",
+            f"index={index}",
+            f"url={actual_url[:60] if actual_url else '?'}{record_suffix}",
+        )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked [{index}]") + verify_note,
+            self.s.build_text_only(data, no_effect_caption) + verify_note,
         )
 
 
@@ -1085,10 +1125,59 @@ class BrowserClickAtTool(Tool):
             postcondition=postcond,
         )
 
+        # Surface silent click failures to the brain. Without this, the
+        # TS-side label_mismatch / snapped=False / mutation_delta=0
+        # diagnostics only land in stderr — the brain reads "Clicked V_n"
+        # plus an unchanged state block, concludes success, and moves to
+        # the next planned action (typing / navigating / etc.) instead of
+        # retrying with a fresh screenshot. _maybe_no_effect_prefix covers
+        # the strict no-DOM/no-URL/no-focus case; we additionally tag
+        # label_mismatch / snapped=False because a snap to the wrong
+        # element can still register a focus change that masks the miss.
+        # Skip both when the click ladder rescued the click via js/keyboard.
+        no_effect_caption = f"Clicked {log_target}{snap_note}"
+        record_suffix = ""
+        _escalation_succeeded = "[click_escalated strategy=" in (verify_note or "")
+        if not _escalation_succeeded:
+            _snap_dbg = (
+                (data.get("snap") or data.get("clicked") or {})
+                if isinstance(data, dict) else {}
+            )
+            _label_mismatch_flag = bool(_snap_dbg.get("labelMismatch")) if isinstance(_snap_dbg, dict) else False
+            _snapped_flag = _snap_dbg.get("snapped") if isinstance(_snap_dbg, dict) else None
+            no_effect_caption = _maybe_no_effect_prefix(
+                data, "browser_click_at", no_effect_caption,
+                session_state=self.s,
+            )
+            _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
+            if not _tagged_no_effect and (_label_mismatch_flag or _snapped_flag is False):
+                no_effect_caption = (
+                    f"[no_effect:browser_click_at] bbox snapped to a "
+                    f"different element than vision predicted "
+                    f"(label_mismatch={_label_mismatch_flag} "
+                    f"snapped={_snapped_flag}). V{vision_index} is stale "
+                    f"— page may have re-rendered or the bbox is in dead "
+                    f"space. Call browser_screenshot to refresh vision "
+                    f"before clicking; DO NOT retry the same V_n.\n"
+                    f"{no_effect_caption}"
+                )
+                _tagged_no_effect = True
+            if _tagged_no_effect:
+                record_suffix = " [no_effect]"
+                # Bust vision cache for this session so the next prefetch
+                # re-runs the model instead of returning identical V_n
+                # bboxes that just missed (dom_hash unchanged → cache HIT
+                # would otherwise serve the same stale labels).
+                try:
+                    from nanobot.vision_agent.client import get_vision_agent
+                    await get_vision_agent()._cache.bust_session(session_id)
+                except Exception:
+                    pass
+
         self.s.record_step(
             "browser_click_at",
             log_target,
-            f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
+            f"url={actual_url[:60] if actual_url else '?'}{snap_note}{record_suffix}",
         )
         # Phase 3.3 click-hit verification: capture pre-click signals
         # so the post-click vision pass can flag a no-op click that
@@ -1108,7 +1197,7 @@ class BrowserClickAtTool(Tool):
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
+            self.s.build_text_only(data, no_effect_caption) + verify_note,
             expected_label=_expected_label or None,
             pre_url=_pre_url,
             pre_dom_hash=_pre_dom_hash,
