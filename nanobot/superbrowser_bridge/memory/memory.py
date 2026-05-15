@@ -131,10 +131,13 @@ class Memory:
         self.ledger.goal = goal
         self._persist()
         # Phase 6 — if the goal text mentions a URL, auto-ingest the
-        # site_model for its domain so the orchestrator's ledger starts
-        # with the lessons of prior tasks on this site. Orchestrator-
-        # only side effect; safe to call from worker (no-op there).
-        if self.role == "orchestrator" and goal:
+        # site_model for its domain so this role's ledger starts with
+        # the lessons of prior tasks on this site. Applies to BOTH
+        # roles: orchestrators get a "we've been here" fact for
+        # planning, workers get URL-tagged dead-ends materialized into
+        # their slice so Phase 5 B1's [DEAD_ENDS_HERE ...] block fires
+        # on the very first navigation to a known-dangerous URL.
+        if goal:
             try:
                 import re
 
@@ -512,13 +515,15 @@ class Memory:
     def ingest_site_model(self, url: str) -> tuple[int, int]:
         """Load any persisted site model for ``url``'s domain.
 
-        Orchestrator-only side effect; safe to call from worker but
-        a no-op there. Returns (notes_count, dead_targets_count) for
-        observability. Pattern: call once when the orchestrator first
-        sees the goal URL (or first navigates to a new domain).
+        Applies to BOTH orchestrator and worker — the worker is the
+        one that actually navigates, so it needs URL-tagged dead-ends
+        materialized into its ledger for Phase 5 B1's
+        [DEAD_ENDS_HERE ...] injection to fire on the very first
+        navigation. The orchestrator also benefits — a "we've been
+        here before" fact in the planning ledger.
+
+        Returns (notes_count, dead_targets_count) for observability.
         """
-        if self.role != "orchestrator":
-            return (0, 0)
         return ingest_into_orchestrator(self, url)
 
     def write_task_summary(self, *, success: bool) -> None:
