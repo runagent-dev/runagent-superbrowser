@@ -26,7 +26,15 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .compaction import SubgoalCompactor
 from .hook import MemoryHook
-from .ledger import Checkpoint, DeadEnd, Fact, Ledger, StepOutcome
+from .ledger import (
+    Checkpoint,
+    DeadEnd,
+    Fact,
+    Ledger,
+    StepOutcome,
+    _normalize_url_for_match,
+)
+from .site_model import SiteModelStore, ingest_into_orchestrator
 from .store import EventLog, LedgerStore
 
 if TYPE_CHECKING:
@@ -106,13 +114,35 @@ class Memory:
                 "resumed": self.ledger.step_count > 0,
             },
         )
-        return MemoryHook(self)
+        hook = MemoryHook(self)
+        # Phase 4 — pass the bot reference into the hook so its
+        # before_iteration can poll ``session.metadata["_last_summary"]``
+        # for AutoCompact writes and absorb them into episodic memory.
+        if bot is not None:
+            try:
+                hook._bind_bot(bot)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return hook
 
     # ----- plan / structure -----
 
     def set_goal(self, goal: str) -> None:
         self.ledger.goal = goal
         self._persist()
+        # Phase 6 — if the goal text mentions a URL, auto-ingest the
+        # site_model for its domain so the orchestrator's ledger starts
+        # with the lessons of prior tasks on this site. Orchestrator-
+        # only side effect; safe to call from worker (no-op there).
+        if self.role == "orchestrator" and goal:
+            try:
+                import re
+
+                match = re.search(r"https?://\S+", goal)
+                if match:
+                    self.ingest_site_model(match.group(0))
+            except Exception:  # pragma: no cover
+                pass
 
     def set_plan(self, subgoals: list[str]) -> None:
         self.ledger.plan = list(subgoals)
@@ -209,17 +239,23 @@ class Memory:
         source_step: int = -1,
         confidence: float = 1.0,
         subgoal: str | None = None,
+        category: str = "observation",
     ) -> None:
+        import time
+
         if source_step < 0:
             source_step = self.ledger.step_count
         if subgoal is None:
             subgoal = self.ledger.subgoal or None
+        now = time.time()
         fact = Fact(
             key=key,
             value=value,
             source_step=source_step,
             confidence=confidence,
             subgoal=subgoal,
+            category=category,
+            last_referenced_at=now,
         )
         self.ledger.add_fact(fact)
         self.store.append_fact_action(key, value, "remember")
@@ -265,13 +301,28 @@ class Memory:
             self._persist()
 
     def mark_dead_end(
-        self, description: str, *, subgoal: str | None = None
+        self,
+        description: str,
+        *,
+        subgoal: str | None = None,
+        url: str = "",
+        cause: str = "unknown",
     ) -> None:
         if not description:
             return
         if subgoal is None:
             subgoal = self.ledger.subgoal or None
-        dead_end = DeadEnd(description=description, subgoal=subgoal)
+        # Default URL to the ledger's current_url if the caller didn't
+        # supply one — most failure-collapse paths know "the worker is
+        # on this URL right now" implicitly via state, not explicitly.
+        if not url:
+            url = self.ledger.current_url or ""
+        dead_end = DeadEnd(
+            description=description,
+            subgoal=subgoal,
+            url=url,
+            cause=cause,
+        )
         self.ledger.add_dead_end(dead_end)
         self._persist()
 
@@ -282,14 +333,46 @@ class Memory:
         title: str = "",
         action: str = "",
         subgoal: str | None = None,
+        kind: str = "navigation",
     ) -> None:
         if not url:
             return
         if subgoal is None:
             subgoal = self.ledger.subgoal or None
-        cp = Checkpoint(url=url, title=title, action=action, subgoal=subgoal)
+        cp = Checkpoint(
+            url=url,
+            title=title,
+            action=action,
+            subgoal=subgoal,
+            kind=kind,
+        )
         self.ledger.add_checkpoint(cp)
         self._persist()
+
+    def dead_ends_for_url(self, url: str) -> list[DeadEnd]:
+        """Return all dead-ends recorded at the given URL.
+
+        Phase 5 (B1) consumers — list_elements result formatter and
+        the screenshot state-block formatter — call this to inject a
+        "[DEAD_ENDS_HERE ...]" block into action-selecting tool
+        results so the model can't miss prior failures on this page.
+
+        URL matching normalizes www-prefix, protocol, port, and
+        trailing slash. Required so cross-task site_model ingestion
+        (which synthesizes urls as ``https://{domain}{path}`` from
+        the eTLD+1 domain) matches the agent's actual current_url
+        (which typically carries ``www.`` and may have a trailing
+        slash). Without this, the dead-end injection silently
+        doesn't fire on revisits.
+        """
+        if not url:
+            return []
+        target = _normalize_url_for_match(url)
+        return [
+            d
+            for d in self.ledger.dead_ends
+            if _normalize_url_for_match(d.url) == target
+        ]
 
     def record_step(
         self,
@@ -300,6 +383,7 @@ class Memory:
         success: bool = True,
         url: str = "",
         iteration: int = -1,
+        caption: str = "",
     ) -> None:
         outcome = StepOutcome(
             tool=tool,
@@ -309,6 +393,7 @@ class Memory:
             success=success,
             subgoal=self.ledger.subgoal or None,
             iteration=iteration,
+            caption=caption,
         )
         self.ledger.append_step(outcome)
         self.store.append_step(outcome)
@@ -334,13 +419,20 @@ class Memory:
         """
         if not query:
             return []
+        import time
+
         needle = query.casefold()
         scored: list[tuple[float, dict[str, Any]]] = []
+        now = time.time()
 
         # Score 3.0: facts (high signal - structured kv data).
         for fact in self.ledger.facts.values():
             haystack = f"{fact.key} {fact.value}".casefold()
             if needle in haystack:
+                # Bump MRU stamp so render shows recently-recalled facts
+                # near the top. The persist below the loop covers the
+                # ledger.json write.
+                fact.last_referenced_at = now
                 scored.append(
                     (
                         3.0,
@@ -349,6 +441,7 @@ class Memory:
                             "key": fact.key,
                             "text": f"{fact.key} = {fact.value}",
                             "subgoal": fact.subgoal,
+                            "category": fact.category,
                         },
                     )
                 )
@@ -391,6 +484,12 @@ class Memory:
                 )
 
         scored.sort(key=lambda x: -x[0])
+        # If any fact's last_referenced_at was bumped during the scan,
+        # persist so the MRU stamp survives restart. Cheap relative to
+        # the recall LLM-context value.
+        fact_hits = sum(1 for s, _ in scored if s == 3.0)
+        if fact_hits:
+            self._persist()
         self.events.log(
             "recall",
             {"query": query, "limit": limit, "hits": len(scored)},
@@ -407,6 +506,131 @@ class Memory:
         in step 8.
         """
         self.store.export_step_history(self.ledger)
+
+    # ----- cross-task site model (Phase 6) -----
+
+    def ingest_site_model(self, url: str) -> tuple[int, int]:
+        """Load any persisted site model for ``url``'s domain.
+
+        Orchestrator-only side effect; safe to call from worker but
+        a no-op there. Returns (notes_count, dead_targets_count) for
+        observability. Pattern: call once when the orchestrator first
+        sees the goal URL (or first navigates to a new domain).
+        """
+        if self.role != "orchestrator":
+            return (0, 0)
+        return ingest_into_orchestrator(self, url)
+
+    def write_task_summary(self, *, success: bool) -> None:
+        """At task end, write a per-task summary AND per-domain site models.
+
+        Two outputs:
+
+        1. ``/tmp/superbrowser/{task_id}/task_summary.json`` — a single
+           structured record of this task's outcome. Useful for
+           post-mortem analysis and as a quick at-a-glance view of
+           what happened without grep-ing through events.jsonl.
+
+        2. ``/tmp/superbrowser/site_models/{domain}.json`` per domain
+           visited — the cross-task procedural memory layer.
+           ``merge_from_ledger`` distills URL-tagged dead-ends and
+           constraint/preference/derived facts into the persistent
+           site model so the next task on the same site benefits.
+
+        Best-effort: file I/O failures are logged and swallowed so a
+        broken site_model or summary write doesn't poison the
+        orchestrator's return path.
+        """
+        # 1. Task summary
+        try:
+            self._write_task_summary_json(success=success)
+        except Exception as exc:  # pragma: no cover
+            from loguru import logger as _logger
+
+            _logger.debug("task_summary.json write failed: {}", exc)
+
+        # 2. Site model merge
+        try:
+            written = SiteModelStore.merge_from_ledger(
+                self.ledger, success=success
+            )
+            self.events.log(
+                "task_summary_written",
+                {
+                    "domains": list(written.keys()),
+                    "success": success,
+                    "step_count": self.ledger.step_count,
+                },
+            )
+        except Exception as exc:  # pragma: no cover
+            from loguru import logger as _logger
+
+            _logger.debug("site_model merge failed: {}", exc)
+
+    def _write_task_summary_json(self, *, success: bool) -> None:
+        """Materialize a single task_summary.json under this task's dir.
+
+        Schema (every field tolerant to None / missing):
+
+        ::
+
+            {
+              "task_id": ...,
+              "role": "orchestrator" | "worker",
+              "goal": ...,
+              "plan": [...],
+              "step_count": N,
+              "success_count": N,
+              "fail_count": N,
+              "dead_end_count": N,
+              "checkpoint_count": N,
+              "best_checkpoint": {url, title, kind} | None,
+              "current_url": ...,
+              "facts": {key: value},
+              "final_outcome": success | failure,
+              "subgoals_completed": N (count of episodic entries from compaction)
+            }
+        """
+        import json
+        from pathlib import Path
+
+        ledger = self.ledger
+        steps = ledger.all_steps or []
+        success_count = sum(1 for s in steps if s.success)
+        fail_count = sum(1 for s in steps if not s.success)
+        best_cp = ledger.best_checkpoint
+        summary = {
+            "task_id": self.task_id,
+            "role": self.role,
+            "goal": ledger.goal,
+            "plan": list(ledger.plan or []),
+            "current_url": ledger.current_url,
+            "step_count": ledger.step_count,
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "dead_end_count": len(ledger.dead_ends),
+            "checkpoint_count": len(ledger.checkpoints),
+            "best_checkpoint": (
+                {"url": best_cp.url, "title": best_cp.title, "kind": best_cp.kind}
+                if best_cp
+                else None
+            ),
+            "facts": {k: v.value for k, v in (ledger.facts or {}).items()},
+            "final_outcome": "success" if success else "failure",
+            "subgoals_completed": sum(
+                1 for e in (ledger.episodic or []) if e.startswith("[subgoal=")
+            ),
+        }
+        # The summary lives one level above memory/ so it's easy to
+        # find next to step_history.{md,json} and not buried in the
+        # event log directory.
+        task_dir = Path(self.store.dir).parent
+        task_dir.mkdir(parents=True, exist_ok=True)
+        out = task_dir / "task_summary.json"
+        tmp = out.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(out)
 
     # ----- internals -----
 

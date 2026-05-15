@@ -89,6 +89,11 @@ class MemoryRecallTool(Tool):
         return "\n".join(lines)
 
 
+_FACT_CATEGORIES = frozenset(
+    {"observation", "constraint", "preference", "identity", "credential", "derived"}
+)
+
+
 @tool_parameters(
     tool_parameters_schema(
         key=StringSchema(
@@ -101,6 +106,12 @@ class MemoryRecallTool(Tool):
         ),
         confidence=IntegerSchema(
             "0-100 confidence in the fact. Default 100.",
+            nullable=True,
+        ),
+        category=StringSchema(
+            "Optional category: observation (default) | constraint | "
+            "preference | identity | credential | derived. Used by the "
+            "render layer to group facts and by recall to filter.",
             nullable=True,
         ),
         required=["key", "value"],
@@ -122,6 +133,7 @@ class MemoryRememberTool(Tool):
         key: str,
         value: str,
         confidence: int | None = None,
+        category: str | None = None,
         **_kw: Any,
     ) -> str:
         err = _role_guard(self.memory, self.name)
@@ -135,8 +147,13 @@ class MemoryRememberTool(Tool):
                 conf = max(0.0, min(1.0, int(confidence) / 100.0))
             except (TypeError, ValueError):
                 conf = 1.0
-        self.memory.remember(key, value, confidence=conf)
-        return json.dumps({"stored": True, "key": key, "value": value})
+        cat = (category or "observation").strip().lower()
+        if cat not in _FACT_CATEGORIES:
+            cat = "observation"
+        self.memory.remember(key, value, confidence=conf, category=cat)
+        return json.dumps(
+            {"stored": True, "key": key, "value": value, "category": cat}
+        )
 
 
 @tool_parameters(

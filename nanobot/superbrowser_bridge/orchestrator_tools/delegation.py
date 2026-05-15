@@ -351,7 +351,15 @@ class DelegateBrowserTaskTool(Tool):
         # the worker's system prompt every iteration - shows the goal
         # and the current subgoal scope, not an empty block.
         worker_memory.set_goal(instructions[:200])
-        worker_memory.begin_subgoal(f"delegated: {instructions[:80]}")
+        # message_floor=0 means "compact from the worker's first message
+        # onward" — the worker starts with an empty conversation log so
+        # the floor is trivially 0. Without this, the floor stays at -1
+        # and compact_subgoal would silently slice from index 0 anyway,
+        # but being explicit avoids relying on that fallback.
+        worker_memory.begin_subgoal(
+            f"delegated: {instructions[:80]}",
+            message_floor=0,
+        )
 
         # Register ALL browser tools with isolated state. The state is
         # bound to worker_memory; legacy callers that read
@@ -1599,3 +1607,94 @@ CRITICAL RULES:
             )
             print(f"\n>> Worker error: {error_msg}")
             return error_msg
+        finally:
+            # Phase 3 — auto-compact the worker's subgoal and debrief the
+            # orchestrator before the worker's Memory goes out of scope.
+            #
+            # 1. compact_subgoal: archives the worker's message slice via
+            #    nanobot's Consolidator and folds the summary into
+            #    episodic memory. The compactor primitive shipped in 2026-05
+            #    has never fired in production until this finally landed
+            #    (no caller invoked end_subgoal / compact_subgoal).
+            #
+            # 2. Debrief: read the worker's on-disk ledger and promote
+            #    high-confidence facts + URL-tagged dead-ends into the
+            #    orchestrator's Memory so the next worker spawned for the
+            #    same task starts with the lessons of this one. Disk-read
+            #    by task_id keeps coupling loose — no signature change to
+            #    delegate_browser_task or its many call sites.
+            try:
+                last_msgs = getattr(worker_memory_hook, "_last_seen_messages", None)
+                if last_msgs is not None:
+                    floor = worker_memory.ledger.subgoal_message_floor
+                    if floor < 0:
+                        floor = 0
+                    final_slice = last_msgs[floor:]
+                    # Heuristic: if we have any content, treat the subgoal
+                    # as successful. Workers that crashed in the except
+                    # branch will have content == "" (variable may be
+                    # undefined since try aborted), so default to False.
+                    completed_content: str | None = None
+                    try:
+                        completed_content = content  # type: ignore[name-defined]
+                    except NameError:
+                        completed_content = None
+                    summary_hint: str | None = None
+                    if completed_content:
+                        summary_hint = completed_content[:240]
+                    success_flag = bool(completed_content)
+                    await worker_memory.compact_subgoal(
+                        final_slice,
+                        success=success_flag,
+                        summary_hint=summary_hint,
+                        clear_subgoal=True,
+                    )
+            except Exception as exc:  # pragma: no cover - best effort
+                print(f">> auto-compact on worker exit failed: {exc}")
+
+            try:
+                from superbrowser_bridge.memory.registry import (
+                    get_orchestrator_memory,
+                )
+                from superbrowser_bridge.memory.store import LedgerStore
+
+                orch_mem = get_orchestrator_memory()
+                if orch_mem is not None:
+                    worker_store = LedgerStore(task_id)
+                    worker_ledger = worker_store.load()
+                    if worker_ledger is not None:
+                        promoted_facts = 0
+                        promoted_dead_ends = 0
+                        for f in worker_ledger.facts.values():
+                            # High-confidence threshold avoids polluting the
+                            # orchestrator's ledger with the worker's guesses.
+                            if f.confidence >= 0.7:
+                                orch_mem.remember(
+                                    f"worker_{task_id[:6]}_{f.key}",
+                                    f.value,
+                                    category="derived",
+                                    source_step=f.source_step,
+                                    confidence=f.confidence,
+                                )
+                                promoted_facts += 1
+                        for d in worker_ledger.dead_ends:
+                            # Only URL-tagged dead-ends are actionable for
+                            # the orchestrator (which doesn't browse — it
+                            # plans the next worker's path).
+                            if d.url:
+                                orch_mem.mark_dead_end(
+                                    d.description,
+                                    url=d.url,
+                                    cause=d.cause,
+                                )
+                                promoted_dead_ends += 1
+                        worker_memory.events.log(
+                            "worker_debrief",
+                            {
+                                "worker_task_id": task_id,
+                                "promoted_facts": promoted_facts,
+                                "promoted_dead_ends": promoted_dead_ends,
+                            },
+                        )
+            except Exception as exc:  # pragma: no cover - best effort
+                print(f">> worker debrief failed: {exc}")

@@ -97,7 +97,7 @@ async def _run_and_capture(
 
 async def main():
     from nanobot import Nanobot
-    from superbrowser_bridge.memory import Memory
+    from superbrowser_bridge.memory import Memory, set_orchestrator_memory
     from superbrowser_bridge.orchestrator_tools import register_orchestrator_tools
 
     # Create the orchestrator with its own workspace
@@ -120,6 +120,9 @@ async def main():
     # writes to its own /tmp/superbrowser/{worker_task_id}/memory/.
     orch_task_id = f"orch-{task_id}"
     orch_memory = Memory(orch_task_id, session_key=session_key, role="orchestrator")
+    # Phase 3 — expose orchestrator memory to delegation.py's finally
+    # block so worker exit can promote findings into this ledger.
+    set_orchestrator_memory(orch_memory)
     orch_hook = orch_memory.attach(orchestrator)
 
     print("Two-agent SuperBrowser system ready")
@@ -147,17 +150,26 @@ async def main():
     print(f"\nAgent: {content}")
 
     # Multi-turn loop
-    while True:
-        user_input = input("\nYou: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit", "q"):
-            break
+    try:
+        while True:
+            user_input = input("\nYou: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                break
 
-        content = await _run_and_capture(
-            orchestrator, user_input, session_key, hooks=[orch_hook]
-        )
-        print(f"\nAgent: {content}")
+            content = await _run_and_capture(
+                orchestrator, user_input, session_key, hooks=[orch_hook]
+            )
+            print(f"\nAgent: {content}")
+    finally:
+        # Phase 6 — distill the session's URL-tagged dead-ends and
+        # constraint/derived facts into per-domain site_models so
+        # repeat runs benefit from this session's lessons.
+        try:
+            orch_memory.write_task_summary(success=True)
+        except Exception as exc:
+            print(f">> task summary write failed: {exc}")
 
 
 if __name__ == "__main__":

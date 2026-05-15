@@ -24,6 +24,11 @@ from __future__ import annotations
 from .hook import MemoryHook
 from .ledger import Checkpoint, DeadEnd, Fact, Ledger, StepOutcome
 from .memory import Memory, Role
+from .registry import (
+    clear_orchestrator_memory,
+    get_orchestrator_memory,
+    set_orchestrator_memory,
+)
 from .store import EventLog, LedgerStore
 from .tools import (
     MemoryForgetTool,
@@ -47,4 +52,7 @@ __all__ = [
     "MemoryRememberTool",
     "Role",
     "StepOutcome",
+    "clear_orchestrator_memory",
+    "get_orchestrator_memory",
+    "set_orchestrator_memory",
 ]

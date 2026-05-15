@@ -914,13 +914,49 @@ class BrowserSessionState:
         render window), and persists to steps.jsonl. The result
         snippet is truncated to 200 chars to match the legacy shape;
         downstream readers (worker_hook, telemetry) depend on this.
+
+        Phase 2: determine success from result text via the same
+        failure regex the MemoryHook collapse pass uses. Capture the
+        most recent vision caption / summary so the ledger render can
+        lead with "✓ clicked Checkout button" instead of
+        "✓ browser_click_at(V2)".
         """
+        truncated = (result_summary or "")[:200]
+        # Success determination — defer to the shared failure regex so
+        # the criterion stays consistent with what failure-collapse
+        # classifies as a failure.
+        success = True
+        try:
+            from superbrowser_bridge.memory.hook import _FAILURE_RE
+            if _FAILURE_RE.search(result_summary or ""):
+                success = False
+        except Exception:
+            pass
+        # Caption — vision_pipeline writes ``_last_vision_summary``
+        # (short, semantic) when a fresh vision pass runs. Falls back
+        # to the response's brain-text excerpt if only the structured
+        # response is available. Empty when no vision info is fresh.
+        caption = ""
+        try:
+            summary = getattr(self, "_last_vision_summary", "") or ""
+            if summary:
+                caption = summary[:160]
+            else:
+                vr = getattr(self, "_last_vision_response", None)
+                if vr is not None:
+                    brain = getattr(vr, "summary", "") or getattr(vr, "as_brain_text", lambda: "")()
+                    if isinstance(brain, str) and brain:
+                        # Strip newlines + cap so it fits the render line cleanly.
+                        caption = brain.replace("\n", " ")[:160]
+        except Exception:
+            caption = ""
         self._memory.record_step(
             tool_name,
             args_summary,
-            (result_summary or "")[:200],
+            truncated,
             url=self.current_url,
-            success=True,
+            success=success,
+            caption=caption,
         )
 
     def check_dead_click(

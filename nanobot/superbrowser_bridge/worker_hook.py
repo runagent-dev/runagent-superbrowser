@@ -805,6 +805,8 @@ class BrowserWorkerHook(AgentHook):
                     "iter": context.iteration,
                     "tokens_in": usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
                     "tokens_out": usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+                    "cache_read": usage.get("cache_read_input_tokens") or 0,
+                    "cache_creation": usage.get("cache_creation_input_tokens") or 0,
                     "images": count_image_blocks(context.messages),
                     "messages": len(context.messages),
                     "tool_calls": len(context.tool_calls),

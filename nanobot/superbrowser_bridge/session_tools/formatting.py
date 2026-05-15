@@ -225,4 +225,43 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
     if notices:
         parts.append(f"[Notices: {' '.join(notices)}]")
 
+    # Phase 5 (B1): if the worker's Memory has URL-tagged dead-ends for
+    # this URL, append a [DEAD_ENDS_HERE ...] block so prior failures
+    # are visible at action-selection time, not buried in the ledger.
+    try:
+        if state is not None and url:
+            mem = getattr(state, "_memory", None)
+            if mem is not None:
+                dead_here = mem.dead_ends_for_url(url)
+                if dead_here:
+                    parts.append(_format_dead_ends_here_block(dead_here))
+    except Exception:
+        pass  # best-effort
+
     return "\n".join(parts)
+
+
+def _format_dead_ends_here_block(dead_ends: list, *, max_show: int = 5) -> str:
+    """Compact one-block summary of dead-ends recorded on the current URL.
+
+    Mirrors the [DEAD_ENDS_HERE ...] shape used by list_elements so
+    the worker sees the same idiom in both action-selecting tool
+    results. Sorted most-recent-first and capped — runaway logs
+    don't bloat the state block.
+    """
+    if not dead_ends:
+        return ""
+    ordered = sorted(
+        dead_ends,
+        key=lambda d: getattr(d, "timestamp", 0.0),
+        reverse=True,
+    )[:max_show]
+    lines = [
+        f"[DEAD_ENDS_HERE {len(dead_ends)} prior failure(s) on this URL:"
+    ]
+    for d in ordered:
+        cause = getattr(d, "cause", "unknown")
+        desc = (getattr(d, "description", "") or "")[:120]
+        lines.append(f"  - [{cause}] {desc}")
+    lines.append("]")
+    return "\n".join(lines)

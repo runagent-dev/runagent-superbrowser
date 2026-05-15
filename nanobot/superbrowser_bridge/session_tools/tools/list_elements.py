@@ -94,4 +94,46 @@ class BrowserListElementsTool(Tool):
             header_bits.append(f"truncated at limit={cap}")
         header = f"[ELEMENTS {' '.join(header_bits)}]"
 
-        return header + "\n" + "\n".join(lines)
+        body = header + "\n" + "\n".join(lines)
+
+        # Phase 5 (B1): if the worker's Memory has dead-ends recorded
+        # for the current URL, append a [DEAD_ENDS_HERE ...] block
+        # so prior failed targets are unmissable when the model picks
+        # its next click. Appended at the END of the result so the
+        # element list itself is what the model first reads, then
+        # gets the "but here's what already failed" reminder.
+        try:
+            mem = getattr(self.s, "_memory", None)
+            cur_url = getattr(self.s, "current_url", "") or ""
+            if mem is not None and cur_url:
+                dead_here = mem.dead_ends_for_url(cur_url)
+                if dead_here:
+                    body += "\n" + _format_dead_ends_here(dead_here, cur_url)
+        except Exception:
+            pass  # best-effort — don't let memory bugs break element listing
+
+        return body
+
+
+def _format_dead_ends_here(
+    dead_ends: list[Any], current_url: str, *, max_show: int = 5
+) -> str:
+    """Render top-N most recent dead-ends as a compact reminder block."""
+    if not dead_ends:
+        return ""
+    # Sort by timestamp desc and cap so a runaway log doesn't bloat
+    # the tool result. Most recent failures are the most actionable.
+    ordered = sorted(
+        dead_ends,
+        key=lambda d: getattr(d, "timestamp", 0.0),
+        reverse=True,
+    )[:max_show]
+    lines = [
+        f"[DEAD_ENDS_HERE {len(dead_ends)} prior failure(s) on this URL:"
+    ]
+    for d in ordered:
+        cause = getattr(d, "cause", "unknown")
+        desc = (getattr(d, "description", "") or "")[:120]
+        lines.append(f"  - [{cause}] {desc}")
+    lines.append("]")
+    return "\n".join(lines)

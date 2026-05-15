@@ -48,6 +48,141 @@ _RENDER_MAX_DEAD_ENDS = 12
 _RENDER_MAX_CHECKPOINTS = 10
 _RENDER_MAX_EPISODIC = 8
 
+# Item 3 — single-line instruction at the top of the rendered ledger
+# block. Goes into messages[0]["content"][1] (the dynamic ledger
+# block) every turn. Steers the model toward the structured ledger
+# when older message-history bulk has been gutted by Item 1's
+# auto-archive — the action results in those messages now read as
+# "[archived]" markers, so the ledger is the only source of truth
+# for what happened earlier in the task.
+_TRUST_LEDGER_INSTRUCTION = (
+    "NOTE: Trust this Agent Ledger as the authoritative structured "
+    "memory of the task. Older message-history details may have been "
+    "archived to bounded markers; when the ledger and message history "
+    "disagree, the ledger wins."
+)
+
+# Tools whose calls naturally come in streaks during a single task
+# (form filling, multi-element clicks, scrollable lists). Phase 5
+# chunking treats consecutive calls of these tools on the same URL
+# as a single conceptual action in the rendered ``recent[]`` view.
+_CHUNKABLE_TOOLS = frozenset(
+    {
+        "browser_type",
+        "browser_click",
+        "browser_click_at",
+        "browser_scroll",
+    }
+)
+
+
+def _chunk_label(tool: str, count: int) -> str:
+    """Short human-readable phrase for a chunked tool streak."""
+    return {
+        "browser_type": f"filled {count} fields",
+        "browser_click": f"clicked {count} elements",
+        "browser_click_at": f"clicked {count} vision targets",
+        "browser_scroll": f"scrolled {count} times",
+    }.get(tool, f"{tool} x{count}")
+
+
+def _normalize_url_for_match(url: str) -> tuple[str, str]:
+    """Normalize ``url`` to ``(domain, path)`` for state-keyed lookups.
+
+    Strips protocol, ``www.`` prefix, port, and trailing slash (except
+    on bare ``/``). Returns ``("", "")`` for empty input.
+
+    The same canonical form is used by ``Ledger`` render grouping and
+    ``Memory.dead_ends_for_url`` so cross-task site_model URLs match
+    live agent URLs even when www/protocol/trailing-slash differs.
+    """
+    if not url:
+        return ("", "")
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        domain = (parsed.netloc or "").lower().split(":")[0]
+        if domain.startswith("www."):
+            domain = domain[4:]
+        path = parsed.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        return (domain, path)
+    except Exception:
+        return ("", url)
+
+
+def _short_url(url: str) -> str:
+    """Strip protocol + host so the chunk line stays readable.
+
+    'https://www.wineaccess.com/store/white-wine/' -> '/store/white-wine/'
+    """
+    if not url:
+        return ""
+    try:
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        slash = url.find("/")
+        return url[slash:] if slash >= 0 else "/"
+    except Exception:
+        return url
+
+
+def _render_recent_chunked(recent: list["StepOutcome"]) -> list[str]:
+    """Render the bounded recent[] view, collapsing consecutive
+    same-tool same-URL streaks into a single chunk line.
+
+    A streak of 5 ``browser_type`` calls on /checkout/ renders as
+    ``✓ filled 5 fields on /checkout/`` instead of 5 separate lines.
+    Solo calls render via the existing StepOutcome.render_line.
+
+    Non-chunkable tools (navigate, screenshot, get_markdown) always
+    render solo; chunking would obscure semantically distinct actions.
+    """
+    if not recent:
+        return []
+    lines: list[str] = []
+    streak_tool: str | None = None
+    streak_url: str | None = None
+    streak_count = 0
+    streak_first: "StepOutcome | None" = None
+    streak_any_failed = False
+
+    def flush() -> None:
+        nonlocal streak_first, streak_count, streak_any_failed
+        if streak_first is None:
+            return
+        if streak_count > 1 and streak_tool in _CHUNKABLE_TOOLS:
+            marker = "✗" if streak_any_failed else "✓"
+            label = _chunk_label(streak_tool or "", streak_count)
+            short = _short_url(streak_url or "")
+            url_part = f" on {short}" if short else ""
+            lines.append(f"  {marker} {label}{url_part}  [{streak_tool}]")
+        else:
+            lines.append(streak_first.render_line())
+        streak_first = None
+        streak_count = 0
+        streak_any_failed = False
+
+    for step in recent:
+        if (
+            step.tool == streak_tool
+            and step.url == streak_url
+            and step.tool in _CHUNKABLE_TOOLS
+        ):
+            streak_count += 1
+            streak_any_failed = streak_any_failed or not step.success
+            continue
+        flush()
+        streak_tool = step.tool
+        streak_url = step.url
+        streak_count = 1
+        streak_first = step
+        streak_any_failed = not step.success
+    flush()
+    return lines
+
 
 @dataclass
 class Fact:
@@ -56,6 +191,13 @@ class Fact:
     Keys are short, human-readable identifiers; values are short
     strings. If a piece of data doesn't fit in one short line, it
     belongs in episodic, not facts.
+
+    ``category`` is a free-form string with documented values rather
+    than an enum: ``observation`` (default), ``constraint``,
+    ``preference``, ``identity``, ``credential``, ``derived``. The
+    render layer doesn't enforce — it groups when callers cooperate.
+    ``last_referenced_at`` is bumped by recall / re-writes; MRU
+    ordering uses it for the fact-render in long-running tasks.
     """
 
     key: str
@@ -64,6 +206,15 @@ class Fact:
     confidence: float = 1.0
     subgoal: str | None = None
     timestamp: float = field(default_factory=time.time)
+    category: str = "observation"
+    last_referenced_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Default last_referenced_at to the creation timestamp so newly
+        # added facts naturally sort to the top of MRU views before they
+        # have ever been queried.
+        if not self.last_referenced_at:
+            self.last_referenced_at = self.timestamp
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +224,8 @@ class Fact:
             "confidence": self.confidence,
             "subgoal": self.subgoal,
             "timestamp": self.timestamp,
+            "category": self.category,
+            "last_referenced_at": self.last_referenced_at,
         }
 
     @classmethod
@@ -84,6 +237,8 @@ class Fact:
             confidence=float(d.get("confidence", 1.0)),
             subgoal=d.get("subgoal"),
             timestamp=float(d.get("timestamp", 0.0)),
+            category=d.get("category", "observation"),
+            last_referenced_at=float(d.get("last_referenced_at", 0.0)),
         )
 
 
@@ -94,6 +249,11 @@ class Checkpoint:
     Checkpoints survive aggressive context eviction so the agent can
     answer "where was I making progress?" even when older history is
     gone. Used by routing/rewind logic to recover after regressions.
+
+    ``kind`` groups checkpoints semantically: ``navigation`` (default),
+    ``landing``, ``login``, ``search_results``, ``form_filled``,
+    ``data_extracted``, ``task_complete``. The render layer groups
+    by kind so "where did I log in?" reads at a glance.
     """
 
     url: str
@@ -101,6 +261,7 @@ class Checkpoint:
     action: str = ""
     subgoal: str | None = None
     timestamp: float = field(default_factory=time.time)
+    kind: str = "navigation"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +270,7 @@ class Checkpoint:
             "action": self.action,
             "subgoal": self.subgoal,
             "timestamp": self.timestamp,
+            "kind": self.kind,
             "time": _fmt_time(self.timestamp),  # legacy HH:MM:SS field
         }
 
@@ -120,6 +282,7 @@ class Checkpoint:
             action=d.get("action", ""),
             subgoal=d.get("subgoal"),
             timestamp=float(d.get("timestamp", 0.0)),
+            kind=d.get("kind", "navigation"),
         )
 
 
@@ -130,6 +293,12 @@ class StepOutcome:
     Compact by design: ``args`` and ``result`` are short summaries, not
     the full payloads. The full tool result lives in the message log
     (until compacted) and on disk in steps.jsonl.
+
+    ``caption`` carries the vision pipeline's semantic description of
+    the page state when this step ran (e.g., "white wine listing page
+    with Region filter expanded"). The render layer leads with
+    ``caption`` when present so the LLM reads "✓ clicked Shop nav →
+    /store/" rather than "✓ browser_click_at(V2) → success" (Phase 5).
     """
 
     tool: str
@@ -140,6 +309,7 @@ class StepOutcome:
     subgoal: str | None = None
     iteration: int = -1
     timestamp: float = field(default_factory=time.time)
+    caption: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +321,7 @@ class StepOutcome:
             "subgoal": self.subgoal,
             "iteration": self.iteration,
             "timestamp": self.timestamp,
+            "caption": self.caption,
             "time": _fmt_time(self.timestamp),  # legacy HH:MM:SS field
         }
 
@@ -165,10 +336,17 @@ class StepOutcome:
             subgoal=d.get("subgoal"),
             iteration=int(d.get("iteration", -1)),
             timestamp=float(d.get("timestamp", 0.0)),
+            caption=d.get("caption", ""),
         )
 
     def render_line(self) -> str:
         marker = "✓" if self.success else "✗"
+        if self.caption:
+            # Caption-first: semantic record leads, syntactic tail.
+            # Phase 5 design — schema landed here so Phase 5 only
+            # changes presentation.
+            result_part = f" → {self.result}" if self.result else ""
+            return f"  {marker} {self.caption}{result_part}  [{self.tool}]"
         args_part = f"({self.args})" if self.args else ""
         result_part = f" → {self.result}" if self.result else ""
         return f"  {marker} {self.tool}{args_part}{result_part}"
@@ -180,17 +358,28 @@ class DeadEnd:
 
     Sourced from collapsed failures, escalations, regressions. The
     description is intentionally short - one line.
+
+    ``url`` is the page on which the failure happened. State-keyed
+    retrieval (``Memory.dead_ends_for_url``) relies on it — without
+    URL the agent could only see "this thing failed somewhere" not
+    "this thing failed HERE". ``cause`` is the coarse classifier
+    output from ``hook._classify_failure`` (network / bot_block /
+    stale_selector / postcondition_miss / etc.).
     """
 
     description: str
     subgoal: str | None = None
     timestamp: float = field(default_factory=time.time)
+    url: str = ""
+    cause: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "description": self.description,
             "subgoal": self.subgoal,
             "timestamp": self.timestamp,
+            "url": self.url,
+            "cause": self.cause,
         }
 
     @classmethod
@@ -199,6 +388,8 @@ class DeadEnd:
             description=d.get("description", ""),
             subgoal=d.get("subgoal"),
             timestamp=float(d.get("timestamp", 0.0)),
+            url=d.get("url", ""),
+            cause=d.get("cause", "unknown"),
         )
 
 
@@ -357,7 +548,7 @@ class Ledger:
         return self._render_full()
 
     def _render_full(self) -> str:
-        parts: list[str] = []
+        parts: list[str] = [_TRUST_LEDGER_INSTRUCTION]
 
         if self.goal:
             parts.append(f"GOAL: {self.goal}")
@@ -372,32 +563,67 @@ class Ledger:
 
         if self.facts:
             parts.append("FACTS:")
-            shown = list(self.facts.values())[:_RENDER_MAX_FACTS]
+            # MRU + current-subgoal-first ordering. Long-running tasks
+            # accumulate facts; without sorting we'd keep showing the
+            # oldest ones and truncate the freshest into "... and N more".
+            sorted_facts = sorted(
+                self.facts.values(),
+                key=lambda f: (
+                    0 if f.subgoal == self.subgoal else 1,
+                    -(f.last_referenced_at or f.timestamp),
+                ),
+            )
+            shown = sorted_facts[:_RENDER_MAX_FACTS]
             for f in shown:
                 tag = f" [subgoal={f.subgoal}]" if f.subgoal else ""
-                parts.append(f"  - {f.key} = {f.value}{tag}")
+                cat = f" ({f.category})" if f.category and f.category != "observation" else ""
+                parts.append(f"  - {f.key} = {f.value}{cat}{tag}")
             extra = len(self.facts) - len(shown)
             if extra > 0:
                 parts.append(f"  ... and {extra} more (use memory_recall to query)")
 
         if self.dead_ends:
-            parts.append("DEAD_ENDS:")
-            shown_dead = self.dead_ends[-_RENDER_MAX_DEAD_ENDS:]
-            for d in shown_dead:
-                tag = f" [subgoal={d.subgoal}]" if d.subgoal else ""
-                parts.append(f"  - {d.description}{tag}")
+            # State-keyed dead-ends are surfaced FIRST and labeled
+            # prominently. They're the most actionable ones: "you're
+            # standing on this URL right now, here's what already failed".
+            cur_key = _normalize_url_for_match(self.current_url)
+            here = [
+                d for d in self.dead_ends
+                if d.url and _normalize_url_for_match(d.url) == cur_key
+            ]
+            other = [d for d in self.dead_ends if d not in here]
+            if here:
+                parts.append(f"DEAD_ENDS ON CURRENT URL ({self.current_url}):")
+                for d in here[-_RENDER_MAX_DEAD_ENDS:]:
+                    cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
+                    parts.append(f"  - {d.description}{cause}")
+            if other:
+                parts.append("DEAD_ENDS (other URLs):")
+                shown_dead = other[-_RENDER_MAX_DEAD_ENDS:]
+                for d in shown_dead:
+                    cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
+                    url_part = f" @{d.url}" if d.url else ""
+                    tag = f" [subgoal={d.subgoal}]" if d.subgoal else ""
+                    parts.append(f"  - {d.description}{cause}{url_part}{tag}")
 
         if self.checkpoints:
             parts.append("CHECKPOINTS:")
             shown_cp = self.checkpoints[-_RENDER_MAX_CHECKPOINTS:]
+            # Group by kind so "where did I log in?" reads at a glance.
+            by_kind: dict[str, list[Checkpoint]] = {}
             for c in shown_cp:
-                title = f' "{c.title}"' if c.title else ""
-                parts.append(f"  - {c.url}{title}")
+                by_kind.setdefault(c.kind or "navigation", []).append(c)
+            for kind, cps in by_kind.items():
+                if len(by_kind) > 1:
+                    parts.append(f"  [{kind}]")
+                for c in cps:
+                    title = f' "{c.title}"' if c.title else ""
+                    parts.append(f"  - {c.url}{title}")
 
         if self.recent:
             parts.append("RECENT:")
-            for s in self.recent:
-                parts.append(s.render_line())
+            for line in _render_recent_chunked(list(self.recent)):
+                parts.append(line)
 
         if self.episodic:
             parts.append("EPISODIC:")
@@ -413,9 +639,11 @@ class Ledger:
         Includes only what the worker needs to execute the current
         subgoal: the subgoal itself, the most recent step outcomes,
         subgoal-tagged facts (or all facts if untagged), and recent
-        dead-ends in the same subgoal.
+        dead-ends in the same subgoal. URL-matched dead-ends are
+        surfaced first regardless of subgoal tag — they're what would
+        bite the worker on its next click.
         """
-        parts: list[str] = []
+        parts: list[str] = [_TRUST_LEDGER_INSTRUCTION]
 
         if self.goal:
             parts.append(f"GOAL: {self.goal}")
@@ -430,22 +658,41 @@ class Ledger:
         ]
         if relevant_facts:
             parts.append("FACTS:")
+            # MRU-sorted within the worker's relevance window.
+            relevant_facts.sort(
+                key=lambda f: -(f.last_referenced_at or f.timestamp),
+            )
             for f in relevant_facts[: _RENDER_MAX_FACTS // 2]:
-                parts.append(f"  - {f.key} = {f.value}")
+                cat = f" ({f.category})" if f.category and f.category != "observation" else ""
+                parts.append(f"  - {f.key} = {f.value}{cat}")
+
+        # URL-matched dead-ends first (state-keyed), then subgoal-relevant.
+        cur_key = _normalize_url_for_match(self.current_url)
+        here = [
+            d for d in self.dead_ends
+            if d.url and _normalize_url_for_match(d.url) == cur_key
+        ]
+        if here:
+            parts.append(f"DEAD_ENDS ON CURRENT URL ({self.current_url}):")
+            for d in here[-_RENDER_MAX_DEAD_ENDS // 2 :]:
+                cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
+                parts.append(f"  - {d.description}{cause}")
 
         relevant_dead = [
             d
             for d in self.dead_ends
-            if d.subgoal is None or d.subgoal == active_subgoal
+            if (d.subgoal is None or d.subgoal == active_subgoal) and d not in here
         ]
         if relevant_dead:
             parts.append("DEAD_ENDS:")
             for d in relevant_dead[-_RENDER_MAX_DEAD_ENDS // 2 :]:
-                parts.append(f"  - {d.description}")
+                cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
+                url_part = f" @{d.url}" if d.url else ""
+                parts.append(f"  - {d.description}{cause}{url_part}")
 
         if self.recent:
             parts.append("RECENT:")
-            for s in self.recent:
-                parts.append(s.render_line())
+            for line in _render_recent_chunked(list(self.recent)):
+                parts.append(line)
 
         return "\n".join(parts) if parts else "(empty ledger - no subgoal in flight)"
