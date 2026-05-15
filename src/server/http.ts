@@ -1187,13 +1187,23 @@ export function createHttpServer(
             | null;
 
           if (live && live.w > 0 && live.h > 0) {
-            const expectedLabel = (
+            // Prefer the brain's expected_label when supplied — that's
+            // what catches the case where the brain confused indices
+            // when reading the elements list. Falls back to the element-
+            // attribute-derived label so older brains (no expected_label
+            // on the call) still get the same self-validating behaviour
+            // they had before.
+            const brainLabel = (typeof expected_label === 'string'
+              ? expected_label.trim()
+              : '');
+            const elementLabel = (
               element.attributes['aria-label']
               || element.attributes['placeholder']
               || element.attributes['title']
               || element.getAllTextTillNextClickableElement(2)
               || ''
             ).slice(0, 80).trim();
+            const expectedLabel = brainLabel || elementLabel;
 
             // Pre-dispatch stability gate. The live bounds we just
             // queried are a single sample taken one tick ago; on

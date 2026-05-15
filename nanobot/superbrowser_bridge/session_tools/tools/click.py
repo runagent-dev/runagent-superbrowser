@@ -117,12 +117,29 @@ _PLAYWRIGHT_PSEUDO_RE = re.compile(
         session_id=StringSchema("Session ID"),
         index=IntegerSchema(description="Element index"),
         button=StringSchema("Mouse button: left, right, middle", nullable=True),
+        expected_label=StringSchema(
+            description=(
+                "The text/aria-label you saw on element [index] when you "
+                "read the elements list. Backend cross-checks this against "
+                "the actual element at [index]; if they don't match, the "
+                "click is rejected as element_mismatch — catches the case "
+                "where you confused indices in your reading of the list. "
+                "Optional but strongly recommended; passing the label you "
+                "saw makes wrong-element clicks fail loudly instead of "
+                "silently landing on an unintended sibling."
+            ),
+            nullable=True,
+        ),
         required=["session_id", "index"],
     )
 )
 class BrowserClickTool(Tool):
     name = "browser_click"
-    description = "Click an interactive element by its [index] number."
+    description = (
+        "Click an interactive element by its [index] number. Pass "
+        "expected_label with the text/aria-label you saw at [index] so "
+        "the backend can cross-check intent vs. the actual element."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
@@ -131,7 +148,14 @@ class BrowserClickTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
+    async def execute(
+        self,
+        session_id: str,
+        index: int,
+        button: str | None = None,
+        expected_label: str | None = None,
+        **kw: Any,
+    ) -> Any:
         print(f"\n>> browser_click([{index}])")
         gate = await _feedback_gate("browser_click")
         if gate:
@@ -220,6 +244,19 @@ class BrowserClickTool(Tool):
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
+        # Brain's expected_label: catches case where the brain misread
+        # the elements list and picked the wrong [N]. Without this, the
+        # backend computes the label from the element AT [N] and
+        # validates against itself — a tautology that always passes.
+        # With it, clickInBbox's Phase 1 label-match guard compares the
+        # element under [N] against what the brain *intended*, surfacing
+        # element_mismatch when the brain's reading and the page's reality
+        # diverge. Length-capped to mirror the TS-side label slice and
+        # keep the click payload bounded.
+        if expected_label:
+            _label = expected_label.strip()[:80]
+            if _label:
+                payload["expected_label"] = _label
         # Send the fingerprint the LLM was targeting. If the DOM shifted,
         # the TS side returns 409 + stale_index with a suggested new index.
         cached_fp = self.s.element_fingerprints.get(index)
