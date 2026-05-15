@@ -40,6 +40,7 @@ from .input_text import (
     BrowserTypeAtTool,
     BrowserTypeTool,
 )
+from .list_elements import BrowserListElementsTool
 from .navigation import (
     BrowserCloseTool,
     BrowserEscalateTool,

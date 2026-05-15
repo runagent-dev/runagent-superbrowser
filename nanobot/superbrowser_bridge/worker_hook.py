@@ -18,6 +18,8 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
 from superbrowser_bridge.loop_detector import LoopDetector
+from superbrowser_bridge.memory import EventLog
+from superbrowser_bridge.memory.store import count_image_blocks
 
 # Phase 3.3 helpers for chevron-focus guidance.
 _CHEVRON_CHARS_SET = set("▼▶◀▲►◄⌃⌄⋮")
@@ -72,6 +74,10 @@ class BrowserWorkerHook(AgentHook):
         # Tier-auto-escalation: fires at most once per session to avoid
         # loop-cascading the LLM into repeated escalations.
         self._auto_escalated: bool = False
+        # Baseline observability sink: per-iteration token + image usage.
+        # Lazily resolved on first use so task_id (set by delegation
+        # AFTER hook construction) is available.
+        self._event_log: EventLog | None = None
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -786,3 +792,25 @@ class BrowserWorkerHook(AgentHook):
                         # Multimodal content (image blocks) — append as text block
                         msg["content"].append({"type": "text", "text": guidance_text})
                     break
+
+        # --- Observability: log per-iteration token + image pressure ---
+        # Best-effort; failures must not crash the run.
+        try:
+            if self._event_log is None:
+                self._event_log = EventLog(self.state.task_id)
+            usage = context.usage or {}
+            self._event_log.log(
+                "iteration",
+                {
+                    "iter": context.iteration,
+                    "tokens_in": usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+                    "tokens_out": usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+                    "images": count_image_blocks(context.messages),
+                    "messages": len(context.messages),
+                    "tool_calls": len(context.tool_calls),
+                    "url": self.state.current_url,
+                    "step": self.state.step_counter,
+                },
+            )
+        except Exception:
+            pass

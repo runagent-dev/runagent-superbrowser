@@ -34,6 +34,13 @@ from .vision_pipeline import (
     _schedule_vision_prefetch,
 )
 
+# Lazy import to avoid a cycle: memory imports nanobot which (transitively)
+# imports session_tools. The TYPE_CHECKING guard plus runtime-local import
+# in __init__ break the cycle.
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+if _TYPE_CHECKING:
+    from superbrowser_bridge.memory import Memory
+
 
 class BrowserSessionState:
     """Per-instance state for browser session tools.
@@ -47,24 +54,45 @@ class BrowserSessionState:
     DEFAULT_SCREENSHOT_BUDGET = 6
     CAPTCHA_MODE_ITERATIONS = 15
 
-    def __init__(self):
+    def __init__(self, memory: "Memory | None" = None):
+        # Memory ownership: every BrowserSessionState is bound to a
+        # Memory instance for its lifetime. If the caller doesn't
+        # supply one (legacy callers, tests, the orchestrator before
+        # it's been given a task_id), we synthesize a local default
+        # so the property delegations below never have to special-case
+        # ``self._memory is None``. delegation.py / run.py pass the
+        # real Memory in explicitly so workers and orchestrator share
+        # the on-disk task directory.
+        if memory is None:
+            # Runtime-local import to break the
+            # superbrowser_bridge.memory -> nanobot -> session_tools
+            # cycle at module-load time.
+            from superbrowser_bridge.memory import Memory as _Memory
+
+            memory = _Memory(
+                "session-default",
+                session_key="session-default",
+                role="worker",
+            )
+        self._memory: "Memory" = memory
+
         self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
         self.screenshot_budget = self.max_screenshots
         self.vision_calls = 0
         self.text_calls = 0
         self.start_time = 0.0
         self.sessions_opened = 0
-        self.activity_log: list[str] = []
+        # activity_log migrated to memory.ledger.activity_log
         # Per-session (reset on each browser_open)
         self.step_counter = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
 
-        # Checkpoint & URL tracking
-        self.task_id: str = ""
-        self.checkpoints: list[dict] = []
+        # Navigation mechanics - intra-session URL accounting used by
+        # regression detection. The semantic side (current URL surfaced
+        # to the LLM, checkpoints, best progress URL) lives in
+        # memory.ledger via the properties further down.
         self.current_url: str = ""
-        self.best_checkpoint_url: str = ""
         self.url_visit_counts: dict[str, int] = {}
         self.regression_count: int = 0
         # Dedupe key: (normalized_url, hash_of_content) — so a same URL with
@@ -78,7 +106,7 @@ class BrowserSessionState:
         # V_n / selector clicks that fire before the brain re-screenshots
         # to see the dropdown. 0.0 means "never screenshotted yet".
         self.last_screenshot_at: float = 0.0
-        self.step_history: list[dict] = []
+        # step_history migrated to memory.ledger.all_steps (via property below)
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
         # Hard guard against the brain re-clicking a target that produced
@@ -376,6 +404,72 @@ class BrowserSessionState:
         # freshness gate to compute epoch age in turns.
         self._brain_turn_counter: int = 0
 
+    # -----------------------------------------------------------------
+    # Memory-backed properties (hard cutover from former direct fields).
+    #
+    # These five fields used to live on BrowserSessionState as plain
+    # lists / strings. They now delegate to the bound Memory instance
+    # so the ledger - not state.py - is the single source of truth.
+    # Existing call sites (`self.task_id`, `state.step_history[-1]`,
+    # `self.checkpoints`, etc.) keep working unchanged.
+    # -----------------------------------------------------------------
+
+    @property
+    def task_id(self) -> str:
+        return self._memory.task_id
+
+    @task_id.setter
+    def task_id(self, value: str) -> None:
+        # Memory.task_id is fixed at construction. Legacy callers that
+        # write ``worker_state.task_id = X`` after the worker_state was
+        # created without a matching Memory get the value reflected back
+        # by reseating the in-memory ledger's task_id reference. The
+        # ledger directory and EventLog continue to use the original
+        # task_id - this setter is for read-back compatibility, not for
+        # changing the persistence target.
+        if value and value != self._memory.task_id:
+            # No-op for persistence; logged so we can spot any callers
+            # that still try to mutate task_id late.
+            self._memory.events.log(
+                "task_id_setter_ignored",
+                {"requested": value, "kept": self._memory.task_id},
+            )
+
+    @property
+    def step_history(self) -> list[dict]:
+        """Legacy view of all steps as dicts.
+
+        Returns the full in-memory step list (Memory.ledger.all_steps)
+        converted to the dict shape state.py used to write. Readers
+        that do ``[-1]``, ``[-3:]``, ``len(...)`` keep working.
+        """
+        return [s.to_dict() for s in self._memory.ledger.all_steps]
+
+    @property
+    def activity_log(self) -> list[str]:
+        return list(self._memory.ledger.activity_log)
+
+    @property
+    def checkpoints(self) -> list[dict]:
+        return [c.to_dict() for c in self._memory.ledger.checkpoints]
+
+    @property
+    def best_checkpoint_url(self) -> str:
+        cp = self._memory.ledger.best_checkpoint
+        return cp.url if cp else ""
+
+    @best_checkpoint_url.setter
+    def best_checkpoint_url(self, value: str) -> None:
+        if not value:
+            return
+        # Used by resumption to restore the prior best URL without
+        # implying a fresh checkpoint event.
+        from superbrowser_bridge.memory import Checkpoint as _Checkpoint
+
+        self._memory.ledger.best_checkpoint = _Checkpoint(url=value)
+        # No save here - resumption batches its restores; the next real
+        # memory mutation (checkpoint / record_step / etc.) will persist.
+
     @property
     def backend(self) -> str:
         """Tier of the active session. `t3` for patchright (undetected
@@ -658,15 +752,19 @@ class BrowserSessionState:
         norm = self._normalize_url(url)
         self.current_url = url
         self.url_visit_counts[norm] = self.url_visit_counts.get(norm, 0) + 1
+        # Mirror into the ledger so render_for_llm and resumption see
+        # the live URL without reaching back into BrowserSessionState.
+        self._memory.update_current_url(url)
 
     def record_checkpoint(self, url: str, title: str, action: str) -> None:
-        """Record a progress checkpoint (successful meaningful step)."""
-        self.checkpoints.append({
-            "url": url, "title": title, "action": action,
-            "time": datetime.now().strftime("%H:%M:%S"),
-        })
-        if url and url != self.best_checkpoint_url:
-            self.best_checkpoint_url = url
+        """Record a progress checkpoint (successful meaningful step).
+
+        Delegates to ``Memory.checkpoint`` (which writes through to
+        ``ledger.checkpoints`` and updates ``best_checkpoint``). The
+        legacy dict shape that callers expect is reconstructed by the
+        ``checkpoints`` / ``best_checkpoint_url`` properties above.
+        """
+        self._memory.checkpoint(url, title=title, action=action)
 
     def is_regression(self, url: str) -> bool:
         """Check if navigating to url is going backward."""
@@ -809,14 +907,21 @@ class BrowserSessionState:
         return hashlib.sha1(canonical.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:
-        """Record a step in the structured step history."""
-        self.step_history.append({
-            "tool": tool_name,
-            "args": args_summary,
-            "result": result_summary[:200],
-            "url": self.current_url,
-            "time": datetime.now().strftime("%H:%M:%S"),
-        })
+        """Record a step in the structured step history.
+
+        Delegates to ``Memory.record_step`` which appends to
+        ``ledger.all_steps``, rolls ``ledger.recent`` (the bounded
+        render window), and persists to steps.jsonl. The result
+        snippet is truncated to 200 chars to match the legacy shape;
+        downstream readers (worker_hook, telemetry) depend on this.
+        """
+        self._memory.record_step(
+            tool_name,
+            args_summary,
+            (result_summary or "")[:200],
+            url=self.current_url,
+            success=True,
+        )
 
     def check_dead_click(
         self,
@@ -1128,94 +1233,92 @@ class BrowserSessionState:
         entry["consumed"] = True
 
     def get_last_checkpoint(self) -> dict | None:
-        """Return the most recent checkpoint."""
-        return self.checkpoints[-1] if self.checkpoints else None
+        """Return the most recent checkpoint as a legacy-shape dict."""
+        cps = self._memory.ledger.checkpoints
+        return cps[-1].to_dict() if cps else None
 
     def export_step_history(self) -> str:
-        """Export structured step history and checkpoint to disk.
+        """Export step history + checkpoint artifacts to disk.
 
-        Writes TWO formats:
-          - step_history.md  — human-readable markdown log
-          - step_history.json — structured data the orchestrator parses
-            to build domain-keyed captcha learnings and to inject prior
-            context into subsequent tasks.
+        Delegates the heavy lifting to ``LedgerStore.export_step_history``
+        which writes the same ``step_history.md`` / ``step_history.json``
+        files that the legacy implementation produced - plus the
+        ``checkpoint.json`` re-delegation marker. The orchestrator's
+        learnings tools and post-mortem scripts read these artifacts so
+        the contract has to stay stable through the cutover.
+
+        Returns the markdown content as a string (legacy contract).
         """
-        lines = ["## Step History"]
-        for i, step in enumerate(self.step_history, 1):
-            lines.append(f"{i}. [{step['time']}] {step['tool']}({step['args']}) → {step['result']}")
-            if step.get("url"):
-                lines.append(f"   URL: {step['url']}")
+        ledger = self._memory.ledger
+        md_path, json_path = self._memory.store.export_step_history(ledger)
 
-        if self.checkpoints:
-            lines.append("\n## Checkpoints (progress markers)")
-            for cp in self.checkpoints:
-                lines.append(f"- [{cp['time']}] {cp['action']} → {cp['url']}")
-
-        lines.append(f"\n## Best checkpoint URL: {self.best_checkpoint_url or 'none'}")
-        lines.append(f"## Regressions detected: {self.regression_count}")
-
-        content = "\n".join(lines)
-
-        # Write to task-specific directory
-        task_dir = f"/tmp/superbrowser/{self.task_id}" if self.task_id else "/tmp/superbrowser"
-        os.makedirs(task_dir, exist_ok=True)
-        step_path = os.path.join(task_dir, "step_history.md")
-        with open(step_path, "w") as f:
-            f.write(content)
-        print(f"  [step history saved: {step_path}]")
-
-        # Structured JSON export for orchestrator consumption.
-        import json as _json_export
-        structured = {
-            "task_id": self.task_id,
-            "sessions_opened": self.sessions_opened,
-            "current_url": self.current_url,
-            "best_checkpoint_url": self.best_checkpoint_url,
-            "regression_count": self.regression_count,
-            "checkpoints": self.checkpoints,
-            "vision_calls": self.vision_calls,
-            "text_calls": self.text_calls,
-            "max_screenshots": self.max_screenshots,
-            "screenshots_used": self.max_screenshots - self.screenshot_budget,
-            "steps": self.step_history,
-            "activity_log": self.activity_log,
-        }
-        json_path = os.path.join(task_dir, "step_history.json")
+        # Augment the structured JSON with telemetry fields the legacy
+        # exporter included (vision/text calls, screenshot budgets,
+        # regression count). These don't live in the ledger because
+        # they're transient session mechanics, but the orchestrator's
+        # post-mortem expects them in the JSON.
         try:
-            with open(json_path, "w") as f:
-                _json_export.dump(structured, f, indent=2, default=str)
-            print(f"  [structured history saved: {json_path}]")
-        except Exception as exc:  # pragma: no cover - best-effort persistence
-            print(f"  [structured history save failed: {exc}]")
+            import json as _json_extra
+            data = _json_extra.loads(json_path.read_text(encoding="utf-8"))
+            data.setdefault("sessions_opened", self.sessions_opened)
+            data.setdefault("current_url", self.current_url)
+            data.setdefault("regression_count", self.regression_count)
+            data.setdefault("vision_calls", self.vision_calls)
+            data.setdefault("text_calls", self.text_calls)
+            data.setdefault("max_screenshots", self.max_screenshots)
+            data.setdefault(
+                "screenshots_used", self.max_screenshots - self.screenshot_budget
+            )
+            data.setdefault("activity_log", list(ledger.activity_log))
+            data["best_checkpoint_url"] = self.best_checkpoint_url
+            json_path.write_text(
+                _json_extra.dumps(data, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except (OSError, ValueError) as exc:
+            print(f"  [structured history augment failed: {exc}]")
 
-        # Save checkpoint as JSON for re-delegation
-        if self.best_checkpoint_url:
-            import json as _json
-            checkpoint_data = {
-                "url": self.best_checkpoint_url,
-                "title": self.checkpoints[-1].get("title", "") if self.checkpoints else "",
-                "regressions": self.regression_count,
-            }
-            cp_path = os.path.join(task_dir, "checkpoint.json")
-            with open(cp_path, "w") as f:
-                _json.dump(checkpoint_data, f)
-            print(f"  [checkpoint saved: {cp_path}]")
+        # checkpoint.json: small re-delegation marker the orchestrator
+        # reads when re-spawning a worker against the same domain.
+        try:
+            import json as _json_cp
+            if self.best_checkpoint_url:
+                cps = ledger.checkpoints
+                title = cps[-1].title if cps else ""
+                cp_data = {
+                    "url": self.best_checkpoint_url,
+                    "title": title,
+                    "regressions": self.regression_count,
+                }
+                cp_path = md_path.parent / "checkpoint.json"
+                cp_path.write_text(
+                    _json_cp.dumps(cp_data, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                print(f"  [checkpoint saved: {cp_path}]")
+        except OSError as exc:
+            print(f"  [checkpoint save failed: {exc}]")
 
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        print(f"  [step history saved: {md_path}]")
         return content
 
     def log_activity(self, action: str, result: str = "ok"):
+        """Append a HH:MM:SS audit entry. Cap-30 enforced by Memory."""
         ts = datetime.now().strftime("%H:%M:%S")
         entry = f"[{ts}] {action}"
         if result != "ok":
             entry += f" → {result}"
-        self.activity_log.append(entry)
-        if len(self.activity_log) > 30:
-            self.activity_log.pop(0)
+        self._memory.log_activity(entry)
 
     def get_activity_summary(self) -> str:
-        if not self.activity_log:
+        log = self._memory.ledger.activity_log
+        if not log:
             return ""
-        lines = "\n".join(self.activity_log[-15:])
+        lines = "\n".join(log[-15:])
         return (
             f"\n--- Previous activity (DO NOT repeat failed approaches) ---\n"
             f"{lines}\n"
@@ -1531,14 +1634,28 @@ class BrowserSessionState:
         if data.get("title"):
             parts.append(f"Title: {data['title']}")
         result = " | ".join(p for p in parts if p)
-        # Auto-include interactive elements so agent knows what's on page
-        # (BrowserOS pattern: every action returns updated element snapshot)
-        if data.get("elements"):
-            result += f"\n\nInteractive elements:\n{data['elements']}"
-        if data.get("consoleErrors"):
-            result += f"\nConsole errors: {data['consoleErrors']}"
-        if data.get("pendingDialogs"):
-            result += f"\nPending dialogs: {data['pendingDialogs']}"
+        # Element-list eviction: surface the count, push the dump
+        # behind browser_list_elements. Matches the canonical contract
+        # in formatting._format_state so tools that build their own
+        # captions (click, type, navigate) carry the same shape.
+        from .formatting import _count_elements
+        elem_count = _count_elements(data, self)
+        if elem_count:
+            result += (
+                f"\nElements: {elem_count} interactive "
+                "(call browser_list_elements(session_id) to inspect)"
+            )
+        notices: list[str] = []
+        console_errors = data.get("consoleErrors")
+        if console_errors:
+            n = len(console_errors) if isinstance(console_errors, (list, dict, str)) else 1
+            notices.append(f"console_errors={n}")
+        pending_dialogs = data.get("pendingDialogs")
+        if pending_dialogs:
+            n = len(pending_dialogs) if isinstance(pending_dialogs, (list, dict, str)) else 1
+            notices.append(f"pending_dialogs={n}")
+        if notices:
+            result += f"\n[Notices: {' '.join(notices)}]"
         # Surface scroll geometry the TS bridge reported on this action
         # response. Wires up the [SCROLL_STATE …] contract the vision
         # system prompt already references — vision can suggest a

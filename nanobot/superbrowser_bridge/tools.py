@@ -9,9 +9,12 @@ Register them with: bot._loop.tools.register(tool_instance)
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+
+if TYPE_CHECKING:
+    from superbrowser_bridge.memory import Memory
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import (
     BooleanSchema,
@@ -288,7 +291,7 @@ def register_high_level_tools(bot: "Nanobot") -> None:
         bot._loop.tools.register(tool)
 
 
-def register_all_tools(bot: "Nanobot") -> None:
+def register_all_tools(bot: "Nanobot", *, memory: "Memory | None" = None) -> None:
     """Register SuperBrowser session tools for nanobot.
 
     Session tools (browser_open, browser_click, browser_screenshot, etc.)
@@ -301,14 +304,23 @@ def register_all_tools(bot: "Nanobot") -> None:
     and doubling the cost. Use register_high_level_tools() only if you
     explicitly need the inner executor loop.
 
+    Args:
+        bot: The Nanobot instance to register tools on.
+        memory: Optional Memory binding. When supplied, the BrowserSessionState
+            created for these tools is bound to this Memory so its task_id /
+            ledger directory persists across the bot's run. Used by run.py
+            to share an orchestrator-scoped memory directory.
+
     Usage:
         from nanobot import Nanobot
+        from superbrowser_bridge.memory import Memory
         from superbrowser_bridge.tools import register_all_tools
 
         bot = Nanobot.from_config(config_path="config/config.json")
-        register_all_tools(bot)
-        result = await bot.run("Go to irctc.co.in and search for trains from Delhi to Mumbai")
+        memory = Memory("task-id", session_key="superbrowser:cli", role="orchestrator")
+        register_all_tools(bot, memory=memory)
+        result = await bot.run("Go to irctc.co.in", hooks=[memory.attach(bot)])
     """
     # Session tools only — nanobot is the single brain, no double LLM loop
     from superbrowser_bridge.session_tools import register_session_tools
-    register_session_tools(bot)
+    register_session_tools(bot, memory=memory)

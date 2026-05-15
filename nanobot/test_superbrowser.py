@@ -30,7 +30,13 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 
-async def _run_and_capture(orchestrator, task: str, session_key: str) -> str:
+async def _run_and_capture(
+    orchestrator,
+    task: str,
+    session_key: str,
+    *,
+    hooks: list | None = None,
+) -> str:
     """Run the orchestrator and return the user-visible content.
 
     `Nanobot.run()` returns `result.content`, which is the LLM's direct
@@ -43,6 +49,10 @@ async def _run_and_capture(orchestrator, task: str, session_key: str) -> str:
     collect any non-progress / non-streaming messages, and fall back to
     the bus-captured content when `result.content` is empty. First
     non-empty content wins; matches what the CLI channel renders.
+
+    ``hooks`` is the MemoryHook list. Passing it through here means the
+    orchestrator's per-iteration screenshot back-patch / failure-collapse
+    / ledger injection actually fires on every turn.
     """
     bus = orchestrator._loop.bus
     captured: list[str] = []
@@ -64,7 +74,7 @@ async def _run_and_capture(orchestrator, task: str, session_key: str) -> str:
 
     pump = asyncio.create_task(_pump())
     try:
-        result = await orchestrator.run(task, session_key=session_key)
+        result = await orchestrator.run(task, session_key=session_key, hooks=hooks)
     finally:
         # Give the pump a beat to drain any still-in-flight message.
         await asyncio.sleep(0.05)
@@ -87,6 +97,7 @@ async def _run_and_capture(orchestrator, task: str, session_key: str) -> str:
 
 async def main():
     from nanobot import Nanobot
+    from superbrowser_bridge.memory import Memory
     from superbrowser_bridge.orchestrator_tools import register_orchestrator_tools
 
     # Create the orchestrator with its own workspace
@@ -95,25 +106,44 @@ async def main():
     )
     register_orchestrator_tools(orchestrator)
 
+    # Each task gets a unique session key — no stale history.
+    # Generate it first so the orchestrator's Memory can bind to it.
+    task_id = uuid.uuid4().hex[:8]
+    session_key = f"orchestrator:{task_id}"
+
+    # Wire orchestrator-side Memory. Registers the four memory_* recall
+    # tools on the orchestrator and returns the MemoryHook the run loop
+    # composes with each iteration (screenshot back-patch, failure
+    # collapse, ledger injection into the system message). The
+    # orchestrator's ledger lives at
+    # /tmp/superbrowser/orch-{task_id}/memory/; each delegated worker
+    # writes to its own /tmp/superbrowser/{worker_task_id}/memory/.
+    orch_task_id = f"orch-{task_id}"
+    orch_memory = Memory(orch_task_id, session_key=session_key, role="orchestrator")
+    orch_hook = orch_memory.attach(orchestrator)
+
     print("Two-agent SuperBrowser system ready")
     print("  Orchestrator: plans tasks, checks learnings, delegates")
     print("  Browser Worker: fresh instance per task, executes scripts")
+    print(f"  Memory: task_id={orch_task_id} role=orchestrator")
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ must go to this site https://gozayaan.com/ .I along with my wife want to stay in a hotel in Sylhet from next sunday to thursday. It has to have five star of four star. Give me the prices of these hotels. Use browser tools."""
+        """ must go to this site https://www.wineaccess.com/ .Find all the highest critic-scored white wine, from Oregon, priced under $40, that pairs well with dessert and fish both. Use browser tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 
     print(f"Task: {task}")
     print("-" * 60)
 
-    # Each task gets a unique session key — no stale history
-    task_id = uuid.uuid4().hex[:8]
-    session_key = f"orchestrator:{task_id}"
+    # Seed the orchestrator's ledger with the user task so render_for_llm
+    # has a goal to anchor on from the first turn.
+    orch_memory.set_goal(task[:300])
 
     # First turn — send the task
-    content = await _run_and_capture(orchestrator, task, session_key)
+    content = await _run_and_capture(
+        orchestrator, task, session_key, hooks=[orch_hook]
+    )
     print(f"\nAgent: {content}")
 
     # Multi-turn loop
@@ -124,7 +154,9 @@ async def main():
         if user_input.lower() in ("quit", "exit", "q"):
             break
 
-        content = await _run_and_capture(orchestrator, user_input, session_key)
+        content = await _run_and_capture(
+            orchestrator, user_input, session_key, hooks=[orch_hook]
+        )
         print(f"\nAgent: {content}")
 
 

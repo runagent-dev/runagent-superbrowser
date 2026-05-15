@@ -305,6 +305,7 @@ class DelegateBrowserTaskTool(Tool):
             register_session_tools,
             save_resumption_artifact,
         )
+        from superbrowser_bridge.memory import Memory
         from superbrowser_bridge.worker_hook import BrowserWorkerHook
 
         task_id = uuid.uuid4().hex[:8]
@@ -340,8 +341,23 @@ class DelegateBrowserTaskTool(Tool):
         for name in default_tools_to_remove:
             worker._loop.tools.unregister(name)
 
-        # Register ALL browser tools with isolated state
-        worker_state = BrowserSessionState()
+        # Worker-side Memory binds first so BrowserSessionState's task_id
+        # / step_history / checkpoints properties resolve correctly from
+        # the moment the worker state is instantiated. The Memory will
+        # write to /tmp/superbrowser/{task_id}/memory/.
+        worker_memory = Memory(task_id, session_key=session_key, role="worker")
+        # Seed the worker's ledger with the delegation context so
+        # render_for_llm("worker") - which the MemoryHook injects into
+        # the worker's system prompt every iteration - shows the goal
+        # and the current subgoal scope, not an empty block.
+        worker_memory.set_goal(instructions[:200])
+        worker_memory.begin_subgoal(f"delegated: {instructions[:80]}")
+
+        # Register ALL browser tools with isolated state. The state is
+        # bound to worker_memory; legacy callers that read
+        # ``worker_state.task_id`` / ``.step_history`` / ``.checkpoints``
+        # get the same data through property delegation.
+        worker_state = BrowserSessionState(memory=worker_memory)
         # Task-complexity-aware screenshot budget (replaces hardcoded MAX_SCREENSHOTS=2).
         # Research tasks, captcha-keywords, and known-hard domains bump the cap.
         worker_state.configure_budget(
@@ -349,7 +365,9 @@ class DelegateBrowserTaskTool(Tool):
             target_url=url or "",
             is_research=is_research,
         )
-        worker_state.task_id = task_id
+        # task_id is already on the bound Memory; the legacy assignment
+        # was used to thread the id into the export path. Setter is a
+        # no-op (task_id is fixed at Memory construction).
 
         # Resolve the target domain once, up front — used by human-handoff
         # auto-enable (below), learnings injection (further down), and the
@@ -387,6 +405,12 @@ class DelegateBrowserTaskTool(Tool):
 
         # Create mid-session guardrail hook
         worker_hook = BrowserWorkerHook(worker_state, max_iterations=max_iterations)
+
+        # MemoryHook precedes BrowserWorkerHook so the worker hook sees a
+        # context that's already had screenshots back-patched and prior-
+        # turn failures collapsed. worker_memory was constructed earlier
+        # so it could bind to worker_state at construction.
+        worker_memory_hook = worker_memory.attach(worker)
 
         # 25 iterations — enough for: open + inspect + script + fail + retry + verify + close
         worker._loop.max_iterations = max_iterations
@@ -1034,7 +1058,11 @@ CRITICAL RULES:
             )
 
         try:
-            result = await worker.run(prompt, session_key=session_key, hooks=[worker_hook])
+            result = await worker.run(
+                prompt,
+                session_key=session_key,
+                hooks=[worker_memory_hook, worker_hook],
+            )
             content = result.content
 
             # Diagnostic: how many browser tool calls did the worker actually

@@ -146,13 +146,46 @@ def _build_network_block_message(
     )
 
 
+def _count_elements(data: dict, state: "BrowserSessionState | None" = None) -> int:
+    """Best-effort interactive-element count for the canonical state block.
+
+    Prefers state.element_fingerprints (authoritative, populated by
+    _fetch_elements). Falls back to counting non-empty lines in the
+    elements text - one element per line in the TS bridge format.
+    """
+    if state is not None:
+        fps = getattr(state, "element_fingerprints", None)
+        if isinstance(fps, dict) and fps:
+            return len(fps)
+    elements = data.get("elements")
+    if not elements:
+        return 0
+    if isinstance(elements, list):
+        return len(elements)
+    if isinstance(elements, str):
+        return sum(1 for line in elements.splitlines() if line.strip())
+    return 0
+
+
 def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
+    """Canonical per-iteration state caption.
+
+    Six-line contract:
+        [SESSION_STATE session_id=... url=... title="..." step=N]
+        URL: ...
+        Title: ...
+        Scroll: y/h (vh)
+        Elements: N interactive (call browser_list_elements to inspect)
+        [Notices: console_errors=N pending_dialogs=N]
+
+    The element dump that used to live here was the dominant per-turn
+    cost - 50+ lines of "[V_n] role 'label'" entries injected after
+    every tool call. It now lives behind browser_list_elements which
+    the worker invokes on demand. Console errors and pending dialogs
+    collapse to a single "Notices" line; full payloads are still
+    available via the elements tool when needed.
+    """
     parts: list[str] = []
-    # Leading structured marker that survives tool-result truncation. Even
-    # when maxToolResultChars slices the trailing base64 image apart, these
-    # first ~120 characters stay intact, so the worker's LLM can always see
-    # "the tool succeeded; a session is open" and won't fire a redundant
-    # browser_open.
     session_id = data.get("sessionId") or (state.session_id if state else "")
     url = data.get("url") or ""
     title = (data.get("title") or "").replace('"', "'")[:80]
@@ -162,17 +195,34 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
             f'[SESSION_STATE session_id={session_id or "?"} '
             f'url={url or "?"} title="{title}" step={step}]'
         )
-    if data.get("url"):
-        parts.append(f"URL: {data['url']}")
+    if url:
+        parts.append(f"URL: {url}")
     if data.get("title"):
         parts.append(f"Title: {data['title']}")
     if data.get("scrollInfo"):
         si = data["scrollInfo"]
-        parts.append(f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} (viewport: {si.get('viewportHeight', 0)})")
-    if data.get("elements"):
-        parts.append(f"\nInteractive elements:\n{data['elements']}")
-    if data.get("consoleErrors"):
-        parts.append(f"\nConsole errors: {data['consoleErrors']}")
-    if data.get("pendingDialogs"):
-        parts.append(f"\nPending dialogs: {data['pendingDialogs']}")
+        parts.append(
+            f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} "
+            f"(viewport: {si.get('viewportHeight', 0)})"
+        )
+
+    elem_count = _count_elements(data, state)
+    if elem_count:
+        parts.append(
+            f"Elements: {elem_count} interactive "
+            "(call browser_list_elements(session_id) to inspect)"
+        )
+
+    notices: list[str] = []
+    console_errors = data.get("consoleErrors")
+    if console_errors:
+        n = len(console_errors) if isinstance(console_errors, (list, dict, str)) else 1
+        notices.append(f"console_errors={n}")
+    pending_dialogs = data.get("pendingDialogs")
+    if pending_dialogs:
+        n = len(pending_dialogs) if isinstance(pending_dialogs, (list, dict, str)) else 1
+        notices.append(f"pending_dialogs={n}")
+    if notices:
+        parts.append(f"[Notices: {' '.join(notices)}]")
+
     return "\n".join(parts)

@@ -34,7 +34,10 @@ except ImportError:
 
 
 async def main():
+    import uuid
+
     from nanobot import Nanobot
+    from superbrowser_bridge.memory import Memory
     from superbrowser_bridge.tools import register_all_tools
 
     # Get task from command line
@@ -48,14 +51,24 @@ async def main():
     # Uses ~/.nanobot/config.json (set up via `nanobot onboard`)
     bot = Nanobot.from_config(workspace=str(Path(__file__).parent / "workspace"))
 
+    # Attach orchestrator-side Memory FIRST so the BrowserSessionState
+    # created during tool registration is bound to it. Each worker
+    # delegation generates its own task_id under /tmp/superbrowser/;
+    # cross-task fact promotion is a Phase-2 concern.
+    orch_task_id = f"orch-{uuid.uuid4().hex[:8]}"
+    memory = Memory(orch_task_id, session_key="superbrowser:cli", role="orchestrator")
+
     # Register SuperBrowser tools (uses library, not MCP)
-    register_all_tools(bot)
+    register_all_tools(bot, memory=memory)
     print(f"Registered SuperBrowser tools with nanobot")
+
+    memory_hook = memory.attach(bot)
+    print(f"Memory attached: task_id={orch_task_id} role=orchestrator")
     print(f"Task: {task}")
     print("---")
 
     # Run the task
-    result = await bot.run(task, session_key="superbrowser:cli")
+    result = await bot.run(task, session_key="superbrowser:cli", hooks=[memory_hook])
     print("\n=== Result ===")
     print(result.content)
 
