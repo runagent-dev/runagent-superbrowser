@@ -56,10 +56,16 @@ _RENDER_MAX_EPISODIC = 8
 # "[archived]" markers, so the ledger is the only source of truth
 # for what happened earlier in the task.
 _TRUST_LEDGER_INSTRUCTION = (
-    "NOTE: Trust this Agent Ledger as the authoritative structured "
-    "memory of the task. Older message-history details may have been "
-    "archived to bounded markers; when the ledger and message history "
-    "disagree, the ledger wins."
+    "NOTE: This Agent Ledger summarizes the task — goal, plan, facts, "
+    "dead-ends, recent actions — for quick reference. The MESSAGE "
+    "HISTORY (tool results, screenshots, click outcomes, exact "
+    "responses) is the authoritative source for what actually happened "
+    "in each turn; the ledger compresses it. When recent message "
+    "content is intact, prefer it for execution detail (V_n picked, "
+    "snap target, mutation, error text). Use the ledger only to fill "
+    "gaps where older messages have been archived to '[archived]' or "
+    "'[state from prior turn evicted]' markers — there the ledger's "
+    "structured fields are the surviving record."
 )
 
 # Tools whose calls naturally come in streaks during a single task
