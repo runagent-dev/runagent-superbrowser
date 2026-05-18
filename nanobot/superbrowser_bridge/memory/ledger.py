@@ -347,14 +347,14 @@ class StepOutcome:
 
     def render_line(self) -> str:
         marker = "✓" if self.success else "✗"
-        if self.caption:
-            # Caption-first: semantic record leads, syntactic tail.
-            # Phase 5 design — schema landed here so Phase 5 only
-            # changes presentation.
-            result_part = f" → {self.result}" if self.result else ""
-            return f"  {marker} {self.caption}{result_part}  [{self.tool}]"
-        args_part = f"({self.args})" if self.args else ""
         result_part = f" → {self.result}" if self.result else ""
+        if self.caption:
+            # Caption leads for semantic readability; args follows in
+            # parens as the syntactic anchor so the LLM can re-identify
+            # V_n / index across turns after message-history compaction.
+            args_part = f" ({self.args})" if self.args else ""
+            return f"  {marker} {self.caption}{args_part}{result_part}  [{self.tool}]"
+        args_part = f"({self.args})" if self.args else ""
         return f"  {marker} {self.tool}{args_part}{result_part}"
 
 

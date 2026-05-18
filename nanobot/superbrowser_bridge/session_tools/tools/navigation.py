@@ -20,6 +20,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from .._label import clean_label
 from ..effects import (
     BLOCKED_BROWSER_OPEN_HARD_STOP,
     WorkerMustExitError,
@@ -709,6 +710,19 @@ class BrowserNavigateTool(Tool):
             ),
             nullable=True,
         ),
+        target_text=StringSchema(
+            description=(
+                "Optional label/regex to probe for in the NEW viewport "
+                "after the scroll lands. When set, the response includes "
+                "a `[PROBE target='X' in_viewport=true|false …]` caption "
+                "line — direct DOM measurement, NOT vision. Use this "
+                "whenever you're scrolling toward a NAMED control: the "
+                "probe is your ground truth. If `in_viewport=false`, "
+                "scroll again or call `browser_get_markdown` — do NOT "
+                "emit a V_n claiming to be this label on the next turn."
+            ),
+            nullable=True,
+        ),
         required=["session_id"],
     )
 )
@@ -722,13 +736,14 @@ class BrowserScrollTool(Tool):
         "RECOMMENDED for fine motion; (c) `percent=N` — ABSOLUTE "
         "position (0=top, 100=bottom) — `percent=20` TELEPORTS to 20% "
         "of the page, NOT 'scroll a bit'. "
-        "To FIND a NAMED below-fold control (e.g. 'Price filter', "
-        "'Brand filter', 'Apply'): DO NOT call this tool. Call "
-        "`browser_scroll_until(target_text='Price')` — it walks the "
-        "page in fine steps, narrates labels passed at each step, "
-        "auto-reverses if it overshot, and tells you whether the label "
-        "exists on this page (look for `reversed_no_match` in the "
-        "response — that means it doesn't)."
+        "When SEARCHING for a named below-fold control (filter, "
+        "button), ALSO pass `target_text='<label>'`. The response will "
+        "include `[PROBE target='<label>' in_viewport=true|false "
+        "below_fold=…]` — direct DOM measurement. If `in_viewport=false` "
+        "and `below_fold=true`, scroll again (pixels=600+, same "
+        "target_text); if `anywhere_in_dom=false`, the label isn't on "
+        "this page — try a synonym or `browser_get_markdown`. NEVER "
+        "click a V_n claiming to be `<label>` when the probe said false."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -744,6 +759,7 @@ class BrowserScrollTool(Tool):
         direction: str | None = None,
         percent: float | None = None,
         pixels: int | None = None,
+        target_text: str | None = None,
         **kw: Any,
     ) -> Any:
         if pixels is not None:
@@ -752,6 +768,8 @@ class BrowserScrollTool(Tool):
             label = f"{percent}%"
         else:
             label = direction or "down"
+        if target_text and target_text.strip():
+            label += f" probe={target_text.strip()!r}"
         print(f"\n>> browser_scroll({label})")
         gate = await _feedback_gate("browser_scroll")
         if gate:
@@ -767,6 +785,8 @@ class BrowserScrollTool(Tool):
             payload["percent"] = percent
         else:
             payload["direction"] = direction or "down"
+        if target_text and target_text.strip():
+            payload["targetText"] = target_text.strip()
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/scroll",
@@ -816,11 +836,78 @@ class BrowserScrollTool(Tool):
                         "`browser_scroll_within` if a popup/modal is "
                         "open, or `browser_get_markdown` to inspect."
                     )
-        action = base
+        # PROBE caption — anti-hallucination signal for pixel-scroll.
+        # When `target_text` is set the TS server returns a `probe` dict
+        # with direct DOM measurement of whether the target landed in
+        # the viewport. `newly_visible` is the equivalent of
+        # scroll_until's per-step trace, but for a single pixel step —
+        # the brain reads it instead of guessing from the post-scroll
+        # vision pass.
+        probe = data.get("probe") if isinstance(data.get("probe"), dict) else None
+        newly_visible_raw = data.get("newly_visible") or []
+        newly_visible: list[str] = [str(x) for x in newly_visible_raw if x]
+
+        probe_lines: list[str] = []
+        if probe is not None:
+            flags_bits: list[str] = [
+                f"in_viewport={bool(probe.get('in_viewport'))}",
+                f"fully={bool(probe.get('fully_in_viewport'))}",
+                f"below_fold={bool(probe.get('below_fold'))}",
+                f"above_fold={bool(probe.get('above_fold'))}",
+            ]
+            if probe.get("sticky_candidate"):
+                flags_bits.append("sticky=true")
+            if probe.get("anywhere_in_dom") and not probe.get("in_viewport"):
+                flags_bits.append("anywhere_in_dom=true")
+            probe_lines.append(
+                f"[PROBE target={target_text!r} {' '.join(flags_bits)}]"
+            )
+            if probe.get("in_viewport") is False and probe.get("below_fold"):
+                probe_lines.append(
+                    f"  → TIP: target is below the fold. Either scroll "
+                    f"more (pixels=600+, same target_text) or call "
+                    f"browser_get_markdown to confirm. Do NOT emit a "
+                    f"V_n claiming to be {target_text!r}."
+                )
+            elif (
+                probe.get("anywhere_in_dom") is False
+                and target_text
+            ):
+                probe_lines.append(
+                    f"  → TIP: {target_text!r} not found anywhere in "
+                    f"the DOM. Likely wrong label/synonym — try "
+                    f"browser_get_markdown or a different keyword."
+                )
+            elif probe.get("sticky_candidate"):
+                probe_lines.append(
+                    f"  → TIP: {target_text!r} appears in viewport but "
+                    f"its position is UNCHANGED from before the scroll "
+                    f"— likely a sticky/pinned element, NOT the "
+                    f"in-flow target. Verify with browser_get_markdown "
+                    f"before clicking."
+                )
+
+        if newly_visible:
+            rendered = ", +".join(newly_visible[:5])
+            probe_lines.append(f"Newly visible: +{rendered}")
+
+        if probe_lines:
+            action = base + "\n" + "\n".join(probe_lines)
+        else:
+            action = base
+
+        extra: dict | None = None
+        if probe is not None:
+            extra = {
+                "last_probe_target": target_text,
+                "last_probe_in_viewport": probe.get("in_viewport"),
+                "last_probe_below_fold": probe.get("below_fold"),
+            }
         _update_scroll_telemetry(
             self.s,
             data.get("scrollInfo"),
             direction or ("down" if pixels and pixels > 0 else None),
+            extra=extra,
         )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
@@ -1684,7 +1771,11 @@ class BrowserScrollToBboxTool(Tool):
                 f"Scrolled V{vision_index} {bbox_label!r} into view via "
                 f"{kind} container (delta_y={delta}px)."
             )
-        self.s.record_step("browser_scroll_to_bbox", f"V{vision_index}", caption)
+        self.s.record_step(
+            "browser_scroll_to_bbox",
+            f'V{vision_index}|"{clean_label(bbox_label)}"',
+            caption,
+        )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task, caption, state=self.s,

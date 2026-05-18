@@ -20,6 +20,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from .._label import clean_label
 from ..effects import _maybe_no_effect_prefix
 from ..feedback import _feedback_gate
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
@@ -404,7 +405,7 @@ class BrowserSetSliderAtTool(Tool):
         outcome = data.get("outcome", {}) or {}
         self.s.record_step(
             "browser_set_slider_at",
-            f"V{vision_index} → {value} (ratio={ratio:.3f})",
+            f'V{vision_index}|"{clean_label(label_text)}" → {value} (ratio={ratio:.3f})',
             data.get("url", ""),
         )
         lines = [

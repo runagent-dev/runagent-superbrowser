@@ -22,6 +22,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from .._label import clean_label
 from ..effects import _maybe_no_effect_prefix
 from ..feedback import _feedback_gate
 from ..formatting import _fetch_elements, _vision_alternatives_hint
@@ -764,7 +765,11 @@ class BrowserClickAtTool(Tool):
             if bbox_label:
                 payload["expected_label"] = bbox_label[:120]
                 payload["label"] = bbox_label[:120]
-            log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
+            # log_target lands in StepOutcome.args → the ledger RECENT
+            # block. Coords churn turn-to-turn (DPR, scroll, post-snap
+            # reflow) so they're useless for re-identification; the
+            # (V_n, label) pair is the determinism anchor.
+            log_target = f'V{vision_index}|"{clean_label(bbox_label)}"'
             # Continuation of the top-of-function dispatch print —
             # adds the resolved bbox so the operator can see what
             # coordinates the cursor will actually go to.
@@ -784,13 +789,9 @@ class BrowserClickAtTool(Tool):
             )
             if isinstance(new_bbox, dict):
                 payload["bbox"] = new_bbox
-                # Refresh log_target so post-dispatch messages reflect
-                # the actual click coords.
-                log_target = (
-                    f"V{vision_index}("
-                    f"{new_bbox['x0']},{new_bbox['y0']}"
-                    f"→{new_bbox['x1']},{new_bbox['y1']})"
-                )
+                # log_target stays label-anchored after auto-scroll —
+                # coords would just churn here too.
+                log_target = f'V{vision_index}|"{clean_label(bbox_label)}"'
 
         r = await _request_with_backoff(
             "POST",

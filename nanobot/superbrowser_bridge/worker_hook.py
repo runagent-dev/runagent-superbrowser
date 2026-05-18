@@ -377,16 +377,61 @@ class BrowserWorkerHook(AgentHook):
                     "happened in the last 3 turns — only re-screenshots. "
                     "If your target (filter, button, named control) is "
                     "plausibly off-screen, call:\n"
-                    f"  browser_scroll_until(session_id='{sid}', "
+                    f"  browser_scroll(session_id='{sid}', "
+                    "direction='down', pixels=400, "
                     "target_text='<label>')\n"
-                    "It walks the page in fine steps, narrates labels "
-                    "passed at each step, and tells you whether the "
-                    "label exists on this page (look for "
-                    "`reversed_no_match` — that means it doesn't). Do "
-                    "NOT keep screenshotting the same viewport, and do "
-                    "NOT reach for browser_run_script(mutates=true) — "
-                    "the run_script gate will refuse it until you have "
-                    "scrolled."
+                    "The response includes `[PROBE target='<label>' "
+                    "in_viewport=…]` — direct DOM measurement that "
+                    "tells you whether the label entered the viewport. "
+                    "Do NOT keep screenshotting the same viewport, and "
+                    "do NOT reach for browser_run_script(mutates=true) "
+                    "— the run_script gate will refuse it until you "
+                    "have scrolled."
+                )
+        except Exception:
+            pass
+
+        # --- Phase 3.2b: probe-ignored hint -----------------------------
+        # When the most recent scroll's PROBE said target NOT in viewport,
+        # but the brain didn't scroll again or call browser_get_markdown,
+        # it's about to hallucinate a V_n. Hard-stop with a directive
+        # that names the exact tool calls to make next.
+        try:
+            tel = getattr(self.state, "scroll_telemetry", None) or {}
+            last_target = tel.get("last_probe_target")
+            last_in_vp = tel.get("last_probe_in_viewport")
+            last_below = tel.get("last_probe_below_fold")
+            recent2 = (
+                self.state.step_history[-2:]
+                if self.state.step_history
+                else []
+            )
+            recovered = any(
+                (s.get("tool") or "").startswith("browser_scroll")
+                or (s.get("tool") or "") == "browser_get_markdown"
+                for s in recent2
+            )
+            if (
+                last_target
+                and last_in_vp is False
+                and not recovered
+            ):
+                sid = self.state.session_id or "<session_id>"
+                more_below_tag = " more_below=true" if last_below else ""
+                guidance_parts.append(
+                    f"[PROBE_IGNORED target={last_target!r} "
+                    f"last_in_viewport=false{more_below_tag}]\n"
+                    "The most recent scroll's PROBE said your target "
+                    "is NOT in the viewport, but you didn't scroll "
+                    "again or check the markdown. Do NOT emit "
+                    "browser_click_at with a V_n claiming to be that "
+                    "target — vision can hallucinate a label that "
+                    "matches a sibling/sticky element. Either:\n"
+                    f"  browser_scroll(session_id='{sid}', "
+                    f"direction='down', pixels=600, "
+                    f"target_text={last_target!r})\n"
+                    f"  OR browser_get_markdown(session_id='{sid}') "
+                    "to verify the label exists."
                 )
         except Exception:
             pass

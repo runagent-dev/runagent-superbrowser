@@ -16,6 +16,7 @@ import { SHADOW_DOM_HELPERS_SRC } from './slider-helpers.js';
 import { typeText as cdpTypeText, pressKeyCombo, clearField, dispatchKey } from './input-keyboard.js';
 import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
+import { findFirstInteractiveMatch } from './scroll-probe.js';
 import { ConsoleCollector, type CollectedLog } from './console-collector.js';
 import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
@@ -3748,16 +3749,17 @@ export class PageWrapper {
     const emitTrace = opts.emitTrace !== false;
     const startDirection = opts.direction === 'up' ? 'up' : 'down';
 
-    // Regex compile once. Caller passes a substring or a regex source.
+    // Regex compile flag — kept for containerProbe below. findMatch
+    // does its own regex compile inside findFirstInteractiveMatch, so
+    // we only need these locally for the container existence probe.
     let regexSrc = '';
     let isRegex = false;
     if (targetText) {
+      regexSrc = targetText;
       try {
         new RegExp(targetText, 'i');
-        regexSrc = targetText;
         isRegex = true;
       } catch {
-        regexSrc = targetText;
         isRegex = false;
       }
     }
@@ -3818,97 +3820,15 @@ export class PageWrapper {
       return { moved: result.fallback !== 'none' && result.after !== result.before };
     };
 
-    // Find a visible match within scope (page or container). Returns
-    // the matched selector + text or null.
+    // Find a visible match within scope (page or container). Shared
+    // matcher lives in scroll-probe.ts so browser_scroll's PROBE path
+    // and browser_scroll_until use identical text/role/visibility logic.
     const findMatch = async (): Promise<{ selector: string; text: string } | null> => {
-      return await this.page.evaluate(
-        (args: { regexSrc: string; isRegex: boolean; role: string; container?: string }) => {
-          const { regexSrc: rs, isRegex: ir, role, container } = args;
-          const matchText = (txt: string): boolean => {
-            if (!rs) return true;
-            if (ir) {
-              try {
-                return new RegExp(rs, 'i').test(txt);
-              } catch {
-                return txt.toLowerCase().includes(rs.toLowerCase());
-              }
-            }
-            return txt.toLowerCase().includes(rs.toLowerCase());
-          };
-          const root: ParentNode = container
-            ? (document.querySelector(container) as HTMLElement | null) ?? document
-            : document;
-          const containerEl = container ? (root as HTMLElement) : null;
-          // v6 G3 — also reject elements inside collapsed accordions /
-          // <details>. Modern filter UIs use <details open> or
-          // [aria-expanded] toggles for filter sections; their text
-          // is rendered but the children are visually hidden by the
-          // closed parent. Without this check, scroll_until reports
-          // the section header as a hit when scanning for a filter
-          // value INSIDE the section.
-          const isHiddenByCollapse = (el: Element): boolean => {
-            let walker: Element | null = el.parentElement;
-            let depth = 0;
-            while (walker && walker !== document.body && depth < 12) {
-              if (
-                walker.tagName === 'DETAILS'
-                && !(walker as HTMLDetailsElement).open
-              ) return true;
-              if (walker.getAttribute('aria-expanded') === 'false') return true;
-              walker = walker.parentElement;
-              depth += 1;
-            }
-            return false;
-          };
-          const isVisible = (el: Element): boolean => {
-            const r = (el as HTMLElement).getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return false;
-            if (containerEl) {
-              const cr = containerEl.getBoundingClientRect();
-              if (r.bottom < cr.top || r.top > cr.bottom) return false;
-              if (r.right < cr.left || r.left > cr.right) return false;
-            } else {
-              const vpH = window.innerHeight;
-              const vpW = window.innerWidth;
-              if (r.bottom < 0 || r.top > vpH) return false;
-              if (r.right < 0 || r.left > vpW) return false;
-            }
-            const cs = window.getComputedStyle(el as HTMLElement);
-            if (cs.visibility === 'hidden' || cs.display === 'none') return false;
-            if (isHiddenByCollapse(el)) return false;
-            return true;
-          };
-          const interactive = Array.from(root.querySelectorAll(
-            'a, button, input, select, textarea, label, summary, ' +
-            '[role], [aria-label], [data-testid], h1, h2, h3, h4, h5, ' +
-            'li, td, th, span, div',
-          ));
-          for (const el of interactive) {
-            if (!isVisible(el)) continue;
-            if (role) {
-              const elRole = (el.getAttribute('role') || el.tagName.toLowerCase()).toLowerCase();
-              if (elRole !== role.toLowerCase()) continue;
-            }
-            const txt = ((el as HTMLElement).innerText || (el as HTMLElement).textContent || '').trim();
-            const ariaLbl = el.getAttribute('aria-label') || '';
-            const placeholder = el.getAttribute('placeholder') || '';
-            const composite = `${txt}\n${ariaLbl}\n${placeholder}`.trim();
-            if (matchText(composite)) {
-              const selectorBits: string[] = [el.tagName.toLowerCase()];
-              const id = el.getAttribute('id');
-              if (id) selectorBits.push(`#${id}`);
-              const dt = el.getAttribute('data-testid');
-              if (dt) selectorBits.push(`[data-testid="${dt}"]`);
-              return {
-                selector: selectorBits.join(''),
-                text: composite.slice(0, 120),
-              };
-            }
-          }
-          return null;
-        },
-        { regexSrc, isRegex, role: targetRole, container: containerSelector },
-      ) as { selector: string; text: string } | null;
+      return await findFirstInteractiveMatch(this.page, {
+        targetText,
+        targetRole,
+        containerSelector,
+      });
     };
 
     // Per-step "what entered view" diff. Tags newcomers with
