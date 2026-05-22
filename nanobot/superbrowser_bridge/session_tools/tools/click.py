@@ -837,7 +837,19 @@ class BrowserClickAtTool(Tool):
             snapped = snap_dbg.get("snapped")
             effect = (data.get("effect") or {})
             mutation_delta = effect.get("mutation_delta", "?")
-            if err_dbg or label_mismatch or snapped is False:
+            # Anomaly = real error, OR (snap-uncertainty AND the click
+            # didn't move the page). When mutation_delta>0 or URL
+            # changed, the click clearly landed — labelMismatch /
+            # snapped=False is advisory noise and we don't shout it.
+            _eff_delta_int = int(effect.get("mutation_delta") or 0)
+            _click_had_effect_print = (
+                _eff_delta_int > 0 or bool(effect.get("url_changed"))
+            )
+            _is_anomaly = bool(err_dbg) or (
+                (label_mismatch or snapped is False)
+                and not _click_had_effect_print
+            )
+            if _is_anomaly:
                 expected_label_dbg = data.get("expected_label", "")
                 found_dbg = data.get("found") or {}
                 found_text = (found_dbg.get("text") or "")[:60]
@@ -855,10 +867,14 @@ class BrowserClickAtTool(Tool):
                         f"found_text={found_text!r}]"
                     )
             else:
+                _lm_tail = (
+                    f" label_mismatch=True (advisory; click had effect)"
+                    if label_mismatch else ""
+                )
                 print(
                     f"  [click_ok: snapped={snapped} "
                     f"mutation_delta={mutation_delta} "
-                    f"target={snap_dbg.get('target', '?')[:60]}]"
+                    f"target={snap_dbg.get('target', '?')[:60]}{_lm_tail}]"
                 )
         # Viewport-shift guard. The TS handler compared the page's
         # current scrollY/scrollHeight/viewport dims to what they were
@@ -978,10 +994,49 @@ class BrowserClickAtTool(Tool):
             }
         snap = data.get("snap")  # {x, y, snapped: bool, target?: str, warning?: str}
         if snap:
-            snap_note = (
-                f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
-                if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
+            # Three snap states distinguished by `snapped` and `target`:
+            #   - snapped=true                  → Phase 1/2 confident match.
+            #   - snapped=false + target set    → Phase 2.5 labelMismatch
+            #     (best-by-area found, label diverged). Common on value-
+            #     bearing triggers (Chakra/MUI/AntD datetime, custom React
+            #     rows showing displayed value where vision labels by
+            #     function). The click DID land on `target.center`.
+            #   - snapped=false + no target     → Phase 3 hard fallback
+            #     (grid scan found NO clickable; clicked raw bbox center).
+            #
+            # The brain previously read "no interactive element matched"
+            # for both snapped=false cases — wrong for the labelMismatch
+            # path. When the page mutated or URL changed, the click
+            # clearly worked, so even the labelMismatch advisory is
+            # noise.
+            _has_target = bool(snap.get("target"))
+            _effect_outer = data.get("effect") or {}
+            _click_had_effect = (
+                int(_effect_outer.get("mutation_delta") or 0) > 0
+                or bool(_effect_outer.get("url_changed"))
             )
+            if snap.get("snapped") or _has_target:
+                # Confident match OR labelMismatch-with-target. Both
+                # clicked at `target.center`; same caption shape.
+                snap_note = (
+                    f" snapped→({snap.get('x')},{snap.get('y')}) "
+                    f"{snap.get('target','')}"
+                ).rstrip()
+            elif _click_had_effect:
+                # Phase 3 hard fallback BUT the page mutated — a same-
+                # coord handler fired. Don't tell the brain "no
+                # interactive element matched" because it'll retry the
+                # click and miss the popup it just opened.
+                snap_note = (
+                    f" clicked→({snap.get('x')},{snap.get('y')}) "
+                    f"(raw bbox center; same-coord handler fired)"
+                )
+            else:
+                # True Phase 3 hard fallback with no effect — the
+                # original message stays accurate here.
+                snap_note = (
+                    " (raw bbox center; no interactive element matched)"
+                )
             # Surface clickInBbox warnings so the brain can react.
             # Variants (Phase A/B):
             #   - target_in_iframe_resolved: descent worked, click
