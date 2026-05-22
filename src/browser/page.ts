@@ -1447,21 +1447,24 @@ export class PageWrapper {
           // day "24"; `aria-label="Saturday, May 24, 2026"` is skipped
           // because the digit "4" inside "2026" or "24" inside another
           // cell's `aria-label` would otherwise false-match.
+          //
+          // Score floor is 0.5, NOT 0.05. Rationale: vision uses short
+          // numeric labels for many non-calendar elements (pagination,
+          // quantity steppers, ratings, time options). A 0.05 floor
+          // would trip the `bestLabelScore < 0.5` snapped=false branch
+          // for those clicks, regressing snap metadata (isAutocompleteOption,
+          // native_select) and surfacing labelMismatch advisories the
+          // brain reads as low-confidence. 0.5 preserves area-only
+          // ordering for non-calendar uses (uniform multiplier) while
+          // still letting a textContent match (0.9-1.0) beat a no-match
+          // sibling (0.5) on actual calendar grids.
           if (isNumericDay) {
             const text = ((el as HTMLElement).textContent || '')
               .toLowerCase().replace(/\s+/g, ' ').trim();
-            if (!text) return 0.05;
-            // textContent must be EXACTLY the day number (a calendar
-            // cell renders just "24"). Buttons or rows that happen to
-            // contain "24" in a longer phrase score 0.05.
             if (text === expLc) return 1;
-            // Whole-word match in textContent — covers cells whose
-            // visible text is "24 " with a trailing badge ("●" for
-            // today, etc.). Splits on whitespace AND punctuation to
-            // catch "24·" / "24*" / "24, today".
             const words = text.split(/[\s.,·*•\-]+/);
             if (words.includes(expLc)) return 0.9;
-            return 0.05;
+            return 0.5;
           }
           const full = (
             ((el as HTMLElement).textContent || '') + ' '
