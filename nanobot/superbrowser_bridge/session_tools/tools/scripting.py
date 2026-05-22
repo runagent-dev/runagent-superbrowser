@@ -47,6 +47,15 @@ class BrowserEvalTool(Tool):
     async def execute(self, session_id: str, script: str, **kw: Any) -> str:
         self.s.actions_since_screenshot += 1
         self.s.consecutive_click_calls = 0  # eval resets click loop tracking
+        # Wire the inverse counter so _maybe_script_usage_warning can
+        # surface a `[script_warning]` advisory at 2+ consecutive
+        # eval/run_script calls. Reset on cursor success in effects.py.
+        try:
+            self.s.consecutive_script_calls = int(
+                getattr(self.s, "consecutive_script_calls", 0) or 0
+            ) + 1
+        except Exception:
+            self.s.consecutive_script_calls = 1
         print(f"\n>> browser_eval({script[:60]}...)")
         r = await _request_with_backoff(
             "POST",
@@ -60,7 +69,14 @@ class BrowserEvalTool(Tool):
         result_str = json.dumps(result, indent=2, ensure_ascii=False)[:5000] if isinstance(result, (dict, list)) else str(result)[:5000]
         self.s.log_activity(f"eval({script[:40]}...)", result_str[:60])
         self.s.record_step("browser_eval", script[:60], result_str[:100])
-        return result_str
+        # Surface the script-usage advisory when the brain is on a
+        # 2+ eval/run_script streak with clickable bboxes available.
+        try:
+            from ..effects import _maybe_script_usage_warning
+            _warning = _maybe_script_usage_warning(self.s)
+        except Exception:
+            _warning = ""
+        return result_str + (_warning or "")
 
 
 @tool_parameters(
@@ -165,6 +181,15 @@ class BrowserRunScriptTool(Tool):
                     "mutates=false — read-only scripts always pass."
                 )
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
+        # Wire the inverse counter so _maybe_script_usage_warning can
+        # surface a `[script_warning]` advisory at 2+ consecutive
+        # eval/run_script calls. Reset on cursor success in effects.py.
+        try:
+            self.s.consecutive_script_calls = int(
+                getattr(self.s, "consecutive_script_calls", 0) or 0
+            ) + 1
+        except Exception:
+            self.s.consecutive_script_calls = 1
         payload: dict[str, Any] = {"code": script, "mutates": bool(mutates)}
         if context:
             payload["context"] = context
@@ -219,7 +244,12 @@ class BrowserRunScriptTool(Tool):
             tip = "\n[TIP: Fix the script and retry in this SAME session. Do NOT navigate back to the start.]"
             if elements:
                 tip += f"\n\nCurrent interactive elements:\n{elements}"
-            return f"Script error: {error}{tip}"
+            try:
+                from ..effects import _maybe_script_usage_warning
+                _err_warning = _maybe_script_usage_warning(self.s)
+            except Exception:
+                _err_warning = ""
+            return f"Script error: {error}{tip}" + (_err_warning or "")
 
         parts = []
         result = data.get("result")
@@ -244,4 +274,12 @@ class BrowserRunScriptTool(Tool):
         if elements:
             parts.append(f"\nInteractive elements:\n{elements}")
 
-        return "\n".join(parts)
+        # Surface the script-usage advisory on success too — even when
+        # the script "worked", 2+ consecutive script calls with visible
+        # clickable V_n means the brain is off-track from the tool ladder.
+        try:
+            from ..effects import _maybe_script_usage_warning
+            _ok_warning = _maybe_script_usage_warning(self.s)
+        except Exception:
+            _ok_warning = ""
+        return "\n".join(parts) + (_ok_warning or "")

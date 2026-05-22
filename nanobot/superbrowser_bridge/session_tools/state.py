@@ -109,6 +109,16 @@ class BrowserSessionState:
         # step_history migrated to memory.ledger.all_steps (via property below)
         # Track consecutive click-type tool calls for loop detection
         self.consecutive_click_calls: int = 0
+        # Inverse counter: how many browser_eval / browser_run_script calls
+        # have fired in a row without a successful cursor action between.
+        # Read by `_maybe_script_usage_warning` in effects.py to surface a
+        # `[script_warning]` advisory listing the top clickable V_n labels
+        # — the brain pivots to scripts faster than the tool ladder
+        # prescribes (training prior + LLM Puppeteer recipes) so we count
+        # explicitly. Reset to 0 by `_maybe_no_effect_prefix` on any
+        # cursor-tool success; incremented in BrowserEvalTool.execute
+        # and BrowserRunScriptTool.execute.
+        self.consecutive_script_calls: int = 0
         # Hard guard against the brain re-clicking a target that produced
         # no DOM change. Cleared by `register_click_attempt` on a fresh
         # target; incremented when the same target re-fires AND the page

@@ -558,7 +558,17 @@ class BrowserWorkerHook(AgentHook):
                                 continue
                             role = (getattr(b, "role", "") or "").lower()
                             clickable = bool(getattr(b, "clickable", False))
-                            if role == "content" and clickable:
+                            # Vision is SUPPOSED to tag autocomplete
+                            # suggestions as role='content' (per
+                            # prompts.py:150-160) but routinely drifts
+                            # to 'other' / 'button' / 'option' / 'link'.
+                            # Accept all four — when the drift happened
+                            # the hint used to silently skip the V_n
+                            # list and the brain pivoted to JS scans.
+                            if (
+                                role in ("content", "other", "button", "option", "link")
+                                and clickable
+                            ):
                                 lbl = (getattr(b, "label", "") or "").strip()[:60]
                                 if lbl:
                                     sugg_lines.append(f"  V{v_n} — {lbl!r}")
