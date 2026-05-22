@@ -494,13 +494,23 @@ class BrowserClickTool(Tool):
                 session_state=self.s,
             )
             _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
-            if not _tagged_no_effect and (_label_mismatch_flag or _snapped_flag is False):
+            # See browser_click_at: labelMismatch is advisory only after
+            # the page.ts:1574 fix; the secondary tag fires only on
+            # genuine Phase 3 hard fallback (snapped=False) combined
+            # with zero page inertia.
+            _effect_dbg = (data or {}).get("effect") or {}
+            _mutation_delta_dbg = int(_effect_dbg.get("mutation_delta") or 0)
+            _url_changed_dbg = bool(_effect_dbg.get("url_changed"))
+            if (not _tagged_no_effect
+                    and _snapped_flag is False
+                    and not _label_mismatch_flag
+                    and _mutation_delta_dbg == 0
+                    and not _url_changed_dbg):
                 no_effect_caption = (
                     f"[no_effect:browser_click] click on [{index}] "
-                    f"snapped to a different element than expected "
-                    f"(label_mismatch={_label_mismatch_flag} "
-                    f"snapped={_snapped_flag}). The DOM index may be "
-                    f"stale (page re-rendered, list re-sorted). Call "
+                    f"resolved to no interactive element (snapped=False) "
+                    f"and had no effect. The DOM index may be stale "
+                    f"(page re-rendered, list re-sorted). Call "
                     f"browser_screenshot or browser_list_elements to "
                     f"refresh; DO NOT retry [{index}].\n"
                     f"{no_effect_caption}"
@@ -1188,15 +1198,34 @@ class BrowserClickAtTool(Tool):
                 session_state=self.s,
             )
             _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
-            if not _tagged_no_effect and (_label_mismatch_flag or _snapped_flag is False):
+            # labelMismatch is now ADVISORY ONLY (page.ts:1574 dropped
+            # the silent-skip; grid-scan winner gets dispatched even on
+            # low-confidence label match — value-bearing controls like
+            # Chakra DateTimePicker triggers systematically have
+            # role-vs-value label divergence). Tagging the brain off
+            # labelMismatch alone would mis-inform it that the click
+            # did nothing when in fact it did. Real silent misclicks
+            # still surface via _maybe_no_effect_prefix above on true
+            # zero url/DOM/focus delta.
+            #
+            # The only secondary case worth surfacing is Phase 3 hard
+            # fallback (snapped=False because grid-scan found NO
+            # interactive element at all — the bbox covered dead space)
+            # combined with genuine page inertia.
+            _effect_dbg = (data or {}).get("effect") or {}
+            _mutation_delta_dbg = int(_effect_dbg.get("mutation_delta") or 0)
+            _url_changed_dbg = bool(_effect_dbg.get("url_changed"))
+            if (not _tagged_no_effect
+                    and _snapped_flag is False
+                    and not _label_mismatch_flag
+                    and _mutation_delta_dbg == 0
+                    and not _url_changed_dbg):
                 no_effect_caption = (
-                    f"[no_effect:browser_click_at] bbox snapped to a "
-                    f"different element than vision predicted "
-                    f"(label_mismatch={_label_mismatch_flag} "
-                    f"snapped={_snapped_flag}). V{vision_index} is stale "
-                    f"— page may have re-rendered or the bbox is in dead "
-                    f"space. Call browser_screenshot to refresh vision "
-                    f"before clicking; DO NOT retry the same V_n.\n"
+                    f"[no_effect:browser_click_at] bbox at V{vision_index} "
+                    f"covered no interactive element (Phase 3 hard fallback) "
+                    f"and the click had no effect. Call browser_screenshot "
+                    f"to refresh vision before clicking; DO NOT retry the "
+                    f"same V_n.\n"
                     f"{no_effect_caption}"
                 )
                 _tagged_no_effect = True

@@ -314,7 +314,13 @@ class BrowserTypeAtTool(Tool):
                         f"max={_max_age}] V{vision_index} resolves "
                         f"against a vision snapshot taken {_age} actions "
                         f"ago. Call browser_screenshot to refresh before "
-                        f"typing."
+                        f"typing. NOTE: if a sibling browser_type_at in "
+                        f"this same turn returned [not_input], this V_n "
+                        f"is likely also a date/time picker trigger or "
+                        f"value-bearing button — use browser_click_at("
+                        f"vision_index={vision_index}) to open the "
+                        f"popup, then screenshot. See SOUL.md \"Date & "
+                        f"time pickers\"."
                     )
             iw, ih = resp.image_width, resp.image_height
             if iw <= 0 or ih <= 0:
@@ -369,14 +375,34 @@ class BrowserTypeAtTool(Tool):
             # browser_run_script.
             if reason == "not_input" and isinstance(result, dict):
                 tag = str(result.get("tag", "") or "?")
+                vi_str = (
+                    str(vision_index)
+                    if vision_index is not None else "<V_n>"
+                )
                 return (
                     f"[type_at_failed:not_input tag={tag}] at {label}. "
                     f"V_n is not a text input — the element under the "
                     f"cursor is a <{tag}>. Call browser_click_at("
-                    f"vision_index={vision_index if vision_index is not None else '<V_n>'}) "
+                    f"vision_index={vi_str}) "
                     f"instead — calendar cells, time options, buttons, "
                     f"and gridcells all dispatch via a CDP click. Do "
-                    f"not retry browser_type_at on this target."
+                    f"not retry browser_type_at on this target.\n"
+                    f"DATE / TIME PICKER PATTERN: if the field's visible "
+                    f"label reads like a VALUE (e.g. 'May 24, 2026', "
+                    f"'1:00 PM', 'Today, 10:00 AM'), it is almost "
+                    f"certainly a picker trigger that opens a calendar "
+                    f"or time popup — NOT a text input. Workflow: "
+                    f"(1) browser_click_at(vision_index={vi_str}) to "
+                    f"open the popup, (2) browser_screenshot so vision "
+                    f"labels the calendar grid + month arrows + time "
+                    f"options as fresh V_n, (3) click next/prev month "
+                    f"to reach the target month (NEVER click 'Previous "
+                    f"month' when target is in the future), (4) click "
+                    f"the day cell, (5) click the time option if a "
+                    f"separate one exists. Do NOT browser_run_script to "
+                    f"set React state — pickers keep separate state "
+                    f"that ignores DOM writes. See SOUL.md \"Date & "
+                    f"time pickers\" for the full pattern."
                 )
             return f"[type_at_failed:{reason}] at {label}. detail={result}"
 
