@@ -2774,6 +2774,33 @@ class T3SessionManager:
                         ).toLowerCase().replace(/\\s+/g, ' ').trim();
                         if (!full) return 0.1;
                         if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) return 1;
+                        // Lenient fallback (mirrors src/browser/page.ts):
+                        //   - Dropdown items (role=option/menuitem/treeitem/listitem, <li>)
+                        //     where vision drifts on suggestion labels.
+                        //   - Value-bearing triggers (role=combobox, aria-haspopup) whose
+                        //     visible text is the displayed VALUE while vision labels them
+                        //     by FUNCTION (e.g. Chakra DateTimePicker shows "1:00 PM" but
+                        //     vision labels it "Start Time"). Misclick risk is low because
+                        //     these are singleton controls inside the bbox.
+                        const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                        const hasPopup = (el.getAttribute && el.getAttribute('aria-haspopup') || '').toLowerCase();
+                        const isDropdownItem = (
+                          role === 'option' || role === 'menuitem'
+                          || role === 'treeitem' || role === 'listitem'
+                        ) || (el.tagName && el.tagName.toLowerCase() === 'li');
+                        const isValueBearingTrigger = (
+                          role === 'combobox'
+                          || (hasPopup !== '' && hasPopup !== 'false')
+                        );
+                        if (isDropdownItem || isValueBearingTrigger) {
+                          const expWords = expLc.split(/\\s+/).filter((t) => t.length >= 3);
+                          const fullWords = new Set(full.split(/\\s+/).filter((t) => t.length >= 3));
+                          let common = 0;
+                          for (const t of expWords) if (fullWords.has(t)) common += 1;
+                          if (common >= 1 || (isValueBearingTrigger && expWords.length > 0)) {
+                            return 0.7;
+                          }
+                        }
                         return 0.05;
                       };
                       const isRowBbox = (b.x1 - b.x0) >= 60 && (b.y1 - b.y0) >= 24;
@@ -2912,26 +2939,28 @@ class T3SessionManager:
                 )
                 if isinstance(snap_info, dict):
                     if snap_info.get("ok") is False and snap_info.get("labelMismatch"):
-                        # Phase 2 found candidates but none matched
-                        # the expected label — surface element_mismatch
-                        # without dispatching the click.
-                        found = snap_info.get("found") or {}
-                        return {
-                            "success": False,
-                            "error": "element_mismatch",
-                            "expected_label": _exp_label[:120],
-                            "found": {
-                                "tag": found.get("tag"),
-                                "role": found.get("role"),
-                                "text": (found.get("text") or "")[:120],
-                            },
-                            "coords": {
-                                "x": int(snap_info.get("x", x)),
-                                "y": int(snap_info.get("y", y)),
-                            },
-                            "strategy": (strategy or "primary"),
-                        }
-                    if snap_info.get("ok") is True:
+                        # Phase 2 found a candidate but its label diverged
+                        # from vision's bbox label (mirrors src/browser/
+                        # page.ts: labelMismatch is now ADVISORY ONLY).
+                        # We dispatch at the grid-scan winner's coords —
+                        # value-bearing controls (combobox / aria-haspopup
+                        # triggers) systematically have role-vs-value
+                        # label drift, and silently no-op'ing legitimate
+                        # clicks was worse than the misclick risk on
+                        # same-shape neighbours. Page-shift attacks
+                        # (the original reason for this escape) are
+                        # already guarded by the viewport_shifted check
+                        # at 2730-2740 above. Carry snapped=False so the
+                        # bridge logs the divergence as a diagnostic.
+                        target_x = float(snap_info.get("x", x))
+                        target_y = float(snap_info.get("y", y))
+                        snapped = False
+                        is_autocomplete_target = False
+                        _found = snap_info.get("found") or {}
+                        snap_target = (
+                            f"{_found.get('tag','')}:{_found.get('text','')[:40]}"
+                        )
+                    elif snap_info.get("ok") is True:
                         target_x = float(snap_info.get("x", x))
                         target_y = float(snap_info.get("y", y))
                         snapped = True

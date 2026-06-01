@@ -328,18 +328,21 @@ def _last_vision_has_captcha_flag(state: "BrowserSessionState") -> bool:
 
 def _maybe_script_usage_warning(state: "BrowserSessionState") -> str:
     """Return a `[script_warning] ...` string when the brain is
-    over-using `browser_run_script` even though cursor alternatives
-    are visible, else empty string.
+    over-using `browser_eval` / `browser_run_script` even though cursor
+    alternatives are visible, else empty string.
 
-    Trigger: 3+ consecutive script calls, AND the last vision pass
-    emitted at least one clickable bbox. The warning lists the top 3
-    labels so the brain has concrete semantic targets to reach for.
+    Trigger: 2+ consecutive script calls (eval OR run_script), AND the
+    last vision pass emitted at least one clickable bbox. The warning
+    lists the top 3 labels so the brain has concrete semantic targets
+    to reach for. Threshold is 2 (not 3) because empirical traces show
+    the brain pivots to scripts in 1-2 turns — once it's on the script
+    track, it tends to stay there until a hard signal pushes back.
     """
     try:
         count = int(state.consecutive_script_calls or 0)
     except Exception:
         count = 0
-    if count < 3:
+    if count < 2:
         return ""
     resp = getattr(state, "_last_vision_response", None)
     bboxes = getattr(resp, "bboxes", None) if resp is not None else None
@@ -358,11 +361,15 @@ def _maybe_script_usage_warning(state: "BrowserSessionState") -> str:
         return ""
     rendered = ", ".join(f"'{lbl}'" for lbl in labels)
     return (
-        f"[script_warning] {count} consecutive run_script calls. "
-        f"Vision shows clickable bboxes ({rendered}, ...) — these can "
-        f"be clicked atomically via `browser_semantic_click(target='<label>')` "
-        f"without the WAF-block risk scripts carry. Reserve scripts "
-        f"for actions no cursor tool can express."
+        f"\n[script_warning] {count} consecutive browser_eval / "
+        f"browser_run_script calls. Vision has clickable bboxes "
+        f"available ({rendered}, ...) — click one with "
+        f"`browser_click_at(vision_index=V_n)` instead of authoring JS. "
+        f"Cursor tools dispatch isTrusted=true CDP events that pass "
+        f"WAF/bot-detection; scripts are isTrusted=false. Reserve "
+        f"scripts for iframe-internal clicks (frame.evaluate), pure "
+        f"read-only data extraction, or after 2 distinct cursor "
+        f"strategies have failed on the SAME target."
     )
 
 

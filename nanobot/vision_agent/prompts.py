@@ -546,7 +546,20 @@ def build_user_prompt(
             "action='scroll' with description starting 'scroll up to' "
             "when SCROLL_STATE shows reached_bottom=true and the target "
             "is likely above. NEVER suggest more scrolling once "
-            "reached_bottom=true unless retreating upward."
+            "reached_bottom=true unless retreating upward.\n\n"
+            "PROBE rule (HARD): if the context contains a "
+            "`[PROBE target='X' in_viewport=false …]` line, the most "
+            "recent scroll did NOT land label 'X' in the viewport. DO "
+            "NOT emit a bbox claiming to be 'X', and DO NOT set "
+            "`target_bbox_index` for any suggested_action that names "
+            "'X'. The probe is direct DOM measurement and overrides "
+            "your visual bbox scan for that label — a screenshot may "
+            "appear to show 'X' (a sticky banner, a sibling tab, a "
+            "ghost label), but the probe is authoritative. Instead, "
+            "suggest action='scroll' with a `description` that "
+            "continues the search when `below_fold=true`; or report "
+            "the target as not on this page when "
+            "`anywhere_in_dom=false`."
         )
     elif bucket == "verify_action":
         specific = (

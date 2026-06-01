@@ -22,6 +22,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from .._label import clean_label
 from ..effects import _maybe_no_effect_prefix
 from ..feedback import _feedback_gate
 from ..formatting import _fetch_elements, _vision_alternatives_hint
@@ -117,12 +118,29 @@ _PLAYWRIGHT_PSEUDO_RE = re.compile(
         session_id=StringSchema("Session ID"),
         index=IntegerSchema(description="Element index"),
         button=StringSchema("Mouse button: left, right, middle", nullable=True),
+        expected_label=StringSchema(
+            description=(
+                "The text/aria-label you saw on element [index] when you "
+                "read the elements list. Backend cross-checks this against "
+                "the actual element at [index]; if they don't match, the "
+                "click is rejected as element_mismatch — catches the case "
+                "where you confused indices in your reading of the list. "
+                "Optional but strongly recommended; passing the label you "
+                "saw makes wrong-element clicks fail loudly instead of "
+                "silently landing on an unintended sibling."
+            ),
+            nullable=True,
+        ),
         required=["session_id", "index"],
     )
 )
 class BrowserClickTool(Tool):
     name = "browser_click"
-    description = "Click an interactive element by its [index] number."
+    description = (
+        "Click an interactive element by its [index] number. Pass "
+        "expected_label with the text/aria-label you saw at [index] so "
+        "the backend can cross-check intent vs. the actual element."
+    )
 
     def __init__(self, state: BrowserSessionState):
         self.s = state
@@ -131,7 +149,14 @@ class BrowserClickTool(Tool):
     def exclusive(self) -> bool:
         return True
 
-    async def execute(self, session_id: str, index: int, button: str | None = None, **kw: Any) -> Any:
+    async def execute(
+        self,
+        session_id: str,
+        index: int,
+        button: str | None = None,
+        expected_label: str | None = None,
+        **kw: Any,
+    ) -> Any:
         print(f"\n>> browser_click([{index}])")
         gate = await _feedback_gate("browser_click")
         if gate:
@@ -220,6 +245,19 @@ class BrowserClickTool(Tool):
         payload: dict[str, Any] = {"index": index}
         if button:
             payload["button"] = button
+        # Brain's expected_label: catches case where the brain misread
+        # the elements list and picked the wrong [N]. Without this, the
+        # backend computes the label from the element AT [N] and
+        # validates against itself — a tautology that always passes.
+        # With it, clickInBbox's Phase 1 label-match guard compares the
+        # element under [N] against what the brain *intended*, surfacing
+        # element_mismatch when the brain's reading and the page's reality
+        # diverge. Length-capped to mirror the TS-side label slice and
+        # keep the click payload bounded.
+        if expected_label:
+            _label = expected_label.strip()[:80]
+            if _label:
+                payload["expected_label"] = _label
         # Send the fingerprint the LLM was targeting. If the DOM shifted,
         # the TS side returns 409 + stale_index with a suggested new index.
         cached_fp = self.s.element_fingerprints.get(index)
@@ -440,12 +478,62 @@ class BrowserClickTool(Tool):
                 alt_bbox=None,
                 postcondition=postcond,
             )
+        # Mirror of the no-effect / label-mismatch surfacing in
+        # browser_click_at — DOM-index clicks share the same silent-miss
+        # failure mode (label_mismatch=True / snapped=False / no DOM
+        # mutation) but the diagnostic was previously stderr-only. See
+        # browser_click_at for the rationale.
+        no_effect_caption = f"Clicked [{index}]"
+        record_suffix = ""
+        _escalation_succeeded = "[click_escalated strategy=" in (verify_note or "")
+        if not _escalation_succeeded:
+            _label_mismatch_flag = bool(snap.get("labelMismatch")) if isinstance(snap, dict) else False
+            _snapped_flag = snap.get("snapped") if isinstance(snap, dict) else None
+            no_effect_caption = _maybe_no_effect_prefix(
+                data, "browser_click", no_effect_caption,
+                session_state=self.s,
+            )
+            _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
+            # See browser_click_at: labelMismatch is advisory only after
+            # the page.ts:1574 fix; the secondary tag fires only on
+            # genuine Phase 3 hard fallback (snapped=False) combined
+            # with zero page inertia.
+            _effect_dbg = (data or {}).get("effect") or {}
+            _mutation_delta_dbg = int(_effect_dbg.get("mutation_delta") or 0)
+            _url_changed_dbg = bool(_effect_dbg.get("url_changed"))
+            if (not _tagged_no_effect
+                    and _snapped_flag is False
+                    and not _label_mismatch_flag
+                    and _mutation_delta_dbg == 0
+                    and not _url_changed_dbg):
+                no_effect_caption = (
+                    f"[no_effect:browser_click] click on [{index}] "
+                    f"resolved to no interactive element (snapped=False) "
+                    f"and had no effect. The DOM index may be stale "
+                    f"(page re-rendered, list re-sorted). Call "
+                    f"browser_screenshot or browser_list_elements to "
+                    f"refresh; DO NOT retry [{index}].\n"
+                    f"{no_effect_caption}"
+                )
+                _tagged_no_effect = True
+            if _tagged_no_effect:
+                record_suffix = " [no_effect]"
+                try:
+                    from nanobot.vision_agent.client import get_vision_agent
+                    await get_vision_agent()._cache.bust_session(session_id)
+                except Exception:
+                    pass
+
         self.s.log_activity(f"click([{index}])", f"url={actual_url[:50] if actual_url else '?'}")
-        self.s.record_step("browser_click", f"index={index}", f"url={actual_url[:60] if actual_url else '?'}")
+        self.s.record_step(
+            "browser_click",
+            f"index={index}",
+            f"url={actual_url[:60] if actual_url else '?'}{record_suffix}",
+        )
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked [{index}]") + verify_note,
+            self.s.build_text_only(data, no_effect_caption) + verify_note,
         )
 
 
@@ -687,7 +775,11 @@ class BrowserClickAtTool(Tool):
             if bbox_label:
                 payload["expected_label"] = bbox_label[:120]
                 payload["label"] = bbox_label[:120]
-            log_target = f"V{vision_index}({x0},{y0}→{x1},{y1})"
+            # log_target lands in StepOutcome.args → the ledger RECENT
+            # block. Coords churn turn-to-turn (DPR, scroll, post-snap
+            # reflow) so they're useless for re-identification; the
+            # (V_n, label) pair is the determinism anchor.
+            log_target = f'V{vision_index}|"{clean_label(bbox_label)}"'
             # Continuation of the top-of-function dispatch print —
             # adds the resolved bbox so the operator can see what
             # coordinates the cursor will actually go to.
@@ -707,13 +799,9 @@ class BrowserClickAtTool(Tool):
             )
             if isinstance(new_bbox, dict):
                 payload["bbox"] = new_bbox
-                # Refresh log_target so post-dispatch messages reflect
-                # the actual click coords.
-                log_target = (
-                    f"V{vision_index}("
-                    f"{new_bbox['x0']},{new_bbox['y0']}"
-                    f"→{new_bbox['x1']},{new_bbox['y1']})"
-                )
+                # log_target stays label-anchored after auto-scroll —
+                # coords would just churn here too.
+                log_target = f'V{vision_index}|"{clean_label(bbox_label)}"'
 
         r = await _request_with_backoff(
             "POST",
@@ -749,7 +837,19 @@ class BrowserClickAtTool(Tool):
             snapped = snap_dbg.get("snapped")
             effect = (data.get("effect") or {})
             mutation_delta = effect.get("mutation_delta", "?")
-            if err_dbg or label_mismatch or snapped is False:
+            # Anomaly = real error, OR (snap-uncertainty AND the click
+            # didn't move the page). When mutation_delta>0 or URL
+            # changed, the click clearly landed — labelMismatch /
+            # snapped=False is advisory noise and we don't shout it.
+            _eff_delta_int = int(effect.get("mutation_delta") or 0)
+            _click_had_effect_print = (
+                _eff_delta_int > 0 or bool(effect.get("url_changed"))
+            )
+            _is_anomaly = bool(err_dbg) or (
+                (label_mismatch or snapped is False)
+                and not _click_had_effect_print
+            )
+            if _is_anomaly:
                 expected_label_dbg = data.get("expected_label", "")
                 found_dbg = data.get("found") or {}
                 found_text = (found_dbg.get("text") or "")[:60]
@@ -767,10 +867,14 @@ class BrowserClickAtTool(Tool):
                         f"found_text={found_text!r}]"
                     )
             else:
+                _lm_tail = (
+                    f" label_mismatch=True (advisory; click had effect)"
+                    if label_mismatch else ""
+                )
                 print(
                     f"  [click_ok: snapped={snapped} "
                     f"mutation_delta={mutation_delta} "
-                    f"target={snap_dbg.get('target', '?')[:60]}]"
+                    f"target={snap_dbg.get('target', '?')[:60]}{_lm_tail}]"
                 )
         # Viewport-shift guard. The TS handler compared the page's
         # current scrollY/scrollHeight/viewport dims to what they were
@@ -890,10 +994,49 @@ class BrowserClickAtTool(Tool):
             }
         snap = data.get("snap")  # {x, y, snapped: bool, target?: str, warning?: str}
         if snap:
-            snap_note = (
-                f" snapped→({snap.get('x')},{snap.get('y')}) {snap.get('target','')}".strip()
-                if snap.get("snapped") else " (raw bbox center; no interactive element matched)"
+            # Three snap states distinguished by `snapped` and `target`:
+            #   - snapped=true                  → Phase 1/2 confident match.
+            #   - snapped=false + target set    → Phase 2.5 labelMismatch
+            #     (best-by-area found, label diverged). Common on value-
+            #     bearing triggers (Chakra/MUI/AntD datetime, custom React
+            #     rows showing displayed value where vision labels by
+            #     function). The click DID land on `target.center`.
+            #   - snapped=false + no target     → Phase 3 hard fallback
+            #     (grid scan found NO clickable; clicked raw bbox center).
+            #
+            # The brain previously read "no interactive element matched"
+            # for both snapped=false cases — wrong for the labelMismatch
+            # path. When the page mutated or URL changed, the click
+            # clearly worked, so even the labelMismatch advisory is
+            # noise.
+            _has_target = bool(snap.get("target"))
+            _effect_outer = data.get("effect") or {}
+            _click_had_effect = (
+                int(_effect_outer.get("mutation_delta") or 0) > 0
+                or bool(_effect_outer.get("url_changed"))
             )
+            if snap.get("snapped") or _has_target:
+                # Confident match OR labelMismatch-with-target. Both
+                # clicked at `target.center`; same caption shape.
+                snap_note = (
+                    f" snapped→({snap.get('x')},{snap.get('y')}) "
+                    f"{snap.get('target','')}"
+                ).rstrip()
+            elif _click_had_effect:
+                # Phase 3 hard fallback BUT the page mutated — a same-
+                # coord handler fired. Don't tell the brain "no
+                # interactive element matched" because it'll retry the
+                # click and miss the popup it just opened.
+                snap_note = (
+                    f" clicked→({snap.get('x')},{snap.get('y')}) "
+                    f"(raw bbox center; same-coord handler fired)"
+                )
+            else:
+                # True Phase 3 hard fallback with no effect — the
+                # original message stays accurate here.
+                snap_note = (
+                    " (raw bbox center; no interactive element matched)"
+                )
             # Surface clickInBbox warnings so the brain can react.
             # Variants (Phase A/B):
             #   - target_in_iframe_resolved: descent worked, click
@@ -1085,10 +1228,78 @@ class BrowserClickAtTool(Tool):
             postcondition=postcond,
         )
 
+        # Surface silent click failures to the brain. Without this, the
+        # TS-side label_mismatch / snapped=False / mutation_delta=0
+        # diagnostics only land in stderr — the brain reads "Clicked V_n"
+        # plus an unchanged state block, concludes success, and moves to
+        # the next planned action (typing / navigating / etc.) instead of
+        # retrying with a fresh screenshot. _maybe_no_effect_prefix covers
+        # the strict no-DOM/no-URL/no-focus case; we additionally tag
+        # label_mismatch / snapped=False because a snap to the wrong
+        # element can still register a focus change that masks the miss.
+        # Skip both when the click ladder rescued the click via js/keyboard.
+        no_effect_caption = f"Clicked {log_target}{snap_note}"
+        record_suffix = ""
+        _escalation_succeeded = "[click_escalated strategy=" in (verify_note or "")
+        if not _escalation_succeeded:
+            _snap_dbg = (
+                (data.get("snap") or data.get("clicked") or {})
+                if isinstance(data, dict) else {}
+            )
+            _label_mismatch_flag = bool(_snap_dbg.get("labelMismatch")) if isinstance(_snap_dbg, dict) else False
+            _snapped_flag = _snap_dbg.get("snapped") if isinstance(_snap_dbg, dict) else None
+            no_effect_caption = _maybe_no_effect_prefix(
+                data, "browser_click_at", no_effect_caption,
+                session_state=self.s,
+            )
+            _tagged_no_effect = no_effect_caption.startswith("[no_effect:")
+            # labelMismatch is now ADVISORY ONLY (page.ts:1574 dropped
+            # the silent-skip; grid-scan winner gets dispatched even on
+            # low-confidence label match — value-bearing controls like
+            # Chakra DateTimePicker triggers systematically have
+            # role-vs-value label divergence). Tagging the brain off
+            # labelMismatch alone would mis-inform it that the click
+            # did nothing when in fact it did. Real silent misclicks
+            # still surface via _maybe_no_effect_prefix above on true
+            # zero url/DOM/focus delta.
+            #
+            # The only secondary case worth surfacing is Phase 3 hard
+            # fallback (snapped=False because grid-scan found NO
+            # interactive element at all — the bbox covered dead space)
+            # combined with genuine page inertia.
+            _effect_dbg = (data or {}).get("effect") or {}
+            _mutation_delta_dbg = int(_effect_dbg.get("mutation_delta") or 0)
+            _url_changed_dbg = bool(_effect_dbg.get("url_changed"))
+            if (not _tagged_no_effect
+                    and _snapped_flag is False
+                    and not _label_mismatch_flag
+                    and _mutation_delta_dbg == 0
+                    and not _url_changed_dbg):
+                no_effect_caption = (
+                    f"[no_effect:browser_click_at] bbox at V{vision_index} "
+                    f"covered no interactive element (Phase 3 hard fallback) "
+                    f"and the click had no effect. Call browser_screenshot "
+                    f"to refresh vision before clicking; DO NOT retry the "
+                    f"same V_n.\n"
+                    f"{no_effect_caption}"
+                )
+                _tagged_no_effect = True
+            if _tagged_no_effect:
+                record_suffix = " [no_effect]"
+                # Bust vision cache for this session so the next prefetch
+                # re-runs the model instead of returning identical V_n
+                # bboxes that just missed (dom_hash unchanged → cache HIT
+                # would otherwise serve the same stale labels).
+                try:
+                    from nanobot.vision_agent.client import get_vision_agent
+                    await get_vision_agent()._cache.bust_session(session_id)
+                except Exception:
+                    pass
+
         self.s.record_step(
             "browser_click_at",
             log_target,
-            f"url={actual_url[:60] if actual_url else '?'}{snap_note}",
+            f"url={actual_url[:60] if actual_url else '?'}{snap_note}{record_suffix}",
         )
         # Phase 3.3 click-hit verification: capture pre-click signals
         # so the post-click vision pass can flag a no-op click that
@@ -1108,7 +1319,7 @@ class BrowserClickAtTool(Tool):
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
-            self.s.build_text_only(data, f"Clicked {log_target}{snap_note}") + verify_note,
+            self.s.build_text_only(data, no_effect_caption) + verify_note,
             expected_label=_expected_label or None,
             pre_url=_pre_url,
             pre_dom_hash=_pre_dom_hash,

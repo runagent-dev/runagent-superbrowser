@@ -16,6 +16,7 @@ import { SHADOW_DOM_HELPERS_SRC } from './slider-helpers.js';
 import { typeText as cdpTypeText, pressKeyCombo, clearField, dispatchKey } from './input-keyboard.js';
 import { getElementCenterBySelector } from './elements.js';
 import { findCursorInteractiveElements, formatCursorElements } from './cursor-detect.js';
+import { findFirstInteractiveMatch } from './scroll-probe.js';
 import { ConsoleCollector, type CollectedLog } from './console-collector.js';
 import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
@@ -1430,10 +1431,41 @@ export class PageWrapper {
           if (/(expand|collapse|toggle|more)/.test(al)) return 1;
           return 0;
         };
-        const labelActive = args.expectedLabel.length >= 3;
         const expLc = args.expectedLabel.toLowerCase().trim();
+        // Numeric short labels ("1".."31") are calendar day cells. Vision
+        // emits the day number; the cell's visible textContent is that
+        // same number. Without this branch, labelActive=false (length<3)
+        // and snap falls back to pure area, which on a misaligned bbox
+        // picks the row below by area dominance.
+        const isNumericDay = /^\d{1,2}$/.test(expLc)
+          && Number(expLc) >= 1 && Number(expLc) <= 31;
+        const labelActive = args.expectedLabel.length >= 3 || isNumericDay;
         const labelScoreOf = (el: Element): number => {
           if (!labelActive) return 1;
+          // Calendar-day path: match against visible textContent only,
+          // word-exact (NOT substring). A `<button>24</button>` matches
+          // day "24"; `aria-label="Saturday, May 24, 2026"` is skipped
+          // because the digit "4" inside "2026" or "24" inside another
+          // cell's `aria-label` would otherwise false-match.
+          //
+          // Score floor is 0.5, NOT 0.05. Rationale: vision uses short
+          // numeric labels for many non-calendar elements (pagination,
+          // quantity steppers, ratings, time options). A 0.05 floor
+          // would trip the `bestLabelScore < 0.5` snapped=false branch
+          // for those clicks, regressing snap metadata (isAutocompleteOption,
+          // native_select) and surfacing labelMismatch advisories the
+          // brain reads as low-confidence. 0.5 preserves area-only
+          // ordering for non-calendar uses (uniform multiplier) while
+          // still letting a textContent match (0.9-1.0) beat a no-match
+          // sibling (0.5) on actual calendar grids.
+          if (isNumericDay) {
+            const text = ((el as HTMLElement).textContent || '')
+              .toLowerCase().replace(/\s+/g, ' ').trim();
+            if (text === expLc) return 1;
+            const words = text.split(/[\s.,·*•\-]+/);
+            if (words.includes(expLc)) return 0.9;
+            return 0.5;
+          }
           const full = (
             ((el as HTMLElement).textContent || '') + ' '
             + ((el as HTMLElement).getAttribute('aria-label') || '') + ' '
@@ -1443,24 +1475,42 @@ export class PageWrapper {
           if (full.includes(expLc) || expLc.includes(full.slice(0, 40))) {
             return 1;
           }
-          // Dropdown-item lenient fallback. Vision routinely drifts on
-          // suggestion / option / menuitem labels — it abbreviates
-          // ("SF MOMA" vs "San Francisco Museum of Modern Art"), strips
-          // address context, or paraphrases. The strict substring check
-          // above then rejects the click as element_mismatch even
-          // though the bbox is on the right item. Misclick risk for
-          // these roles is low (only one dropdown / listbox is open at
-          // a time, so the bbox neighbours are sibling options whose
-          // labels would all share the same drift pattern). Accept any
-          // ≥3-char word overlap as a partial match.
+          // Lenient fallback for two element families where vision's
+          // label systematically diverges from the DOM's text:
+          //
+          //   1. Dropdown items (role=option/menuitem/treeitem/listitem,
+          //      <li>). Vision drifts on suggestion labels — abbreviates
+          //      ("SF MOMA" vs "San Francisco Museum of Modern Art"),
+          //      strips address context, paraphrases. Misclick risk is
+          //      low because only one popup is open at a time and
+          //      sibling options share the same drift pattern.
+          //
+          //   2. Value-bearing triggers (role=combobox, anything with
+          //      aria-haspopup). Vision labels these by FUNCTION
+          //      ("Start Time Picker"); the DOM exposes the current
+          //      VALUE ("1:00 PM"). The two strings will never substring-
+          //      match. Misclick risk is also low — these are singleton
+          //      controls whose only sibling is another picker which
+          //      would share the same divergence; we still pick the best
+          //      candidate by area inside the bbox.
+          //
+          // Either family: accept ≥3-char word overlap (or no expected
+          // words at all) as a partial match worth dispatching.
           const role = (
             ((el as HTMLElement).getAttribute('role') || '').toLowerCase()
           );
+          const hasPopup = (
+            (el as HTMLElement).getAttribute('aria-haspopup') || ''
+          ).toLowerCase();
           const isDropdownItem = (
             role === 'option' || role === 'menuitem'
             || role === 'treeitem' || role === 'listitem'
           ) || (el as HTMLElement).tagName.toLowerCase() === 'li';
-          if (isDropdownItem) {
+          const isValueBearingTrigger = (
+            role === 'combobox'
+            || (hasPopup !== '' && hasPopup !== 'false')
+          );
+          if (isDropdownItem || isValueBearingTrigger) {
             const expWords = new Set(
               expLc.split(/\s+/).filter((t) => t.length >= 3),
             );
@@ -1469,7 +1519,14 @@ export class PageWrapper {
             );
             let common = 0;
             for (const t of expWords) if (fullWords.has(t)) common += 1;
-            if (common >= 1) return 0.7;
+            // Value-bearing triggers often have NO overlap (semantic
+            // role vs displayed value) — grant the leniency anyway so
+            // the dispatch can land. The 0.7 score still loses to a 1.0
+            // exact-match neighbour with comparable area, so a labelled
+            // sibling wins if present.
+            if (common >= 1 || (isValueBearingTrigger && expWords.size > 0)) {
+              return 0.7;
+            }
           }
           return 0.05;
         };
@@ -1515,12 +1572,16 @@ export class PageWrapper {
           }
         }
         if (best) {
-          // Label-mismatch escape hatch: if the best candidate failed
-          // label-match (ls < 0.5 means 0.05 or 0.1 — i.e. mismatch or
-          // unlabelled when a label was expected), surface labelMismatch
-          // so the caller skips dispatch. This converts a silent
-          // misclick into a structured signal the bridge already
-          // surfaces as `element_mismatch`.
+          // Low-confidence snap: best candidate failed label-match
+          // (ls < 0.5 means 0.05 or 0.1 — strict mismatch or
+          // unlabelled when a label was expected). We still dispatch
+          // the click at this candidate's centre (see the caller
+          // notes on labelMismatch being advisory-only), but mark
+          // snapped=false + labelMismatch=true so the bridge can log
+          // the divergence and the brain can read `found.text` to see
+          // what was actually clicked. The bridge's `[no_effect:...]`
+          // tag only fires when this AND mutation_delta=0 — i.e. the
+          // low-confidence click also failed to move the page.
           if (labelActive && bestLabelScore < 0.5) {
             const r = best.getBoundingClientRect();
             return {
@@ -1559,20 +1620,24 @@ export class PageWrapper {
       { b: bbox, expectedLabel },
     );
 
-    // Label-mismatch escape: Phase 2 grid-scan found no candidate
-    // matching expectedLabel. Skip dispatch and let the caller surface
-    // a structured mismatch (the bridge then forces the brain to
-    // re-screenshot instead of clicking the wrong neighbour).
+    // labelMismatch is ADVISORY ONLY — we used to skip dispatch here
+    // when Phase 2 grid-scan returned bestLabelScore < 0.5, but that
+    // silently no-op'd legitimate clicks on value-bearing controls
+    // (Chakra DateTimePicker, MUI Select, AntD picker triggers) whose
+    // visible text is the displayed VALUE while vision labels them by
+    // FUNCTION. The two strings systematically diverge and labelScore
+    // never crosses the threshold.
     //
-    // IMPORTANT: this check MUST run BEFORE the click-burst emit
-    // below. Otherwise the live viewer sees the crosshair flash and
-    // the operator assumes a click happened, when in fact dispatch
-    // was skipped — that was the long-standing "burst but page
-    // doesn't change" bug. Burst is only emitted on the actual-
-    // dispatch path now.
-    if (snap.labelMismatch) {
-      return snap;
-    }
+    // Page-shift attacks (the real reason this escape existed) are
+    // already covered by the dedicated viewport_shifted guard at
+    // src/server/http.ts:884-907 and src/browser/page-readiness.ts:550
+    // (compareViewportShift), which fires BEFORE clickInBbox runs.
+    // labelScoreOf's new value-bearing leniency keeps the strict-mismatch
+    // path tight for genuine same-shape-neighbour cases while letting
+    // combobox / aria-haspopup triggers through.
+    //
+    // snap.labelMismatch stays on the response so the bridge can log it
+    // as a diagnostic in the operator stdout line; it no longer blocks.
 
     // Broadcast resolved target to live viewers BEFORE the click so the
     // crosshair appears in the same frame the click lands.
@@ -3748,16 +3813,17 @@ export class PageWrapper {
     const emitTrace = opts.emitTrace !== false;
     const startDirection = opts.direction === 'up' ? 'up' : 'down';
 
-    // Regex compile once. Caller passes a substring or a regex source.
+    // Regex compile flag — kept for containerProbe below. findMatch
+    // does its own regex compile inside findFirstInteractiveMatch, so
+    // we only need these locally for the container existence probe.
     let regexSrc = '';
     let isRegex = false;
     if (targetText) {
+      regexSrc = targetText;
       try {
         new RegExp(targetText, 'i');
-        regexSrc = targetText;
         isRegex = true;
       } catch {
-        regexSrc = targetText;
         isRegex = false;
       }
     }
@@ -3818,97 +3884,15 @@ export class PageWrapper {
       return { moved: result.fallback !== 'none' && result.after !== result.before };
     };
 
-    // Find a visible match within scope (page or container). Returns
-    // the matched selector + text or null.
+    // Find a visible match within scope (page or container). Shared
+    // matcher lives in scroll-probe.ts so browser_scroll's PROBE path
+    // and browser_scroll_until use identical text/role/visibility logic.
     const findMatch = async (): Promise<{ selector: string; text: string } | null> => {
-      return await this.page.evaluate(
-        (args: { regexSrc: string; isRegex: boolean; role: string; container?: string }) => {
-          const { regexSrc: rs, isRegex: ir, role, container } = args;
-          const matchText = (txt: string): boolean => {
-            if (!rs) return true;
-            if (ir) {
-              try {
-                return new RegExp(rs, 'i').test(txt);
-              } catch {
-                return txt.toLowerCase().includes(rs.toLowerCase());
-              }
-            }
-            return txt.toLowerCase().includes(rs.toLowerCase());
-          };
-          const root: ParentNode = container
-            ? (document.querySelector(container) as HTMLElement | null) ?? document
-            : document;
-          const containerEl = container ? (root as HTMLElement) : null;
-          // v6 G3 — also reject elements inside collapsed accordions /
-          // <details>. Modern filter UIs use <details open> or
-          // [aria-expanded] toggles for filter sections; their text
-          // is rendered but the children are visually hidden by the
-          // closed parent. Without this check, scroll_until reports
-          // the section header as a hit when scanning for a filter
-          // value INSIDE the section.
-          const isHiddenByCollapse = (el: Element): boolean => {
-            let walker: Element | null = el.parentElement;
-            let depth = 0;
-            while (walker && walker !== document.body && depth < 12) {
-              if (
-                walker.tagName === 'DETAILS'
-                && !(walker as HTMLDetailsElement).open
-              ) return true;
-              if (walker.getAttribute('aria-expanded') === 'false') return true;
-              walker = walker.parentElement;
-              depth += 1;
-            }
-            return false;
-          };
-          const isVisible = (el: Element): boolean => {
-            const r = (el as HTMLElement).getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return false;
-            if (containerEl) {
-              const cr = containerEl.getBoundingClientRect();
-              if (r.bottom < cr.top || r.top > cr.bottom) return false;
-              if (r.right < cr.left || r.left > cr.right) return false;
-            } else {
-              const vpH = window.innerHeight;
-              const vpW = window.innerWidth;
-              if (r.bottom < 0 || r.top > vpH) return false;
-              if (r.right < 0 || r.left > vpW) return false;
-            }
-            const cs = window.getComputedStyle(el as HTMLElement);
-            if (cs.visibility === 'hidden' || cs.display === 'none') return false;
-            if (isHiddenByCollapse(el)) return false;
-            return true;
-          };
-          const interactive = Array.from(root.querySelectorAll(
-            'a, button, input, select, textarea, label, summary, ' +
-            '[role], [aria-label], [data-testid], h1, h2, h3, h4, h5, ' +
-            'li, td, th, span, div',
-          ));
-          for (const el of interactive) {
-            if (!isVisible(el)) continue;
-            if (role) {
-              const elRole = (el.getAttribute('role') || el.tagName.toLowerCase()).toLowerCase();
-              if (elRole !== role.toLowerCase()) continue;
-            }
-            const txt = ((el as HTMLElement).innerText || (el as HTMLElement).textContent || '').trim();
-            const ariaLbl = el.getAttribute('aria-label') || '';
-            const placeholder = el.getAttribute('placeholder') || '';
-            const composite = `${txt}\n${ariaLbl}\n${placeholder}`.trim();
-            if (matchText(composite)) {
-              const selectorBits: string[] = [el.tagName.toLowerCase()];
-              const id = el.getAttribute('id');
-              if (id) selectorBits.push(`#${id}`);
-              const dt = el.getAttribute('data-testid');
-              if (dt) selectorBits.push(`[data-testid="${dt}"]`);
-              return {
-                selector: selectorBits.join(''),
-                text: composite.slice(0, 120),
-              };
-            }
-          }
-          return null;
-        },
-        { regexSrc, isRegex, role: targetRole, container: containerSelector },
-      ) as { selector: string; text: string } | null;
+      return await findFirstInteractiveMatch(this.page, {
+        targetText,
+        targetRole,
+        containerSelector,
+      });
     };
 
     // Per-step "what entered view" diff. Tags newcomers with

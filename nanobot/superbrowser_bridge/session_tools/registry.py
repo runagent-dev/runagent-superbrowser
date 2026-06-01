@@ -7,7 +7,12 @@ effects (last-registered-wins / shadowing) are preserved verbatim.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .state import BrowserSessionState
+
+if TYPE_CHECKING:
+    from superbrowser_bridge.memory import Memory
 from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
@@ -32,6 +37,7 @@ from .tools import (
     BrowserGetRectTool,
     BrowserImageRegionTool,
     BrowserKeysTool,
+    BrowserListElementsTool,
     BrowserListSliderHandlesTool,
     BrowserNavigateTool,
     BrowserOpenTool,
@@ -58,18 +64,28 @@ from .tools import (
 )
 
 
-def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = None) -> BrowserSessionState:
+def register_session_tools(
+    bot: "Nanobot",
+    state: BrowserSessionState | None = None,
+    *,
+    memory: "Memory | None" = None,
+) -> BrowserSessionState:
     """Register all browser session tools with a nanobot instance.
 
     Args:
         bot: The Nanobot instance to register tools on.
-        state: Optional shared state. If None, creates a new one.
+        state: Optional shared state. If None, creates a new one
+            bound to ``memory`` (or a synthesized default Memory).
+        memory: Optional Memory instance to bind. Only honored when
+            ``state`` is None. delegation.py constructs the worker's
+            Memory before BrowserSessionState so the on-disk task
+            directory and ledger are stable from the first tool call.
 
     Returns:
         The BrowserSessionState used (for external access if needed).
     """
     if state is None:
-        state = BrowserSessionState()
+        state = BrowserSessionState(memory=memory)
 
     tools = [
         BrowserOpenTool(state),
@@ -102,6 +118,7 @@ def register_session_tools(bot: "Nanobot", state: BrowserSessionState | None = N
         BrowserDragSliderUntilTool(state),
         BrowserImageRegionTool(state),     # kept: image region helper
         BrowserSolvePuzzleTool(state),     # kept: puzzle solver
+        BrowserListElementsTool(state),    # on-demand element inspection
         BrowserGetMarkdownTool(),          # stateless
         BrowserDialogTool(),               # stateless
         BrowserDetectCaptchaTool(state),

@@ -18,6 +18,8 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 
 from superbrowser_bridge.session_tools import BrowserSessionState
 from superbrowser_bridge.loop_detector import LoopDetector
+from superbrowser_bridge.memory import EventLog
+from superbrowser_bridge.memory.store import count_image_blocks
 
 # Phase 3.3 helpers for chevron-focus guidance.
 _CHEVRON_CHARS_SET = set("▼▶◀▲►◄⌃⌄⋮")
@@ -72,6 +74,10 @@ class BrowserWorkerHook(AgentHook):
         # Tier-auto-escalation: fires at most once per session to avoid
         # loop-cascading the LLM into repeated escalations.
         self._auto_escalated: bool = False
+        # Baseline observability sink: per-iteration token + image usage.
+        # Lazily resolved on first use so task_id (set by delegation
+        # AFTER hook construction) is available.
+        self._event_log: EventLog | None = None
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         """Inject guidance after each tool execution round."""
@@ -371,16 +377,61 @@ class BrowserWorkerHook(AgentHook):
                     "happened in the last 3 turns — only re-screenshots. "
                     "If your target (filter, button, named control) is "
                     "plausibly off-screen, call:\n"
-                    f"  browser_scroll_until(session_id='{sid}', "
+                    f"  browser_scroll(session_id='{sid}', "
+                    "direction='down', pixels=400, "
                     "target_text='<label>')\n"
-                    "It walks the page in fine steps, narrates labels "
-                    "passed at each step, and tells you whether the "
-                    "label exists on this page (look for "
-                    "`reversed_no_match` — that means it doesn't). Do "
-                    "NOT keep screenshotting the same viewport, and do "
-                    "NOT reach for browser_run_script(mutates=true) — "
-                    "the run_script gate will refuse it until you have "
-                    "scrolled."
+                    "The response includes `[PROBE target='<label>' "
+                    "in_viewport=…]` — direct DOM measurement that "
+                    "tells you whether the label entered the viewport. "
+                    "Do NOT keep screenshotting the same viewport, and "
+                    "do NOT reach for browser_run_script(mutates=true) "
+                    "— the run_script gate will refuse it until you "
+                    "have scrolled."
+                )
+        except Exception:
+            pass
+
+        # --- Phase 3.2b: probe-ignored hint -----------------------------
+        # When the most recent scroll's PROBE said target NOT in viewport,
+        # but the brain didn't scroll again or call browser_get_markdown,
+        # it's about to hallucinate a V_n. Hard-stop with a directive
+        # that names the exact tool calls to make next.
+        try:
+            tel = getattr(self.state, "scroll_telemetry", None) or {}
+            last_target = tel.get("last_probe_target")
+            last_in_vp = tel.get("last_probe_in_viewport")
+            last_below = tel.get("last_probe_below_fold")
+            recent2 = (
+                self.state.step_history[-2:]
+                if self.state.step_history
+                else []
+            )
+            recovered = any(
+                (s.get("tool") or "").startswith("browser_scroll")
+                or (s.get("tool") or "") == "browser_get_markdown"
+                for s in recent2
+            )
+            if (
+                last_target
+                and last_in_vp is False
+                and not recovered
+            ):
+                sid = self.state.session_id or "<session_id>"
+                more_below_tag = " more_below=true" if last_below else ""
+                guidance_parts.append(
+                    f"[PROBE_IGNORED target={last_target!r} "
+                    f"last_in_viewport=false{more_below_tag}]\n"
+                    "The most recent scroll's PROBE said your target "
+                    "is NOT in the viewport, but you didn't scroll "
+                    "again or check the markdown. Do NOT emit "
+                    "browser_click_at with a V_n claiming to be that "
+                    "target — vision can hallucinate a label that "
+                    "matches a sibling/sticky element. Either:\n"
+                    f"  browser_scroll(session_id='{sid}', "
+                    f"direction='down', pixels=600, "
+                    f"target_text={last_target!r})\n"
+                    f"  OR browser_get_markdown(session_id='{sid}') "
+                    "to verify the label exists."
                 )
         except Exception:
             pass
@@ -507,7 +558,17 @@ class BrowserWorkerHook(AgentHook):
                                 continue
                             role = (getattr(b, "role", "") or "").lower()
                             clickable = bool(getattr(b, "clickable", False))
-                            if role == "content" and clickable:
+                            # Vision is SUPPOSED to tag autocomplete
+                            # suggestions as role='content' (per
+                            # prompts.py:150-160) but routinely drifts
+                            # to 'other' / 'button' / 'option' / 'link'.
+                            # Accept all four — when the drift happened
+                            # the hint used to silently skip the V_n
+                            # list and the brain pivoted to JS scans.
+                            if (
+                                role in ("content", "other", "button", "option", "link")
+                                and clickable
+                            ):
                                 lbl = (getattr(b, "label", "") or "").strip()[:60]
                                 if lbl:
                                     sugg_lines.append(f"  V{v_n} — {lbl!r}")
@@ -786,3 +847,27 @@ class BrowserWorkerHook(AgentHook):
                         # Multimodal content (image blocks) — append as text block
                         msg["content"].append({"type": "text", "text": guidance_text})
                     break
+
+        # --- Observability: log per-iteration token + image pressure ---
+        # Best-effort; failures must not crash the run.
+        try:
+            if self._event_log is None:
+                self._event_log = EventLog(self.state.task_id)
+            usage = context.usage or {}
+            self._event_log.log(
+                "iteration",
+                {
+                    "iter": context.iteration,
+                    "tokens_in": usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+                    "tokens_out": usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+                    "cache_read": usage.get("cache_read_input_tokens") or 0,
+                    "cache_creation": usage.get("cache_creation_input_tokens") or 0,
+                    "images": count_image_blocks(context.messages),
+                    "messages": len(context.messages),
+                    "tool_calls": len(context.tool_calls),
+                    "url": self.state.current_url,
+                    "step": self.state.step_counter,
+                },
+            )
+        except Exception:
+            pass

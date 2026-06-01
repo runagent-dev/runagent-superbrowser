@@ -21,6 +21,7 @@ import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
+import { runScrollProbe, capturePreScrollBboxes } from '../browser/scroll-probe.js';
 import { selectOptionByLabel, selectOptionByVisionBbox, selectOptionInIframe } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
@@ -1187,13 +1188,23 @@ export function createHttpServer(
             | null;
 
           if (live && live.w > 0 && live.h > 0) {
-            const expectedLabel = (
+            // Prefer the brain's expected_label when supplied — that's
+            // what catches the case where the brain confused indices
+            // when reading the elements list. Falls back to the element-
+            // attribute-derived label so older brains (no expected_label
+            // on the call) still get the same self-validating behaviour
+            // they had before.
+            const brainLabel = (typeof expected_label === 'string'
+              ? expected_label.trim()
+              : '');
+            const elementLabel = (
               element.attributes['aria-label']
               || element.attributes['placeholder']
               || element.attributes['title']
               || element.getAllTextTillNextClickableElement(2)
               || ''
             ).slice(0, 80).trim();
+            const expectedLabel = brainLabel || elementLabel;
 
             // Pre-dispatch stability gate. The live bounds we just
             // queried are a single sample taken one tick ago; on
@@ -1531,8 +1542,17 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { direction, percent, pixels } = req.body;
+      const { direction, percent, pixels, targetText } = req.body;
+      const trimmedTarget = typeof targetText === 'string' ? targetText.trim() : '';
       const [preY] = await page.getScrollInfo();
+      // Pre-scroll bbox capture for sticky-candidate detection — only
+      // when caller supplied a target. Costs one extra page.evaluate
+      // (~20-40ms) but suppresses false-positive in_viewport=true on
+      // pinned/sticky elements, which is the exact failure the probe
+      // is now trusted to rule out.
+      const preBboxes = trimmedTarget
+        ? await capturePreScrollBboxes(page.getRawPage(), trimmedTarget)
+        : undefined;
       // `pixels` (when set) wins — explicit incremental motion that
       // sidesteps the percent-vs-viewport ambiguity. Falls through to
       // legacy direction/percent paths otherwise.
@@ -1545,11 +1565,24 @@ export function createHttpServer(
       }
 
       const newState = await page.getState({ useVision: false });
+      // Newly-visible trace is meaningful for incremental motion
+      // (pixels or direction step), not for absolute teleports
+      // (percent), where "what newly appeared" has no useful
+      // interpretation.
+      const isAbsoluteJump = percent !== undefined
+        && !(typeof pixels === 'number' && pixels > 0);
+      const { probe, newly_visible } = await runScrollProbe(page.getRawPage(), {
+        targetText: trimmedTarget || undefined,
+        preBboxes,
+        collectNewlyVisible: !isAbsoluteJump,
+      });
       res.json({
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         prevScrollInfo: { scrollY: preY },
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
+        probe,
+        newly_visible,
       });
     } catch (err) {
       handleError(res, err);
