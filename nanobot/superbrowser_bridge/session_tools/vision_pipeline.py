@@ -957,6 +957,12 @@ def _schedule_vision_prefetch(
     navigate). Uses the same cache key as the sync path so the real
     screenshot call hits cache.
     """
+    # Ablation toggle (default on). VISION_ASYNC_PREFETCH=0 disables the
+    # background prefetch entirely (forcing the synchronous vision path) for the
+    # "- asynchronous vision prefetch" row of the Table 1 ablations. Callers
+    # already treat None as "no prefetch scheduled", so no caller change needed.
+    if os.environ.get("VISION_ASYNC_PREFETCH", "1") in ("0", "false", "no"):
+        return None
     try:
         from vision_agent import (  # type: ignore[import-not-found]
             dom_hash_of,

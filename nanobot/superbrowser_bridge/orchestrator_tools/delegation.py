@@ -45,6 +45,71 @@ from .result_quality import _result_is_substantive, _task_fingerprint
 from .url_probe import _probe_url
 
 
+# --- Eval instrumentation (gated; no-op unless env vars are set) ------------
+# When SUPERBROWSER_EVAL_CAPTURE_DIR is set, each delegated worker dumps its
+# full transcript (raw tool_calls INCLUDING rejected/malformed ones), the
+# worker's live tool registry, and telemetry to {dir}/{task_id}.json. The
+# eval/ harness reads these to score the three §7.4 failure modes (tool-schema
+# fidelity, [Vn] index discipline, procedural/declarative use). When the env
+# var is unset the helper returns immediately and production is unchanged.
+#
+# When SUPERBROWSER_EVAL_SCHEMA_REMINDER is set, a short tool-contract nudge is
+# appended to the worker prompt — the ONLY delta for the rescue ablation.
+_SCHEMA_REMINDER_TEXT = (
+    "TOOL-CALL CONTRACT (follow exactly):\n"
+    "- Emit EXACTLY the registered tool name and argument names. Never a "
+    "synonym (use `vision_index`, never `idx`); never an unregistered tool "
+    "(there is no `browser_navigate_and_click`).\n"
+    "- Make the call in the tool-call channel; do NOT describe it in prose.\n"
+    "- `[Vn]` indices are 1-based and ROTATE on every screenshot — reference "
+    "only indices from the MOST RECENT screenshot, never a stale one.\n"
+    "- If the page has not changed since the last screenshot, prefer the "
+    "procedural click (`browser_click` by index / `browser_click_selector`) "
+    "over re-grounding with `browser_click_at`."
+)
+
+
+def _eval_dump_worker(task_id, instructions, url, result, worker_state, worker) -> None:
+    """Dump a delegated worker's transcript + tool registry + telemetry for the
+    eval harness. Gated on SUPERBROWSER_EVAL_CAPTURE_DIR; safe to call always —
+    instrumentation failures are swallowed so a capture bug never breaks a run.
+    """
+    cap_dir = os.environ.get("SUPERBROWSER_EVAL_CAPTURE_DIR")
+    if not cap_dir:
+        return
+    try:
+        os.makedirs(cap_dir, exist_ok=True)
+        try:
+            tool_schemas = worker._loop.tools.get_definitions()
+        except Exception:
+            tool_schemas = []
+        payload = {
+            "task_id": task_id,
+            "instructions": instructions,
+            "url": url,
+            "content": (result.content if result else "") or "",
+            "messages": (result.messages if result else []) or [],
+            "tool_schemas": tool_schemas,
+            "meta": {
+                "schema_reminder": bool(
+                    os.environ.get("SUPERBROWSER_EVAL_SCHEMA_REMINDER")
+                ),
+                "step_count": len(worker_state.step_history),
+                "vision_calls": getattr(worker_state, "vision_calls", None),
+                "text_calls": getattr(worker_state, "text_calls", None),
+                "sessions_opened": getattr(worker_state, "sessions_opened", None),
+                "regression_count": getattr(worker_state, "regression_count", None),
+                "current_url": getattr(worker_state, "current_url", None),
+                "network_blocked": getattr(worker_state, "network_blocked", None),
+            },
+        }
+        with open(os.path.join(cap_dir, f"{task_id}.json"), "w") as f:
+            _json.dump(payload, f, default=str)
+        print(f"   [eval-capture] worker transcript -> {cap_dir}/{task_id}.json")
+    except Exception as exc:  # never let instrumentation break a run
+        print(f"   [eval-capture failed: {exc}]")
+
+
 @tool_parameters(
     tool_parameters_schema(
         instructions=StringSchema(
@@ -1054,6 +1119,10 @@ CRITICAL RULES:
   to re-observe, browser_rewind_to_checkpoint. Call browser_request_help
   only after multiple concrete alternatives failed.""")
 
+        # Rescue ablation: the ONLY delta vs a normal run (gated; see top).
+        if os.environ.get("SUPERBROWSER_EVAL_SCHEMA_REMINDER"):
+            parts.append(_SCHEMA_REMINDER_TEXT)
+
         prompt = "\n".join(parts)
 
         # Pre-announce the view URL if handoff is enabled — a user pre-opening
@@ -1077,6 +1146,11 @@ CRITICAL RULES:
                 hooks=[worker_memory_hook, worker_hook],
             )
             content = result.content
+
+            # Eval capture (gated on SUPERBROWSER_EVAL_CAPTURE_DIR; no-op when
+            # unset). Dumps the worker's full transcript + tool registry so the
+            # eval harness can score tool-schema fidelity / index discipline.
+            _eval_dump_worker(task_id, instructions, url, result, worker_state, worker)
 
             # Diagnostic: how many browser tool calls did the worker actually
             # make? If 0, the model refused to try — classify explicitly so

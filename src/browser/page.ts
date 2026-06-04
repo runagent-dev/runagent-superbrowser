@@ -522,7 +522,15 @@ export class PageWrapper {
     // but trips Cloudflare/Akamai's behavioral signals on real targets.
     // Opt out via SUPERBROWSER_HUMANIZE_ALL_CLICKS=0 (defaults to on).
     let coverReason: FailureReason | null = null;
-    const humanizeAll = process.env.SUPERBROWSER_HUMANIZE_ALL_CLICKS !== '0';
+    // MOTOR_HUMANIZATION=off (Table 1 "- motor humanization" ablation) also
+    // forces the raw dispatchClick path here, in addition to the early-returns
+    // inside humanize.ts, so the live-view sweep stays consistent.
+    const humanizeAll = process.env.SUPERBROWSER_HUMANIZE_ALL_CLICKS !== '0'
+      && process.env.MOTOR_HUMANIZATION !== 'off';
+    // SUPERBROWSER_CLICK_TIERS=tier1 (Table 1 "- click cascade Tier-2/3"
+    // ablation) keeps only the Tier-1 CDP click; the Tier-2/3 fallbacks below
+    // are short-circuited.
+    const tier1Only = process.env.SUPERBROWSER_CLICK_TIERS === 'tier1';
     try {
       const coords = await getElementCenterBySelector(this.page, selector);
       if (coords) {
@@ -696,6 +704,19 @@ export class PageWrapper {
       }
     } catch {
       // Fallthrough
+    }
+
+    // Ablation: with SUPERBROWSER_CLICK_TIERS=tier1, stop after Tier-1 instead
+    // of falling through to the Puppeteer (Tier-2) and scripted-XPath (Tier-3)
+    // fallbacks. Scope is this clickElement cascade only (clickAt is a separate
+    // vision-grounded path).
+    if (tier1Only) {
+      return {
+        success: false,
+        reason: coverReason ?? 'unknown',
+        tried,
+        error: 'Tier-2/3 click cascade disabled (SUPERBROWSER_CLICK_TIERS=tier1 ablation)',
+      };
     }
 
     // Tier 2: Puppeteer click (isTrusted=true — Puppeteer dispatches via CDP)

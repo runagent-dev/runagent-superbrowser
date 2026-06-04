@@ -27,3 +27,5 @@ nanobot/workspace*/**/.nanobot/
 *.jsonl
 
 todo/
+
+.cursor/
