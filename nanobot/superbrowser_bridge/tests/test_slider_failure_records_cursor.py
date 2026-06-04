@@ -1,9 +1,12 @@
 """Unit test: slider-tool failures populate the cursor-failure ledger.
 
 Before the patch, slider tools never called state.record_cursor_failure().
-Result: when slider attempts failed, the run_script lockout
-(scripting.py:165-198) saw zero cursor-strategy failures, and the agent
-got stuck — slider→fail→run_script→blocked, with no path forward.
+Result: when slider attempts failed, the cursor-failure ledger saw zero
+slider failures. That ledger is what the heavy-page run_script guard now
+consults (BrowserSessionState.cursor_failures_released, exercised in
+test_run_script_release.py) to lift the mutating-script lockout once
+cursor tools have demonstrably failed — so a slider that silently failed
+would never count toward opening that escape hatch.
 
 This test drives each slider tool through every failure path with the
 HTTP layer monkey-patched to fake errors, then asserts that
@@ -143,9 +146,10 @@ async def test_drag_slider_until_no_handle_records_strategy() -> None:
 
 @pytest.mark.anyio
 async def test_two_distinct_failures_unlock_run_script_threshold() -> None:
-    """End-to-end: two different slider failures push the lockout count
-    to ≥ 2, the threshold scripting.py uses to unblock mutating JS. This
-    is the core behavior change — slider failures now count."""
+    """Two different slider failures register as ≥ 2 distinct strategies in
+    the ledger — accruing toward the run_script release decision (which
+    opens at ≥ 3 distinct OR ≥ 5 total; see test_run_script_release.py).
+    The core behavior under test is that slider failures now count at all."""
     s = _make_state()
     set_tool = BrowserSetSliderTool(s)
     list_tool = BrowserListSliderHandlesTool(s)

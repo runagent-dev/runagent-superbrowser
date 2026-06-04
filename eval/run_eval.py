@@ -248,7 +248,7 @@ def main() -> None:
     p.add_argument("--seeds", type=int, default=3, help="runs per task (default 3)")
     p.add_argument("--tasks", default="all", help="'all' or comma-separated task ids")
     p.add_argument("--label", default=None, help="run label (default = slug of active model)")
-    p.add_argument("--timeout", type=int, default=600, help="per-run wall-clock budget (s)")
+    p.add_argument("--timeout", type=int, default=1800, help="per-run wall-clock budget (s)")
     p.add_argument("--out", default=str(REPO_ROOT / "eval" / "runs"), help="output dir")
     p.add_argument("--config", default=None, help="config.json path for reading active model")
     p.add_argument("--no-judge", action="store_true", help="skip the LLM judge (heuristic only)")

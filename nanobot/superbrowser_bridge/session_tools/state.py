@@ -25,7 +25,6 @@ from typing import Any, Optional
 from .effects import BLOCKED_BROWSER_OPEN_HARD_STOP  # re-imported for state.py module surface
 from .formatting import _fetch_elements, _format_state
 from .http_client import SCREENSHOT_DIR
-from .telemetry import _compute_screenshot_budget
 from .vision_pipeline import (
     _append_fresh_vision,
     _await_vision_required,
@@ -49,9 +48,6 @@ class BrowserSessionState:
     This prevents multi-agent setups from sharing globals.
     """
 
-    # Default budget when no task context is supplied. Use
-    # configure_budget() to switch to complexity-aware allocation.
-    DEFAULT_SCREENSHOT_BUDGET = 6
     CAPTCHA_MODE_ITERATIONS = 15
 
     def __init__(self, memory: "Memory | None" = None):
@@ -76,8 +72,8 @@ class BrowserSessionState:
             )
         self._memory: "Memory" = memory
 
-        self.max_screenshots = self.DEFAULT_SCREENSHOT_BUDGET
-        self.screenshot_budget = self.max_screenshots
+        # Screenshots are unlimited; we only count them for telemetry.
+        self.screenshots_taken = 0
         self.vision_calls = 0
         self.text_calls = 0
         self.start_time = 0.0
@@ -291,7 +287,7 @@ class BrowserSessionState:
         self._last_intent: str = ""
         self._last_dom_hash: str = ""
         self._last_vision_summary: str = ""
-        # Task context stamped by configure_budget() when the orchestrator
+        # Task context stamped by set_task_context() when the orchestrator
         # spawns a browser worker — piped into the vision prompt so
         # Gemini knows WHAT the user is trying to do before it picks
         # which bboxes to emit.
@@ -371,14 +367,21 @@ class BrowserSessionState:
         self._pending_postcondition: Optional[dict] = None
 
         # Phase 3.1: cursor-failure ledger. Each cursor-based interaction
-        # tool that returns a failure caption records its strategy here
-        # so BrowserRunScriptTool(mutates=true) can refuse to run until
-        # at least 2 distinct cursor strategies have been tried and
-        # failed. Eliminates the brain's reflex of "click failed → run
-        # JS to click" which trips Cloudflare/Akamai isTrusted=false
-        # detection. `cursor_failure_strategies` records DISTINCT
-        # strategies for the lockout decision; `cursor_failure_records`
-        # keeps the last few entries for the prompt-side hint.
+        # tool that returns a failure caption — including a snapped-but-
+        # silent `no_effect` click (see click.py) — records its strategy
+        # here. The heavy-page run_script guard (scripting.py) consults
+        # this ledger via `cursor_failures_released()`: a mutating script
+        # stays locked on heavy/bot-detected pages until cursor tools have
+        # DEMONSTRABLY failed recently — ≥3 distinct strategies OR ≥5 total
+        # failures within the last RUN_SCRIPT_CURSOR_FAIL_WINDOW brain
+        # turns. This both (a) eliminates the brain's reflex of "click
+        # failed → run JS to click" (which trips Cloudflare/Akamai
+        # isTrusted=false detection) AND (b) opens an escape hatch once
+        # cursor genuinely can't move the page, so the worker isn't
+        # deadlocked. `cursor_failure_strategies` is the all-time DISTINCT
+        # set (prompt hints); `cursor_failure_records` keeps the last few
+        # dated entries (each stamped with the current brain turn) that the
+        # turn-windowed release decision and the prompt-side hint read.
         self.cursor_failure_strategies: set[str] = set()
         self.cursor_failure_records: list[dict[str, Any]] = []
 
@@ -490,27 +493,23 @@ class BrowserSessionState:
 
     # --- budget configuration ---------------------------------------------
 
-    def configure_budget(
+    def set_task_context(
         self,
         task_instruction: str = "",
         target_url: str = "",
         is_research: bool = False,
-    ) -> int:
-        """Set screenshot budget based on task complexity. Returns new budget."""
-        self.max_screenshots = _compute_screenshot_budget(
-            task_instruction=task_instruction,
-            target_url=target_url,
-            is_research=is_research,
-        )
-        self.screenshot_budget = self.max_screenshots
-        # Capture the task context so the vision agent can reason about
-        # what the agent is trying to do on this site when picking which
-        # regions to bbox. "Book a flight on trip.com" → the vision agent
-        # should prioritize departure / destination / date / search
-        # button bboxes, not navbar noise.
+    ) -> None:
+        """Stamp the task context the vision agent reasons over.
+
+        Screenshots are unlimited, so there's no budget to configure; we
+        only capture WHAT the agent is trying to do on this site so the
+        vision pass prioritizes relevant bboxes. "Book a flight on
+        trip.com" → prioritize departure / destination / date / search
+        button bboxes, not navbar noise. (``is_research`` is accepted for
+        caller-shape stability; it no longer affects anything here.)
+        """
         self.task_instruction = (task_instruction or "")[:500]
         self.task_target_url = target_url or ""
-        return self.max_screenshots
 
     def enter_captcha_mode(self) -> None:
         """Relax screenshot limits for the next N iterations.
@@ -536,7 +535,8 @@ class BrowserSessionState:
             self.captcha_mode_remaining = 0
 
     def reset_per_session(self):
-        """Reset per-session counters. Budget is NOT reset."""
+        """Reset per-session counters. screenshots_taken is NOT reset
+        (it accumulates across sessions within one task)."""
         self.step_counter = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
@@ -682,6 +682,37 @@ class BrowserSessionState:
         ]
         return "\n".join(rows)
 
+    def cursor_failures_released(
+        self, *, window: int = 10, min_distinct: int = 3, min_total: int = 5,
+    ) -> tuple[bool, int, int]:
+        """Has cursor interaction demonstrably failed recently enough to
+        lift the heavy-page run_script lockout?
+
+        Counts only RECENT failures — those whose recorded brain turn is
+        within `window` of the current `_brain_turn_counter`. The counter
+        increments solely on mutating cursor tools (click/click_at/
+        click_selector/type/type_at), so the window measures cursor
+        actions, not wall-clock or read-only calls. This ages out stale
+        failures from earlier in the session (the ledger itself is never
+        reset, only capped at 12 entries), so a single early failure burst
+        can't keep the hatch open forever.
+
+        Releases when EITHER ≥`min_distinct` distinct strategies failed
+        (breadth — the brain tried several cursor approaches) OR ≥`min_total`
+        failures occurred (depth — same tool hammered with no effect, the
+        common silent-deadlock shape). Returns
+        `(released, recent_distinct, recent_total)`.
+        """
+        now = self._brain_turn_counter
+        recent = [
+            r for r in self.cursor_failure_records
+            if now - int(r.get("turn", 0)) <= window
+        ]
+        distinct = len({r.get("strategy", "") for r in recent if r.get("strategy")})
+        total = len(recent)
+        released = distinct >= min_distinct or total >= min_total
+        return released, distinct, total
+
     async def ensure_vision_synced(self, *, reason: str = "pre_action") -> "str | None":
         """Soft sync gate. By default, blocks up to VISION_SOFT_SYNC_TIMEOUT_MS
         (1500ms) for an in-flight prefetch; on timeout it sets
@@ -802,8 +833,6 @@ class BrowserSessionState:
           - a hard cap (captcha_mode_screenshot_cap) prevents runaway burn
             even if vision keeps failing
         """
-        if self.screenshot_budget <= 0:
-            return False, "[Screenshot budget exhausted] Use browser_get_markdown or browser_eval instead."
         if self.captcha_mode:
             if self.captcha_screenshots_used >= self.captcha_mode_screenshot_cap:
                 return False, (
@@ -1311,10 +1340,7 @@ class BrowserSessionState:
             data.setdefault("regression_count", self.regression_count)
             data.setdefault("vision_calls", self.vision_calls)
             data.setdefault("text_calls", self.text_calls)
-            data.setdefault("max_screenshots", self.max_screenshots)
-            data.setdefault(
-                "screenshots_used", self.max_screenshots - self.screenshot_budget
-            )
+            data.setdefault("screenshots_used", self.screenshots_taken)
             data.setdefault("activity_log", list(ledger.activity_log))
             data["best_checkpoint_url"] = self.best_checkpoint_url
             json_path.write_text(
@@ -1368,26 +1394,23 @@ class BrowserSessionState:
         return (
             f"\n--- Previous activity (DO NOT repeat failed approaches) ---\n"
             f"{lines}\n"
-            f"--- Screenshots remaining: {self.screenshot_budget}/{self.max_screenshots} | Sessions opened: {self.sessions_opened} ---"
+            f"--- Screenshots taken: {self.screenshots_taken} (unlimited) | Sessions opened: {self.sessions_opened} ---"
         )
 
     def print_summary(self):
         elapsed = time.time() - self.start_time if self.start_time else 0
-        used = self.max_screenshots - self.screenshot_budget
         print(f"\n  [Session Summary]")
         print(f"  Duration: {elapsed:.1f}s | Sessions: {self.sessions_opened}")
-        print(f"  Vision calls: {self.vision_calls} | Text calls: {self.text_calls} | Screenshots: {used}/{self.max_screenshots}")
+        print(f"  Vision calls: {self.vision_calls} | Text calls: {self.text_calls} | Screenshots: {self.screenshots_taken} (unlimited)")
         est = self.vision_calls * 0.03 + self.text_calls * 0.002
         print(f"  Estimated cost: ~${est:.3f}")
 
     def export_activity_log(self) -> str:
         """Export structured activity log to disk for the orchestrator to read."""
         elapsed = time.time() - self.start_time if self.start_time else 0
-        used = self.max_screenshots - self.screenshot_budget
-
         lines = [
             f"## Browser Worker Activity",
-            f"Duration: {elapsed:.1f}s | Screenshots: {used}/{self.max_screenshots} | Tool calls: {self.vision_calls + self.text_calls}",
+            f"Duration: {elapsed:.1f}s | Screenshots: {self.screenshots_taken} (unlimited) | Tool calls: {self.vision_calls + self.text_calls}",
             "",
             "### Actions",
         ]

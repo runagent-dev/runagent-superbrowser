@@ -431,9 +431,8 @@ class DelegateBrowserTaskTool(Tool):
         # ``worker_state.task_id`` / ``.step_history`` / ``.checkpoints``
         # get the same data through property delegation.
         worker_state = BrowserSessionState(memory=worker_memory)
-        # Task-complexity-aware screenshot budget (replaces hardcoded MAX_SCREENSHOTS=2).
-        # Research tasks, captcha-keywords, and known-hard domains bump the cap.
-        worker_state.configure_budget(
+        # Stamp task context for the vision agent (screenshots are unlimited).
+        worker_state.set_task_context(
             task_instruction=instructions,
             target_url=url or "",
             is_research=is_research,
@@ -854,15 +853,32 @@ class DelegateBrowserTaskTool(Tool):
             "calling `browser_click_at` — the V_n indices you saw "
             "from the previous screenshot may already be stale.\n"
             "\n"
-            "**Before `browser_run_script(mutates=true)`:** the tool "
-            "is locked until at least 2 distinct cursor strategies "
-            "have failed in this session. List in your reasoning the "
-            "exact failure captions (e.g. `[click_at_failed:...]`, "
-            "`[click_selector_failed]`) you got — if those captions "
-            "haven't appeared, the lockout will refuse the script. "
-            "JS clicks are isTrusted=false; Cloudflare/Akamai reject "
-            "them and the page navigates to a challenge URL, "
-            "poisoning the run.\n"
+            "**When cursor controls won't budge (filters, search, "
+            "listings):** if `browser_click_at` / `browser_type_at` keep "
+            "returning `[no_effect:...]` or `[..._failed:...]`, do NOT "
+            "reflexively reach for a script — and do NOT guess a filter "
+            "URL. The RESCUE is read-then-navigate: do ONE `browser_eval` "
+            "to read a REAL navigable target from the live DOM (an anchor "
+            "`href` actually present on the page, or the search form's real "
+            "`action` + its real single query-param name), then "
+            "`browser_navigate` to THAT observed url — or, for a plain "
+            "keyword search, a single-param url (`?q=…` / `?st=…`). For "
+            "multi-value filters, click the real filter chips instead: a "
+            "constructed ≥2-param URL is refused (`[navigate_filter_hack_"
+            "refused]`) and usually 404s/empties anyway. `browser_navigate` "
+            "stays on the pinned domain.\n"
+            "**Before `browser_run_script(mutates=true)`:** on heavy pages "
+            "(search results, listings, checkout, maps) and high-detection "
+            "domains the tool is LOCKED until cursor has demonstrably "
+            "failed — at least 3 DISTINCT cursor strategies (e.g. "
+            "`click_at`, then `click`, then `select_option`) OR 5+ cursor "
+            "failures total (incl. silent `[no_effect:...]` clicks) within "
+            "the last several actions. Until then the guard returns "
+            "`[run_script_blocked:bot_detection_risk]`; once it lifts you "
+            "get a `[run_script_released:...]` note. Even when released, JS "
+            "clicks are isTrusted=false; Cloudflare/Akamai may reject them "
+            "and navigate to a challenge URL — so a constructed-URL "
+            "`browser_navigate` is still the safer recovery.\n"
             "\n"
             "**How to phrase your final `done()` call:** if you "
             "extracted ANY verified live data from the page (prices, "
@@ -1288,9 +1304,7 @@ CRITICAL RULES:
                     _time.time() - worker_state.start_time
                     if worker_state.start_time else 0.0
                 )
-                screenshots_used = (
-                    worker_state.max_screenshots - worker_state.screenshot_budget
-                )
+                screenshots_used = worker_state.screenshots_taken
                 # Classify the block layer so per-domain decisions can rest
                 # on data, not speculation:
                 #   edge       — HTTP 4xx/5xx at the network layer (TLS / IP /

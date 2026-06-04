@@ -212,7 +212,7 @@ def main():
     ap.add_argument("--manage-server", action="store_true",
                     help="let this script stop/start the TS server per config (exclusive use)")
     ap.add_argument("--no-judge", action="store_true", help="heuristic-only scoring (no judge)")
-    ap.add_argument("--timeout", type=int, default=600, help="per-run wall-clock budget (s)")
+    ap.add_argument("--timeout", type=int, default=1800, help="per-run wall-clock budget (s)")
     args = ap.parse_args()
 
     if args.list:

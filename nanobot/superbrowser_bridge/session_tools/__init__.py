@@ -52,7 +52,6 @@ from .resumption import (
     save_resumption_artifact,
 )
 from .telemetry import (
-    _compute_screenshot_budget,
     _extract_recent_failures,
     _update_scroll_telemetry,
 )

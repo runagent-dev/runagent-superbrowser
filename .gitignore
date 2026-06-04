@@ -28,4 +28,4 @@ nanobot/workspace*/**/.nanobot/
 
 todo/
 
-.cursor/
+eval/*

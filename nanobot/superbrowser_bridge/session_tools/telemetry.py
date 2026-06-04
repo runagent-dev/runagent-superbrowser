@@ -1,15 +1,12 @@
-"""Step-history mining + budget computation + scroll telemetry.
+"""Step-history mining + scroll telemetry.
 
-Read by the resumption-handoff path (for `recent_failures`), by
-`BrowserOpenTool` (for budget allocation), and by the scroll tools
-(for `[SCROLL_STATE …]` caption lines).
+Read by the resumption-handoff path (for `recent_failures`) and by the
+scroll tools (for `[SCROLL_STATE …]` caption lines).
 """
 
 from __future__ import annotations
 
 from typing import Any
-
-from .effects import _CAPTCHA_KEYWORDS, _HARD_DOMAINS
 
 
 def _extract_recent_failures(step_history: list[dict], limit: int = 5) -> list[dict]:
@@ -34,28 +31,6 @@ def _extract_recent_failures(step_history: list[dict], limit: int = 5) -> list[d
         if len(out) >= limit:
             break
     return list(reversed(out))
-
-
-def _compute_screenshot_budget(
-    task_instruction: str = "",
-    target_url: str = "",
-    is_research: bool = False,
-) -> int:
-    """Task-complexity-aware screenshot budget.
-
-    Base=6. +4 for research tasks, +10 for captcha-suspect tasks, +8 for
-    known-hard domains. Capped at 30 to prevent runaway cost.
-    """
-    budget = 6
-    lower_task = (task_instruction or "").lower()
-    lower_url = (target_url or "").lower()
-    if is_research:
-        budget += 4
-    if any(kw in lower_task for kw in _CAPTCHA_KEYWORDS):
-        budget += 10
-    if any(dom in lower_url for dom in _HARD_DOMAINS):
-        budget += 8
-    return min(budget, 30)
 
 
 def _update_scroll_telemetry(
