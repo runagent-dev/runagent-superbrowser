@@ -45,6 +45,71 @@ from .result_quality import _result_is_substantive, _task_fingerprint
 from .url_probe import _probe_url
 
 
+# --- Eval instrumentation (gated; no-op unless env vars are set) ------------
+# When SUPERBROWSER_EVAL_CAPTURE_DIR is set, each delegated worker dumps its
+# full transcript (raw tool_calls INCLUDING rejected/malformed ones), the
+# worker's live tool registry, and telemetry to {dir}/{task_id}.json. The
+# eval/ harness reads these to score the three §7.4 failure modes (tool-schema
+# fidelity, [Vn] index discipline, procedural/declarative use). When the env
+# var is unset the helper returns immediately and production is unchanged.
+#
+# When SUPERBROWSER_EVAL_SCHEMA_REMINDER is set, a short tool-contract nudge is
+# appended to the worker prompt — the ONLY delta for the rescue ablation.
+_SCHEMA_REMINDER_TEXT = (
+    "TOOL-CALL CONTRACT (follow exactly):\n"
+    "- Emit EXACTLY the registered tool name and argument names. Never a "
+    "synonym (use `vision_index`, never `idx`); never an unregistered tool "
+    "(there is no `browser_navigate_and_click`).\n"
+    "- Make the call in the tool-call channel; do NOT describe it in prose.\n"
+    "- `[Vn]` indices are 1-based and ROTATE on every screenshot — reference "
+    "only indices from the MOST RECENT screenshot, never a stale one.\n"
+    "- If the page has not changed since the last screenshot, prefer the "
+    "procedural click (`browser_click` by index / `browser_click_selector`) "
+    "over re-grounding with `browser_click_at`."
+)
+
+
+def _eval_dump_worker(task_id, instructions, url, result, worker_state, worker) -> None:
+    """Dump a delegated worker's transcript + tool registry + telemetry for the
+    eval harness. Gated on SUPERBROWSER_EVAL_CAPTURE_DIR; safe to call always —
+    instrumentation failures are swallowed so a capture bug never breaks a run.
+    """
+    cap_dir = os.environ.get("SUPERBROWSER_EVAL_CAPTURE_DIR")
+    if not cap_dir:
+        return
+    try:
+        os.makedirs(cap_dir, exist_ok=True)
+        try:
+            tool_schemas = worker._loop.tools.get_definitions()
+        except Exception:
+            tool_schemas = []
+        payload = {
+            "task_id": task_id,
+            "instructions": instructions,
+            "url": url,
+            "content": (result.content if result else "") or "",
+            "messages": (result.messages if result else []) or [],
+            "tool_schemas": tool_schemas,
+            "meta": {
+                "schema_reminder": bool(
+                    os.environ.get("SUPERBROWSER_EVAL_SCHEMA_REMINDER")
+                ),
+                "step_count": len(worker_state.step_history),
+                "vision_calls": getattr(worker_state, "vision_calls", None),
+                "text_calls": getattr(worker_state, "text_calls", None),
+                "sessions_opened": getattr(worker_state, "sessions_opened", None),
+                "regression_count": getattr(worker_state, "regression_count", None),
+                "current_url": getattr(worker_state, "current_url", None),
+                "network_blocked": getattr(worker_state, "network_blocked", None),
+            },
+        }
+        with open(os.path.join(cap_dir, f"{task_id}.json"), "w") as f:
+            _json.dump(payload, f, default=str)
+        print(f"   [eval-capture] worker transcript -> {cap_dir}/{task_id}.json")
+    except Exception as exc:  # never let instrumentation break a run
+        print(f"   [eval-capture failed: {exc}]")
+
+
 @tool_parameters(
     tool_parameters_schema(
         instructions=StringSchema(
@@ -366,9 +431,8 @@ class DelegateBrowserTaskTool(Tool):
         # ``worker_state.task_id`` / ``.step_history`` / ``.checkpoints``
         # get the same data through property delegation.
         worker_state = BrowserSessionState(memory=worker_memory)
-        # Task-complexity-aware screenshot budget (replaces hardcoded MAX_SCREENSHOTS=2).
-        # Research tasks, captcha-keywords, and known-hard domains bump the cap.
-        worker_state.configure_budget(
+        # Stamp task context for the vision agent (screenshots are unlimited).
+        worker_state.set_task_context(
             task_instruction=instructions,
             target_url=url or "",
             is_research=is_research,
@@ -789,15 +853,32 @@ class DelegateBrowserTaskTool(Tool):
             "calling `browser_click_at` — the V_n indices you saw "
             "from the previous screenshot may already be stale.\n"
             "\n"
-            "**Before `browser_run_script(mutates=true)`:** the tool "
-            "is locked until at least 2 distinct cursor strategies "
-            "have failed in this session. List in your reasoning the "
-            "exact failure captions (e.g. `[click_at_failed:...]`, "
-            "`[click_selector_failed]`) you got — if those captions "
-            "haven't appeared, the lockout will refuse the script. "
-            "JS clicks are isTrusted=false; Cloudflare/Akamai reject "
-            "them and the page navigates to a challenge URL, "
-            "poisoning the run.\n"
+            "**When cursor controls won't budge (filters, search, "
+            "listings):** if `browser_click_at` / `browser_type_at` keep "
+            "returning `[no_effect:...]` or `[..._failed:...]`, do NOT "
+            "reflexively reach for a script — and do NOT guess a filter "
+            "URL. The RESCUE is read-then-navigate: do ONE `browser_eval` "
+            "to read a REAL navigable target from the live DOM (an anchor "
+            "`href` actually present on the page, or the search form's real "
+            "`action` + its real single query-param name), then "
+            "`browser_navigate` to THAT observed url — or, for a plain "
+            "keyword search, a single-param url (`?q=…` / `?st=…`). For "
+            "multi-value filters, click the real filter chips instead: a "
+            "constructed ≥2-param URL is refused (`[navigate_filter_hack_"
+            "refused]`) and usually 404s/empties anyway. `browser_navigate` "
+            "stays on the pinned domain.\n"
+            "**Before `browser_run_script(mutates=true)`:** on heavy pages "
+            "(search results, listings, checkout, maps) and high-detection "
+            "domains the tool is LOCKED until cursor has demonstrably "
+            "failed — at least 3 DISTINCT cursor strategies (e.g. "
+            "`click_at`, then `click`, then `select_option`) OR 5+ cursor "
+            "failures total (incl. silent `[no_effect:...]` clicks) within "
+            "the last several actions. Until then the guard returns "
+            "`[run_script_blocked:bot_detection_risk]`; once it lifts you "
+            "get a `[run_script_released:...]` note. Even when released, JS "
+            "clicks are isTrusted=false; Cloudflare/Akamai may reject them "
+            "and navigate to a challenge URL — so a constructed-URL "
+            "`browser_navigate` is still the safer recovery.\n"
             "\n"
             "**How to phrase your final `done()` call:** if you "
             "extracted ANY verified live data from the page (prices, "
@@ -1054,6 +1135,10 @@ CRITICAL RULES:
   to re-observe, browser_rewind_to_checkpoint. Call browser_request_help
   only after multiple concrete alternatives failed.""")
 
+        # Rescue ablation: the ONLY delta vs a normal run (gated; see top).
+        if os.environ.get("SUPERBROWSER_EVAL_SCHEMA_REMINDER"):
+            parts.append(_SCHEMA_REMINDER_TEXT)
+
         prompt = "\n".join(parts)
 
         # Pre-announce the view URL if handoff is enabled — a user pre-opening
@@ -1077,6 +1162,11 @@ CRITICAL RULES:
                 hooks=[worker_memory_hook, worker_hook],
             )
             content = result.content
+
+            # Eval capture (gated on SUPERBROWSER_EVAL_CAPTURE_DIR; no-op when
+            # unset). Dumps the worker's full transcript + tool registry so the
+            # eval harness can score tool-schema fidelity / index discipline.
+            _eval_dump_worker(task_id, instructions, url, result, worker_state, worker)
 
             # Diagnostic: how many browser tool calls did the worker actually
             # make? If 0, the model refused to try — classify explicitly so
@@ -1214,9 +1304,7 @@ CRITICAL RULES:
                     _time.time() - worker_state.start_time
                     if worker_state.start_time else 0.0
                 )
-                screenshots_used = (
-                    worker_state.max_screenshots - worker_state.screenshot_budget
-                )
+                screenshots_used = worker_state.screenshots_taken
                 # Classify the block layer so per-domain decisions can rest
                 # on data, not speculation:
                 #   edge       — HTTP 4xx/5xx at the network layer (TLS / IP /

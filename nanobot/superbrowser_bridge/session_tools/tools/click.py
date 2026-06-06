@@ -518,6 +518,16 @@ class BrowserClickTool(Tool):
                 _tagged_no_effect = True
             if _tagged_no_effect:
                 record_suffix = " [no_effect]"
+                # Phase 3.1: feed the cursor-failure ledger (mirrors
+                # browser_click_at) so a silent DOM-index click counts
+                # toward lifting the run_script lockout. No expected_label
+                # dedup needed here — vision_pipeline.py only records the
+                # click_at path.
+                self.s.record_cursor_failure(
+                    strategy="click",
+                    target=f"[{index}]",
+                    reason="no_effect",
+                )
                 try:
                     from nanobot.vision_agent.client import get_vision_agent
                     await get_vision_agent()._cache.bust_session(session_id)
@@ -1286,6 +1296,29 @@ class BrowserClickAtTool(Tool):
                 _tagged_no_effect = True
             if _tagged_no_effect:
                 record_suffix = " [no_effect]"
+                # Phase 3.1: feed the cursor-failure ledger so the
+                # run_script escape hatch (scripting.py) can eventually
+                # open when cursor clicks silently no-op (snapped but zero
+                # DOM/url/focus delta) — the exact deadlock shape on heavy
+                # search pages. Skip when an expected_label was passed: the
+                # post-click label_still_visible check in vision_pipeline.py
+                # already records a click_at failure for that case, and we
+                # want exactly ONE record per silent click (the total-failure
+                # release threshold counts records).
+                try:
+                    _exp_label_nf = (
+                        payload.get("expected_label")
+                        or payload.get("label")
+                        or ""
+                    )
+                except Exception:
+                    _exp_label_nf = ""
+                if not _exp_label_nf:
+                    self.s.record_cursor_failure(
+                        strategy="click_at",
+                        target=(log_target or f"V{vision_index}")[:80],
+                        reason="no_effect",
+                    )
                 # Bust vision cache for this session so the next prefetch
                 # re-runs the model instead of returning identical V_n
                 # bboxes that just missed (dom_hash unchanged → cache HIT

@@ -130,6 +130,10 @@ class BrowserRunScriptTool(Tool):
         **kw: Any,
     ) -> str:
         print(f"\n>> browser_run_script(mutates={bool(mutates)}, len={len(script or '')})")
+        # Prepended to the eventual return when the heavy-page guard is
+        # released after cursor tools have demonstrably failed (see below).
+        # Empty string otherwise, so the f-string concat is a no-op.
+        release_advisory = ""
         # Bot-detection warning on known-hard domains and heavy
         # page types. Mutating JS click/type on Cloudflare/Akamai-
         # protected listings is routinely rejected because the events
@@ -161,25 +165,76 @@ class BrowserRunScriptTool(Tool):
                     if is_hard_domain and page_type not in heavy_page_types
                     else ""
                 )
-                print(f"  [run_script rejected: heavy_page_use_vision ({pt_label})]")
-                return (
-                    "[run_script_blocked:bot_detection_risk] "
-                    f"This is a {pt_label} page{domain_note}. Mutating "
-                    "scripts on bot-detected sites (Cloudflare, Akamai, "
-                    "etc.) are routinely rejected because synthetic JS "
-                    "clicks are isTrusted=false. Use the atomic cursor "
-                    "tools — they dispatch isTrusted=true CDP events "
-                    "and adapt to live state:\n"
-                    "  • browser_click_at(vision_index=V_n)\n"
-                    "  • browser_type_at(vision_index=V_n, value=…)\n"
-                    "  • browser_select_option(vision_index=V_n, label=…)\n"
-                    "  • browser_scroll_until(target_text=…)\n"
-                    "  • browser_get_markdown(include_anchors=true) — "
-                    "inspect page structure\n"
-                    "For pure DATA EXTRACTION (no clicks/typing) you "
-                    "may still call browser_run_script with "
-                    "mutates=false — read-only scripts always pass."
+                # Cursor-first escape hatch. The block below is correct as
+                # a DEFAULT — but once cursor tools have DEMONSTRABLY failed
+                # on this page, "use vision instead" is useless advice
+                # (vision already failed) and hard-blocking just deadlocks
+                # the worker. Consult the cursor-failure ledger; lift the
+                # lockout when enough recent failures have accrued. Fails
+                # CLOSED (keeps blocking) on any error. Thresholds match the
+                # contract surfaced in the worker prompt + worker_hook hint.
+                try:
+                    _window = int(os.environ.get("RUN_SCRIPT_CURSOR_FAIL_WINDOW", "10"))
+                    _min_distinct = int(os.environ.get("RUN_SCRIPT_CURSOR_FAIL_MIN_DISTINCT", "3"))
+                    _min_total = int(os.environ.get("RUN_SCRIPT_CURSOR_FAIL_MIN_TOTAL", "5"))
+                    released, n_distinct, n_total = self.s.cursor_failures_released(
+                        window=_window,
+                        min_distinct=_min_distinct,
+                        min_total=_min_total,
+                    )
+                except Exception:
+                    released, n_distinct, n_total = False, 0, 0
+                    _window = 10
+                if not released:
+                    print(f"  [run_script rejected: heavy_page_use_vision ({pt_label})]")
+                    return (
+                        "[run_script_blocked:bot_detection_risk] "
+                        f"This is a {pt_label} page{domain_note}. Mutating "
+                        "scripts on bot-detected sites (Cloudflare, Akamai, "
+                        "etc.) are routinely rejected because synthetic JS "
+                        "clicks are isTrusted=false. Use the atomic cursor "
+                        "tools — they dispatch isTrusted=true CDP events "
+                        "and adapt to live state:\n"
+                        "  • browser_click_at(vision_index=V_n)\n"
+                        "  • browser_type_at(vision_index=V_n, value=…)\n"
+                        "  • browser_select_option(vision_index=V_n, label=…)\n"
+                        "  • browser_scroll_until(target_text=…)\n"
+                        "  • browser_get_markdown(include_anchors=true) — "
+                        "inspect page structure\n"
+                        "For pure DATA EXTRACTION (no clicks/typing) you "
+                        "may still call browser_run_script with "
+                        "mutates=false — read-only scripts always pass."
+                    )
+                # Released — build the advisory and FALL THROUGH so the
+                # counter bookkeeping below (consecutive_script_calls,
+                # recent_run_script_outcomes) runs like any other script
+                # call. Do NOT early-return here.
+                print(
+                    f"  [run_script released: cursor_first_exhausted "
+                    f"({pt_label}) distinct={n_distinct} total={n_total}]"
                 )
+                release_advisory = (
+                    "[run_script_released:cursor_first_exhausted] "
+                    f"{n_distinct} distinct / {n_total} total cursor "
+                    f"strategies failed on this {pt_label} page within the "
+                    f"last {_window} actions, so the mutating-script lockout "
+                    "is lifted for this call. NOTE: synthetic JS clicks/"
+                    "typing are isTrusted=false and this page (or its WAF) "
+                    "may STILL reject the mutation — if you get "
+                    "[blocked_op:...] or a challenge URL, do NOT retry the "
+                    "script. The safest fallback is browser_navigate to a "
+                    "self-constructed filtered URL (build the query params "
+                    "yourself, e.g. ?location=...&distance=...&type=...) — "
+                    "browser_navigate is NOT gated by this guard and stays "
+                    "on the pinned domain."
+                )
+                if is_hard_domain:
+                    release_advisory += (
+                        " This domain is on the high-detection list — prefer "
+                        "browser_navigate; reserve mutates=true for in-iframe "
+                        "frame.evaluate() where cursor events can't reach."
+                    )
+                release_advisory += "\n"
         self.s.consecutive_click_calls = 0  # script execution resets click loop tracking
         # Wire the inverse counter so _maybe_script_usage_warning can
         # surface a `[script_warning]` advisory at 2+ consecutive
@@ -249,7 +304,7 @@ class BrowserRunScriptTool(Tool):
                 _err_warning = _maybe_script_usage_warning(self.s)
             except Exception:
                 _err_warning = ""
-            return f"Script error: {error}{tip}" + (_err_warning or "")
+            return release_advisory + f"Script error: {error}{tip}" + (_err_warning or "")
 
         parts = []
         result = data.get("result")
@@ -282,4 +337,4 @@ class BrowserRunScriptTool(Tool):
             _ok_warning = _maybe_script_usage_warning(self.s)
         except Exception:
             _ok_warning = ""
-        return "\n".join(parts) + (_ok_warning or "")
+        return release_advisory + "\n".join(parts) + (_ok_warning or "")

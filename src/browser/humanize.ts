@@ -54,6 +54,15 @@ export async function humanMouseMove(
   steps?: number,
   context?: HumanizeContext,
 ): Promise<void> {
+  if (process.env.MOTOR_HUMANIZATION === 'off') {
+    // Ablation ("- motor humanization"): no bezier/jitter/wobble — teleport
+    // straight to the target (the un-humanized baseline this module replaces).
+    const px = Math.round(toX);
+    const py = Math.round(toY);
+    await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py });
+    if (context?.sessionId) inputEventBus.emitMouseMove(context.sessionId, px, py);
+    return;
+  }
   const dist = distance(fromX, fromY, toX, toY);
   const numSteps = steps || Math.max(10, Math.round(dist / 20));
 
@@ -117,6 +126,24 @@ export async function humanClick(
     sessionId?: string;
   },
 ): Promise<void> {
+  if (process.env.MOTOR_HUMANIZATION === 'off') {
+    // Ablation ("- motor humanization"): no bezier sweep, hesitation, or
+    // click-point jitter — a trusted press+release at the exact target.
+    const btn = options?.button || 'left';
+    const px = Math.round(x);
+    const py = Math.round(y);
+    await safeRelease(client, px, py, btn);
+    await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py });
+    if (options?.sessionId) inputEventBus.emitMouseMove(options.sessionId, px, py);
+    let pressedAblate = false;
+    try {
+      await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: btn, clickCount: 1 });
+      pressedAblate = true;
+    } finally {
+      if (pressedAblate) await safeRelease(client, px, py, btn);
+    }
+    return;
+  }
   // Resolve start position from the LAST KNOWN cursor coord — the
   // bezier should sweep from where the cursor actually is, not from
   // a synthetic point 200px away. Falling back to the synthetic
@@ -198,6 +225,21 @@ export async function humanType(
     sessionId?: string;
   },
 ): Promise<void> {
+  if (process.env.MOTOR_HUMANIZATION === 'off') {
+    // Ablation ("- motor humanization"): no per-keystroke delays, simulated
+    // typos, or thinking pauses — emit each character back to back.
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '\n') {
+        await typeKey(client, 'Enter');
+        if (options?.sessionId) inputEventBus.emitKeystroke(options.sessionId, 'Enter', 'char');
+      } else {
+        await typeChar(client, ch);
+        if (options?.sessionId) inputEventBus.emitKeystroke(options.sessionId, ch, 'char');
+      }
+    }
+    return;
+  }
   const minDelay = options?.minDelay ?? 30;
   const maxDelay = options?.maxDelay ?? 120;
   const mistakeRate = options?.mistakeRate ?? 0.02; // 2% chance of typo + correction
@@ -335,6 +377,32 @@ export async function humanDrag(
     sessionId?: string;
   },
 ): Promise<void> {
+  if (process.env.MOTOR_HUMANIZATION === 'off') {
+    // Ablation ("- motor humanization"): straight linear drag — no bezier arc,
+    // overshoot, micro-pauses, or randomized dwell. Release at the EXACT target
+    // (slider validators check it). Keep the try/finally release safety.
+    const px = Math.round(fromX), py = Math.round(fromY);
+    const tx = Math.round(toX), ty = Math.round(toY);
+    await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py });
+    if (options?.sessionId) inputEventBus.emitMouseMove(options.sessionId, px, py);
+    let pressedAblate = false;
+    try {
+      await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', clickCount: 1 });
+      pressedAblate = true;
+      const linSteps = 12;
+      for (let i = 1; i <= linSteps; i++) {
+        const mx = Math.round(px + (tx - px) * (i / linSteps));
+        const my = Math.round(py + (ty - py) * (i / linSteps));
+        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: mx, y: my });
+        if (options?.sessionId) inputEventBus.emitMouseMove(options.sessionId, mx, my);
+      }
+      await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: tx, y: ty, button: 'left', clickCount: 1 });
+      pressedAblate = false;
+    } finally {
+      if (pressedAblate) await safeRelease(client, tx, ty, 'left');
+    }
+    return;
+  }
   const pressDwell = options?.pressDwellMs ?? gaussianInt(180, 60, 80, 300);
   const releaseDwell = options?.releaseDwellMs ?? gaussianInt(110, 40, 60, 200);
   const microPauseChance = options?.microPauseChance ?? 0.05;

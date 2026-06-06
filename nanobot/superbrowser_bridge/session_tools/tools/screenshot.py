@@ -57,7 +57,7 @@ class BrowserScreenshotTool(Tool):
             self.s.log_activity("screenshot(BLOCKED)", reason[:60])
             return reason
 
-        self.s.screenshot_budget -= 1
+        self.s.screenshots_taken += 1
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/state",
@@ -79,7 +79,7 @@ class BrowserScreenshotTool(Tool):
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
         self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")
         caption = _format_state(data, self.s)
-        caption += f"\n[Screenshots remaining: {self.s.screenshot_budget}]"
+        caption += f"\n[Screenshots taken: {self.s.screenshots_taken} (unlimited)]"
         if data.get("screenshot"):
             entries = data.get("selectorEntries") or []
             dpr = float(data.get("devicePixelRatio") or 1.0)

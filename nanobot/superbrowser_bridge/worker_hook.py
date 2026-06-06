@@ -821,15 +821,19 @@ class BrowserWorkerHook(AgentHook):
         try:
             recs = getattr(self.state, "cursor_failure_records", None) or []
             distinct = len(getattr(self.state, "cursor_failure_strategies", set()) or set())
-            if recs and distinct < 2:
+            if recs and distinct < 3:
                 tried = ", ".join(sorted(self.state.cursor_failure_strategies)) or "(none)"
                 guidance_parts.append(
                     "[CURSOR_FAILURES_SO_FAR strategies_tried="
-                    f"{tried} distinct={distinct}/2]\n"
-                    "Try a DIFFERENT cursor strategy before considering "
-                    "browser_run_script(mutates=true). The script lockout "
-                    "will refuse it until 2 distinct cursor strategies have "
-                    "failed."
+                    f"{tried} distinct={distinct}/3]\n"
+                    "Try a DIFFERENT cursor strategy, OR — for filter/search "
+                    "controls — rescue via read-then-navigate: ONE "
+                    "browser_eval to read a real anchor href / the search "
+                    "form's real single query-param, then browser_navigate to "
+                    "that observed url (multi-value filters: click the real "
+                    "chips, do NOT URL-hack ≥2 params). The script lockout "
+                    "refuses browser_run_script(mutates=true) until 3 distinct "
+                    "(or 5 total) cursor strategies have failed."
                 )
         except Exception:
             pass

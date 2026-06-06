@@ -19,6 +19,7 @@ has older screenshots evicted and prior-turn failures collapsed.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -772,6 +773,13 @@ class MemoryHook(AgentHook):
             logger.debug("autocompact ingestion failed: {}", exc)
 
     async def before_iteration(self, context: AgentHookContext) -> None:
+        # Ablation toggles (default off → full eviction + structured ledger).
+        # Set by the eval ablation harness (eval/run_ablations.py) to isolate a
+        # single mechanism for Table 1; production runs never set these.
+        #   ABLATE_MEMORY_EVICTION  → naive accumulation (skip every pruning pass)
+        #   ABLATE_STRUCTURED_LEDGER → rolling buffer only (don't inject the ledger)
+        _ablate_evict = os.environ.get("ABLATE_MEMORY_EVICTION") in ("1", "true", "yes")
+        _ablate_ledger = os.environ.get("ABLATE_STRUCTURED_LEDGER") in ("1", "true", "yes")
         # Context-pruning passes run before BrowserWorkerHook so the
         # worker hook reads a clean message log. Phase 1 + 4 expanded
         # the lineup to:
@@ -806,7 +814,7 @@ class MemoryHook(AgentHook):
             logger.debug("MemoryHook autocompact-ingest failed: {}", exc)
 
         try:
-            evicted = _back_patch_screenshots(
+            evicted = 0 if _ablate_evict else _back_patch_screenshots(
                 context.messages,
                 keep_last_n=self.keep_last_screenshots,
             )
@@ -823,7 +831,7 @@ class MemoryHook(AgentHook):
             logger.debug("MemoryHook back-patch failed: {}", exc)
 
         try:
-            collapsed = _collapse_failed_tool_messages(
+            collapsed = [] if _ablate_evict else _collapse_failed_tool_messages(
                 context.messages,
                 keep_last_n=self.keep_last_failures,
             )
@@ -862,7 +870,7 @@ class MemoryHook(AgentHook):
         # list that also happens to contain a failure marker is handled
         # by the failure pass first.
         try:
-            collapsed_lists = _collapse_stale_element_lists(
+            collapsed_lists = 0 if _ablate_evict else _collapse_stale_element_lists(
                 context.messages,
                 keep_last_n=self.keep_last_element_lists,
             )
@@ -884,7 +892,7 @@ class MemoryHook(AgentHook):
         # dominant growth driver in long browsing tasks. Keep the
         # most recent ``keep_last_state_blocks`` and strip the rest.
         try:
-            stripped_states = _collapse_stale_state_blocks(
+            stripped_states = 0 if _ablate_evict else _collapse_stale_state_blocks(
                 context.messages,
                 keep_last_n=self.keep_last_state_blocks,
             )
@@ -906,7 +914,7 @@ class MemoryHook(AgentHook):
         # stripped block is 500-2000 tokens; the dominant remaining
         # bulk in old assistant messages after state-block-collapse.
         try:
-            stripped_thinking = _collapse_stale_thinking_blocks(
+            stripped_thinking = 0 if _ablate_evict else _collapse_stale_thinking_blocks(
                 context.messages,
                 keep_last_n=self.keep_last_thinking,
             )
@@ -931,7 +939,7 @@ class MemoryHook(AgentHook):
         # while the ledger render in messages[0] carries the
         # structured ground truth.
         try:
-            gutted = _gut_old_message_content(
+            gutted = 0 if _ablate_evict else _gut_old_message_content(
                 context.messages,
                 threshold=self.gut_threshold,
                 keep_last_turns=self.keep_recent_turns,
@@ -968,8 +976,10 @@ class MemoryHook(AgentHook):
         # back-patch and failure-collapse so the ledger reflects the
         # latest dead-end additions on the same turn.
         try:
-            ledger_text = self.memory.render_for_llm()
-            ok = _refresh_ledger_in_system_message(context.messages, ledger_text)
+            ledger_text = "" if _ablate_ledger else self.memory.render_for_llm()
+            ok = (not _ablate_ledger) and _refresh_ledger_in_system_message(
+                context.messages, ledger_text
+            )
             if ok:
                 self.memory.events.log(
                     "ledger_injected",

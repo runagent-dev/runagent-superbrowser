@@ -223,7 +223,7 @@ class BrowserOpenTool(Tool):
         self.s.reset_per_session()
         self.s.sessions_opened += 1
 
-        print(f"\n>> browser_open(url={url}, region={region}, tier={chosen_tier}) [session #{self.s.sessions_opened}, screenshots left: {self.s.screenshot_budget}]")
+        print(f"\n>> browser_open(url={url}, region={region}, tier={chosen_tier}) [session #{self.s.sessions_opened}, screenshots taken: {self.s.screenshots_taken} (unlimited)]")
 
         # Escalate=True when the caller wants T1→T3 auto-recovery. Kept
         # behind a flag so an explicit `tier='t1'` request from the agent
@@ -440,8 +440,8 @@ class BrowserOpenTool(Tool):
             if activity:
                 caption += activity
 
-        if data.get("screenshot") and self.s.screenshot_budget > 0:
-            self.s.screenshot_budget -= 1
+        if data.get("screenshot"):
+            self.s.screenshots_taken += 1
             if actual_url:
                 self.s.mark_screenshot_taken(
                     actual_url,
@@ -668,8 +668,8 @@ class BrowserNavigateTool(Tool):
                 f"Call browser_solve_captcha(session_id='{session_id}', method='auto') to solve it."
             )
 
-        if data.get("screenshot") and self.s.screenshot_budget > 0:
-            self.s.screenshot_budget -= 1
+        if data.get("screenshot"):
+            self.s.screenshots_taken += 1
             if actual_url:
                 self.s.mark_screenshot_taken(
                     actual_url,
@@ -1041,8 +1041,7 @@ class BrowserCloseTool(Tool):
             timeout=10.0,
         )
         r.raise_for_status()
-        used = self.s.max_screenshots - self.s.screenshot_budget
-        return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {used}/{self.s.max_screenshots}, Regressions: {self.s.regression_count}"
+        return f"Session closed. Vision: {self.s.vision_calls}, Text: {self.s.text_calls}, Screenshots: {self.s.screenshots_taken} (unlimited), Regressions: {self.s.regression_count}"
 
 
 @tool_parameters(
