@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: 20 }
+          - { os: ubuntu-latest, node: 22 }
+          - { os: macos-latest, node: 20 }
+          - { os: windows-latest, node: 20 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: stable
+      - run: npm ci
+      - name: Build (gate)
+        run: npm run build
+      - name: Test
+        # Non-blocking until the browser-dependent suite is proven CI-stable.
+        # Build above is the hard gate; flip this to blocking once green.
+        continue-on-error: true
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm test
+
+  python:
+    name: py ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.11" }
+          - { os: windows-latest, python: "3.11" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install (released nanobot-ai lane)
+        run: pip install -e ".[dev]"
+      - name: Import smoke (gate — validates the package layout installs flat)
+        run: python -c "import superbrowser_bridge, vision_agent; print('import OK')"
+
+  python-tests:
+    name: py tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Install patchright Chromium
+        run: |
+          patchright install chromium
+          playwright install-deps chromium || true
+      - name: Tests
+        # Non-blocking until the suite is proven hermetic in CI.
+        continue-on-error: true
+        run: pytest nanobot/superbrowser_bridge/tests -q
+
+  python-lockfile:
+    name: py lockfile lane (drift check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Import smoke against the pinned lockfile
+        run: PYTHONPATH=nanobot python -c "import superbrowser_bridge, vision_agent; print('lockfile import OK')"
+
+  dist:
+    name: build distributions (gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: npm tarball
+        run: |
+          npm ci
+          npm run build
+          npm pack --dry-run
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: python sdist + wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*

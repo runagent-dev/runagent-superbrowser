@@ -1,0 +1,90 @@
+# Python distribution for SuperBrowser — the nanobot orchestrator + browser
+# bridge half of the project. The TS browser engine is published separately to
+# npm (see package.json). Import names stay `superbrowser_bridge` /
+# `vision_agent`; the distribution name is `runagent-superbrowser` to match the
+# npm package and the GitHub repo.
+#
+# Dependencies below are the DIRECT, loosely-pinned deps the two shipped
+# packages import. `requirements.txt` remains the fully-pinned dev/CI lockfile
+# (and the known-good `nanobot-ai` tree). Audit command used to derive this set:
+#   grep -rhoE "^[[:space:]]*(from|import) [a-z0-9_]+" nanobot/superbrowser_bridge nanobot/vision_agent
+
+[project]
+name = "runagent-superbrowser"
+version = "0.1.0"
+description = "Nanobot orchestrator + stealth browser bridge for SuperBrowser — the browser your agent won't get blocked on."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "RunAgent" }]
+keywords = ["browser", "agent", "captcha", "cloudflare", "stealth", "nanobot", "automation", "scraping", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    # released nanobot-ai from PyPI (not the dev git pin); floor+ceiling bound
+    # to the known-good 0.1.x line — 0.2.x may break the bridge.
+    "nanobot-ai>=0.1.5,<0.2",
+    "httpx>=0.28",
+    "curl_cffi>=0.7",
+    "patchright>=1.49",
+    "playwright-stealth>=2.0",
+    "python-dotenv>=1.0",
+    "pillow>=10",
+    "loguru>=0.7",
+    "lxml>=5.0",
+    "openai>=1.40",
+    "pydantic>=2.0",
+    "aiohttp>=3.9",
+    "chess>=1.11",
+]
+
+[project.optional-dependencies]
+# Vision-based slider/jigsaw/rotation puzzle solving uses OpenCV; imported
+# lazily inside the puzzle engines, so it's optional.
+puzzles = ["opencv-python>=4.8", "numpy>=1.24"]
+dev = ["pytest>=8", "ruff>=0.5", "build", "twine"]
+
+[project.scripts]
+superbrowser-agent = "superbrowser_bridge.cli:main"
+superbrowser-doctor = "superbrowser_bridge.doctor:main"
+
+[project.urls]
+Homepage = "https://github.com/runagent-dev/runagent-superbrowser"
+Repository = "https://github.com/runagent-dev/runagent-superbrowser"
+Issues = "https://github.com/runagent-dev/runagent-superbrowser/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Ship both top-level packages from under ./nanobot/ flattened to the wheel
+# root, so installed imports (`import vision_agent`, `import superbrowser_bridge`)
+# match the in-tree layout. Internal tests, caches and workspaces are excluded.
+packages = ["nanobot/superbrowser_bridge", "nanobot/vision_agent"]
+exclude = ["**/tests", "**/tests/**", "**/__pycache__", "**/*.pyc", "**/.pytest_cache"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "nanobot/superbrowser_bridge",
+    "nanobot/vision_agent",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "**/tests",
+    "**/__pycache__",
+    "**/.pytest_cache",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
