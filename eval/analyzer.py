@@ -283,12 +283,14 @@ def _scaffold_hash(workers) -> str:
     return "none"
 
 
-def load_runs(runs_dir):
+def load_runs(runs_dir, task=None):
     out = []
     for meta_path in sorted(Path(runs_dir).glob("*/*/seed*/meta.json")):
         try:
             meta = json.loads(meta_path.read_text())
         except Exception:
+            continue
+        if task and task != "all" and meta.get("task_id") != task:
             continue
         workers = []
         for wf in sorted((meta_path.parent / "workers").glob("*.json")):
@@ -343,10 +345,11 @@ def _aggregate_row(label, metas, ms) -> dict:
     return row
 
 
-def analyze(runs_dir: Path, out_dir: Path):
-    runs = load_runs(runs_dir)
+def analyze(runs_dir: Path, out_dir: Path, task=None):
+    runs = load_runs(runs_dir, task=task)
     if not runs:
-        print(f"[error] no runs found under {runs_dir}. Run `python -m eval.run_eval` first.")
+        scope = f" for task={task!r}" if task and task != "all" else ""
+        print(f"[error] no runs found under {runs_dir}{scope}. Run `python -m eval.run_eval` first.")
         return
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -442,8 +445,11 @@ def main():
     p = argparse.ArgumentParser(description="Classify worker transcripts -> metrics")
     p.add_argument("--runs", default=str(REPO_ROOT / "eval" / "runs"))
     p.add_argument("--out", default=str(REPO_ROOT / "eval" / "results"))
+    p.add_argument("--task", default=None,
+                   help="restrict to one task id (e.g. petfinder_rabbits) for a fair "
+                        "per-task model comparison; default = pool all tasks")
     args = p.parse_args()
-    analyze(Path(args.runs), Path(args.out))
+    analyze(Path(args.runs), Path(args.out), task=args.task)
 
 
 if __name__ == "__main__":
