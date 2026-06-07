@@ -29,14 +29,15 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 WORKDIR /app
 
-# Install Node.js dependencies
+# Install Node.js dependencies (incl. dev — tsc is needed to build)
 COPY package*.json ./
-RUN npm ci --production
+RUN npm ci
 
-# Copy source and build
+# Copy source and build, then drop dev deps to keep the image lean
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+COPY bin/ ./bin/
+RUN npm run build && npm prune --omit=dev
 
 # Install nanobot (optional, for MCP integration)
 COPY nanobot/ ./nanobot/

@@ -1,0 +1,21 @@
+# Keep the build context (and the image) small. The Dockerfile builds the TS
+# engine from src/; none of this is needed and some of it is huge.
+.git
+node_modules
+build
+dist
+venv
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+eval
+todo
+assets
+*.tgz
+/tmp
+
+# nanobot/ is copied for optional MCP use — but never its runtime state
+nanobot/workspace*
+nanobot/**/__pycache__
+nanobot/**/.nanobot

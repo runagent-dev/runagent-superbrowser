@@ -65,59 +65,98 @@ The webhook receives `{viewUrl, captchaType, pageTitle, screenshot, caption}` �
 
 ---
 
-## Quick start
+## Install
 
-### Prerequisites
+> **Run it locally.** Datacenter IPs (Hetzner, AWS, DigitalOcean…) get blocked
+> by a lot of sites. On your own machine — macOS, Windows, or Ubuntu — you look
+> like a normal visitor. The one-liner below gets you there on any of them.
 
-- **Node 20+** and **Python 3.11+**
-- **Chrome** (real, not bundled Chromium — fingerprint targets need it)
-- **Xvfb** (only if you run headful in a container — required for the hardest CF targets)
+### Fastest — one-command bootstrap
 
-### 1. Install Chrome
-
-```bash
-wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-  | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-  > /etc/apt/sources.list.d/google-chrome.list
-sudo apt update && sudo apt install -y google-chrome-stable
-# binary lands at /usr/bin/google-chrome-stable — that's what CHROME_PATH points to
-```
-
-On a server / container, also grab Xvfb for headful mode:
+**macOS / Linux**
 
 ```bash
-sudo apt install -y xvfb
+curl -fsSL https://raw.githubusercontent.com/runagent-dev/runagent-superbrowser/main/scripts/install.sh | bash
 ```
 
-### 2. Clone + build the TS server
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/runagent-dev/runagent-superbrowser/main/scripts/install.ps1 | iex
+```
+
+It clones the repo, installs Google Chrome (+ Xvfb and the headless system libs
+on Linux), sets up a Python venv and the patchright Chromium, builds the TS
+engine, and writes a `.env`. The only things it won't silently install are the
+**Node 20+ / Python 3.11+ runtimes** — it detects them and prints the right
+command for your OS so it never clobbers nvm/pyenv. Pass `--check` to dry-run,
+`--yes` for non-interactive (`-Check` / `-Yes` on PowerShell).
+
+Then:
 
 ```bash
-git clone https://github.com/runagent-dev/superbrowser.git
-cd superbrowser
-npm install && npm run build
-cp .env.example .env       # then edit keys you care about
-npm start                  # runs on :3100
+superbrowser-doctor     # verify Chrome, build, env, server
+superbrowser            # start the engine on :3100  (alias: npm start)
 ```
 
-That's the whole TS side. No API key needed.
+### From packages
 
-### 3. Python bridge (for captcha-solving, Tier 3, nanobot tools)
+The two halves publish separately — the browser engine to npm, the agent bridge
+to PyPI:
 
 ```bash
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-patchright install chromium        # downloads patchright's Chromium
-playwright install-deps chromium   # apt deps Chromium needs (libnss3 etc.)
+# TS browser engine (HTTP + MCP server):
+npm install -g runagent-superbrowser
+
+# Python agent bridge (nanobot tools, captcha solving, Tier-3):
+pip install runagent-superbrowser
+patchright install chromium          # download the stealth Chromium (pip can't)
+playwright install-deps chromium     # Linux only: the apt libs Chromium needs
+superbrowser-doctor                  # check Chrome, build, env
 ```
 
-### Or just Docker
+`puppeteer-core` does **not** bundle a browser — you need real Google Chrome on
+the machine. The installer handles it; if you set things up by hand, point
+`PUPPETEER_EXECUTABLE_PATH` at the binary:
+
+| OS | Typical Chrome path |
+|---|---|
+| Ubuntu/Debian | `/usr/bin/google-chrome-stable` |
+| macOS | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
+| Windows | `C:\Program Files\Google\Chrome\Application\chrome.exe` |
+
+### Or Docker
 
 ```bash
 docker compose up -d
 ```
 
-The Docker image bakes Chrome, Xvfb, Node, and Python in. Mount `~/.superbrowser/profiles/` and `~/.superbrowser/cookie-jar/` as volumes if you want state to survive restarts.
+The image bakes Chrome, Xvfb, Node, and Python in. Mount `~/.superbrowser/profiles/`
+and `~/.superbrowser/cookie-jar/` as volumes if you want state to survive restarts.
+
+### Per-OS notes
+
+| | Install Chrome | Headless | Extra |
+|---|---|---|---|
+| **Ubuntu / Debian** | `apt install google-chrome-stable` | `HEADLESS=true` works; headful Tier-3 needs Xvfb | `apt install xvfb` + the lib list (the installer does this) |
+| **macOS** | `brew install --cask google-chrome` | headful, no Xvfb | — |
+| **Windows** | `winget install Google.Chrome` | headful (`HEADLESS=false`) | no Xvfb/apt needed |
+
+### From source (contributors)
+
+```bash
+git clone https://github.com/runagent-dev/runagent-superbrowser.git
+cd runagent-superbrowser
+npm install && npm run build            # TS engine
+cp .env.example .env                    # then edit the keys you care about
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt         # Python bridge (pinned dev lockfile)
+patchright install chromium
+playwright install-deps chromium        # Linux only
+npm start                               # engine on :3100 — no API key needed
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev + release workflow.
 
 ---
 

@@ -1,0 +1,136 @@
+name: Publish
+
+# "Publish acts like CI/CD": push a version tag and everything ships.
+#
+#   node scripts/bump-version.mjs 0.2.0   # bumps package.json + pyproject.toml
+#   git commit -am "release: v0.2.0"
+#   git tag v0.2.0 && git push --follow-tags
+#
+# Or run manually from the Actions tab (workflow_dispatch). Manual runs default
+# to a dry run (build + validate, no upload) so you can rehearse safely.
+#
+# One-time setup (see docs/RELEASING.md):
+#   - npm:    repo secret NPM_TOKEN (automation token)
+#   - PyPI:   a Trusted Publisher for this repo + workflow (OIDC, no token)
+#   - GHCR:   nothing — uses the built-in GITHUB_TOKEN
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate but do not upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: version gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: package.json == pyproject == tag
+        run: |
+          NPM_V=$(node -p "require('./package.json').version")
+          PY_V=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "package.json=$NPM_V  pyproject=$PY_V"
+          if [ "$NPM_V" != "$PY_V" ]; then
+            echo "::error::version mismatch — package.json=$NPM_V pyproject=$PY_V"; exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$NPM_V" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $NPM_V"; exit 1
+            fi
+          fi
+          echo "version=$NPM_V" >> "$GITHUB_OUTPUT"
+
+  npm:
+    name: publish npm
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Publish
+        run: npm publish --provenance --access public ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  pypi:
+    name: publish PyPI
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - name: Publish to PyPI
+        if: ${{ inputs.dry_run != true }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  docker:
+    name: publish image (GHCR)
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/runagent-dev/runagent-superbrowser
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=${{ needs.guard.outputs.version }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ inputs.dry_run != true }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    name: GitHub Release
+    needs: [guard, npm, pypi, docker]
+    if: ${{ github.ref_type == 'tag' && inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
