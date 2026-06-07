@@ -102,6 +102,27 @@ def load_ablation(runs_dir: Path) -> dict:
     return by_cfg
 
 
+def _load_full_run(run_dir: Path):
+    """Build the 'full' config bucket from a single full-system run under
+    eval/runs/<label>/<task>/seed<k> (e.g. a model-split run). The full system
+    is exactly that run, so this fills Table 1's top row with real Success +
+    Tokens/iter without needing an ablation__full sweep. Ablation rows stay TODO
+    — they measure success WITHOUT a mechanism, a counterfactual no single
+    full-system run can supply."""
+    run_dir = Path(run_dir)
+    meta_path = run_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"[warn] --full-run: no meta.json under {run_dir}")
+        return None
+    meta = json.loads(meta_path.read_text())
+    if meta.get("api_error"):
+        print(f"[warn] --full-run: {run_dir} is an API-error run (brain never ran)")
+        return None
+    tok, iters, zero = _iter_tokens(run_dir)
+    return {"succ": [_run_success(meta)], "tok": tok, "iters": iters, "zero": zero,
+            "tasks": {meta.get("task_id")}, "seeds": {meta.get("seed")}}
+
+
 def _succ_pct(d):
     return 100.0 * sum(d["succ"]) / len(d["succ"]) if d and d["succ"] else None
 
@@ -171,13 +192,24 @@ def main():
     ap.add_argument("--table", default=str(PAPER / "tables" / "tab1_ablations.tex"))
     ap.add_argument("--annotate-n", action="store_true",
                     help="append an interim-n note to the caption (opt-in)")
+    ap.add_argument("--full-run", default=None,
+                    help="fill the 'full system' row from a single full-system run dir "
+                         "under eval/runs/<label>/<task>/seed<k> (e.g. the Claude Opus "
+                         "model-split run); ablation rows stay TODO until run_ablations.")
     ap.add_argument("--verify", action="store_true",
                     help="standalone-compile the filled table via pdflatex")
     args = ap.parse_args()
 
     by_cfg = load_ablation(Path(args.runs))
+    if args.full_run:
+        full = _load_full_run(Path(args.full_run))
+        if full:
+            by_cfg["full"] = full   # real full-system run overrides any ablation__full
+            print(f"[full-run] {args.full_run}: success={_succ_pct(full):.0f}% "
+                  f"tok/iter={(full['tok']/full['iters'] if full['iters'] else 0):,.0f} "
+                  f"(iters={full['iters']})")
     if not by_cfg:
-        print(f"[error] no ablation runs under {args.runs}. "
+        print(f"[error] no ablation runs under {args.runs} and no --full-run. "
               f"Run `python -m eval.run_ablations` first.")
         return
 

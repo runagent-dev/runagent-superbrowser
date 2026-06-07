@@ -168,6 +168,8 @@ def heatmap_per_task_tikz(rows) -> str:
     by_task: dict[str, list[dict]] = {}
     for r in rows:
         by_task.setdefault(r.get("task_id", "?"), []).append(r)
+    if len(by_task) <= 1:
+        return ""  # single task -> per-task panel just duplicates the aggregate grid
     blocks = []
     for task_id in sorted(by_task):
         models = _order(by_task[task_id])

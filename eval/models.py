@@ -37,21 +37,32 @@ class ModelSpec:
 # NOTE: every bench_composite below is a PLACEHOLDER (confirmed=False). Replace
 # with cited numbers for the exact models you run. Names reflect the paper's
 # "-class" slots; adjust `match`/`short_name` to your actual model ids.
+#
+# Longer `match` wins, so specific ids (e.g. "gpt-5.4") override family
+# fallbacks (e.g. "gpt-5"). The entries marked "(run)" resolve the exact model
+# ids actually evaluated under eval/runs/ for the §7.4 model-split.
 MODELS: list[ModelSpec] = [
     # ---- US labs ----
-    ModelSpec("gpt-5-mini", "GPT-5-mini", "US", 74.0, "OpenAI model card [CONFIRM]"),
-    ModelSpec("gpt-5.5",    "GPT-5.5",    "US", 82.0, "OpenAI model card [CONFIRM]"),
-    ModelSpec("gpt-5",      "GPT-5",      "US", 80.0, "OpenAI model card [CONFIRM]"),
-    ModelSpec("claude",     "Claude",     "US", 83.0, "Anthropic model card [CONFIRM]"),
-    ModelSpec("gemini",     "Gemini 3",   "US", 81.0, "Google model card [CONFIRM]"),
-    ModelSpec("nemotron",   "Nemotron",   "US", 72.0, "NVIDIA model card [CONFIRM]"),
+    ModelSpec("gpt-5.4",      "GPT-5.4",          "US", 79.0, "OpenAI model card [CONFIRM]"),  # (run)
+    ModelSpec("gpt-5-mini",   "GPT-5-mini",       "US", 74.0, "OpenAI model card [CONFIRM]"),
+    ModelSpec("gpt-5.5",      "GPT-5.5",          "US", 82.0, "OpenAI model card [CONFIRM]"),
+    ModelSpec("gpt-5",        "GPT-5",            "US", 80.0, "OpenAI model card [CONFIRM]"),
+    ModelSpec("claude-opus",  "Claude-Opus-4.8",  "US", 86.0, "Anthropic model card [CONFIRM]"),  # (run)
+    ModelSpec("claude",       "Claude",           "US", 83.0, "Anthropic model card [CONFIRM]"),
+    ModelSpec("gemini-3.5-flash", "Gemini-3.5-Flash", "US", 76.0, "Google model card [CONFIRM]"),  # (run)
+    ModelSpec("gemini",       "Gemini 3",         "US", 81.0, "Google model card [CONFIRM]"),
+    ModelSpec("nemotron",     "Nemotron-3",       "US", 72.0, "NVIDIA model card [CONFIRM]"),  # (run)
     # ---- Chinese labs ----
-    ModelSpec("kimi",       "Kimi K2",    "CN", 81.0, "Moonshot model card [CONFIRM]"),
-    ModelSpec("moonshot",   "Kimi K2",    "CN", 81.0, "Moonshot model card [CONFIRM]"),
-    ModelSpec("qwen",       "Qwen3-Max",  "CN", 83.0, "Alibaba model card [CONFIRM]"),
-    ModelSpec("glm",        "GLM",        "CN", 80.0, "Zhipu model card [CONFIRM]"),
-    ModelSpec("zhipu",      "GLM",        "CN", 80.0, "Zhipu model card [CONFIRM]"),
-    ModelSpec("z-ai",       "GLM",        "CN", 80.0, "Zhipu model card [CONFIRM]"),
+    ModelSpec("kimi",         "Kimi-K2.6",        "CN", 81.0, "Moonshot model card [CONFIRM]"),  # (run)
+    ModelSpec("moonshot",     "Kimi-K2.6",        "CN", 81.0, "Moonshot model card [CONFIRM]"),
+    ModelSpec("minimax",      "MiniMax-M3",       "CN", 80.0, "MiniMax model card [CONFIRM]"),  # (run)
+    ModelSpec("deepseek",     "DeepSeek-V4",      "CN", 84.0, "DeepSeek model card [CONFIRM]"),  # (run)
+    ModelSpec("inclusionai",  "Ring-2.6",         "CN", 82.0, "InclusionAI model card [CONFIRM]"),  # (run)
+    ModelSpec("ring-2",       "Ring-2.6",         "CN", 82.0, "InclusionAI model card [CONFIRM]"),
+    ModelSpec("qwen",         "Qwen3-Max",        "CN", 83.0, "Alibaba model card [CONFIRM]"),
+    ModelSpec("glm",          "GLM",              "CN", 80.0, "Zhipu model card [CONFIRM]"),
+    ModelSpec("zhipu",        "GLM",              "CN", 80.0, "Zhipu model card [CONFIRM]"),
+    ModelSpec("z-ai",         "GLM",              "CN", 80.0, "Zhipu model card [CONFIRM]"),
 ]
 
 

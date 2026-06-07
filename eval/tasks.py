@@ -34,7 +34,7 @@ TASKS: list[Task] = [
     Task(
         id="petfinder_rabbits",
         instruction=(
-            "Go to https://www.petfinder.com/ and show me the list of young male "
+            "Go to https://www.petfinder.com/ and show me the list of young male    Must use this url. "
             "English Spot rabbits available for adoption in Chicago, IL, within 50 miles. Do it very very carefully. Don't use any check learning tool."
         ),
         url="https://www.petfinder.com/",
