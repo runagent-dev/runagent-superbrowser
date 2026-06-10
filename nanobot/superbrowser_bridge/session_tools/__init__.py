@@ -78,6 +78,7 @@ from .registry import register_session_tools
 from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
+    BrowserChessMoveTool,
     BrowserClickAtTool,
     BrowserClickSelectorTool,
     BrowserClickTool,

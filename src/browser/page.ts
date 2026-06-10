@@ -2236,6 +2236,11 @@ export class PageWrapper {
     }
     const client = await this.getCDPSession();
     const button = opts?.button ?? 'left';
+    // Held-button bitmask re-asserted on every in-drag move (left=1, right=2,
+    // middle=4). CDP doesn't carry button state across events — a mouseMoved
+    // without `buttons` arrives as a button-up hover, so the drag never
+    // registers and the piece/handle won't follow the cursor.
+    const buttonBit = button === 'right' ? 2 : button === 'middle' ? 4 : 1;
     const stepMs = opts?.stepMs ?? 16;
     const first = points[0];
     await client.send('Input.dispatchMouseEvent', {
@@ -2243,18 +2248,18 @@ export class PageWrapper {
     });
     await new Promise((r) => setTimeout(r, opts?.holdMs ?? 50));
     await client.send('Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: first.x, y: first.y, button, clickCount: 1,
+      type: 'mousePressed', x: first.x, y: first.y, button, buttons: buttonBit, clickCount: 1,
     });
     for (let i = 1; i < points.length; i++) {
       const p = points[i];
       await client.send('Input.dispatchMouseEvent', {
-        type: 'mouseMoved', x: Math.round(p.x), y: Math.round(p.y), button,
+        type: 'mouseMoved', x: Math.round(p.x), y: Math.round(p.y), button, buttons: buttonBit,
       });
       if (stepMs > 0) await new Promise((r) => setTimeout(r, stepMs));
     }
     const last = points[points.length - 1];
     await client.send('Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: last.x, y: last.y, button, clickCount: 1,
+      type: 'mouseReleased', x: last.x, y: last.y, button, buttons: 0, clickCount: 1,
     });
     await this.waitForIdle(600).catch(() => {});
   }
@@ -2911,7 +2916,7 @@ export class PageWrapper {
     await new Promise((r) => setTimeout(r, 50));
     await client.send('Input.dispatchMouseEvent', {
       type: 'mousePressed', x: handleCx, y: handleCy,
-      button: 'left', clickCount: 1,
+      button: 'left', buttons: 1, clickCount: 1,
     });
 
     let cursorX = handleCx;
@@ -2949,7 +2954,7 @@ export class PageWrapper {
           const t = s / subSteps;
           const ix = Math.round(cursorX + (nextX - cursorX) * t);
           await client.send('Input.dispatchMouseEvent', {
-            type: 'mouseMoved', x: ix, y: handleCy, button: 'left',
+            type: 'mouseMoved', x: ix, y: handleCy, button: 'left', buttons: 1,
           });
           await new Promise((r) => setTimeout(r, 8));
         }
@@ -2992,7 +2997,7 @@ export class PageWrapper {
       // Always release.
       await client.send('Input.dispatchMouseEvent', {
         type: 'mouseReleased', x: cursorX, y: handleCy,
-        button: 'left', clickCount: 1,
+        button: 'left', buttons: 0, clickCount: 1,
       }).catch(() => {});
     }
 

@@ -10,6 +10,7 @@ from .captcha import (
     BrowserDetectCaptchaTool,
     BrowserSolveCaptchaTool,
 )
+from .chess import BrowserChessMoveTool
 from .click import (
     BrowserClickAtTool,
     BrowserClickSelectorTool,

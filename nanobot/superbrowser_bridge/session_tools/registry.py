@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
+    BrowserChessMoveTool,
     BrowserClickAtTool,
     BrowserClickSelectorTool,
     BrowserClickTool,
@@ -118,6 +119,7 @@ def register_session_tools(
         BrowserDragSliderUntilTool(state),
         BrowserImageRegionTool(state),     # kept: image region helper
         BrowserSolvePuzzleTool(state),     # kept: puzzle solver
+        BrowserChessMoveTool(state),       # pixel-exact chess move (board-rect 8x8 subdivide)
         BrowserListElementsTool(state),    # on-demand element inspection
         BrowserGetMarkdownTool(),          # stateless
         BrowserDialogTool(),               # stateless

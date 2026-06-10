@@ -197,20 +197,22 @@ export async function dispatchDrag(
   await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: startX, y: startY });
   await sleep(50);
   await client.send('Input.dispatchMouseEvent', {
-    type: 'mousePressed', x: startX, y: startY, button: 'left', clickCount: 1,
+    type: 'mousePressed', x: startX, y: startY, button: 'left', buttons: 1, clickCount: 1,
   });
 
   for (let i = 1; i <= steps; i++) {
     const x = startX + ((endX - startX) * i) / steps;
     const y = startY + ((endY - startY) * i) / steps;
+    // `buttons: 1` re-asserts the held left button on every move; without it
+    // CDP delivers the move as a button-up hover and the drag is ignored.
     await client.send('Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: Math.round(x), y: Math.round(y), button: 'left',
+      type: 'mouseMoved', x: Math.round(x), y: Math.round(y), button: 'left', buttons: 1,
     });
     await sleep(delay);
   }
 
   await client.send('Input.dispatchMouseEvent', {
-    type: 'mouseReleased', x: endX, y: endY, button: 'left', clickCount: 1,
+    type: 'mouseReleased', x: endX, y: endY, button: 'left', buttons: 0, clickCount: 1,
   });
 }
 

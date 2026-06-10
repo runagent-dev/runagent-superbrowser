@@ -132,7 +132,7 @@ async def main():
     print("=" * 60)
 
     task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        """ must go to this site https://www.petfinder.com/ .Show me the list of young male English Spot rabbits available for adoption in Chicago, IL, within 50 miles."""
+        """ must go to this site https://www.chess.com/play/computer/chessbacca-BOT . Try to win Please. Make sure to drag properly with your tools."""
         # """ Go to trip.com and find me the cheapest flight from dhaka to bangkok on 30th April 2026 and return on 5th May 2026."""
     )
 

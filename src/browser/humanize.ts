@@ -387,16 +387,17 @@ export async function humanDrag(
     if (options?.sessionId) inputEventBus.emitMouseMove(options.sessionId, px, py);
     let pressedAblate = false;
     try {
-      await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', clickCount: 1 });
+      await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', buttons: 1, clickCount: 1 });
       pressedAblate = true;
       const linSteps = 12;
       for (let i = 1; i <= linSteps; i++) {
         const mx = Math.round(px + (tx - px) * (i / linSteps));
         const my = Math.round(py + (ty - py) * (i / linSteps));
-        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: mx, y: my });
+        // buttons:1 keeps the left button asserted across the drag moves.
+        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: mx, y: my, button: 'left', buttons: 1 });
         if (options?.sessionId) inputEventBus.emitMouseMove(options.sessionId, mx, my);
       }
-      await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: tx, y: ty, button: 'left', clickCount: 1 });
+      await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: tx, y: ty, button: 'left', buttons: 0, clickCount: 1 });
       pressedAblate = false;
     } finally {
       if (pressedAblate) await safeRelease(client, tx, ty, 'left');
