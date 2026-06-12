@@ -116,8 +116,20 @@ superbrowser-doctor                  # check Chrome, build, env
 ```
 
 `puppeteer-core` does **not** bundle a browser — you need real Google Chrome on
-the machine. The installer handles it; if you set things up by hand, point
-`PUPPETEER_EXECUTABLE_PATH` at the binary:
+the machine. The bootstrap installer handles it; if you set things up by hand on
+a **fresh Ubuntu/Debian VM**, Chrome isn't in the default apt repos, so
+`apt install google-chrome-stable` fails until you add Google's repo first:
+
+```bash
+# add Google's signing key + apt source, then install Chrome
+wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+  | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/google-chrome.list
+sudo apt update && sudo apt install -y google-chrome-stable
+```
+
+Then point `PUPPETEER_EXECUTABLE_PATH` at the binary:
 
 | OS | Typical Chrome path |
 |---|---|
@@ -138,7 +150,7 @@ and `~/.superbrowser/cookie-jar/` as volumes if you want state to survive restar
 
 | | Install Chrome | Headless | Extra |
 |---|---|---|---|
-| **Ubuntu / Debian** | `apt install google-chrome-stable` | `HEADLESS=true` works; headful Tier-3 needs Xvfb | `apt install xvfb` + the lib list (the installer does this) |
+| **Ubuntu / Debian** | add Google's apt repo, then `apt install google-chrome-stable` ([snippet above](#from-packages)) | `HEADLESS=true` works; headful Tier-3 needs Xvfb | `apt install xvfb` + the lib list (the installer does this) |
 | **macOS** | `brew install --cask google-chrome` | headful, no Xvfb | — |
 | **Windows** | `winget install Google.Chrome` | headful (`HEADLESS=false`) | no Xvfb/apt needed |
 
