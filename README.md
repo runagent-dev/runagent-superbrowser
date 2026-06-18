@@ -15,14 +15,106 @@
 Give your agent a real browser. SuperBrowser handles the parts that break LLMs in the wild — captchas, Cloudflare, autocomplete dropdowns, "let me Google that" drift — so your prompt can stay focused on the task.
 
 ```python
-from nanobot import Nanobot
-from superbrowser_bridge.tools import register_all_tools
+from runagent_superbrowser import SuperBrowser
 
-bot = Nanobot.from_config(workspace="nanobot/workspace")
-register_all_tools(bot)
+sb = SuperBrowser()
 
-await bot.run("find me a black summer dress under $80 on zara.com, size M, ships to Dhaka")
+# One call. The agent decides whether a lightweight fetch or a full browser
+# session is the right tool — you just say what you want, no "please click…".
+res = sb.run("find me a black summer dress under $80 on zara.com, size M, ships to Dhaka")
+print(res.text)
 ```
+
+---
+
+## Python SDK
+
+`pip install runagent-superbrowser` gives you a one-object SDK. Terse goals in,
+structured results out — the heavy prompting (routing rules, anti-fabrication,
+the browser tool ladder) **ships inside the package**, so you don't hand-write
+"please click… please type…".
+
+```python
+from runagent_superbrowser import SuperBrowser
+
+sb = SuperBrowser()
+res = sb.run("what's the top story on Hacker News right now?")
+print(res.text)        # the answer
+print(res.success)     # did it work?
+```
+
+### Pick how it browses — or let it decide
+
+`mode` is the intelligence switch:
+
+| `mode` | What runs | Needs the engine? |
+|---|---|---|
+| `"auto"` *(default)* | the agent decides: lightweight fetch/search **or** a real browser | only if it picks the browser |
+| `"fetch"` | read-only: HTTP / stealth fetch / search. Fast, no captcha risk | no |
+| `"browser"` | a real headless browser — clicks, forms, logins, bookings | yes |
+
+```python
+sb.run("average price of used iPhone 16 Pro on mercari.com", mode="fetch")
+sb.run("book a 4-star Sylhet hotel, Sun–Thu, 2 adults", url="https://gozayaan.com", mode="browser")
+```
+
+In `auto` mode the result tells you which way it leaned, and why:
+
+```python
+res = sb.run("cheapest DAC→BKK flight Apr 30, return May 5")
+print(res.classification)   # {'approach': 'browser', 'reason': '…', 'confidence': 0.88}
+```
+
+### Typed results
+
+Pass a pydantic model (or `list[Model]`, or a JSON Schema dict) and get parsed
+data back in `res.data` — best-effort, never raises:
+
+```python
+from pydantic import BaseModel
+from runagent_superbrowser import SuperBrowser
+
+class Hotel(BaseModel):
+    name: str
+    price_usd: float
+
+res = SuperBrowser().run(
+    "list 4–5 star hotels in Sylhet with nightly prices",
+    url="https://gozayaan.com", mode="browser",
+    output_schema=list[Hotel],
+)
+for h in res.data or []:    # list[Hotel]; None if the model didn't return clean JSON
+    print(h.name, h.price_usd)
+```
+
+### The browser engine
+
+Browser mode needs the TS engine on `:3100`. Start it yourself (`superbrowser http`),
+or let the SDK start and stop it for you:
+
+```python
+with SuperBrowser(auto_start_server=True) as sb:   # spawns the engine, tears it down on exit
+    res = sb.run("…", mode="browser")
+```
+
+### Async + CLI
+
+```python
+res = await SuperBrowser().arun("…", mode="fetch")
+```
+
+```bash
+superbrowser-run "what's trending on github this week" --mode fetch
+superbrowser-run "book the cheapest DAC→BKK flight" --mode browser --auto-start-server
+```
+
+> Model + API keys come from `~/.nanobot/config.json` (`nanobot onboard`); vision
+> and server knobs from env / `.env`. Override per-instance with
+> `SuperBrowser(model=…, vision=…, server_url=…, workspace_root=…)`.
+> Full guide: [`docs/sdk.md`](docs/sdk.md).
+
+The low-level `register_all_tools(bot)` / raw `/session` HTTP API are still there
+for advanced use — see [Examples](#examples).
 
 ---
 

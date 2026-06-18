@@ -55,8 +55,14 @@ async def run_task(task: str, workspace: str | None = None) -> bool:
 
     from .memory import Memory, set_orchestrator_memory
     from .tools import register_all_tools
+    from .workspaces import provision
 
     workspace = _resolve_workspace(workspace)
+
+    # Materialize the per-role worker workspaces and their bundled SOUL
+    # prompts. In a source checkout this is a no-op; once installed it's what
+    # keeps the agents from silently falling back to nanobot's default prompt.
+    provision()
 
     # Uses ~/.nanobot/config.json (set up via `nanobot onboard`).
     bot = Nanobot.from_config(workspace=workspace)

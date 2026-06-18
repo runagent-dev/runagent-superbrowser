@@ -18,12 +18,13 @@ from __future__ import annotations
 import json as _json
 import os
 import re as _re
-from pathlib import Path
 from urllib.parse import urlparse
 
-# Same layout as before — the orchestrator workspace lives one level up.
-_BASE = Path(__file__).resolve().parent.parent
-LEARNINGS_DIR = str(_BASE / "workspace_orchestrator" / "learnings")
+# Resolved via the shared workspaces module so it's correct both installed
+# and in-tree (see superbrowser_bridge/workspaces.py).
+from superbrowser_bridge.workspaces import learnings_dir as _learnings_dir
+
+LEARNINGS_DIR = str(_learnings_dir())
 
 
 # --- Path helpers ---------------------------------------------------------

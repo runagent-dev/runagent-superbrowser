@@ -9,7 +9,8 @@ public surface (orchestrator_tools.__init__ re-exports it).
 from __future__ import annotations
 
 import re as _re
-from pathlib import Path
+
+from superbrowser_bridge.workspaces import workspace_for
 
 # Outer-loop circuit breaker.
 #
@@ -43,9 +44,8 @@ _SUBSTANTIVE_KEYWORDS = (
 )
 
 
-# Where the browser worker workspace lives (relative to this file).
-# `_BASE` walks `parent.parent.parent` instead of `parent.parent` because
-# the package nesting changed — this file is now one level deeper than
-# the old monolithic `orchestrator_tools.py`.
-_BASE = Path(__file__).resolve().parent.parent.parent
-BROWSER_WORKSPACE = str(_BASE / "workspace_browser")
+# Where the browser worker workspace lives. Resolved via the shared
+# `workspaces` module so it's correct both in a source checkout and once the
+# package is installed/flattened (see superbrowser_bridge/workspaces.py).
+# Set $SUPERBROWSER_WORKSPACE_ROOT before importing the bridge to override.
+BROWSER_WORKSPACE = str(workspace_for("browser"))

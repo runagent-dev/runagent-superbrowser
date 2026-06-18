@@ -21,7 +21,10 @@ from typing import Any
 
 import httpx
 
-SUPERBROWSER_URL = "http://localhost:3100"
+# Read from the env (consistent with search_tools.py and doctor.py) so the
+# server URL can be overridden before import. Set $SUPERBROWSER_URL prior to
+# importing the bridge to point at a non-default engine.
+SUPERBROWSER_URL = os.environ.get("SUPERBROWSER_URL", "http://localhost:3100")
 SCREENSHOT_DIR = os.environ.get("SUPERBROWSER_SCREENSHOT_DIR", "/tmp/superbrowser/screenshots")
 
 

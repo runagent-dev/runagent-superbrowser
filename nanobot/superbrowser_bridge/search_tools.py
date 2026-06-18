@@ -17,7 +17,6 @@ import os
 import re as _re
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -25,8 +24,10 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
 
-_BASE = Path(__file__).resolve().parent.parent
-SEARCH_WORKSPACE = str(_BASE / "workspace_search")
+from superbrowser_bridge.workspaces import workspace_for
+
+# Resolved via the shared workspaces module so it's correct installed + in-tree.
+SEARCH_WORKSPACE = str(workspace_for("search"))
 
 SUPERBROWSER_URL = os.environ.get("SUPERBROWSER_URL", "http://localhost:3100")
 
