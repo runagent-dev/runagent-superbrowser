@@ -34,6 +34,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model", default=None, help="override the model from ~/.nanobot/config.json")
     parser.add_argument("--timeout", type=float, default=None, help="seconds before the task is aborted")
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="execute on the RunAgent serverless engine via the middleware (reuses the runagent SDK)",
+    )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        help="remote: keep a per-user persistent browser session (cookies/profiles) across runs",
+    )
+    parser.add_argument("--agent-id", default=None, help="remote: Browser agent id (or set SUPERBROWSER_AGENT_ID)")
+    parser.add_argument("--api-key", default=None, help="remote: RunAgent API key (or set RUNAGENT_API_KEY)")
+    parser.add_argument("--base-url", default=None, help="remote: middleware base URL (or set RUNAGENT_BASE_URL)")
     ns = parser.parse_args(argv)
 
     from .client import SuperBrowser
@@ -43,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
         server_url=ns.server_url,
         auto_start_server=ns.auto_start_server,
         model=ns.model,
+        remote=ns.remote,
+        persistent=ns.persistent,
+        agent_id=ns.agent_id,
+        api_key=ns.api_key,
+        base_url=ns.base_url,
     )
     try:
         res = sb.run(task, mode=ns.mode, url=ns.url, timeout=ns.timeout)

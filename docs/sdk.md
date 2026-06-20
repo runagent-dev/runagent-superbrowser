@@ -102,6 +102,86 @@ the engine when `auto_start_server=True` and the classifier leans browser.
 > the npm engine — install it with `npm i -g runagent-superbrowser`. The SDK
 > only ever stops an engine **it** started.
 
+## Remote (serverless) mode
+
+Run the browser on the RunAgent **serverless** engine instead of a local one. The
+query is authenticated with your RunAgent API key, routed through the middleware,
+and executed in an **on-demand micro-VM** with a **per-user persistent session**
+(cookies/profiles survive across runs). Under the hood this reuses the runagent
+SDK's remote stack — `RunAgentClient` with `local=False` + `persistent_memory` —
+hitting the same `/api/v1/agents/{id}/run` path as any other RunAgent agent.
+
+```python
+from runagent_superbrowser import SuperBrowser
+
+sb = SuperBrowser(
+    remote=True,                     # execute on serverless via the middleware
+    persistent=True,                 # per-user persistent browser session across runs
+    agent_id="<browser-agent-id>",   # from your Browser agent page in the dashboard
+    api_key="rau_...",               # or set RUNAGENT_API_KEY
+)
+res = sb.run("find the cheapest 4-star hotel in Sylhet for next weekend")
+print(res.text)
+```
+
+Everything also resolves from the environment, so this is equivalent:
+
+```bash
+export RUNAGENT_API_KEY=rau_...
+export SUPERBROWSER_AGENT_ID=<browser-agent-id>
+export SUPERBROWSER_REMOTE=1          # or pass remote=True
+```
+```python
+SuperBrowser(persistent=True).run("…")
+```
+
+Or from the CLI:
+
+```bash
+superbrowser-run "summarize today's top HN story" \
+  --remote --persistent --agent-id <browser-agent-id> --api-key rau_...
+```
+
+Notes:
+- **Local mode is unchanged** — without `remote`, `npm run dev` then `SuperBrowser().run(...)`.
+- Remote mode needs the runagent SDK: `pip install 'runagent-superbrowser[remote]'`.
+- `output_schema` is not sent in remote mode (the engine returns text); use it
+  locally for typed parsing.
+- The first call cold-starts a micro-VM (Chromium boot ~10–15s); subsequent calls
+  reuse the warm VM until it's idle-reaped.
+
+## Deploy via the runagent CLI (callable from every SDK)
+
+Beyond local mode, you can **deploy SuperBrowser to RunAgent serverless** with the
+`runagent` CLI as a standard agent. Once deployed it runs on on-demand micro-VMs
+with a per-user persistent session, and is reachable from **any** RunAgent SDK
+(Python/TS/Go/Rust/Dart/C#) — not just this Python package. The heavy Node +
+Chromium engine is built server-side, so the deploy project is tiny.
+
+```bash
+# scaffold a deploy project (or use the repo's deploy/ directory)
+runagent init my-browser --from-template superbrowser/default
+cd my-browser
+cp .env.example .env          # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+runagent deploy .             # prints your agent_id
+```
+
+`.env` is uploaded at deploy and written to `/root/.env` in the VM — that's how
+the agent gets its LLM key. Infra (headless, Chromium, persistence) is baked into
+the image; you only provide secrets/options (see `.env.example`).
+
+Call the `run` entrypoint from any SDK with `local=false` + `persistent_memory=true`:
+
+```python
+from runagent import RunAgentClient
+client = RunAgentClient(agent_id="<agent_id>", entrypoint_tag="run",
+                        local=False, persistent_memory=True)
+print(client.run(task="find the cheapest 4-star hotel in Sylhet this weekend"))
+```
+
+This is the generic equivalent of `SuperBrowser(remote=True, persistent=True,
+agent_id="<agent_id>")` — use whichever fits your stack.
+
 ## Constructor reference
 
 ```python
@@ -116,6 +196,13 @@ SuperBrowser(
     server_start_timeout=30.0,
     provision_force=False,       # re-copy bundled SOUL.md even if a workspace one exists
     env=None,                    # extra env vars to set before the bridge imports
+    # remote (serverless) execution — see "Remote (serverless) mode":
+    remote=False,                # route the run through the middleware → serverless engine
+    persistent=False,            # remote: per-user persistent browser session
+    agent_id=None,               # remote: Browser agent id ($SUPERBROWSER_AGENT_ID)
+    api_key=None,                # remote: RunAgent API key ($RUNAGENT_API_KEY)
+    user_id=None,                # remote: scope persistence to a user id (optional)
+    base_url=None,               # remote: middleware base URL ($RUNAGENT_BASE_URL)
 )
 ```
 

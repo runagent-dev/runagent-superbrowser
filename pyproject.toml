@@ -49,6 +49,8 @@ dependencies = [
 # Vision-based slider/jigsaw/rotation puzzle solving uses OpenCV; imported
 # lazily inside the puzzle engines, so it's optional.
 puzzles = ["opencv-python>=4.8", "numpy>=1.24"]
+# Remote (serverless) execution reuses the runagent SDK's RunAgentClient.
+remote = ["runagent>=0.1"]
 dev = ["pytest>=8", "ruff>=0.5", "build", "twine"]
 
 [project.scripts]

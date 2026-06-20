@@ -27,6 +27,25 @@ print(res.text)
 
 ---
 
+## Run it locally — or deploy to serverless
+
+- **Local**: `npm run dev` (starts the engine) + the Python SDK below.
+- **Serverless (callable from *every* RunAgent SDK)**: deploy with the `runagent` CLI —
+
+  ```bash
+  runagent init my-browser --from-template superbrowser/default   # or: cd deploy
+  cp .env.example .env     # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+  runagent deploy .        # prints an agent_id
+  ```
+
+  Then call it from Python/TS/Go/Rust/Dart/C# via
+  `RunAgentClient(agent_id, "run", local=False, persistent_memory=True).run(task="…")`.
+  On-demand micro-VMs, per-user persistent sessions. See
+  [deploy/README.md](deploy/README.md) and
+  [docs/sdk.md](docs/sdk.md#deploy-via-the-runagent-cli-callable-from-every-sdk).
+
+---
+
 ## Python SDK
 
 `pip install runagent-superbrowser` gives you a one-object SDK. Terse goals in,

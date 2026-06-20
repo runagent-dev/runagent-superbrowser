@@ -75,10 +75,29 @@ class SuperBrowser:
         server_start_timeout: float = 30.0,
         provision_force: bool = False,
         env: dict[str, str] | None = None,
+        remote: bool = False,
+        persistent: bool = False,
+        agent_id: str | None = None,
+        api_key: str | None = None,
+        user_id: str | None = None,
+        base_url: str | None = None,
     ) -> None:
         # Load .env FIRST so .env values are visible below and to the bridge.
         # Explicit kwargs still take precedence (they're `x or os.environ...`).
         _load_project_dotenv()
+
+        # Remote (serverless) mode: execution is delegated to the RunAgent
+        # serverless engine through the middleware, reusing the runagent SDK's
+        # RunAgentClient (local=False + persistent_memory). See _run_remote and
+        # docs/sdk.md "Remote (serverless) mode". When remote, the local engine /
+        # ServerHandle below is never used.
+        self.remote = remote or os.environ.get("SUPERBROWSER_REMOTE", "").lower() in ("1", "true", "yes")
+        self.persistent = persistent
+        self.api_key = api_key or os.environ.get("RUNAGENT_API_KEY")
+        self.base_url = base_url or os.environ.get("RUNAGENT_BASE_URL")
+        self.user_id = user_id
+        self.agent_id = agent_id or os.environ.get("SUPERBROWSER_AGENT_ID") or os.environ.get("RUNAGENT_AGENT_ID")
+        self._remote_client = None
 
         self.model = model
         self.auto_start_server = auto_start_server
@@ -116,6 +135,17 @@ class SuperBrowser:
     ) -> RunResult:
         """Synchronous entry point. Raises if called from a running event loop —
         use :meth:`arun` there."""
+        if self.remote:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return self._run_remote(
+                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                )
+            raise RuntimeError(
+                "SuperBrowser.run() cannot be called from inside a running event "
+                "loop; await SuperBrowser.arun(...) instead."
+            )
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -146,6 +176,14 @@ class SuperBrowser:
         enable_human_handoff: bool = True,
         timeout: float | None = None,
     ) -> RunResult:
+        if self.remote:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: self._run_remote(
+                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                ),
+            )
         classification = self._classify(task, url) if mode == "auto" else None
 
         # Server lifecycle: browser mode requires the engine (raise if missing
@@ -233,6 +271,96 @@ class SuperBrowser:
 
     async def __aexit__(self, *exc: object) -> None:
         self.close()
+
+    # ----- remote (serverless) execution -----
+
+    def _run_remote(
+        self,
+        task: str,
+        *,
+        mode: Mode = "auto",
+        url: str | None = None,
+        output_schema: Any | None = None,
+        timeout: float | None = None,
+    ) -> RunResult:
+        """Execute on the RunAgent serverless engine via the middleware, reusing
+        the runagent SDK's ``RunAgentClient`` (``local=False`` + ``persistent_memory``).
+
+        ``output_schema`` is not forwarded remotely in v1 (the engine returns
+        text); pass it in local mode for typed parsing.
+        """
+        client = self._remote_runagent_client()
+        input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
+        if url is not None:
+            input_kwargs["url"] = url
+        try:
+            payload = client.run(**input_kwargs)
+        except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
+            return RunResult(
+                text="",
+                success=False,
+                task_id="",
+                mode=mode,
+                data=None,
+                error=f"{type(exc).__name__}: {exc}",
+                raw_content="",
+                classification=None,
+            )
+        return self._result_from_remote(payload, mode)
+
+    def _remote_runagent_client(self):
+        if self._remote_client is None:
+            if not self.agent_id:
+                raise ValueError(
+                    "Remote mode requires an agent_id. Pass agent_id=... or set "
+                    "SUPERBROWSER_AGENT_ID — find it on your Browser agent's page "
+                    "in the RunAgent dashboard."
+                )
+            try:
+                from runagent import RunAgentClient
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "Remote mode needs the runagent SDK. Install it with "
+                    "`pip install 'runagent-superbrowser[remote]'` (or `pip install runagent`)."
+                ) from exc
+            self._remote_client = RunAgentClient(
+                agent_id=self.agent_id,
+                entrypoint_tag="run",
+                local=False,
+                user_id=self.user_id,
+                persistent_memory=self.persistent,
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+        return self._remote_client
+
+    @staticmethod
+    def _result_from_remote(payload: Any, mode: str) -> RunResult:
+        """Wrap the in-VM ``main.py:run`` dict (already deserialized by
+        RunAgentClient) into a RunResult."""
+        if isinstance(payload, dict):
+            text = payload.get("text", "") or ""
+            return RunResult(
+                text=text,
+                success=bool(payload.get("success", bool(text))),
+                task_id=payload.get("task_id") or "",
+                mode=payload.get("mode") or mode,
+                data=payload.get("data"),
+                error=payload.get("error"),
+                raw_content=text,
+                classification=payload.get("classification"),
+            )
+        text = "" if payload is None else str(payload)
+        return RunResult(
+            text=text,
+            success=bool(text),
+            task_id="",
+            mode=mode,
+            data=None,
+            error=None if text else "the agent returned no answer",
+            raw_content=text,
+            classification=None,
+        )
 
     # ----- internals -----
 
