@@ -150,6 +150,53 @@ Notes:
 - The first call cold-starts a micro-VM (Chromium boot ~10–15s); subsequent calls
   reuse the warm VM until it's idle-reaped.
 
+## Local agent server (Docker)
+
+There are **three** ways to execute, on one axis of "where the orchestrator runs":
+
+| Mode | How | RunAgent key? |
+|---|---|---|
+| **in-process** (default) | `pip install`, then `SuperBrowser().run(...)` — runs the orchestrator in your process; needs the npm engine on `:3100` for browser mode | no |
+| **local-agent** (Docker) | `docker compose up`, then `SuperBrowser(remote=False, local_agent_url="http://localhost:8450")` | **no** |
+| **remote** (serverless) | `SuperBrowser(remote=True, api_key="rau_...")` → middleware → micro-VM | yes |
+
+The **all-in-one container** runs the stealth browser engine *and* the orchestrator,
+exposed as a local RunAgent agent server on `:8450` — no Node/Python/venv on the
+host, and no RunAgent account. It mirrors the serverless VM exactly (engine on
+`127.0.0.1:3100` + in-process `deploy/main.py:run`, served via `runagent serve`).
+
+```bash
+cp deploy/.env.example deploy/.env    # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+docker compose up -d                  # ready when :8450/api/v1/health is healthy
+```
+
+```python
+from runagent_superbrowser import SuperBrowser
+
+# remote=False + a local agent URL -> talk to the container (no API key).
+sb = SuperBrowser(remote=False, local_agent_url="http://localhost:8450")
+print(sb.run("what's the top story on Hacker News right now?").text)
+```
+
+Everything resolves from the env too — set `SUPERBROWSER_LOCAL_AGENT_URL=http://localhost:8450`
+and just call `SuperBrowser().run(...)`. Or from the CLI:
+
+```bash
+superbrowser-run "summarize today's top HN story" --local-agent-url http://localhost:8450
+```
+
+Notes:
+- Under the hood this reuses `RunAgentClient(local=True, host, port)` — the same
+  interface as remote mode, just `local=True` and **no api_key**.
+- Unlike remote mode, **`output_schema` IS parsed locally** here (we own both ends
+  of the round-trip).
+- The container's `agent_id` is fixed (the all-zeros UUID from
+  `deploy/runagent.config.json`); you never type it. Override with
+  `SUPERBROWSER_LOCAL_AGENT_ID` only if you change that config.
+- Local-agent mode is opt-in: with no `local_agent_url`, `remote=False` keeps the
+  in-process path (fully backward compatible).
+- Needs the runagent SDK: `pip install 'runagent-superbrowser[remote]'`.
+
 ## Deploy via the runagent CLI (callable from every SDK)
 
 Beyond local mode, you can **deploy SuperBrowser to RunAgent serverless** with the
@@ -203,6 +250,9 @@ SuperBrowser(
     api_key=None,                # remote: RunAgent API key ($RUNAGENT_API_KEY)
     user_id=None,                # remote: scope persistence to a user id (optional)
     base_url=None,               # remote: middleware base URL ($RUNAGENT_BASE_URL)
+    # local-agent (Docker) execution — see "Local agent server (Docker)":
+    local_agent_url=None,        # route remote=False through a `runagent serve` container ($SUPERBROWSER_LOCAL_AGENT_URL)
+    local_agent_id=None,         # the container's agent id (defaults to the all-zeros UUID)
 )
 ```
 

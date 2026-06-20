@@ -1,5 +1,6 @@
 # Keep the build context (and the image) small. The Dockerfile builds the TS
-# engine from src/; none of this is needed and some of it is huge.
+# engine from src/ and pip-installs the Python package; none of this is needed
+# and some of it is huge.
 .git
 node_modules
 build
@@ -12,10 +13,23 @@ __pycache__
 eval
 todo
 assets
+docs
+examples
 *.tgz
 /tmp
 
-# nanobot/ is copied for optional MCP use — but never its runtime state
-nanobot/workspace*
+# Secrets must never enter the image.
+.env
+deploy/.env
+
+# nanobot/ is copied for the Python package build + MCP use, but never its
+# runtime state. Exclude the workspace CONTENTS (sessions/learnings/memory/
+# images/pdfs) while KEEPING the three canonical SOUL.md prompts — the wheel
+# build force-includes them as package data, so the build fails without them.
+nanobot/workspace*/**
+!nanobot/workspace_orchestrator/SOUL.md
+!nanobot/workspace_browser/SOUL.md
+!nanobot/workspace_search/SOUL.md
 nanobot/**/__pycache__
 nanobot/**/.nanobot
+nanobot/**/tests

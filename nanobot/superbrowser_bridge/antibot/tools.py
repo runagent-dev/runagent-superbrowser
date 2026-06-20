@@ -20,36 +20,48 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from .extract import extract as _extract
+from .fetch import fetch as _fetch
 from .fetch_archive import fetch_archive as _archive
-from .fetch_auto import fetch_auto as _auto
 from .fetch_impersonate import fetch_impersonate as _impersonate
 from .fetch_undetected import fetch_undetected as _undetected
-from . import content as _content
 
 # Keep tool responses bounded. The agent can ask for more by extracting
 # specific sections; the full page stays in the jar/returned HTML.
-_MAX_HTML_CHARS = 32_000
+_MAX_BODY_CHARS = 32_000
+_MAX_REFS_CHARS = 2_000
+_MAX_MEDIA = 6
 
 
-def _format_response(meta: dict, html: str) -> str:
-    """Return a human/LLM-friendly string that leads with meta and ends with HTML."""
-    summary = {k: v for k, v in meta.items() if k != "html"}
+def _format_response(meta: dict, body: str) -> str:
+    """Return a human/LLM-friendly string that leads with meta and ends with body."""
+    summary = {k: v for k, v in meta.items() if k not in ("html", "markdown")}
     summary_str = _json.dumps(summary, indent=2, default=str)
-    truncated = html[:_MAX_HTML_CHARS]
-    if len(html) > _MAX_HTML_CHARS:
-        truncated += f"\n<!-- truncated, total {len(html)} chars -->"
+    truncated = body[:_MAX_BODY_CHARS]
+    if len(body) > _MAX_BODY_CHARS:
+        truncated += f"\n<!-- truncated, total {len(body)} chars -->"
     return f"{summary_str}\n\n---\n{truncated}"
 
 
-def _postprocess(html: str, query: str | None, markdown: bool) -> str:
-    """Apply BM25 filter, markdown conversion, or return raw HTML."""
+def _format_rich(meta: dict, html: str, url: str | None, query: str | None, markdown: bool) -> str:
+    """Run the extraction pipeline on fetched HTML and format the rich result:
+    structured data + scored images in the header, fit/raw markdown + numbered
+    citations in the body."""
     if not html:
-        return ""
-    if query:
-        return _content.bm25_filter(html, query, top_k=20)
-    if markdown:
-        return _content.to_markdown(html)
-    return html
+        return _format_response(meta, "")
+    er = _extract(html, url=url, query=query)
+    meta = dict(meta)
+    meta["structured"] = er.structured
+    if er.media:
+        meta["images"] = [
+            {"src": m.get("src"), "alt": m.get("alt"), "score": m.get("score")}
+            for m in er.media[:_MAX_MEDIA]
+        ]
+    # query/markdown -> the focused/pruned "fit" view; otherwise the full page.
+    body = er.fit_markdown if (query or markdown) else (er.raw_markdown or er.fit_markdown)
+    if er.references and (query or markdown):
+        body = f"{body}\n{er.references[:_MAX_REFS_CHARS]}"
+    return _format_response(meta, body)
 
 
 @tool_parameters(
@@ -146,9 +158,7 @@ class FetchImpersonateTool(Tool):
             referer=referer,
         )
         html = result.pop("html", "")
-        body = _postprocess(html, query, markdown)
-        result["structured"] = _content.extract_meta_title_description(html)
-        return _format_response(result, body)
+        return _format_rich(result, html, url, query, markdown)
 
 
 @tool_parameters(
@@ -255,12 +265,7 @@ class FetchUndetectedTool(Tool):
             screenshot=screenshot,
         )
         html = result.pop("html", "")
-        body = _postprocess(html, query, markdown)
-        result["structured"] = {
-            "json_ld": _content.extract_json_ld(html),
-            "meta": _content.extract_meta_title_description(html),
-        }
-        return _format_response(result, body)
+        return _format_rich(result, html, url, query, markdown)
 
 
 @tool_parameters(
@@ -288,7 +293,7 @@ class FetchArchiveTool(Tool):
     async def execute(self, url: str, **_kw: Any) -> str:
         result = await _archive(url)
         html = result.pop("html", "")
-        return _format_response(result, html)
+        return _format_rich(result, html, url, None, True)
 
 
 @tool_parameters(
@@ -359,17 +364,39 @@ class FetchAutoTool(Tool):
         timeout_s: float = 45,
         **_kw: Any,
     ) -> str:
-        result = await _auto(
+        result = await _fetch(
             url,
             query=query,
-            markdown=markdown,
             max_tier=int(max_tier),
             timeout_s=float(timeout_s),
         )
-        content = result.pop("content", "")
-        # Drop the raw HTML from the summary — the formatted body already has it.
-        result.pop("html", None)
-        return _format_response(result, content)
+        # The new pipeline already returns fit/raw markdown, citations, scored
+        # images, and structured data. Surface the rich shape.
+        body = result.get("fit_markdown") or result.get("raw_markdown") or ""
+        if markdown and not query:
+            body = result.get("raw_markdown") or body
+        refs = result.get("references") or ""
+        if refs:
+            body = f"{body}\n{refs[:_MAX_REFS_CHARS]}"
+        media = result.get("media") or []
+        meta = {
+            "engine_used": result.get("engine_used"),
+            "tier_used": result.get("tier_used"),
+            "status": result.get("status"),
+            "block_class": result.get("block_class"),
+            "reason": result.get("reason"),
+            "source": result.get("source"),
+            "captured_at": result.get("captured_at"),
+            "final_url": result.get("final_url"),
+            "attempts": result.get("attempts"),
+            "structured": result.get("structured"),
+        }
+        if media:
+            meta["images"] = [
+                {"src": m.get("src"), "alt": m.get("alt"), "score": m.get("score")}
+                for m in media[:_MAX_MEDIA]
+            ]
+        return _format_response(meta, body)
 
 
 __all__ = [

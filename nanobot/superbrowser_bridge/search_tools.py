@@ -443,8 +443,19 @@ class DelegateSearchTaskTool(Tool):
             worker._loop.tools.unregister("web_search")
             worker._loop.tools.register(RateLimitedWebSearchTool(original_search))
 
-        # Register the stealth-browser fallback fetcher (Layer 5.2). Used
-        # when web_fetch returns a bot-block stub.
+        # Supersede core web_fetch (Jina -> readability) with the engine-pluggable
+        # bridge fetch: plain HTTP -> impersonate -> stealth browser -> Jina ->
+        # archive, all feeding one extraction pipeline (clean markdown + numbered
+        # citations + scored images + structured data). Jina lives on as one engine.
+        if worker._loop.tools._tools.get("web_fetch"):
+            worker._loop.tools.unregister("web_fetch")
+        from superbrowser_bridge.web_fetch_tool import BridgeWebFetchTool
+        worker._loop.tools.register(BridgeWebFetchTool())
+
+        # Register the stealth-browser fallback fetcher (Layer 5.2). Mostly
+        # redundant now that web_fetch self-escalates, but kept for the rare
+        # case where the dedicated /fetch/rendered path bypasses a page the
+        # in-process tiers couldn't.
         worker._loop.tools.register(WebFetchRenderedTool())
 
         worker._loop.max_iterations = max_iterations
@@ -467,8 +478,8 @@ Find the answer to the research question above by:
 
 ## Tool usage
 - `web_search(query)` — free, returns titles + URLs + snippets. Start here.
-- `web_fetch(url)` — free, HTTP GET of the page. Primary way to read full text. Fast (~1s) but fails on bot-protected sites (Cloudflare, Mercari, LinkedIn, etc.) — those return stub HTML like "Just a moment" or an empty SPA shell.
-- `web_fetch_rendered(url)` — uses a stealth browser, ~3s and ~$0.005 per call. ONLY for retrying URLs where web_fetch returned a block stub (Cloudflare, 403/429, JS-only SPA). Do NOT use as a default — always try web_fetch first.
+- `web_fetch(url)` — primary way to read full text. Returns clean markdown with numbered citations (⟨n⟩ + a References list), scored images, and structured data. Engine-pluggable and SELF-ESCALATING: it tries plain HTTP, then TLS impersonation, then a stealth browser, then Jina, then archive — so it handles most bot-protected sites (Cloudflare, etc.) on its own. Pass `web_fetch(url, query="...")` to get only the passages relevant to your question (much cheaper than reading the whole page).
+- `web_fetch_rendered(url)` — rarely needed now that web_fetch self-escalates. If web_fetch explicitly says it could not retrieve a page, pick a DIFFERENT source URL rather than re-rendering the same dead page.
 
 CRITICAL RULES:
 - Call web_search ONE query at a time. Wait for results before searching again.

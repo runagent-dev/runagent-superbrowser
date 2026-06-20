@@ -47,6 +47,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agent-id", default=None, help="remote: Browser agent id (or set SUPERBROWSER_AGENT_ID)")
     parser.add_argument("--api-key", default=None, help="remote: RunAgent API key (or set RUNAGENT_API_KEY)")
     parser.add_argument("--base-url", default=None, help="remote: middleware base URL (or set RUNAGENT_BASE_URL)")
+    parser.add_argument(
+        "--local-agent-url",
+        default=None,
+        help=(
+            "local (Docker): URL of a `runagent serve` agent server, e.g. "
+            "http://localhost:8450 (or set SUPERBROWSER_LOCAL_AGENT_URL). No API key needed."
+        ),
+    )
     ns = parser.parse_args(argv)
 
     from .client import SuperBrowser
@@ -61,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_id=ns.agent_id,
         api_key=ns.api_key,
         base_url=ns.base_url,
+        local_agent_url=ns.local_agent_url,
     )
     try:
         res = sb.run(task, mode=ns.mode, url=ns.url, timeout=ns.timeout)

@@ -248,14 +248,30 @@ Then point `PUPPETEER_EXECUTABLE_PATH` at the binary:
 | macOS | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
 | Windows | `C:\Program Files\Google\Chrome\Application\chrome.exe` |
 
-### Or Docker
+### Or Docker (all-in-one agent server)
+
+One container runs the stealth browser engine **and** the agent orchestrator,
+exposed as a local RunAgent agent server on `:8450` — no Node/Python/venv on the
+host and no RunAgent account or key.
 
 ```bash
-docker compose up -d
+cp deploy/.env.example deploy/.env   # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+docker compose up -d                 # ready when :8450/api/v1/health is healthy
 ```
 
-The image bakes Chrome, Xvfb, Node, and Python in. Mount `~/.superbrowser/profiles/`
-and `~/.superbrowser/cookie-jar/` as volumes if you want state to survive restarts.
+Then from Python on the host (no API key):
+
+```python
+from runagent_superbrowser import SuperBrowser
+sb = SuperBrowser(remote=False, local_agent_url="http://localhost:8450")
+print(sb.run("what's the top story on Hacker News right now?").text)
+```
+
+The image bakes Node, Chromium, patchright's stealth Chromium, and the Python
+bridge. Compose persists `~/.superbrowser` (cookies/profiles) and `~/.nanobot`
+(orchestrator state) in named volumes across restarts. See
+[docs/sdk.md → Local agent server (Docker)](docs/sdk.md) for the full picture
+(in-process vs local-agent vs remote).
 
 ### Per-OS notes
 

@@ -1,19 +1,41 @@
+# All-in-one SuperBrowser agent server.
+#
+#   cp deploy/.env.example deploy/.env   # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+#   docker compose up -d                 # ready when :8450/api/v1/health is healthy
+#
+# Then from Python on the host (NO RunAgent key needed):
+#   from runagent_superbrowser import SuperBrowser
+#   sb = SuperBrowser(remote=False, local_agent_url="http://localhost:8450")
+#   print(sb.run("what's the top story on Hacker News?").text)
 services:
   superbrowser:
     build: .
+    image: runagent-superbrowser:all-in-one
     ports:
-      - "3100:3100"
-    volumes:
-      - ./downloads:/tmp/superbrowser/downloads
-      - ./nanobot/workspace:/app/nanobot/workspace
+      - "8450:8450"          # the agent server — the only port clients use
+      # - "3100:3100"        # uncomment only to debug the raw TS engine
+    env_file:
+      - deploy/.env          # LLM_MODEL + OPENAI_API_KEY / ANTHROPIC_API_KEY (+ optional features)
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
+      - SUPERBROWSER_URL=http://127.0.0.1:3100
       - PORT=3100
       - HEADLESS=true
-      - TOKEN=${TOKEN}
-      - SUPERBROWSER_TOKEN=${SUPERBROWSER_TOKEN}
+      # NOTE: the container never needs a RunAgent (rau_) key. That key matters
+      # only for the host SDK when remote=True (which bypasses this container).
+    volumes:
+      - sb-superbrowser:/home/app/.superbrowser   # per-user cookies / profiles
+      - sb-nanobot:/home/app/.nanobot             # orchestrator state
+      - ./downloads:/tmp/superbrowser/downloads   # downloaded files land on the host
     cap_add:
-      - SYS_ADMIN
+      - SYS_ADMIN            # Chromium's namespace sandbox (or use a seccomp profile)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8450/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s      # cold start: engine boot + chromium warmup + register
     restart: unless-stopped
+
+volumes:
+  sb-superbrowser:
+  sb-nanobot:

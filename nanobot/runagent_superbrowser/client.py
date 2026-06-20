@@ -40,6 +40,18 @@ from .result import RunResult
 from .server import ServerHandle, ServerStartError, ServerUnavailable
 
 _DEFAULT_URL = "http://localhost:3100"
+_DEFAULT_LOCAL_AGENT_PORT = 8450
+
+
+def _split_url(url: str) -> tuple[str, int]:
+    """Split a ``http://host:port`` URL into ``(host, port)``.
+
+    Defaults the port to 8450 (the ``runagent serve`` default) when absent.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url if "//" in url else f"//{url}", scheme="http")
+    return parsed.hostname or "localhost", parsed.port or _DEFAULT_LOCAL_AGENT_PORT
 
 
 def _load_project_dotenv() -> None:
@@ -81,6 +93,8 @@ class SuperBrowser:
         api_key: str | None = None,
         user_id: str | None = None,
         base_url: str | None = None,
+        local_agent_url: str | None = None,
+        local_agent_id: str | None = None,
     ) -> None:
         # Load .env FIRST so .env values are visible below and to the bridge.
         # Explicit kwargs still take precedence (they're `x or os.environ...`).
@@ -98,6 +112,22 @@ class SuperBrowser:
         self.user_id = user_id
         self.agent_id = agent_id or os.environ.get("SUPERBROWSER_AGENT_ID") or os.environ.get("RUNAGENT_AGENT_ID")
         self._remote_client = None
+
+        # Local-agent (Docker) mode: when NOT remote and a local agent server URL
+        # is set, execution is delegated to a `runagent serve` agent server (the
+        # all-in-one container) via RunAgentClient(local=True) — NO api key needed.
+        # When no local URL is set, remote=False keeps the in-process path
+        # (backward compatible). See _run_local_agent and docs/sdk.md.
+        self.local_agent_url = local_agent_url or os.environ.get("SUPERBROWSER_LOCAL_AGENT_URL")
+        self.local_agent = (not self.remote) and bool(self.local_agent_url)
+        # The container's agent_id is the all-zeros UUID from
+        # deploy/runagent.config.json; the user never has to type it.
+        self.local_agent_id = (
+            local_agent_id
+            or os.environ.get("SUPERBROWSER_LOCAL_AGENT_ID")
+            or "00000000-0000-0000-0000-000000000000"
+        )
+        self._local_client = None
 
         self.model = model
         self.auto_start_server = auto_start_server
@@ -146,6 +176,17 @@ class SuperBrowser:
                 "SuperBrowser.run() cannot be called from inside a running event "
                 "loop; await SuperBrowser.arun(...) instead."
             )
+        if self.local_agent:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return self._run_local_agent(
+                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                )
+            raise RuntimeError(
+                "SuperBrowser.run() cannot be called from inside a running event "
+                "loop; await SuperBrowser.arun(...) instead."
+            )
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -181,6 +222,14 @@ class SuperBrowser:
             return await loop.run_in_executor(
                 None,
                 lambda: self._run_remote(
+                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                ),
+            )
+        if self.local_agent:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: self._run_local_agent(
                     task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
                 ),
             )
@@ -333,6 +382,67 @@ class SuperBrowser:
                 base_url=self.base_url,
             )
         return self._remote_client
+
+    # ----- local-agent (Docker) execution -----
+
+    def _run_local_agent(
+        self,
+        task: str,
+        *,
+        mode: Mode = "auto",
+        url: str | None = None,
+        output_schema: Any | None = None,
+        timeout: float | None = None,
+    ) -> RunResult:
+        """Execute against a local ``runagent serve`` agent server (the all-in-one
+        Docker container) via ``RunAgentClient(local=True)``. No API key required.
+
+        Unlike remote mode, ``output_schema`` IS parsed locally here — we own both
+        ends of the round-trip and the engine returns the answer text.
+        """
+        client = self._local_runagent_client()
+        input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
+        if url is not None:
+            input_kwargs["url"] = url
+        try:
+            payload = client.run(**input_kwargs)
+        except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
+            return RunResult(
+                text="",
+                success=False,
+                task_id="",
+                mode=mode,
+                data=None,
+                error=f"{type(exc).__name__}: {exc}",
+                raw_content="",
+                classification=None,
+            )
+        result = self._result_from_remote(payload, mode)
+        if output_schema is not None and result.success and result.data is None:
+            result.data = parse_output(result.text, output_schema)
+        return result
+
+    def _local_runagent_client(self):
+        if self._local_client is None:
+            try:
+                from runagent import RunAgentClient
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "Local-agent mode needs the runagent SDK. Install it with "
+                    "`pip install 'runagent-superbrowser[remote]'` (or `pip install runagent`)."
+                ) from exc
+            host, port = _split_url(self.local_agent_url or "")
+            self._local_client = RunAgentClient(
+                agent_id=self.local_agent_id,  # all-zeros UUID — matches the server route
+                entrypoint_tag="run",
+                local=True,
+                host=host,
+                port=port,
+                user_id=self.user_id,
+                persistent_memory=self.persistent,
+                # NO api_key / base_url — a local agent server needs neither.
+            )
+        return self._local_client
 
     @staticmethod
     def _result_from_remote(payload: Any, mode: str) -> RunResult:

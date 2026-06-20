@@ -39,6 +39,7 @@ dependencies = [
     "pillow>=10",
     "loguru>=0.7",
     "lxml>=5.0",
+    "html2text>=2024.2.26",
     "openai>=1.40",
     "pydantic>=2.0",
     "aiohttp>=3.9",
@@ -49,8 +50,10 @@ dependencies = [
 # Vision-based slider/jigsaw/rotation puzzle solving uses OpenCV; imported
 # lazily inside the puzzle engines, so it's optional.
 puzzles = ["opencv-python>=4.8", "numpy>=1.24"]
-# Remote (serverless) execution reuses the runagent SDK's RunAgentClient.
-remote = ["runagent>=0.1"]
+# Remote (serverless) + local-agent (Docker) execution reuse the runagent SDK's
+# RunAgentClient. 0.1.40+ has `runagent serve`, `config --register-agent`, and
+# RunAgentClient(local=True, host=, port=) — all needed by the all-in-one image.
+remote = ["runagent>=0.1.40"]
 dev = ["pytest>=8", "ruff>=0.5", "build", "twine"]
 
 [project.scripts]
