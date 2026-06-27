@@ -350,6 +350,24 @@ When SuperBrowser hits a captcha it can't auto-solve, your phone buzzes with a l
 
 ## Configuration
 
+### LLM brain — one `.env`, every mode
+
+The agent's brain needs a model + provider key. Either run `nanobot onboard` once,
+**or** put it in `.env` — the SDK bridges `.env` into nanobot's config for you, and
+the **same keys work locally, in Docker, and on serverless**:
+
+```bash
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=sk-...        # or ANTHROPIC_API_KEY, or the LLM_PROVIDER/LLM_API_KEY contract
+```
+
+Precedence is "onboard wins, `.env` bootstraps": a `.env` only (re)writes nanobot's
+config when you set an explicit `LLM_*` var or haven't onboarded yet, so a stray
+exported key never clobbers a deliberate `nanobot onboard`. Details:
+[docs/sdk.md → Configuration & `.env`](docs/sdk.md#configuration--env).
+
+### Engine knobs
+
 Zero config required. The knobs that matter most:
 
 | Variable | What it does |

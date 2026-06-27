@@ -30,9 +30,9 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
 
-from ._capture import run_and_capture
+from ._capture import run_and_capture, stream_and_capture
 from ._runtime import build_orchestrator
 from .framing import frame_task, parse_output
 from .modes import Mode
@@ -71,6 +71,29 @@ def _load_project_dotenv() -> None:
     path = find_dotenv(usecwd=True)
     if path:
         load_dotenv(path)
+
+
+def _drive_async_gen(factory):
+    """Iterate an async generator from synchronous code on a private loop.
+
+    Used by :meth:`SuperBrowser.stream` for the in-process path. ``factory`` must
+    return a fresh async generator each call.
+    """
+    loop = asyncio.new_event_loop()
+    agen = None
+    try:
+        agen = factory()
+        while True:
+            try:
+                yield loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                break
+    finally:
+        try:
+            if agen is not None:
+                loop.run_until_complete(agen.aclose())
+        finally:
+            loop.close()
 
 
 class SuperBrowser:
@@ -112,6 +135,7 @@ class SuperBrowser:
         self.user_id = user_id
         self.agent_id = agent_id or os.environ.get("SUPERBROWSER_AGENT_ID") or os.environ.get("RUNAGENT_AGENT_ID")
         self._remote_client = None
+        self._remote_stream_client_obj = None
 
         # Local-agent (Docker) mode: when NOT remote and a local agent server URL
         # is set, execution is delegated to a `runagent serve` agent server (the
@@ -128,6 +152,7 @@ class SuperBrowser:
             or "00000000-0000-0000-0000-000000000000"
         )
         self._local_client = None
+        self._local_stream_client_obj = None
 
         self.model = model
         self.auto_start_server = auto_start_server
@@ -233,43 +258,13 @@ class SuperBrowser:
                     task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
                 ),
             )
-        classification = self._classify(task, url) if mode == "auto" else None
-
-        # Server lifecycle: browser mode requires the engine (raise if missing
-        # and auto-start is off). Auto mode only *pre-warms* it when the
-        # classifier leans browser AND auto-start is on — never hard-fails,
-        # since the agent may well choose fetch/search.
-        if mode == "browser":
-            await self._server.ensure(auto_start=self.auto_start_server)
-        elif (
-            mode == "auto"
-            and self.auto_start_server
-            and classification
-            and classification.get("approach") in ("browser", "hybrid")
-        ):
-            try:
-                await self._server.ensure(auto_start=True)
-            except (ServerUnavailable, ServerStartError):
-                pass
-
-        orch = build_orchestrator(
-            mode=mode, task=task, model=self.model, provision_force=self.provision_force
-        )
-
-        directive = orch.directive
-        if not enable_human_handoff:
-            note = (
-                "Unattended run: when delegating to the browser, pass "
-                "enable_human_handoff=False — no human is available to solve captchas."
-            )
-            directive = f"{directive}\n\n{note}" if directive else note
-
-        framed = frame_task(
+        orch, framed, classification = await self._build_inprocess(
             task,
-            mode_directive=directive,
+            mode=mode,
             url=url,
             output_schema=output_schema,
-            force_browser=force_browser or mode == "browser",
+            force_browser=force_browser,
+            enable_human_handoff=enable_human_handoff,
         )
 
         text, raw, error, success = "", "", None, False
@@ -301,6 +296,233 @@ class SuperBrowser:
             raw_content=raw,
             classification=classification,
         )
+
+    # ----- streaming (progress / step events) -----
+
+    async def _build_inprocess(
+        self,
+        task: str,
+        *,
+        mode: Mode,
+        url: str | None,
+        output_schema: Any | None,
+        force_browser: bool,
+        enable_human_handoff: bool,
+    ):
+        """Classify, ensure the engine when needed, build the orchestrator, and
+        frame the task. Shared by :meth:`arun` and :meth:`astream` in-process."""
+        classification = self._classify(task, url) if mode == "auto" else None
+
+        # Server lifecycle: browser mode requires the engine (raise if missing
+        # and auto-start is off). Auto mode only *pre-warms* it when the
+        # classifier leans browser AND auto-start is on — never hard-fails,
+        # since the agent may well choose fetch/search.
+        if mode == "browser":
+            await self._server.ensure(auto_start=self.auto_start_server)
+        elif (
+            mode == "auto"
+            and self.auto_start_server
+            and classification
+            and classification.get("approach") in ("browser", "hybrid")
+        ):
+            try:
+                await self._server.ensure(auto_start=True)
+            except (ServerUnavailable, ServerStartError):
+                pass
+
+        orch = build_orchestrator(
+            mode=mode, task=task, model=self.model, provision_force=self.provision_force
+        )
+        directive = orch.directive
+        if not enable_human_handoff:
+            note = (
+                "Unattended run: when delegating to the browser, pass "
+                "enable_human_handoff=False — no human is available to solve captchas."
+            )
+            directive = f"{directive}\n\n{note}" if directive else note
+        framed = frame_task(
+            task,
+            mode_directive=directive,
+            url=url,
+            output_schema=output_schema,
+            force_browser=force_browser or mode == "browser",
+        )
+        return orch, framed, classification
+
+    async def astream(
+        self,
+        task: str,
+        *,
+        mode: Mode = "auto",
+        url: str | None = None,
+        output_schema: Any | None = None,
+        force_browser: bool = False,
+        enable_human_handoff: bool = True,
+        timeout: float | None = None,
+    ) -> AsyncIterator[dict]:
+        """Stream a task as step-level events, ending with a ``result`` event.
+
+        Each yielded item is a JSON-serializable dict with a ``type``:
+        ``classification`` / ``status`` / ``thinking`` / ``tool`` / ``tool_hint``
+        / ``message`` for progress, then a final ``{"type": "result", ...}``
+        mirroring :class:`RunResult`. Works in remote, local-agent, and
+        in-process modes.
+        """
+        if self.remote:
+            async for ev in self._astream_via_client(self._remote_stream_client, task, mode, url):
+                yield ev
+            return
+        if self.local_agent:
+            async for ev in self._astream_via_client(self._local_stream_client, task, mode, url):
+                yield ev
+            return
+
+        orch, framed, classification = await self._build_inprocess(
+            task,
+            mode=mode,
+            url=url,
+            output_schema=output_schema,
+            force_browser=force_browser,
+            enable_human_handoff=enable_human_handoff,
+        )
+        if classification is not None:
+            yield {"type": "classification", "classification": classification}
+
+        final: dict | None = None
+        try:
+            async for ev in stream_and_capture(
+                orch.bot, framed, orch.session_key, hooks=[orch.hook], timeout=timeout
+            ):
+                if ev.get("type") == "result":
+                    final = ev
+                else:
+                    yield ev
+        finally:
+            try:
+                orch.memory.write_task_summary(success=bool(final and final.get("success")))
+            except Exception:  # noqa: BLE001 - best-effort summary
+                pass
+
+        final = final or {
+            "type": "result", "text": "", "raw_content": "",
+            "success": False, "error": "the agent returned no answer",
+        }
+        text = final.get("text", "") or ""
+        success = bool(final.get("success"))
+        data = parse_output(text, output_schema) if (success and output_schema is not None) else None
+        yield {
+            "type": "result",
+            "text": text,
+            "success": success,
+            "task_id": orch.task_id,
+            "mode": mode,
+            "data": data,
+            "error": final.get("error"),
+            "raw_content": final.get("raw_content", text),
+            "classification": classification,
+        }
+
+    def stream(
+        self,
+        task: str,
+        *,
+        mode: Mode = "auto",
+        url: str | None = None,
+        output_schema: Any | None = None,
+        force_browser: bool = False,
+        enable_human_handoff: bool = True,
+        timeout: float | None = None,
+    ) -> Iterator[dict]:
+        """Synchronous streaming. Raises if called from a running event loop —
+        use :meth:`astream` there. Yields the same events as :meth:`astream`."""
+        # Remote / local-agent: iterate the runagent client's sync stream directly.
+        if self.remote or self.local_agent:
+            client = (self._remote_stream_client() if self.remote
+                      else self._local_stream_client())
+            input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
+            if url is not None:
+                input_kwargs["url"] = url
+            yield from client.run_stream(**input_kwargs)
+            return
+        # In-process: drive the async generator from a sync caller.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            yield from _drive_async_gen(
+                lambda: self.astream(
+                    task, mode=mode, url=url, output_schema=output_schema,
+                    force_browser=force_browser,
+                    enable_human_handoff=enable_human_handoff, timeout=timeout,
+                )
+            )
+            return
+        raise RuntimeError(
+            "SuperBrowser.stream() cannot be called from inside a running event "
+            "loop; use `async for ev in SuperBrowser.astream(...)` instead."
+        )
+
+    async def _astream_via_client(self, client_factory, task: str, mode: str, url: str | None):
+        """Bridge a runagent ``RunAgentClient`` sync streaming generator to async
+        by stepping it in the default executor (the socket I/O is blocking)."""
+        client = client_factory()
+        input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
+        if url is not None:
+            input_kwargs["url"] = url
+        loop = asyncio.get_running_loop()
+        done = object()
+        iterator = await loop.run_in_executor(None, lambda: client.run_stream(**input_kwargs))
+        while True:
+            chunk = await loop.run_in_executor(None, lambda: next(iterator, done))
+            if chunk is done:
+                break
+            yield chunk
+
+    def _remote_stream_client(self):
+        if self._remote_stream_client_obj is None:
+            if not self.agent_id:
+                raise ValueError(
+                    "Remote mode requires an agent_id. Pass agent_id=... or set "
+                    "SUPERBROWSER_AGENT_ID — find it on your Browser agent's page "
+                    "in the RunAgent dashboard."
+                )
+            try:
+                from runagent import RunAgentClient
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "Remote mode needs the runagent SDK. Install it with "
+                    "`pip install 'runagent-superbrowser[remote]'` (or `pip install runagent`)."
+                ) from exc
+            self._remote_stream_client_obj = RunAgentClient(
+                agent_id=self.agent_id,
+                entrypoint_tag="run_stream",
+                local=False,
+                user_id=self.user_id,
+                persistent_memory=self.persistent,
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+        return self._remote_stream_client_obj
+
+    def _local_stream_client(self):
+        if self._local_stream_client_obj is None:
+            try:
+                from runagent import RunAgentClient
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "Local-agent mode needs the runagent SDK. Install it with "
+                    "`pip install 'runagent-superbrowser[remote]'` (or `pip install runagent`)."
+                ) from exc
+            host, port = _split_url(self.local_agent_url or "")
+            self._local_stream_client_obj = RunAgentClient(
+                agent_id=self.local_agent_id,
+                entrypoint_tag="run_stream",
+                local=True,
+                host=host,
+                port=port,
+                user_id=self.user_id,
+                persistent_memory=self.persistent,
+            )
+        return self._local_stream_client_obj
 
     # ----- lifecycle -----
 

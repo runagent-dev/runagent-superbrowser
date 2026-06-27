@@ -258,26 +258,72 @@ SuperBrowser(
 
 `run()` / `arun()` accept: `mode`, `url`, `output_schema`, `force_browser`,
 `enable_human_handoff` (default `True`; set `False` for unattended runs so a
-failed captcha doesn't wait on a human), and `timeout` (seconds).
+failed captcha doesn't wait on a human), and `timeout` (seconds). `run()`/`arun()`
+return a [`RunResult`](#the-result-object); `stream()`/`astream()` take the same
+arguments and instead yield step events (`classification` / `status` / `thinking`
+/ `tool` / `message`) ending with a final `{"type": "result", ...}`.
 
 ## Configuration & `.env`
 
-`SuperBrowser()` loads a `.env` file on construction (walking up from the
-current directory), so anything you'd otherwise `export` works from `.env`:
+`SuperBrowser()` loads a `.env` file on construction (walking up from the current
+directory), so anything you'd otherwise `export` works from `.env`. **One `.env`
+configures the LLM brain in all three run modes** — local in-process, the Docker
+all-in-one, and remote serverless:
 
 ```bash
-LLM_MODEL=openai/gpt-4o
+# The brain LLM (required). Set a model + one provider key…
+LLM_MODEL=gpt-4o
 OPENAI_API_KEY=sk-...
+# …or use the explicit provider contract (custom / OpenAI-compatible endpoints):
+# LLM_PROVIDER=anthropic
+# LLM_API_KEY=sk-ant-...
+# LLM_BASE_URL=https://...
+
 VISION_API_KEY=...                 # cheap vision model for screenshots (browser mode)
 SUPERBROWSER_URL=http://localhost:3100
 ```
 
-Precedence, highest first: **explicit constructor argument → shell env var →
-`.env` → built-in default**. So `SuperBrowser(server_url=…)` beats a shell
-`SUPERBROWSER_URL`, which beats `.env`. Model selection comes from
-`~/.nanobot/config.json` (`nanobot onboard`); your provider key can live in
-`.env` and nanobot resolves it. Server, vision, captcha, and stealth knobs are
-all plain env vars — see [`.env.example`](../.env.example).
+### How the LLM brain is configured
+
+nanobot reads its model + provider key **only** from `~/.nanobot/config.json`. The
+SDK bridges your env into that file so you never hand-edit it:
+
+- **Local (in-process):** the SDK writes `~/.nanobot/config.json` from your env on
+  first run — but **"onboard wins, `.env` bootstraps"**: it writes only when an
+  explicit `LLM_*` signal is set (`LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` /
+  `LLM_BASE_URL`) **or** there's no usable config yet. A previous `nanobot onboard`
+  is never silently overwritten by a stray exported `OPENAI_API_KEY` — set an
+  explicit `LLM_*` to override it on purpose.
+- **Docker / serverless:** the container/VM is fresh, so the same env is written to
+  `~/.nanobot/config.json` unconditionally at startup. For serverless,
+  `runagent deploy` uploads `deploy/.env` and the engine writes it to `/root/.env`
+  in the VM (the `.env` *file* is gitignored — its **values** travel as the agent's
+  config, not the file).
+
+Net: run `nanobot onboard` once, **or** put `LLM_MODEL` + a provider key in `.env`
+— either works, identically, locally and deployed.
+
+### Precedence and the full reference
+
+Precedence for non-LLM SDK settings, highest first: **explicit constructor
+argument → shell env var → `.env` → built-in default** (so `SuperBrowser(server_url=…)`
+beats a shell `SUPERBROWSER_URL`, which beats `.env`).
+
+| Variable | Purpose |
+|---|---|
+| `LLM_MODEL`, `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | brain model + provider key (simplest form) |
+| `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL` | explicit provider contract (custom endpoints); overrides onboard locally |
+| `VISION_ENABLED`, `VISION_MODEL`, `VISION_PROVIDER`, `VISION_API_KEY`, `VISION_BASE_URL` | cheap screenshot vision model (keep its key separate from the brain) |
+| `SUPERBROWSER_URL` | TS engine URL (default `http://localhost:3100`) |
+| `SUPERBROWSER_WORKSPACE_ROOT` | base dir for provisioned SOUL workspaces |
+| `SUPERBROWSER_REMOTE`, `SUPERBROWSER_AGENT_ID`, `RUNAGENT_API_KEY`, `RUNAGENT_BASE_URL` | remote (serverless) mode |
+| `SUPERBROWSER_LOCAL_AGENT_URL` | local-agent (Docker) mode |
+| `CAPTCHA_PROVIDER` + `CAPTCHA_API_KEY` | Turnstile / captcha auto-solve |
+| `PROXY_POOL`, `PROXY_POOL_RESIDENTIAL` | datacenter / residential proxy pools |
+| `FIREWALL_ALLOW_LIST`, `FIREWALL_DENY_LIST`, `HANDOFF_WEBHOOK_URL` | URL firewall + human-handoff webhook |
+
+Full reference: [`.env.example`](../.env.example) (SDK + engine) and
+[`deploy/.env.example`](../deploy/.env.example) (deploy secrets).
 
 ## How the prompting ships
 

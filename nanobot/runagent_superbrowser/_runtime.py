@@ -85,6 +85,15 @@ def build_orchestrator(
     from superbrowser_bridge.orchestrator_tools import register_orchestrator_tools
     from superbrowser_bridge.workspaces import provision, workspace_for
 
+    from ._nanobot_config import bootstrap_nanobot_config
+
+    # Make the local in-process path match remote/Docker: bridge an LLM choice in
+    # .env / the shell into ~/.nanobot/config.json before nanobot is constructed.
+    # "Onboard wins, .env bootstraps" — only writes when an explicit LLM_* signal
+    # is set or no usable config exists yet (see bootstrap_nanobot_config). .env
+    # was already loaded into os.environ by SuperBrowser.__init__.
+    bootstrap_nanobot_config()
+
     provision(force=provision_force)
 
     bot = _bot_from_config(str(workspace_for("orchestrator")), model)
