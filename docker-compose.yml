@@ -12,8 +12,9 @@ services:
     build: .
     image: runagent-superbrowser:all-in-one
     ports:
-      - "8450:8450"          # the agent server — the only port clients use
-      # - "3100:3100"        # uncomment only to debug the raw TS engine
+      - "8450:8450"               # the agent server — the only port clients use
+      - "127.0.0.1:3100:3100"     # live browser viewer (TS engine) — host-only
+      - "127.0.0.1:3101:3101"     # T3 (patchright) viewer — host-only, tier-3 runs
     env_file:
       - deploy/.env          # LLM_MODEL + OPENAI_API_KEY / ANTHROPIC_API_KEY (+ optional features)
     environment:

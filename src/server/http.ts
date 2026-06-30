@@ -19,7 +19,7 @@ import { BrowserError } from '../browser/errors.js';
 import { detectCaptcha, solveWithExternalApi, waitForCaptchaSolution, screenshotCaptchaArea, solveCaptchaFull } from '../browser/captcha.js';
 import { captchaWatchdog } from '../browser/captcha-watchdog.js';
 import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
-import { tokenAuth, validateUrl, isValidSessionId, RateLimiter } from './auth.js';
+import { tokenAuth, validateUrl, isValidSessionId, RateLimiter, isLoopbackRequest } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { runScrollProbe, capturePreScrollBboxes } from '../browser/scroll-probe.js';
 import { selectOptionByLabel, selectOptionByVisionBbox, selectOptionInIframe } from '../browser/elements.js';
@@ -342,9 +342,10 @@ export function createHttpServer(
   // --- Function execution (run puppeteer code — requires TOKEN auth) ---
 
   app.post('/function', async (req, res) => {
-    // Double-check auth — this endpoint is dangerous
-    if (!process.env.TOKEN) {
-      res.status(403).json({ error: '/function endpoint requires TOKEN to be set for security' });
+    // Double-check auth — this endpoint is dangerous. Loopback (same-host) callers are
+    // trusted even without TOKEN, matching the tokenAuth loopback bypass.
+    if (!process.env.TOKEN && !isLoopbackRequest(req)) {
+      res.status(403).json({ error: '/function endpoint requires TOKEN to be set (or a loopback caller) for security' });
       return;
     }
 
@@ -2160,9 +2161,10 @@ export function createHttpServer(
 
   /** Execute a Puppeteer script with full page API access in a session. */
   app.post('/session/:id/script', async (req, res) => {
-    // Require TOKEN — this runs arbitrary Node.js code
-    if (!process.env.TOKEN) {
-      res.status(403).json({ error: '/session/:id/script requires TOKEN to be set for security' });
+    // Require TOKEN — this runs arbitrary Node.js code. Loopback (same-host) callers are
+    // trusted even without TOKEN, matching the tokenAuth loopback bypass.
+    if (!process.env.TOKEN && !isLoopbackRequest(req)) {
+      res.status(403).json({ error: '/session/:id/script requires TOKEN to be set (or a loopback caller) for security' });
       return;
     }
 

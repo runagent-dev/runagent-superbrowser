@@ -8,6 +8,22 @@
 import type { Request, Response, NextFunction } from 'express';
 
 /**
+ * True when the request originates from the local host (same-machine / in-container).
+ * Used to treat loopback callers as trusted — the nanobot bridge talks to the engine
+ * over 127.0.0.1, and the local live-viewer UI loads from the same host. Mirrors the
+ * IP check in `RateLimiter.isLoopback`.
+ */
+export function isLoopbackRequest(req: Request): boolean {
+  const ip = req.ip || req.socket.remoteAddress || '';
+  return (
+    ip === '127.0.0.1' ||
+    ip === '::1' ||
+    ip === '::ffff:127.0.0.1' ||
+    ip.startsWith('127.')
+  );
+}
+
+/**
  * Bearer token authentication middleware.
  * If TOKEN env var is set, all requests must include it.
  * If TOKEN is not set, auth is disabled (development mode).
@@ -25,17 +41,9 @@ export function tokenAuth(req: Request, res: Response, next: NextFunction): void
     return;
   }
 
-  if (process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false') {
-    const ip = req.ip || req.socket.remoteAddress || '';
-    if (
-      ip === '127.0.0.1' ||
-      ip === '::1' ||
-      ip === '::ffff:127.0.0.1' ||
-      ip.startsWith('127.')
-    ) {
-      next();
-      return;
-    }
+  if (process.env.TOKEN_AUTH_LOOPBACK_BYPASS !== 'false' && isLoopbackRequest(req)) {
+    next();
+    return;
   }
 
   const authHeader = req.headers.authorization;
