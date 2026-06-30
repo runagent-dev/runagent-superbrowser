@@ -336,11 +336,13 @@ class DelegateBrowserTaskTool(Tool):
                         f"\n## Pre-validation Notice\n"
                         f"Probe of {url} returned a thin/JS-heavy body "
                         f"(protection={protection}, status={probe.get('status', 0)}, "
-                        f"reason={reason_bits}). This is most likely a normal "
-                        f"JS-rendered site, NOT a WAF block. Use "
+                        f"reason={reason_bits}). This is often a normal "
+                        f"JS-rendered site rather than a hard WAF block, so use "
                         f"`browser_open(tier=\"auto\")` and let the runtime "
-                        f"decide; do NOT force tier=\"t3\" or pre-emptively "
-                        f"call browser_solve_captcha based on this notice."
+                        f"decide; do NOT pre-emptively force tier=\"t3\" or call "
+                        f"browser_solve_captcha based on this notice. If the page "
+                        f"actually renders blank (a stealth bot block), "
+                        f"tier=\"auto\" auto-escalates to T3 on its own."
                     )
 
         # --- Classifier gate (Layer 2) ---------------------------------

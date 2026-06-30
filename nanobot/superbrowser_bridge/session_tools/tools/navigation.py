@@ -146,6 +146,33 @@ class BrowserOpenTool(Tool):
         r.raise_for_status()
         return r.json()
 
+    async def _page_looks_blank(self, session_id: str) -> bool:
+        """True when a freshly opened page rendered effectively no visible
+        text — the signature of a stealthy HTTP-200 anti-bot block (the page
+        "loads" with status 200 but the body is blank for detected
+        automation, e.g. StubHub). Reads the page markdown (the same endpoint
+        browser_get_markdown uses) and compares the stripped length against a
+        small threshold. A legitimate page — including a JS-hydrated SPA,
+        since browser_open already settles the DOM — renders far more than
+        this. Any error/ambiguity returns False so escalation never fires on
+        a false signal.
+        """
+        if not session_id:
+            return False
+        BLANK_PAGE_TEXT_THRESHOLD = 80  # chars of visible text
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
+                timeout=15.0,
+            )
+            if r.status_code != 200:
+                return False
+            content = (r.json() or {}).get("content", "") or ""
+            return len(content.strip()) < BLANK_PAGE_TEXT_THRESHOLD
+        except Exception:
+            return False
+
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, tier: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
 
@@ -344,6 +371,61 @@ class BrowserOpenTool(Tool):
             )
             if isinstance(data, str):
                 return data
+
+        # --- T1 → T3 escalation on a BLANK rendered page (HTTP-200 bot block) -
+        # Hardened sites (e.g. StubHub) can return HTTP 200 while serving a
+        # blank / near-empty body to detected automation. No 4xx/5xx fires, so
+        # the network-block path above misses it and the worker is left on a
+        # white page it can never act on — and it cannot re-open (the
+        # "browser_open at most once" rule). Detect "rendered blank despite
+        # 200" and escalate to T3, mirroring the network-block path. A real
+        # browser renders text for legitimate content (including JS-hydrated
+        # SPAs, since the open already settles), so a near-empty render after a
+        # clean 200 is a reliable block signal.
+        if (
+            allow_escalation
+            and url
+            and chosen_tier == "t1"
+            and isinstance(data, dict)
+            and (status_code is None or status_code == 200)
+            and await self._page_looks_blank(data.get("sessionId", ""))
+        ):
+            print(
+                "  [T1→T3 auto-escalation] HTTP 200 but page rendered blank on "
+                "T1 (stealth bot block); retrying with patchright (T3)..."
+            )
+            # Clean up the blank T1 session.
+            t1_sid = (data or {}).get("sessionId", "")
+            if t1_sid:
+                try:
+                    await _request_with_backoff(
+                        "DELETE",
+                        f"{SUPERBROWSER_URL}/session/{t1_sid}",
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            # Record the T1 block so a learning-enabled run starts on T3 next
+            # time (mirrors the 4xx/5xx escalation bookkeeping).
+            try:
+                from urllib.parse import urlparse as _up
+                from superbrowser_bridge.routing import _record_routing_outcome
+                host = (_up(url or "").hostname or "").lower()
+                if host:
+                    _record_routing_outcome(
+                        host, approach="browser", success=False,
+                        tier=1, block_class="antibot_empty",
+                    )
+            except Exception:
+                pass
+            chosen_tier = "t3"
+            data = await self._open_session_on_tier(
+                "t3", url=url, region=region, proxy=proxy,
+                max_stealth=True,
+            )
+            if isinstance(data, str):
+                return data
+            status_code = data.get("statusCode") if isinstance(data, dict) else None
 
         actual_url = data.get("url", url or "")
         self.s.session_id = data.get("sessionId", "")
