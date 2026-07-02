@@ -20,9 +20,28 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
+from ..effects import WorkerMustExitError
 from ..formatting import _fetch_elements
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
+
+
+def _consec_script_abort_threshold() -> int:
+    """Consecutive browser_eval / browser_run_script calls (no intervening
+    cursor success) after which the worker is HARD-aborted.
+
+    ``_maybe_script_usage_warning`` only *warns* at 2+; a weak model can ignore
+    the advisory and loop on read-only scripts until the wall-clock timeout,
+    draining the entire token/iteration budget for a guaranteed failure (seen in
+    the model-split eval: 86 iterations / ~2.9M tokens, then a 900s timeout).
+    This bounds that runaway so a stuck run fails fast and cheap. Deliberately
+    high so normal inspect-a-few-things use never trips it. 0 disables.
+    Env: ``SUPERBROWSER_MAX_CONSEC_SCRIPTS`` (default 16).
+    """
+    try:
+        return max(0, int(os.environ.get("SUPERBROWSER_MAX_CONSEC_SCRIPTS", "16")))
+    except (TypeError, ValueError):
+        return 16
 
 
 @tool_parameters(
@@ -56,6 +75,19 @@ class BrowserEvalTool(Tool):
             ) + 1
         except Exception:
             self.s.consecutive_script_calls = 1
+        # Safety valve: hard-abort a pathological read-only-script loop before it
+        # drains the whole budget against the wall-clock timeout. Bubbles via
+        # WorkerMustExitError → delegation.py returns a clean failure (and
+        # re-delegation is itself capped). Env-tunable; 0 disables.
+        _consec_abort = _consec_script_abort_threshold()
+        if _consec_abort and int(self.s.consecutive_script_calls or 0) >= _consec_abort:
+            raise WorkerMustExitError(
+                f"{self.s.consecutive_script_calls} consecutive browser_eval / "
+                f"browser_run_script calls with no cursor progress — the worker "
+                f"is looping on scripts instead of acting on the page. Aborting "
+                f"to stop an unbounded token drain against the wall-clock timeout "
+                f"(tune/disable via SUPERBROWSER_MAX_CONSEC_SCRIPTS)."
+            )
         print(f"\n>> browser_eval({script[:60]}...)")
         r = await _request_with_backoff(
             "POST",
@@ -245,6 +277,19 @@ class BrowserRunScriptTool(Tool):
             ) + 1
         except Exception:
             self.s.consecutive_script_calls = 1
+        # Safety valve: hard-abort a pathological read-only-script loop before it
+        # drains the whole budget against the wall-clock timeout. Bubbles via
+        # WorkerMustExitError → delegation.py returns a clean failure (and
+        # re-delegation is itself capped). Env-tunable; 0 disables.
+        _consec_abort = _consec_script_abort_threshold()
+        if _consec_abort and int(self.s.consecutive_script_calls or 0) >= _consec_abort:
+            raise WorkerMustExitError(
+                f"{self.s.consecutive_script_calls} consecutive browser_eval / "
+                f"browser_run_script calls with no cursor progress — the worker "
+                f"is looping on scripts instead of acting on the page. Aborting "
+                f"to stop an unbounded token drain against the wall-clock timeout "
+                f"(tune/disable via SUPERBROWSER_MAX_CONSEC_SCRIPTS)."
+            )
         payload: dict[str, Any] = {"code": script, "mutates": bool(mutates)}
         if context:
             payload["context"] = context

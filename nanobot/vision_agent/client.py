@@ -313,6 +313,22 @@ class VisionAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 return None, "", f"provider error: {exc}"
+            # Account this vision round-trip's tokens to the active task. Fires
+            # on every attempt (first pass, compact retry, fallback) and even on
+            # a subsequent parse failure — the tokens were already spent. The
+            # function-level import avoids a vision_agent -> superbrowser_bridge
+            # cycle and no-ops when the bridge isn't present.
+            try:
+                from superbrowser_bridge.usage import record_vision
+
+                record_vision(
+                    raw_.tokens_used,
+                    prompt_tokens=getattr(raw_, "prompt_tokens", None),
+                    completion_tokens=getattr(raw_, "completion_tokens", None),
+                    model=getattr(provider, "model", ""),
+                )
+            except Exception:  # noqa: BLE001 - accounting must never break vision
+                pass
             parsed_, err_ = _parse_response_with_error(raw_.text)
             if parsed_ is None:
                 return None, raw_.text, f"parse: {err_}"

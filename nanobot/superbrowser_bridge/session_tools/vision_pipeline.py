@@ -233,7 +233,14 @@ def _enrich_bboxes_with_dom_metadata(
                 or adis
             )
             active_signals = []
-            for k in ("aria-checked", "aria-pressed", "aria-selected"):
+            # Native <input type=checkbox|radio> and <option> advertise their
+            # state via the .checked/.selected DOM property (surfaced as
+            # 'checked'/'selected' by the TS DOM scan) — NOT aria-*. Include
+            # both families so is_active is correct for native controls, not
+            # only ARIA widgets. Without this a site-preselected native
+            # checkbox reads is_active=false and the brain can't tell it's ON.
+            for k in ("aria-checked", "aria-pressed", "aria-selected",
+                      "checked", "selected"):
                 v = (attrs.get(k) or "").lower()
                 if v == "true":
                     active_signals.append(k)
@@ -809,6 +816,328 @@ def _apply_compound_row_split(
     return added
 
 
+# --- Stateful form-control injection (v6) -----------------------------------
+#
+# The vision model routinely OMITS pre-checked checkboxes/radios/switches from
+# its bbox list — they visually "blend in", so the brain gets no V_n to
+# un-check a site-preselected default (opt-in insurance, add-ons, marketing).
+# The DOM scan, however, knows every such control's exact bounds AND live
+# checked/selected state (via selectorEntries). We use it as a deterministic
+# safety net — the same pattern as `_apply_compound_row_split`.
+_STATEFUL_INPUT_TYPES = frozenset({"checkbox", "radio"})
+_STATEFUL_ROLES = frozenset({
+    "checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio",
+})
+
+
+def _control_kind(entry: dict) -> str | None:
+    """Classify a selectorEntry as a stateful form control.
+
+    Returns the canonical BBox role ('checkbox' | 'radio' | 'switch') when the
+    entry is a checkbox / radio / switch / selectable-option, else None.
+    """
+    if not isinstance(entry, dict):
+        return None
+    tag = (entry.get("tagName") or "").lower()
+    attrs = entry.get("attributes") or {}
+    role = (attrs.get("role") or "").lower()
+    if tag == "input":
+        itype = (attrs.get("type") or "").lower()
+        if itype == "radio":
+            return "radio"
+        if itype == "checkbox":
+            return "checkbox"
+        # A type-less <input> defaults to text — not stateful.
+    if role in ("radio", "menuitemradio"):
+        return "radio"
+    if role == "switch":
+        return "switch"
+    if role in ("checkbox", "menuitemcheckbox"):
+        return "checkbox"
+    if tag == "option":
+        # Only the pre-SELECTED option is worth surfacing (the default the
+        # user may want to change); unselected options are vision's job.
+        return "checkbox"
+    return None
+
+
+def _entry_is_active(attrs: dict) -> bool:
+    """True when the control's DOM state says it's ON / checked / selected."""
+    if not isinstance(attrs, dict):
+        return False
+    for k in ("checked", "selected", "aria-checked", "aria-pressed",
+              "aria-selected"):
+        if (attrs.get(k) or "").lower() == "true":
+            return True
+    ac = (attrs.get("aria-current") or "").lower()
+    return bool(ac and ac != "false")
+
+
+def _resolve_control_label(
+    entry: dict,
+    selector_entries: list[dict],
+    fallback: str,
+) -> str:
+    """Best-effort human label for a bare form control.
+
+    Native checkboxes usually have empty text and no aria-label — the visible
+    label is a sibling ``<label for=id>``. Resolve in order: own text →
+    aria-label → the ``<label>`` entry whose ``for`` matches this entry's
+    ``id`` → a discriminating attribute (name/title/placeholder/value) → the
+    control kind disambiguated by DOM index. The last two steps stop two
+    same-kind controls from collapsing to an identical bare ``"checkbox"``
+    label, which confused the brain (wrong pick) and the label-keyed
+    toggle/misclick detectors (spurious flips → re-click loops).
+    """
+    text = (entry.get("text") or "").strip()
+    if text:
+        return text[:120]
+    attrs = entry.get("attributes") or {}
+    al = (attrs.get("aria-label") or "").strip()
+    if al:
+        return al[:120]
+    my_id = (attrs.get("id") or "").strip()
+    if my_id:
+        for other in selector_entries:
+            if (other.get("tagName") or "").lower() != "label":
+                continue
+            oattrs = other.get("attributes") or {}
+            if (oattrs.get("for") or "").strip() == my_id:
+                lt = (other.get("text") or "").strip()
+                if lt:
+                    return lt[:120]
+    # Secondary attribute sources — more discriminating than a bare kind.
+    for k in ("name", "title", "placeholder", "value"):
+        av = (attrs.get(k) or "").strip()
+        if av:
+            return f"{fallback} {av}"[:120]
+    # Last resort: disambiguate by DOM index so bare identical controls stay
+    # individually addressable (e.g. "checkbox #7" vs "checkbox #12").
+    idx = entry.get("index")
+    if isinstance(idx, int):
+        return f"{fallback} #{idx}"
+    return fallback
+
+
+def _stateful_control_max() -> int:
+    """Per-step cap on NEWLY injected stateful-control bboxes (env-tunable).
+
+    A control-dense filter/booking page can carry dozens of checkboxes; without
+    a cap every one becomes an extra ``[V_n]`` line the brain reads each step,
+    growing the observation and crowding genuine targets out of the render cap.
+    Refresh-in-place of already-present boxes is NOT capped (it doesn't grow the
+    list). 0 disables new injection entirely.
+    """
+    try:
+        return max(0, int(os.environ.get("BBOX_STATEFUL_CONTROL_MAX", "24")))
+    except (TypeError, ValueError):
+        return 24
+
+
+def _task_keywords(task_instruction: str | None) -> frozenset[str]:
+    """Content words from the task, for ranking injected controls by relevance."""
+    if not task_instruction:
+        return frozenset()
+    toks = re.findall(r"[a-z0-9]{3,}", task_instruction.lower())
+    return frozenset(t for t in toks if t not in _COMPOUND_TASK_STOPWORDS)
+
+
+def _label_task_relevance(label: str, task_kw: frozenset[str]) -> int:
+    """Count task keywords present in a control's label (higher = keep first)."""
+    if not task_kw or not label:
+        return 0
+    ll = label.lower()
+    return sum(1 for kw in task_kw if kw in ll)
+
+
+def _inject_stateful_control_bboxes(
+    resp: Any,
+    selector_entries: list[dict] | None,
+    image_w: int,
+    image_h: int,
+    dpr: float,
+    task_instruction: str | None,
+) -> int:
+    """Guarantee every stateful form control has a clickable bbox with a
+    correct ``is_active`` — inject one when vision omitted it, refresh state
+    in place when vision already emitted it.
+
+    Mutates ``resp.bboxes`` in place. Returns the count of bboxes injected +
+    refreshed.
+
+    inject-OR-refresh (idempotent across vision-cache reuse): a pure
+    ``.checked`` flip does NOT change ``dom_hash``, so the cached
+    ``VisionResponse`` object is reused after a toggle. Refreshing
+    ``is_active`` in place on the already-present bbox is what surfaces the
+    flip to the brain without paying a fresh Gemini pass; the IoU de-dup below
+    means repeated calls never append a duplicate.
+
+    De-dup uses a HIGH IoU threshold (0.5), not center-containment: a WIDE
+    "☐ Add insurance $9.99" row *contains* the tiny input's centre but has low
+    IoU with it, so we still inject the tight, state-bearing box for it.
+
+    Run AFTER ``_enrich_bboxes_with_dom_metadata`` (so its greedy bbox↔entry
+    IoU matching isn't perturbed) and BEFORE ``_apply_just_toggled_marker`` /
+    ``_detect_misclick_flip`` (so those detectors see injected boxes).
+
+    Safe no-op when: env flag disabled, no bboxes container, no selector
+    entries, no usable image dims, or the BBox schema can't be imported.
+    """
+    if os.environ.get("BBOX_STATEFUL_CONTROL_INJECT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or getattr(resp, "bboxes", None) is None:
+        return 0
+    if not selector_entries:
+        return 0
+    if image_w <= 0 or image_h <= 0:
+        return 0
+    try:
+        from vision_agent.schemas import BBox  # type: ignore[import-not-found]
+    except ImportError:
+        return 0
+
+    dpr_eff = dpr if dpr and dpr > 0 else 1.0
+
+    # Existing bbox pixel rects. Recomputed each call because resp.bboxes may
+    # have grown via compound-split / a prior injection on a reused cached
+    # response object.
+    existing_rects: list[tuple[int, int, int, int] | None] = []
+    for b in resp.bboxes:
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_w, image_h, dpr=dpr_eff)
+            existing_rects.append((x0, y0, x1, y1))
+        except Exception:
+            existing_rects.append(None)
+
+    def _norm_y(py: float) -> int:
+        return max(0, min(1000, int(round(py * dpr_eff / image_h * 1000))))
+
+    def _norm_x(px: float) -> int:
+        return max(0, min(1000, int(round(px * dpr_eff / image_w * 1000))))
+
+    # Only pre-checked/active controls are INJECTED by default. An un-checked
+    # control vision omitted is vision's job; injecting every checkbox on a
+    # dense filter page is what floods the observation and invites wrong/
+    # repeated clicks. Set BBOX_STATEFUL_INJECT_INACTIVE=1 to restore the old
+    # "inject all" behavior. Refresh-in-place below runs for ALL controls.
+    inject_inactive = os.environ.get(
+        "BBOX_STATEFUL_INJECT_INACTIVE", "0"
+    ) in ("1", "true", "yes")
+    task_kw = _task_keywords(task_instruction)
+
+    touched = 0
+    # (relevance, ex0, ey0, ex1, ey1, kind, label, active, dom_index)
+    candidates: list[tuple[int, float, float, float, float, str, str, bool, Any]] = []
+    for entry in selector_entries:
+        kind = _control_kind(entry)
+        if kind is None:
+            continue
+        rect = _entry_pixel_rect(entry)
+        if rect is None:
+            continue
+        ex0, ey0, ex1, ey1 = rect
+        attrs = entry.get("attributes") or {}
+        active = _entry_is_active(attrs)
+        # Pre-selected options only: an unselected <option> is vision's job.
+        if (entry.get("tagName") or "").lower() == "option" and not active:
+            continue
+        # Viewport guard — bounds + screenshot come from the same /state
+        # response, so an off-image centre means the control isn't on screen.
+        ecx = (ex0 + ex1) / 2.0
+        ecy = (ey0 + ey1) / 2.0
+        if not (0 <= ecx <= image_w and 0 <= ecy <= image_h):
+            continue
+
+        # De-dup by IoU against existing bboxes.
+        best_iou = 0.0
+        best_idx = -1
+        for idx, er in enumerate(existing_rects):
+            if er is None:
+                continue
+            iou = _rect_iou(
+                (ex0, ey0, ex1, ey1), (er[0], er[1], er[2], er[3]),
+            )
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = idx
+
+        if best_iou >= 0.5 and best_idx >= 0:
+            # Already represented — refresh state in place (cache-reuse path).
+            existing = resp.bboxes[best_idx]
+            try:
+                existing.is_active = active
+                if getattr(existing, "dom_index", None) is None:
+                    existing.dom_index = entry.get("index")
+                touched += 1
+            except Exception:
+                pass
+            continue
+
+        # No existing box → injection candidate (gated on active state).
+        if not active and not inject_inactive:
+            continue
+        label = _resolve_control_label(entry, selector_entries, kind)
+        relevance = _label_task_relevance(label, task_kw)
+        candidates.append(
+            (relevance, ex0, ey0, ex1, ey1, kind, label, active, entry.get("index"))
+        )
+
+    # Inject the most task-relevant candidates first, capped so a control-dense
+    # page can't explode the per-step observation.
+    max_new = _stateful_control_max()
+    candidates.sort(key=lambda c: -c[0])
+    injected = 0
+    for relevance, ex0, ey0, ex1, ey1, kind, label, active, dom_index in candidates:
+        if injected >= max_new:
+            break
+        # Re-check IoU against boxes injected earlier in THIS pass so two
+        # overlapping candidates don't both land.
+        if any(
+            er is not None
+            and _rect_iou((ex0, ey0, ex1, ey1), (er[0], er[1], er[2], er[3])) >= 0.5
+            for er in existing_rects
+        ):
+            continue
+        ymin, ymax = _norm_y(ey0), _norm_y(ey1)
+        xmin, xmax = _norm_x(ex0), _norm_x(ex1)
+        if ymax <= ymin:
+            ymax = min(1000, ymin + 1)
+        if xmax <= xmin:
+            xmax = min(1000, xmin + 1)
+        try:
+            new_bbox = BBox(
+                label=label[:120],
+                box_2d=[ymin, xmin, ymax, xmax],
+                clickable=True,
+                role=kind,
+                confidence=0.8,
+                role_in_scene="unknown",
+                # A task-keyword match ranks the box higher in as_brain_text's
+                # capped render so a genuinely relevant control isn't evicted.
+                intent_relevant=relevance > 0,
+            )
+            # is_active / dom_index are DOM-derived (never vision-emitted);
+            # set them post-construction, mirroring the enrichment pass.
+            new_bbox.is_active = active
+            new_bbox.dom_index = dom_index
+        except Exception:
+            continue
+        resp.bboxes.append(new_bbox)
+        existing_rects.append((int(ex0), int(ey0), int(ex1), int(ey1)))
+        injected += 1
+        touched += 1
+
+    dropped = len(candidates) - injected
+    if dropped > 0:
+        # Surface the cap so bounded coverage never reads as full coverage.
+        print(
+            f"  [stateful_control_inject: capped {dropped} of "
+            f"{len(candidates)} candidates (max={max_new})]"
+        )
+
+    return touched
+
+
 def _read_image_dims(b64: str) -> tuple[int, int]:
     """Decode (width, height) from a base64-encoded screenshot.
 
@@ -1099,6 +1428,22 @@ def _schedule_vision_prefetch(
                 )
             except Exception as exc:
                 print(f"  [dom_enrichment prefetch failed: {exc}]")
+            # v6 — guarantee every stateful form control (checkbox / radio /
+            # switch / pre-selected option) has a clickable V_n with correct
+            # is_active: inject when vision omitted the box, refresh state in
+            # place otherwise. AFTER enrichment (so its greedy match isn't
+            # perturbed), BEFORE the toggle/misclick detectors below.
+            try:
+                _inject_stateful_control_bboxes(
+                    resp,
+                    sel_entries_pref,
+                    img_w,
+                    img_h,
+                    dpr_val,
+                    state.task_instruction,
+                )
+            except Exception as exc:
+                print(f"  [stateful_control_inject prefetch failed: {exc}]")
             # v4 C6 — stamp `just_toggled` on the bbox the brain just
             # clicked, when its is_active flipped relative to what was
             # recorded at click dispatch. Brain then sees e.g.

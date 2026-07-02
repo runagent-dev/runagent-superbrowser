@@ -255,6 +255,22 @@ export function getBuildDomTreeScript(): string {
       const v = el.getAttribute(attr);
       if (v !== null && v !== '') attributes[attr] = v.substring(0, 100);
     }
+    // Native form-control STATE — the live .checked/.selected DOM *property*,
+    // NOT the attribute. getAttribute('checked') only reflects the initial
+    // HTML default and serializes a bare \`checked\` to '' (dropped by the
+    // loop above), so a site-preselected box would be invisible to Python.
+    // This is the load-bearing signal for detecting checkboxes/radios the
+    // user must un-check. Rides selectorEntries.attributes to the bridge;
+    // deliberately NOT added to INCLUDE_ATTRIBUTES (which reads the default).
+    if (tag === 'input') {
+      const inputType = (el.getAttribute('type') || '').toLowerCase();
+      if (inputType === 'checkbox' || inputType === 'radio') {
+        attributes['checked'] = el.checked ? 'true' : 'false';
+        if (el.indeterminate) attributes['indeterminate'] = 'true';
+      }
+    } else if (tag === 'option') {
+      attributes['selected'] = el.selected ? 'true' : 'false';
+    }
     let bounds = null;
     let regionTag = null;
     if (interactive) {
@@ -418,12 +434,49 @@ export function getBuildDomTreeScript(): string {
     const c = candidates[i];
     if (occluded.has(c.ref) || shadowed.has(c.ref)) continue;
     c.ref.highlightIndex = highlightIndex++;
+    // Accessible-name fallback. getTextContent() collects only DIRECT text
+    // nodes, but custom ARIA controls (role=checkbox/radio/switch, styled
+    // buttons/links) routinely put their visible label in a CHILD node
+    // (e.g. trip.com's <div role=checkbox><i/><div>Explore hotels</div><i/>),
+    // so the direct-text pass yields ''. Without a label the brain sees
+    // "[V_n] checkbox '' active=true" and can't tell WHICH control to act on.
+    // Fall back to aria-label, then to the element's aggregate descendant
+    // text — stripping icon-font glyphs in the Unicode Private Use Area that
+    // widgets render for the check mark. Only when direct text is empty and
+    // only for control-ish elements, so ordinary nodes are untouched. Kept
+    // on the selectorEntry alone (NOT ref.text) so the elements string /
+    // dom_hash stay byte-stable and the vision cache isn't busted.
+    let entryText = c.ref.text;
+    if (!entryText) {
+      const el = c.el;
+      const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').trim();
+      if (aria) {
+        entryText = aria.substring(0, 120);
+      } else {
+        const role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+        const tag = c.ref.tagName;
+        const controlish = (
+          role === 'checkbox' || role === 'radio' || role === 'switch' ||
+          role === 'menuitemcheckbox' || role === 'menuitemradio' ||
+          role === 'tab' || role === 'button' || role === 'option' ||
+          role === 'menuitem' ||
+          tag === 'button' || tag === 'label' || tag === 'a' || tag === 'summary'
+        );
+        if (controlish) {
+          const agg = (el.textContent || '')
+            .replace(/[\\uE000-\\uF8FF]/g, '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+          if (agg) entryText = agg.substring(0, 120);
+        }
+      }
+    }
     selectorEntries.push({
       index: c.ref.highlightIndex,
       xpath: c.ref.xpath,
       tagName: c.ref.tagName,
       attributes: c.ref.attributes,
-      text: c.ref.text,
+      text: entryText,
       bounds: c.ref.bounds,
       regionTag: c.ref.regionTag,
       role: c.ref.attributes && c.ref.attributes.role,

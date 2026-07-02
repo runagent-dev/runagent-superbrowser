@@ -139,13 +139,27 @@ async def _run_one(task: Task, seed: int, args, label: str, model_info: dict) ->
     print(f"\n=== [{label}] {task.id} seed{seed} ===")
     print(f"    {task.instruction[:110]}")
 
+    from superbrowser_bridge.usage import (
+        UsageHook,
+        pop,
+        snapshot,
+        track_task,
+        write_usage_json,
+    )
+
     start = time.time()
     stop_reason, err, content = "ok", None, ""
     try:
-        content = await asyncio.wait_for(
-            _run_and_capture(orch, task.instruction, session_key, hooks=[orch_hook]),
-            timeout=args.timeout,
-        )
+        with track_task(orch_task_id):
+            content = await asyncio.wait_for(
+                _run_and_capture(
+                    orch,
+                    task.instruction,
+                    session_key,
+                    hooks=[orch_hook, UsageHook("orchestrator")],
+                ),
+                timeout=args.timeout,
+            )
     except asyncio.TimeoutError:
         stop_reason = "timeout"
     except Exception as exc:  # keep going; record the failure
@@ -158,6 +172,15 @@ async def _run_one(task: Task, seed: int, args, label: str, model_info: dict) ->
         pass
 
     worker_ids = _harvest_ledgers(cap_dir, run_dir / "ledgers")
+
+    # Per-task token usage across all roles (orchestrator + worker(s) + vision).
+    usage = snapshot(orch_task_id)
+    pop(orch_task_id)
+    if usage is not None:
+        (run_dir / "usage.json").write_text(
+            json.dumps(usage.to_dict(), indent=2, default=str)
+        )
+        write_usage_json(usage)
 
     # Score: LLM judge (unless --no-judge) + cheap heuristic.
     verdict = {"success": None, "rationale": "judge skipped", "judge_model": None}
@@ -193,6 +216,7 @@ async def _run_one(task: Task, seed: int, args, label: str, model_info: dict) ->
         "timestamp": time.time(),
         "n_worker_transcripts": len(worker_ids),
         "worker_ids": worker_ids,
+        "usage": (usage.to_dict() if usage is not None else None),
         "harness_git_sha": _git_sha(),
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2, default=str))

@@ -132,6 +132,14 @@ Page-type coverage rules (CRITICAL for dense filter/booking UIs):
   These controls often look like "chrome" next to the main content
   cards, but without them the caller CANNOT complete a booking task.
   They are `role_in_scene = "target"` or `"content"`, not "chrome".
+- PRE-CHECKED / PRE-SELECTED controls RELEVANT to the caller's task (a
+  pre-selected shipping/room/fare option, a default the task asks you to
+  change) — emit a tight bbox with role='checkbox'|'radio'|'switch' even when
+  they look "already done / satisfied", since the caller may need to change a
+  default it didn't ask for. You do NOT need to exhaustively emit every
+  chrome-y opt-in (insurance, newsletter, "save my info") unrelated to the
+  task: a DOM-side safety net already gives pre-checked controls a clickable
+  V_n, so prioritize the task target over blanket opt-in coverage.
 - On any page, if the caller's task phrases name specific
   attributes ("Ford F-150", "in-and-out", "wheelchair accessible",
   "pet-friendly", "king bed"), include every bbox whose label touches

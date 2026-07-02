@@ -34,6 +34,8 @@ BBoxRole = Literal[
     "link",
     "input",
     "checkbox",
+    "radio",
+    "switch",
     "captcha_tile",
     "captcha_widget",
     "slider_handle",
@@ -64,6 +66,10 @@ def _coerce_role(value: object) -> str:
         "heading": "text_block",
         "label": "text_block",
         "text": "text_block",
+        "toggle": "switch",
+        "menuitemcheckbox": "checkbox",
+        "menuitemradio": "radio",
+        "option": "checkbox",
     }
     return aliases.get(v, "other")
 

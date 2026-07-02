@@ -381,22 +381,37 @@ class DelegateBrowserTaskTool(Tool):
         # Research tasks need more iterations: search + visit 3-5 pages + refine
         _research_kw = ("search", "research", "find information", "google", "look up", "investigate")
         is_research = any(k in instructions.lower() for k in _research_kw)
-        # Caps are env-overridable so a stuck flow can be widened without
-        # a code edit. NB: the Nanobot.from_config workspace defaults
-        # from config.json are clobbered a few lines below by an explicit
-        # `worker._loop.max_iterations = max_iterations` — so this is
-        # the SOLE source of truth for browser-worker iteration budget.
-        max_iterations = (
-            int(os.environ.get("SUPERBROWSER_WORKER_MAX_ITER_RESEARCH") or "100")
-            if is_research
-            else int(os.environ.get("SUPERBROWSER_WORKER_MAX_ITER") or "100")
-        )
+        # Browser-worker iteration budget is computed just after the worker is
+        # built (below) so it can honor the worker's config.json
+        # `maxToolIterations` instead of a hardcoded constant. See there.
 
         print(f"\n>> delegate_browser_task(session={session_key})")
         print(f"   Instructions: {instructions[:120]}...")
 
         # Create a FRESH browser worker — isolated state, clean session
         worker = Nanobot.from_config(workspace=BROWSER_WORKSPACE)
+
+        # Browser-worker iteration budget. Precedence:
+        #   1. SUPERBROWSER_WORKER_MAX_ITER[_RESEARCH] env — widen a stuck flow
+        #      without a code edit;
+        #   2. the config.json `maxToolIterations` the worker was built with, so
+        #      a user who raises it actually raises the loop where browser steps
+        #      accumulate (previously hardcoded to 100 and silently ignoring
+        #      config — the footgun behind "I set 200 but it stops at ~82");
+        #   3. a 100-step fallback when config carries no usable value.
+        # NB: the wall-clock task timeout — not this cap — is usually the binding
+        # limit, so raising this alone will not stop a task from timing out.
+        _config_iter = getattr(getattr(worker, "_loop", None), "max_iterations", None)
+        _env_key = (
+            "SUPERBROWSER_WORKER_MAX_ITER_RESEARCH"
+            if is_research
+            else "SUPERBROWSER_WORKER_MAX_ITER"
+        )
+        _env_iter = os.environ.get(_env_key)
+        try:
+            max_iterations = int(_env_iter) if _env_iter else int(_config_iter or 100)
+        except (TypeError, ValueError):
+            max_iterations = int(_config_iter or 100)
 
         # Remove default nanobot tools — worker only needs browser tools
         default_tools_to_remove = [
@@ -486,7 +501,8 @@ class DelegateBrowserTaskTool(Tool):
         # so it could bind to worker_state at construction.
         worker_memory_hook = worker_memory.attach(worker)
 
-        # 25 iterations — enough for: open + inspect + script + fail + retry + verify + close
+        # Apply the computed budget (precedence note above). This is the SOLE
+        # applied value for the browser worker's loop.
         worker._loop.max_iterations = max_iterations
 
         # Build the worker prompt with enforced workflow structure
@@ -1157,11 +1173,17 @@ CRITICAL RULES:
                 f">> (session_id is printed when browser_open runs)"
             )
 
+        # Account this worker delegation's tokens to the active task. The
+        # orchestrator's track_task() contextvar is live here (the worker runs
+        # inside the orchestrator's awaited bot.run); multiple delegations
+        # accumulate under by_role["worker"]. Purely additive to the hook list.
+        from superbrowser_bridge.usage import UsageHook
+
         try:
             result = await worker.run(
                 prompt,
                 session_key=session_key,
-                hooks=[worker_memory_hook, worker_hook],
+                hooks=[worker_memory_hook, worker_hook, UsageHook("worker")],
             )
             content = result.content
 

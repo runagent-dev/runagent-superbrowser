@@ -32,7 +32,7 @@ def main() -> int:
         persistent=True,          # reuse the container's per-user cookies/profiles
     )
 
-    res = sb.run("what is the top story on Hacker News right now?", mode="fetch")
+    res = sb.run("go to https://www.stubhub.com/ and Book 4 tickets in the upper for any Kevin Hart show in New York in the next three months and view ticket prices with estimated fees.", mode="browser")
     print(res.text)
     if not res.success and res.error:
         print(f"[error] {res.error}", file=sys.stderr)

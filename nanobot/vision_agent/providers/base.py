@@ -21,6 +21,10 @@ class ProviderResponse:
     tokens_used: Optional[int]
     model: str
     provider: str
+    # Optional input/output split when the endpoint reports it (else None and
+    # ``tokens_used`` carries the combined total).
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
 
 
 class VisionProvider(abc.ABC):

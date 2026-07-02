@@ -267,11 +267,24 @@ class SuperBrowser:
             enable_human_handoff=enable_human_handoff,
         )
 
+        from superbrowser_bridge.usage import (
+            UsageHook,
+            pop,
+            snapshot,
+            track_task,
+            write_usage_json,
+        )
+
         text, raw, error, success = "", "", None, False
         try:
-            text, raw = await run_and_capture(
-                orch.bot, framed, orch.session_key, hooks=[orch.hook], timeout=timeout
-            )
+            with track_task(orch.task_id):
+                text, raw = await run_and_capture(
+                    orch.bot,
+                    framed,
+                    orch.session_key,
+                    hooks=[orch.hook, UsageHook("orchestrator")],
+                    timeout=timeout,
+                )
             success = bool(text)
             if not success and error is None:
                 error = "the agent returned no answer"
@@ -285,6 +298,13 @@ class SuperBrowser:
             except Exception:  # noqa: BLE001 - best-effort summary
                 pass
 
+        # Aggregate per-task token usage (orchestrator + worker(s) + vision),
+        # persist it, then drop the registry entry. Best-effort — never fail the run.
+        usage = snapshot(orch.task_id)
+        if usage is not None:
+            write_usage_json(usage)
+        pop(orch.task_id)
+
         data = parse_output(text, output_schema) if success else None
         return RunResult(
             text=text,
@@ -295,6 +315,10 @@ class SuperBrowser:
             error=error,
             raw_content=raw,
             classification=classification,
+            input_tokens=usage.input_tokens if usage is not None else 0,
+            output_tokens=usage.output_tokens if usage is not None else 0,
+            total_tokens=usage.total_tokens if usage is not None else 0,
+            usage=usage.to_dict() if usage is not None else None,
         )
 
     # ----- streaming (progress / step events) -----
@@ -388,20 +412,38 @@ class SuperBrowser:
         if classification is not None:
             yield {"type": "classification", "classification": classification}
 
+        from superbrowser_bridge.usage import (
+            UsageHook,
+            pop,
+            snapshot,
+            track_task,
+            write_usage_json,
+        )
+
         final: dict | None = None
         try:
-            async for ev in stream_and_capture(
-                orch.bot, framed, orch.session_key, hooks=[orch.hook], timeout=timeout
-            ):
-                if ev.get("type") == "result":
-                    final = ev
-                else:
-                    yield ev
+            with track_task(orch.task_id):
+                async for ev in stream_and_capture(
+                    orch.bot,
+                    framed,
+                    orch.session_key,
+                    hooks=[orch.hook, UsageHook("orchestrator")],
+                    timeout=timeout,
+                ):
+                    if ev.get("type") == "result":
+                        final = ev
+                    else:
+                        yield ev
         finally:
             try:
                 orch.memory.write_task_summary(success=bool(final and final.get("success")))
             except Exception:  # noqa: BLE001 - best-effort summary
                 pass
+
+        usage = snapshot(orch.task_id)
+        if usage is not None:
+            write_usage_json(usage)
+        pop(orch.task_id)
 
         final = final or {
             "type": "result", "text": "", "raw_content": "",
@@ -420,6 +462,10 @@ class SuperBrowser:
             "error": final.get("error"),
             "raw_content": final.get("raw_content", text),
             "classification": classification,
+            "input_tokens": usage.input_tokens if usage is not None else 0,
+            "output_tokens": usage.output_tokens if usage is not None else 0,
+            "total_tokens": usage.total_tokens if usage is not None else 0,
+            "usage": usage.to_dict() if usage is not None else None,
         }
 
     def stream(
@@ -672,6 +718,7 @@ class SuperBrowser:
         RunAgentClient) into a RunResult."""
         if isinstance(payload, dict):
             text = payload.get("text", "") or ""
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
             return RunResult(
                 text=text,
                 success=bool(payload.get("success", bool(text))),
@@ -681,6 +728,10 @@ class SuperBrowser:
                 error=payload.get("error"),
                 raw_content=text,
                 classification=payload.get("classification"),
+                input_tokens=int(payload.get("input_tokens") or (usage or {}).get("input_tokens") or 0),
+                output_tokens=int(payload.get("output_tokens") or (usage or {}).get("output_tokens") or 0),
+                total_tokens=int(payload.get("total_tokens") or (usage or {}).get("total_tokens") or 0),
+                usage=usage,
             )
         text = "" if payload is None else str(payload)
         return RunResult(

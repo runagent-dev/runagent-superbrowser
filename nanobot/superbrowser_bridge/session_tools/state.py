@@ -1555,6 +1555,25 @@ class BrowserSessionState:
                     )
                 except Exception as exc:
                     print(f"  [dom_enrichment build_blocks failed: {exc}]")
+                # v6 — guarantee stateful form controls (checkbox / radio /
+                # switch / pre-selected option) each have a clickable V_n with
+                # correct is_active: inject when vision omitted the box,
+                # refresh state in place otherwise. After enrichment, before
+                # the toggle/misclick detectors.
+                try:
+                    from .vision_pipeline import (
+                        _inject_stateful_control_bboxes,
+                    )
+                    _inject_stateful_control_bboxes(
+                        resp,
+                        selector_entries or [],
+                        img_w,
+                        img_h,
+                        device_pixel_ratio,
+                        self.task_instruction,
+                    )
+                except Exception as exc:
+                    print(f"  [stateful_control_inject build_blocks failed: {exc}]")
                 # v4 C6 — stamp just_toggled on the bbox the brain
                 # just clicked, when is_active flipped vs. what was
                 # recorded at click dispatch. Surfaces as

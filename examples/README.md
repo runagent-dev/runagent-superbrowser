@@ -28,17 +28,27 @@ Every example needs an LLM (the orchestrator is an agent) — set it up with
 
 | File | Mode | Needs the TS engine (`:3100`)? | Shows |
 |---|---|---|---|
+| [`00_smoke_test.py`](00_smoke_test.py) | all | optional (`--browser`) | **verify your setup** — runs every mode, prints PASS / WARN / FAIL |
 | [`01_quickstart_fetch.py`](01_quickstart_fetch.py) | `fetch` | **no** | the simplest call — read-only, in-process |
 | [`02_auto_mode.py`](02_auto_mode.py) | `auto` | only if it picks the browser | letting the agent decide + `res.classification` |
 | [`03_browser_mode.py`](03_browser_mode.py) | `browser` | **yes** | a real browser session + `auto_start_server` |
 | [`04_structured_output.py`](04_structured_output.py) | `fetch` | no | typed results via a pydantic `output_schema` |
 | [`05_async.py`](05_async.py) | `fetch` | no | `arun()` + running several tasks concurrently |
+| [`06_local_agent_server.py`](06_local_agent_server.py) | any | in the container | run against the all-in-one Docker container (no API key) |
 
-Start with `01` — it needs nothing but an API key:
+Start with `00` to verify your setup end to end, then `01`:
 
 ```bash
+python examples/00_smoke_test.py              # in-process (needs an LLM)
+python examples/00_smoke_test.py --docker     # against `docker compose up -d`
+python examples/00_smoke_test.py 2>/dev/null  # just the summary (hide agent logs)
+
 python examples/01_quickstart_fetch.py
 ```
+
+`00_smoke_test.py` reports `PASS` (worked), `WARN` (pipeline works but your
+LLM key/model/quota is the problem — fix `.env`), or `FAIL` (a real error).
+Add `--strict` to make WARN exit non-zero for CI.
 
 ## The browser engine
 

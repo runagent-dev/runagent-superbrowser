@@ -45,16 +45,13 @@ TASKS: list[Task] = [
         ),
     ),
     Task(
-        id="trip_flight_dac_bkk",
+        id="trip_shanghai_beijing",
         instruction=(
-            "Go to trip.com and find the cheapest flight from Dhaka (DAC) to Bangkok (BKK) "
-            "departing 30 April 2026 and returning 5 May 2026."
+            "Go to https://us.trip.com/ and Select a high speed train ticket with a departure time before 23:00 from Shanghai to Beijing. "
         ),
-        url="https://www.trip.com/",
+        url="https://us.trip.com/",
         reference=(
-            "Success = a concrete cheapest-fare price with airline/itinerary for the "
-            "DAC->BKK round trip departing 30 Apr 2026 / returning 5 May 2026, read from "
-            "trip.com search results — not fabricated."
+            "Success = Select a high speed train ticket with a departure time before 23:00 from Shanghai to Beijing read from https://us.trip.com/ not fabricated."
         ),
     ),
     Task(

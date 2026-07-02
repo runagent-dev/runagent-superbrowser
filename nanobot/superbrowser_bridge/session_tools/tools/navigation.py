@@ -147,29 +147,46 @@ class BrowserOpenTool(Tool):
         return r.json()
 
     async def _page_looks_blank(self, session_id: str) -> bool:
-        """True when a freshly opened page rendered effectively no visible
-        text — the signature of a stealthy HTTP-200 anti-bot block (the page
-        "loads" with status 200 but the body is blank for detected
-        automation, e.g. StubHub). Reads the page markdown (the same endpoint
-        browser_get_markdown uses) and compares the stripped length against a
-        small threshold. A legitimate page — including a JS-hydrated SPA,
-        since browser_open already settles the DOM — renders far more than
-        this. Any error/ambiguity returns False so escalation never fires on
-        a false signal.
+        """True when a freshly opened page rendered effectively no visible text —
+        the signature of a stealthy HTTP-200 anti-bot block (the page "loads"
+        with status 200 but serves a blank body to detected automation, e.g.
+        StubHub). Reads the page markdown (the same endpoint browser_get_markdown
+        uses) and compares the stripped length against a small threshold.
+
+        Tunables — a false positive here is expensive (it kills a good T1
+        session and pays the heavyweight T3 max-stealth launch), so this is
+        deliberately conservative and opt-out-able:
+          * ``SUPERBROWSER_BLANK_ESCALATE=0`` disables the check entirely.
+          * ``SUPERBROWSER_BLANK_PAGE_THRESHOLD`` sets the char cutoff
+            (default 32). The default cleanly separates a true bot-block blank
+            (~0 chars) from a genuinely minimal-but-real page (a nav + heading +
+            footer renders well past this). It was 80, which over-fired on
+            sparse-but-legitimate landing pages.
+
+        Any error/ambiguity returns False so escalation never fires on a false
+        signal — a false negative (miss a block) is cheaper than a false
+        positive (kill a good session).
         """
         if not session_id:
             return False
-        BLANK_PAGE_TEXT_THRESHOLD = 80  # chars of visible text
+        if os.environ.get("SUPERBROWSER_BLANK_ESCALATE", "1") in ("0", "false", "no"):
+            return False
+        try:
+            threshold = max(
+                0, int(os.environ.get("SUPERBROWSER_BLANK_PAGE_THRESHOLD", "32"))
+            )
+        except (TypeError, ValueError):
+            threshold = 32
         try:
             r = await _request_with_backoff(
                 "GET",
                 f"{SUPERBROWSER_URL}/session/{session_id}/markdown",
-                timeout=15.0,
+                timeout=10.0,
             )
             if r.status_code != 200:
                 return False
             content = (r.json() or {}).get("content", "") or ""
-            return len(content.strip()) < BLANK_PAGE_TEXT_THRESHOLD
+            return len(content.strip()) < threshold
         except Exception:
             return False
 

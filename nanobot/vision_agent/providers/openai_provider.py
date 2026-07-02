@@ -181,12 +181,18 @@ class OpenAIVisionProvider(VisionProvider):
             )
         text = completion.choices[0].message.content or ""
         tokens = None
+        prompt_tokens = None
+        completion_tokens = None
         usage = getattr(completion, "usage", None)
         if usage is not None:
             tokens = getattr(usage, "total_tokens", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            completion_tokens = getattr(usage, "completion_tokens", None)
         return ProviderResponse(
             text=text,
             tokens_used=tokens,
             model=self.model,
             provider=self.name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )

@@ -33,6 +33,16 @@ class RunResult:
         classification: For ``mode="auto"``, the routing classifier's verdict
             (``{"approach","reason","confidence"}``) — surfaces *why* the agent
             would lean fetch vs browser. ``None`` for forced modes.
+        input_tokens: Total input (prompt) tokens across all roles
+            (orchestrator + worker delegations + vision). Embedded screenshots
+            are already counted inside this figure by the model API.
+        output_tokens: Total output (completion) tokens across all roles.
+        total_tokens: Headline grand total of all tokens the task consumed.
+        usage: The full per-role token breakdown (the ``TaskUsage.to_dict()``
+            payload — ``by_role``, ``vision_tokens``, ``image_blocks``, …), or
+            ``None`` when accounting was unavailable. Populated for in-process
+            runs; remote/Docker modes surface it only when the deployed runtime
+            returns it.
     """
 
     text: str
@@ -43,6 +53,10 @@ class RunResult:
     error: str | None = None
     raw_content: str = ""
     classification: dict[str, Any] | None = field(default=None)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    usage: dict[str, Any] | None = None
 
     def __bool__(self) -> bool:  # `if result:` reads as "did it work?"
         return self.success
