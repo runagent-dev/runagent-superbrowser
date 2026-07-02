@@ -144,6 +144,20 @@ export function getBuildDomTreeScript(): string {
       if (r.width >= 10 && r.width <= 50 && r.height >= 10 && r.height <= 50) return true;
       // Large div with cursor:pointer is usually a link-like element
       if (r.width >= 24 && r.height >= 20) return true;
+      // Thin text-line links: 12-19px tall divs/spans with JS-attached
+      // handlers (invisible to Tier 3) fall between the icon band and
+      // the large-div arm above. Short own text keeps this from
+      // swallowing pointer-styled layout containers — those get their
+      // text from descendants, not directly.
+      if (r.width >= 24 && r.height >= 12) {
+        let ownText = '';
+        for (let i = 0; i < el.childNodes.length; i++) {
+          const n = el.childNodes[i];
+          if (n.nodeType === 3) ownText += n.textContent || '';
+        }
+        ownText = ownText.trim();
+        if (ownText.length > 0 && ownText.length <= 80) return true;
+      }
     }
 
     // Tier 7: iframes larger than 100×100 — typically embedded UIs
