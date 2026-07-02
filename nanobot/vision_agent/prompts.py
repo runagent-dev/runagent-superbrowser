@@ -471,8 +471,14 @@ def build_user_prompt(
         "    - other → best-effort, prioritise anything labelled\n"
         "      interactively or clearly clickable.\n"
         "  The overall task above tells you which elements most serve\n"
-        "  the user's goal — mark those intent_relevant=true. Keep\n"
-        "  bbox count tight (10–25 is a good target); more is noise.\n"
+        "  the user's goal — mark those intent_relevant=true. Do NOT\n"
+        "  trim coverage to look tidy — the up-to-50 budget from the\n"
+        "  general rules applies; on sparse pages fewer is fine, but a\n"
+        "  visible link/button you omit is one the caller cannot click.\n"
+        "  EXCEPTION to every skip-rule above: an element whose label\n"
+        "  matches the task or current subgoal wording must ALWAYS be\n"
+        "  emitted — even when it sits in a header, footer, or nav you\n"
+        "  were told to skip.\n"
     )
     context += "\n" + page_type_detection
 

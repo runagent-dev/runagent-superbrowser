@@ -192,6 +192,25 @@ class BBox(BaseModel):
             "click comparison fills it."
         ),
     )
+    source: Optional[Literal["dom"]] = Field(
+        default=None,
+        description=(
+            "Provenance marker. 'dom' when this bbox was injected from "
+            "the DOM scan because the vision model omitted the element "
+            "(links/buttons safety net — `_inject_dom_link_bboxes`). "
+            "None for vision-emitted boxes. Rendered as `src=dom` so "
+            "the brain knows the geometry is DOM-exact but the visual "
+            "description came from markup, not pixels. Vision (Gemini) "
+            "never sets this."
+        ),
+    )
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _coerce_source(cls, v: object) -> Optional[str]:
+        # Anything other than the known marker collapses to None — a
+        # hallucinated `source` from a model must not fail validation.
+        return "dom" if v == "dom" else None
 
     @field_validator("box_2d", mode="before")
     @classmethod
@@ -1000,6 +1019,10 @@ class VisionResponse(BaseModel):
             di = getattr(b, "dom_index", None)
             if isinstance(di, int) and di >= 0:
                 extras.append(f"dom_idx={di}")
+            if getattr(b, "source", None) == "dom":
+                # DOM-injected safety-net box (vision omitted it). The
+                # geometry is DOM-exact; treat it like any other V_n.
+                extras.append("src=dom")
             primary = (
                 f"  [V{i}] {b.role:<14s} "
                 f"{b.label!r:<40s} "

@@ -1138,6 +1138,253 @@ def _inject_stateful_control_bboxes(
     return touched
 
 
+def _link_kind(entry: dict) -> str | None:
+    """Classify a selectorEntry as a link/button-like navigation target.
+
+    Returns the canonical BBox role ('link' | 'button') when the entry is
+    an anchor, button, or carries an equivalent ARIA role, else None.
+    'tab' and 'menuitem' map to 'button' — the canonical BBox vocabulary
+    has no entry for them and `_coerce_role` would collapse them to
+    'other', which the brain treats as non-actionable.
+    """
+    if not isinstance(entry, dict):
+        return None
+    tag = (entry.get("tagName") or "").lower()
+    attrs = entry.get("attributes") or {}
+    role = (attrs.get("role") or "").lower()
+    if tag == "a" or role == "link":
+        return "link"
+    if tag == "button" or role in ("button", "tab", "menuitem"):
+        return "button"
+    return None
+
+
+def _link_label(entry: dict) -> str:
+    """Visible-ish label for a link/button entry: own text → aria-label →
+    title → value. Empty string when none — callers SKIP unlabeled
+    entries (a label-less injected box would read as noise to the brain
+    and can't be dedup-matched against vision's boxes)."""
+    text = (entry.get("text") or "").strip()
+    if text:
+        return text[:120]
+    attrs = entry.get("attributes") or {}
+    for k in ("aria-label", "title", "value"):
+        v = (attrs.get(k) or "").strip()
+        if v:
+            return v[:120]
+    return ""
+
+
+def _entry_is_disabled(attrs: dict) -> bool:
+    if not isinstance(attrs, dict):
+        return False
+    if "disabled" in attrs and (attrs.get("disabled") or "").lower() not in ("false",):
+        return True
+    return (attrs.get("aria-disabled") or "").lower() == "true"
+
+
+def _dom_link_max() -> int:
+    """Per-step cap on injected DOM link/button bboxes (env-tunable).
+
+    Same rationale as `_stateful_control_max`: a nav-dense page carries
+    dozens of links; without a cap every vision omission becomes an extra
+    [V_n] line. Ranking below puts task-relevant links first, so the cap
+    trims generic chrome, not targets. 0 disables injection."""
+    try:
+        return max(0, int(os.environ.get("BBOX_DOM_LINK_MAX", "12")))
+    except (TypeError, ValueError):
+        return 12
+
+
+def _normalize_label(label: str) -> str:
+    return " ".join((label or "").casefold().split())
+
+
+def _inject_dom_link_bboxes(
+    resp: Any,
+    selector_entries: list[dict] | None,
+    image_w: int,
+    image_h: int,
+    dpr: float,
+    task_instruction: str | None,
+) -> int:
+    """Inject DOM-detected links/buttons the vision model omitted.
+
+    The brain-facing bbox list is otherwise Gemini-only: a link that is
+    obvious in the DOM (`<a href>`, `<button>`, role=link/button) but
+    culled by the vision model's conservatism / bbox caps simply does
+    not exist for the brain. This is the generalized sibling of
+    `_inject_stateful_control_bboxes` — same geometry helpers, same
+    viewport guard, same idempotency contract (cached VisionResponse
+    objects are aliased across steps; every dedup below must make a
+    re-run a no-op).
+
+    Dedup is IoU ≥ 0.4 against existing boxes OR normalized-label exact
+    match — the label arm catches Gemini boxing the same link with
+    looser geometry than the DOM rect (common on padded nav items),
+    where plain IoU stays under threshold and would double-inject.
+
+    Ranking (anti-nav-chrome-flood): task-keyword-relevant labels first,
+    then boxes OUTSIDE the top/bottom 10% chrome bands, then top-to-
+    bottom. Injected boxes carry confidence=0.55 so they sort toward the
+    tail of `as_brain_text`'s capped render — a safety net, not a rival
+    to vision's own targets — and `source='dom'` (rendered `src=dom`)
+    so provenance is visible.
+
+    Mutates ``resp.bboxes`` in place; returns the count injected. Safe
+    no-op when the env flag is off or inputs are unusable.
+    """
+    if os.environ.get("BBOX_DOM_LINK_INJECT", "1") in ("0", "false", "no"):
+        return 0
+    if not resp or getattr(resp, "bboxes", None) is None:
+        return 0
+    if not selector_entries:
+        return 0
+    if image_w <= 0 or image_h <= 0:
+        return 0
+    try:
+        from vision_agent.schemas import BBox  # type: ignore[import-not-found]
+    except ImportError:
+        return 0
+
+    dpr_eff = dpr if dpr and dpr > 0 else 1.0
+
+    # Existing bbox pixel rects + normalized labels. Recomputed each call
+    # because resp.bboxes may have grown via compound-split / stateful /
+    # a prior link injection on a reused cached response object.
+    existing_rects: list[tuple[int, int, int, int] | None] = []
+    existing_labels: set[str] = set()
+    for b in resp.bboxes:
+        try:
+            x0, y0, x1, y1 = b.to_pixels(image_w, image_h, dpr=dpr_eff)
+            existing_rects.append((x0, y0, x1, y1))
+        except Exception:
+            existing_rects.append(None)
+        nl = _normalize_label(getattr(b, "label", "") or "")
+        if nl:
+            existing_labels.add(nl)
+
+    def _norm_y(py: float) -> int:
+        return max(0, min(1000, int(round(py * dpr_eff / image_h * 1000))))
+
+    def _norm_x(px: float) -> int:
+        return max(0, min(1000, int(round(px * dpr_eff / image_w * 1000))))
+
+    task_kw = _task_keywords(task_instruction)
+    image_area = float(image_w * image_h)
+
+    # (relevance, in_chrome_band, y0, x0, y1, x1, kind, label, dom_index)
+    candidates: list[tuple[int, int, float, float, float, float, str, str, Any]] = []
+    for entry in selector_entries:
+        kind = _link_kind(entry)
+        if kind is None:
+            continue
+        attrs = entry.get("attributes") or {}
+        if _entry_is_disabled(attrs):
+            continue
+        label = _link_label(entry)
+        if not label:
+            continue
+        rect = _entry_pixel_rect(entry)
+        if rect is None:
+            continue
+        ex0, ey0, ex1, ey1 = rect
+        w = ex1 - ex0
+        h = ey1 - ey0
+        if w < 4 or h < 4:
+            continue
+        # Card-container guard: a wrapper <a> spanning a large chunk of
+        # the viewport would shadow everything under it in the brain's
+        # mental model. Vision reliably boxes elements that big itself.
+        if (w * h) > 0.35 * image_area:
+            continue
+        # Viewport guard — bounds + screenshot come from the same /state
+        # response, so an off-image centre means the link isn't on screen.
+        ecx = (ex0 + ex1) / 2.0
+        ecy = (ey0 + ey1) / 2.0
+        if not (0 <= ecx <= image_w and 0 <= ecy <= image_h):
+            continue
+
+        # Dedup arm 1: geometry.
+        if any(
+            er is not None
+            and _rect_iou((ex0, ey0, ex1, ey1), (er[0], er[1], er[2], er[3])) >= 0.4
+            for er in existing_rects
+        ):
+            continue
+        # Dedup arm 2: identical label — Gemini boxed the same link with
+        # looser geometry than the DOM rect.
+        if _normalize_label(label) in existing_labels:
+            continue
+
+        relevance = _label_task_relevance(label, task_kw)
+        in_chrome_band = 1 if (ecy < 0.10 * image_h or ecy > 0.90 * image_h) else 0
+        candidates.append(
+            (relevance, in_chrome_band, ey0, ex0, ey1, ex1, kind, label,
+             entry.get("index"))
+        )
+
+    max_new = _dom_link_max()
+    # Task-relevant first; generic header/footer chrome sinks; then
+    # top-to-bottom for stable, scannable ordering.
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    injected = 0
+    for relevance, _band, ey0, ex0, ey1, ex1, kind, label, dom_index in candidates:
+        if injected >= max_new:
+            break
+        # Re-check both dedup arms against boxes injected earlier in THIS
+        # pass so two overlapping/same-label candidates don't both land.
+        if any(
+            er is not None
+            and _rect_iou((ex0, ey0, ex1, ey1), (er[0], er[1], er[2], er[3])) >= 0.4
+            for er in existing_rects
+        ):
+            continue
+        nl = _normalize_label(label)
+        if nl in existing_labels:
+            continue
+        ymin, ymax = _norm_y(ey0), _norm_y(ey1)
+        xmin, xmax = _norm_x(ex0), _norm_x(ex1)
+        if ymax <= ymin:
+            ymax = min(1000, ymin + 1)
+        if xmax <= xmin:
+            xmax = min(1000, xmin + 1)
+        try:
+            new_bbox = BBox(
+                label=label,
+                box_2d=[ymin, xmin, ymax, xmax],
+                clickable=True,
+                role=kind,
+                # Low confidence by design: sorts injected boxes toward
+                # the tail of as_brain_text's ranking so they never
+                # displace vision's own targets, only extend coverage.
+                confidence=0.55,
+                role_in_scene="unknown",
+                intent_relevant=relevance > 0,
+            )
+            # DOM-derived, never vision-emitted — set post-construction,
+            # mirroring the enrichment pass.
+            new_bbox.dom_index = dom_index
+            new_bbox.source = "dom"
+        except Exception:
+            continue
+        resp.bboxes.append(new_bbox)
+        existing_rects.append((int(ex0), int(ey0), int(ex1), int(ey1)))
+        if nl:
+            existing_labels.add(nl)
+        injected += 1
+
+    dropped = len(candidates) - injected
+    if dropped > 0:
+        # Surface the cap so bounded coverage never reads as full coverage.
+        print(
+            f"  [dom_link_inject: capped {dropped} of "
+            f"{len(candidates)} candidates (max={max_new})]"
+        )
+
+    return injected
+
+
 def _read_image_dims(b64: str) -> tuple[int, int]:
     """Decode (width, height) from a base64-encoded screenshot.
 
@@ -1444,6 +1691,20 @@ def _schedule_vision_prefetch(
                 )
             except Exception as exc:
                 print(f"  [stateful_control_inject prefetch failed: {exc}]")
+            # Links/buttons safety net — inject DOM-detected links vision
+            # omitted (see _inject_dom_link_bboxes). Same slot contract:
+            # after enrichment, before the toggle/misclick detectors.
+            try:
+                _inject_dom_link_bboxes(
+                    resp,
+                    sel_entries_pref,
+                    img_w,
+                    img_h,
+                    dpr_val,
+                    state.task_instruction,
+                )
+            except Exception as exc:
+                print(f"  [dom_link_inject prefetch failed: {exc}]")
             # v4 C6 — stamp `just_toggled` on the bbox the brain just
             # clicked, when its is_active flipped relative to what was
             # recorded at click dispatch. Brain then sees e.g.
