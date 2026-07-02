@@ -110,6 +110,22 @@ export class ScreencastManager {
     this.frameHandler = null;
   }
 
+  /**
+   * Re-acquire the CDP client via getClient() and resume streaming —
+   * used when the session's active tab changes (each tab is a separate
+   * CDP target, so the old stream keeps showing the old tab otherwise).
+   * No-op when no viewers are connected; the next addViewer() will
+   * start against the new page anyway.
+   */
+  async restart(): Promise<void> {
+    if (this.viewers.size === 0) {
+      if (this.running) await this.stop();
+      return;
+    }
+    await this.stop();
+    await this.start();
+  }
+
   /** Clean up when the session is destroyed. */
   async destroy(): Promise<void> {
     this.viewers.clear();

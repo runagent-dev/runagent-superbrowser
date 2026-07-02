@@ -76,6 +76,7 @@ from .slider import (
     BrowserSetSliderAtTool,
     BrowserSetSliderTool,
 )
+from .tabs import BrowserTabsTool
 from .verification import (
     BrowserPlanNextStepsTool,
     BrowserVerifyFactTool,

@@ -9,7 +9,7 @@
 import { EventEmitter } from 'events';
 import puppeteerExtra from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import type { Browser, Page } from 'puppeteer-core';
+import type { Browser, Page, Target } from 'puppeteer-core';
 
 const puppeteer = puppeteerExtra as any;
 import { getStealthScript, getPlatformOverrideScript } from './stealth.js';
@@ -111,6 +111,63 @@ const CHROME_FLAGS = [
   '--accept-lang=en-US,en;q=0.9',
 ];
 
+/**
+ * `__name` shim — arrow functions compiled by tsx/esbuild are wrapped in
+ * `__name(fn, 'name')` for name preservation; without this shim Puppeteer-
+ * serialized functions hit `ReferenceError: __name is not defined` in the
+ * page context (manifested as HTTP 500s on /session/:id/click).
+ * Module-level const so popup adoption can late-inject it via
+ * `page.evaluate` (evaluateOnNewDocument only lands on the NEXT nav).
+ */
+const NAME_SHIM_SRC = `
+  (function () {
+    try {
+      if (typeof window === 'undefined') return;
+      if (typeof window.__name !== 'function') {
+        Object.defineProperty(window, '__name', {
+          value: function (fn) { return fn; },
+          configurable: true, writable: true,
+        });
+      }
+    } catch (_) { /* silent */ }
+  })();
+`;
+
+/**
+ * Mutation counter — installs window.__nb_mutation_counter and a
+ * MutationObserver that bumps it on any childList/attribute change.
+ * Used by post-action effect verification (captureEffect/diffEffect).
+ * characterData is deliberately excluded (fires on every text tick in
+ * chat apps). Idempotent via __nb_mutation_counter_installed, so it is
+ * safe to inject both on-new-document AND late via `page.evaluate` when
+ * adopting a popup page whose document already loaded.
+ */
+const MUTATION_COUNTER_SRC = `
+  (function () {
+    try {
+      if (typeof window === 'undefined') return;
+      if (window.__nb_mutation_counter_installed) return;
+      window.__nb_mutation_counter_installed = true;
+      window.__nb_mutation_counter = 0;
+      var obs = new MutationObserver(function () {
+        window.__nb_mutation_counter = (window.__nb_mutation_counter || 0) + 1;
+      });
+      var start = function () {
+        if (document.documentElement) {
+          obs.observe(document.documentElement, {
+            childList: true, subtree: true, attributes: true,
+          });
+        }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start, { once: true });
+      } else {
+        start();
+      }
+    } catch (e) { /* never let instrumentation break the page */ }
+  })();
+`;
+
 /** Auto-detect Chrome/Chromium binary path. */
 function findChromePath(): string | undefined {
   const fs = require('fs');
@@ -132,6 +189,15 @@ export class BrowserEngine extends EventEmitter {
   private browser: Browser | null = null;
   private config: BrowserConfig;
   private running = false;
+  /**
+   * Guard against popup-adopting our own pages: `browser.newPage()` also
+   * fires `targetcreated` with `opener=null`, so the tab layer's
+   * opener-less fallback could otherwise steal the page of a concurrently
+   * created second session. Incremented before `browser.newPage()`,
+   * decremented once the target is registered in `selfCreatedTargets`.
+   */
+  private pendingSelfPages = 0;
+  private selfCreatedTargets = new WeakSet<Target>();
 
   constructor(config: Partial<BrowserConfig> = {}) {
     super();
@@ -195,6 +261,89 @@ export class BrowserEngine extends EventEmitter {
     this.emit('launched');
   }
 
+  /**
+   * Apply the full per-page setup to a page: stealth scripts, `__name`
+   * shim, mutation counter, viewport, UA, download behavior, ad-block
+   * interception. When `soft` is true every step is individually
+   * best-effort (used for popup adoption, where the page is already
+   * mid-flight and e.g. setRequestInterception can race a navigation).
+   */
+  private async instrumentPage(page: Page, soft = false): Promise<void> {
+    const run = async (fn: () => Promise<unknown>): Promise<void> => {
+      if (soft) {
+        try { await fn(); } catch { /* best-effort on adopted pages */ }
+      } else {
+        await fn();
+      }
+    };
+
+    // Per-session seed so canvas/audio fingerprint noise is stable within
+    // a session but differs across sessions.
+    const sessionSeed = Math.floor(Math.random() * 2147483647);
+
+    // Inject stealth scripts before any page script
+    if (this.config.stealth) {
+      await run(() => page.evaluateOnNewDocument(
+        getStealthScript({
+          sessionSeed,
+          chromeVersion: CHROME_VERSION,
+          platform: DEFAULT_PLATFORM,
+        }),
+      ));
+      await run(() => page.evaluateOnNewDocument(getPlatformOverrideScript()));
+    }
+
+    // See NAME_SHIM_SRC / MUTATION_COUNTER_SRC docs above. Shim first so
+    // the mutation-observer install can't trip the shim load order.
+    await run(() => page.evaluateOnNewDocument(NAME_SHIM_SRC));
+    await run(() => page.evaluateOnNewDocument(MUTATION_COUNTER_SRC));
+
+    await run(() => page.setViewport(this.config.viewport));
+
+    // Set user agent — derived from CHROME_VERSION so stealth UA hints stay in sync.
+    const ua = this.config.userAgent || DEFAULT_UA;
+    await run(() => page.setUserAgent(ua));
+
+    // Setup CDP session for download behavior
+    await run(async () => {
+      const client = await page.createCDPSession();
+      await client.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: this.config.downloadDir,
+      });
+    });
+
+    // Block known ad/tracker URL patterns when blockAds is enabled.
+    // 'media' and 'font' resource types are deliberately NOT blocked:
+    // many sites gate body visibility on @font-face load (FOUT-prevention
+    // CSS like `body { visibility: hidden } body.fonts-loaded { visibility:
+    // visible }`), so aborting fonts leaves the page blank until timeout.
+    if (this.config.blockAds) {
+      await run(async () => {
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+          const url = req.url();
+
+          const blockedPatterns = [
+            /doubleclick\.net/,
+            /google-analytics\.com/,
+            /googletagmanager\.com/,
+            /facebook\.net.*\/tr/,
+            /analytics/,
+            /adservice/,
+          ];
+
+          if (blockedPatterns.some((p) => p.test(url))) {
+            req.abort().catch(() => {});
+            return;
+          }
+
+          req.continue().catch(() => {});
+        });
+      });
+    }
+  }
+
   /** Create a new page with stealth scripts applied. Auto-relaunches if crashed. */
   async newPage(): Promise<PageWrapper> {
     // Auto-recovery: relaunch if browser crashed
@@ -206,127 +355,49 @@ export class BrowserEngine extends EventEmitter {
     }
     if (!this.browser) throw new Error('Failed to launch browser');
 
-    const page = await this.browser.newPage();
-
-    // Per-session seed so canvas/audio fingerprint noise is stable within
-    // a session but differs across sessions.
-    const sessionSeed = Math.floor(Math.random() * 2147483647);
-
-    // Inject stealth scripts before any page script
-    if (this.config.stealth) {
-      await page.evaluateOnNewDocument(
-        getStealthScript({
-          sessionSeed,
-          chromeVersion: CHROME_VERSION,
-          platform: DEFAULT_PLATFORM,
-        }),
-      );
-      await page.evaluateOnNewDocument(getPlatformOverrideScript());
+    this.pendingSelfPages++;
+    let page: Page;
+    try {
+      page = await this.browser.newPage();
+      this.selfCreatedTargets.add(page.target());
+    } finally {
+      this.pendingSelfPages--;
     }
 
-    // Mutation counter: installs window.__nb_mutation_counter and a
-    // MutationObserver that bumps it on any childList/attribute change.
-    // Used by post-action effect verification — the HTTP mutation
-    // handlers read this before + after an action and surface the
-    // delta so the Python side can tell "Puppeteer dispatched" apart
-    // from "the page actually changed." characterData is deliberately
-    // excluded (fires on every text tick in chat apps, would tank CPU
-    // on Slack/Notion); childList+subtree+attributes is sufficient for
-    // React re-renders and DOM-level autocomplete state changes.
-    // Shim `__name` so arrow functions compiled by tsx/esbuild (which
-    // wraps every function in `__name(fn, 'name')` for name
-    // preservation) don't hit `ReferenceError: __name is not defined`
-    // when Puppeteer serializes them into the browser context. This
-    // manifested as HTTP 500s on /session/:id/click — semantic_click
-    // couldn't dismiss any popup. Keep it before the mutation observer
-    // install so that instrumentation itself doesn't trip the shim
-    // load order. `fn => fn` preserves behaviour — the `__name` helper
-    // is a decorator-style identity wrapper in practice.
-    await page.evaluateOnNewDocument(`
-      (function () {
-        try {
-          if (typeof window === 'undefined') return;
-          if (typeof window.__name !== 'function') {
-            Object.defineProperty(window, '__name', {
-              value: function (fn) { return fn; },
-              configurable: true, writable: true,
-            });
-          }
-        } catch (_) { /* silent */ }
-      })();
-    `);
-
-    await page.evaluateOnNewDocument(`
-      (function () {
-        try {
-          if (typeof window === 'undefined') return;
-          if (window.__nb_mutation_counter_installed) return;
-          window.__nb_mutation_counter_installed = true;
-          window.__nb_mutation_counter = 0;
-          var obs = new MutationObserver(function () {
-            window.__nb_mutation_counter = (window.__nb_mutation_counter || 0) + 1;
-          });
-          var start = function () {
-            if (document.documentElement) {
-              obs.observe(document.documentElement, {
-                childList: true, subtree: true, attributes: true,
-              });
-            }
-          };
-          if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', start, { once: true });
-          } else {
-            start();
-          }
-        } catch (e) { /* never let instrumentation break the page */ }
-      })();
-    `);
-
-    // Set viewport
-    await page.setViewport(this.config.viewport);
-
-    // Set user agent — derived from CHROME_VERSION so stealth UA hints stay in sync.
-    const ua = this.config.userAgent || DEFAULT_UA;
-    await page.setUserAgent(ua);
-
-    // Setup CDP session for download behavior
-    const client = await page.createCDPSession();
-    await client.send('Page.setDownloadBehavior', {
-      behavior: 'allow',
-      downloadPath: this.config.downloadDir,
-    });
-
-    // Block known ad/tracker URL patterns when blockAds is enabled.
-    // 'media' and 'font' resource types are deliberately NOT blocked:
-    // many sites gate body visibility on @font-face load (FOUT-prevention
-    // CSS like `body { visibility: hidden } body.fonts-loaded { visibility:
-    // visible }`), so aborting fonts leaves the page blank until timeout.
-    if (this.config.blockAds) {
-      await page.setRequestInterception(true);
-      page.on('request', (req) => {
-        const url = req.url();
-
-        const blockedPatterns = [
-          /doubleclick\.net/,
-          /google-analytics\.com/,
-          /googletagmanager\.com/,
-          /facebook\.net.*\/tr/,
-          /analytics/,
-          /adservice/,
-        ];
-
-        if (blockedPatterns.some((p) => p.test(url))) {
-          req.abort().catch(() => {});
-          return;
-        }
-
-        req.continue().catch(() => {});
-      });
-    }
+    await this.instrumentPage(page);
 
     const wrapper = new PageWrapper(page, this.config);
+    wrapper.ownerEngine = this;
     this.emit('newPage', wrapper);
     return wrapper;
+  }
+
+  /**
+   * Wrap a browser-created popup page (target=_blank / window.open) in a
+   * PageWrapper with best-effort instrumentation. evaluateOnNewDocument
+   * only takes effect on the popup's NEXT navigation, so the mutation
+   * counter and `__name` shim are ALSO late-injected via `page.evaluate`
+   * (both are idempotent installs). Never throws.
+   */
+  async adoptPage(page: Page): Promise<PageWrapper> {
+    await this.instrumentPage(page, true);
+    try { await page.evaluate(NAME_SHIM_SRC); } catch { /* best-effort */ }
+    try { await page.evaluate(MUTATION_COUNTER_SRC); } catch { /* best-effort */ }
+
+    const wrapper = new PageWrapper(page, this.config);
+    wrapper.ownerEngine = this;
+    this.emit('newPage', wrapper);
+    return wrapper;
+  }
+
+  /**
+   * True when `target` is a page WE created via newPage() (or one may be
+   * mid-creation). The tab layer's opener-less popup fallback consults
+   * this so it never adopts another session's page.
+   */
+  isSelfCreated(target: Target): boolean {
+    if (this.pendingSelfPages > 0) return true; // maybe self — defer
+    return this.selfCreatedTargets.has(target);
   }
 
   /** Get the raw browser instance. */

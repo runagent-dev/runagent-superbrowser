@@ -7,7 +7,7 @@
  */
 
 import type { Page, CDPSession } from 'puppeteer-core';
-import type { BrowserConfig } from './engine.js';
+import type { BrowserConfig, BrowserEngine } from './engine.js';
 import { buildDomTree, type PageState, type DialogInfo, type DOMElementNode } from './dom.js';
 import { getAccessibilitySnapshot } from './accessibility.js';
 import { dispatchClick, dispatchHover, dispatchDrag, dispatchScroll } from './input-mouse.js';
@@ -134,6 +134,11 @@ export class PageWrapper {
    *  to humanize/input-mouse so input events can be broadcast to the
    *  live view via InputEventBus. */
   public sessionId?: string;
+
+  /** Back-reference to the engine that created/adopted this page. Set by
+   *  BrowserEngine.newPage()/adoptPage(); the tab layer uses it to adopt
+   *  popup pages with the same instrumentation as the opener. */
+  public ownerEngine?: BrowserEngine;
 
   /**
    * Page reference frame (scrollY, scrollHeight, viewport dims) at the
@@ -1707,9 +1712,19 @@ export class PageWrapper {
     // call returns in <1ms and async state updates fire AFTER the
     // captureEffect, producing mutation_delta=0 even though the click
     // landed. Adds ~32ms on idle pages; far cheaper than waitForVisualStable.
+    // Timer-bounded: when this click opened a NEW tab, this page is now
+    // backgrounded and stops painting — rAF never fires — and an
+    // unbounded rAF wait stalls the whole click handler until the CDP
+    // protocol timeout (~180s). Timers keep firing on background tabs
+    // (--disable-background-timer-throttling), so the race stays cheap
+    // on the happy path and 250ms worst-case on popup clicks.
     try {
       await this.page.evaluate(() => new Promise<void>((r) => {
-        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+        const t = setTimeout(r, 250);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          clearTimeout(t);
+          r();
+        }));
       }));
     } catch { /* page closed mid-click */ }
     await this.waitForIdle(1000).catch(() => {});

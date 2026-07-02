@@ -44,7 +44,10 @@ import { ScreencastManager } from '../browser/screencast.js';
 import { inputEventBus, type MouseMoveEvent, type KeystrokeEvent, type ClickTargetEvent, type VisionBboxesEvent, type VisionPendingEvent } from '../browser/input-events.js';
 
 interface SessionBinding {
-  page: PageWrapper;
+  /** Resolved lazily (getter over the live session object) so commands
+   *  and the screencast follow the session's ACTIVE tab — an eager
+   *  capture here would keep driving the pre-switch tab forever. */
+  readonly page: PageWrapper;
   humanInput?: HumanInputManager;
   ws: WebSocket;
 }
@@ -133,7 +136,12 @@ export function attachWebSocketServer(
       return;
     }
 
-    const binding: SessionBinding = { page: session.page, ws };
+    const binding: SessionBinding = {
+      get page() {
+        return session.page;
+      },
+      ws,
+    };
     const sessionSet = bindings.get(sessionId) ?? new Set<SessionBinding>();
     sessionSet.add(binding);
     bindings.set(sessionId, sessionSet);
@@ -322,6 +330,25 @@ export function attachWebSocketServer(
   });
 
   return wss;
+}
+
+/**
+ * Called by the HTTP/tab layer when a session's active tab changed.
+ * Restarts the screencast against the new page's CDP session (the
+ * getClient closure re-reads `session.page`, so a plain restart picks
+ * up the new tab) and tells viewers so the UI can indicate the switch.
+ */
+export async function notifyActiveTabChanged(
+  sessionId: string,
+  info: { url: string; index: number; count: number },
+): Promise<void> {
+  const mgr = screencasts.get(sessionId);
+  if (mgr) {
+    await mgr.restart().catch((err: Error) => {
+      console.error(`[ws] screencast restart failed: ${err.message}`);
+    });
+  }
+  broadcastToSession(undefined as unknown as WebSocketServer, sessionId, 'tab_switched', info);
 }
 
 /**

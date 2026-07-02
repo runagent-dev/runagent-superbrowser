@@ -1574,6 +1574,24 @@ class BrowserSessionState:
                     )
                 except Exception as exc:
                     print(f"  [stateful_control_inject build_blocks failed: {exc}]")
+                # Links/buttons safety net — the bbox list is otherwise
+                # Gemini-only, so a link vision culled does not exist for
+                # the brain. Inject DOM-detected links/buttons with no
+                # matching bbox (IoU + label dedup, capped, ranked by
+                # task relevance). Same slot contract as stateful inject:
+                # after enrichment, before the toggle/misclick detectors.
+                try:
+                    from .vision_pipeline import _inject_dom_link_bboxes
+                    _inject_dom_link_bboxes(
+                        resp,
+                        selector_entries or [],
+                        img_w,
+                        img_h,
+                        device_pixel_ratio,
+                        self.task_instruction,
+                    )
+                except Exception as exc:
+                    print(f"  [dom_link_inject build_blocks failed: {exc}]")
                 # v4 C6 — stamp just_toggled on the bbox the brain
                 # just clicked, when is_active flipped vs. what was
                 # recorded at click dispatch. Surfaces as
@@ -1722,6 +1740,29 @@ class BrowserSessionState:
         if data.get("title"):
             parts.append(f"Title: {data['title']}")
         result = " | ".join(p for p in parts if p)
+        # New-tab awareness: when the action opened a popup, the server
+        # auto-switched observation to it and this response describes the
+        # NEW tab. Lead with the notice — everything below it (elements,
+        # scroll, cached vision suppression via the URL change) already
+        # reflects the new tab. Also invalidate the vision epoch: the
+        # brain's V_n bboxes belong to the previous tab's document.
+        try:
+            from .formatting import _format_tab_notices
+            tab_notices = _format_tab_notices(data)
+            if tab_notices:
+                result = f"{tab_notices}\n{result}"
+                if data.get("newTab") is not None:
+                    self._vision_epoch_response = None
+                    self._last_vision_ts = 0.0
+            tabs_summary = data.get("tabs")
+            if isinstance(tabs_summary, dict) and int(tabs_summary.get("count") or 1) > 1:
+                result += (
+                    f"\nTab: {int(tabs_summary.get('activeIndex') or 0) + 1}/"
+                    f"{tabs_summary['count']} (other tabs open — "
+                    "browser_tabs(session_id, action='list') to inspect)"
+                )
+        except Exception:
+            pass  # best-effort — never fail the caption on tab metadata
         # Element-list eviction: surface the count, push the dump
         # behind browser_list_elements. Matches the canonical contract
         # in formatting._format_state so tools that build their own

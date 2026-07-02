@@ -57,6 +57,7 @@ from .tools import (
     BrowserSetSliderAtTool,
     BrowserSetSliderTool,
     BrowserSolveCaptchaTool,
+    BrowserTabsTool,
     BrowserSolvePuzzleTool,
     BrowserTypeAtTool,
     BrowserTypeTool,
@@ -121,6 +122,7 @@ def register_session_tools(
         BrowserSolvePuzzleTool(state),     # kept: puzzle solver
         BrowserChessMoveTool(state),       # pixel-exact chess move (board-rect 8x8 subdivide)
         BrowserListElementsTool(state),    # on-demand element inspection
+        BrowserTabsTool(state),            # list/switch/close tabs (popups auto-switch)
         BrowserGetMarkdownTool(),          # stateless
         BrowserDialogTool(),               # stateless
         BrowserDetectCaptchaTool(state),

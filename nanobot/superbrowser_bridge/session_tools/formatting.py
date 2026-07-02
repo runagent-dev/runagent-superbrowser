@@ -167,6 +167,54 @@ def _count_elements(data: dict, state: "BrowserSessionState | None" = None) -> i
     return 0
 
 
+def _format_tab_notices(data: dict) -> str:
+    """Render new-tab awareness from a TS response into brain-visible text.
+
+    Two sources, both attached by the TS server:
+      - ``newTab``: the action the brain JUST took opened a popup and the
+        system auto-switched observation to it (mirrors real browser
+        focus). The brain must re-screenshot — its V_n bboxes belong to
+        the previous tab's document.
+      - ``tabNotices``: popups that opened/closed OUTSIDE an action's
+        response window (delayed window.open, site-side window.close).
+        Drained by the server into the next state-bearing response so
+        they surface one turn late but are never lost.
+
+    Returns "" when there is nothing to report (the overwhelmingly
+    common single-tab case — zero caption change).
+    """
+    lines: list[str] = []
+    new_tab = data.get("newTab")
+    if isinstance(new_tab, dict):
+        url = new_tab.get("url") or "?"
+        idx = int(new_tab.get("tabIndex") or 0)
+        count = int(new_tab.get("tabCount") or 1)
+        lines.append(
+            f"[NEW_TAB opened and auto-switched → {url} (tab {idx + 1}/{count})]\n"
+            "You are now observing the NEW tab; the previous page is "
+            "preserved — browser_tabs(action='switch', index=...) to go "
+            "back. Old V_n bboxes belong to the previous tab: take a "
+            "fresh browser_screenshot before clicking."
+        )
+    for evt in data.get("tabNotices") or []:
+        if not isinstance(evt, dict):
+            continue
+        kind = evt.get("kind")
+        url = evt.get("url") or "?"
+        idx = int(evt.get("index") or 0)
+        if kind == "opened":
+            lines.append(
+                f"[NEW_TAB opened and auto-switched → {url} (tab {idx + 1})]\n"
+                "A new tab opened since your last action and observation "
+                "moved to it. Take a fresh browser_screenshot; "
+                "browser_tabs(action='list') shows all tabs."
+            )
+        elif kind == "closed":
+            focus = " — focus fell back automatically" if evt.get("autoSwitched") else ""
+            lines.append(f"[TAB_CLOSED {url}{focus} (now tab {idx + 1})]")
+    return "\n".join(lines)
+
+
 def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
     """Canonical per-iteration state caption.
 
@@ -186,6 +234,9 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
     available via the elements tool when needed.
     """
     parts: list[str] = []
+    tab_notices = _format_tab_notices(data)
+    if tab_notices:
+        parts.append(tab_notices)
     session_id = data.get("sessionId") or (state.session_id if state else "")
     url = data.get("url") or ""
     title = (data.get("title") or "").replace('"', "'")[:80]
@@ -204,6 +255,13 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
         parts.append(
             f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} "
             f"(viewport: {si.get('viewportHeight', 0)})"
+        )
+    tabs_summary = data.get("tabs")
+    if isinstance(tabs_summary, dict) and int(tabs_summary.get("count") or 1) > 1:
+        parts.append(
+            f"Tab: {int(tabs_summary.get('activeIndex') or 0) + 1}/"
+            f"{tabs_summary['count']} (other tabs open — "
+            "browser_tabs(session_id, action='list') to inspect)"
         )
 
     elem_count = _count_elements(data, state)

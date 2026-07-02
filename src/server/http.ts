@@ -31,7 +31,9 @@ import { fingerprintMap, invertFingerprintMap, fingerprintElement } from '../bro
 import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
 import { coordBand } from '../agent/step-observation.js';
-import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot } from './effect.js';
+import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot, type EffectDelta } from './effect.js';
+import { SessionTabs } from '../browser/tab-manager.js';
+import { notifyActiveTabChanged } from './websocket.js';
 import {
   waitForTargetStable,
   capturePageRef,
@@ -40,7 +42,12 @@ import {
 
 /** Session with TTL tracking. */
 interface ManagedSession {
+  /** ALWAYS the session's ACTIVE tab — repointed by SessionTabs on
+   *  popup auto-switch / explicit tab switch, so every endpoint that
+   *  reads `session.page` follows focus without changes. */
   page: PageWrapper;
+  /** Ordered tab list + popup detection for this session. */
+  tabs: SessionTabs;
   createdAt: number;
   lastAccessed: number;
 }
@@ -474,7 +481,9 @@ export function createHttpServer(
       const idle = now - session.lastAccessed > SESSION_IDLE_TIMEOUT;
       const expired = now - session.createdAt > SESSION_MAX_LIFETIME;
       if (idle || expired) {
-        session.page.close().catch(() => {});
+        // dispose() closes EVERY tab (not just the active page) and
+        // releases the per-Browser targetcreated listener refcount.
+        session.tabs.dispose().catch(() => {});
         sessions.delete(id);
         disposeSessionHumanInput(id);
       }
@@ -487,6 +496,81 @@ export function createHttpServer(
     if (!session) return null;
     session.lastAccessed = Date.now();
     return session.page;
+  }
+
+  /**
+   * Attach tab awareness to a state-bearing JSON payload:
+   *  - `tabs` summary when more than one tab exists
+   *  - `tabNotices` (drained TabEvents: popups opened/closed since the
+   *    last state-bearing response) — how a popup that arrived AFTER a
+   *    click response was already sent still reaches the brain.
+   */
+  function withTabInfo(id: string, payload: Record<string, unknown>): Record<string, unknown> {
+    const session = sessions.get(id);
+    if (!session?.tabs) return payload;
+    const notices = session.tabs.drainEvents();
+    const summary = session.tabs.summary();
+    const out: Record<string, unknown> = { ...payload };
+    if (summary.count > 1) out.tabs = summary;
+    if (notices.length > 0) out.tabNotices = notices;
+    return out;
+  }
+
+  /** Grace window for "did this action spawn a popup?" after settle.
+   *  Popup targets are created near-synchronously with the click and
+   *  settleForEffect already waited several hundred ms, so this is a
+   *  short backstop, not the primary wait. */
+  const TAB_OPEN_GRACE_MS = parseInt(process.env.TAB_OPEN_GRACE_MS || '150', 10);
+
+  interface PostActionObservation {
+    /** Page to observe/report from — the NEW tab when one was adopted. */
+    page: PageWrapper;
+    /** null only when effectBefore was null and no popup opened. */
+    effect: EffectDelta | null;
+    newTab?: { url: string; title: string; tabIndex: number; tabCount: number };
+  }
+
+  /**
+   * Shared post-action observation for the click paths. Settles the
+   * dispatch page, then checks whether the action spawned a popup tab.
+   * On popup: observation moves to the (auto-switched) new tab and the
+   * effect is SYNTHESIZED as url_changed=true — without that, the
+   * Python silent-click ladder reads mutation_delta≈0 on the old page
+   * as a no-op and re-clicks via js/keyboard, opening a second popup.
+   */
+  async function observeAfterAction(
+    sessionId: string,
+    pageAtDispatch: PageWrapper,
+    effectBefore: EffectSnapshot | null,
+    actionStart: number,
+  ): Promise<PostActionObservation> {
+    await settleForEffect(pageAtDispatch.getRawPage());
+    const tabs = sessions.get(sessionId)?.tabs;
+    const opened = tabs
+      ? await tabs.waitForOpenedSince(actionStart, TAB_OPEN_GRACE_MS)
+      : null;
+    if (opened && tabs) {
+      const active = tabs.active;
+      await SessionTabs.waitForTabReady(active);
+      let url = '';
+      let title = '';
+      try { url = active.getRawPage().url(); } catch { /* closed */ }
+      try {
+        title = await Promise.race([
+          active.getRawPage().title(),
+          new Promise<string>((r) => setTimeout(() => r(''), 800)),
+        ]);
+      } catch { /* best-effort */ }
+      const s = tabs.summary();
+      return {
+        page: active,
+        effect: { url_changed: true, mutation_delta: 0, focused_changed: false },
+        newTab: { url, title, tabIndex: s.activeIndex, tabCount: s.count },
+      };
+    }
+    if (!effectBefore) return { page: pageAtDispatch, effect: null };
+    const effectAfter = await captureEffect(pageAtDispatch.getRawPage());
+    return { page: pageAtDispatch, effect: diffEffect(effectBefore, effectAfter) };
   }
 
   /** Create a new persistent session. Accepts optional proxy/region for geo-restricted sites. */
@@ -508,7 +592,22 @@ export function createHttpServer(
 
       const id = `session-${crypto.randomUUID().split('-')[0]}`;
       page.sessionId = id;
-      sessions.set(id, { page, createdAt: Date.now(), lastAccessed: Date.now() });
+      const managed = {
+        page,
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+      } as ManagedSession;
+      managed.tabs = new SessionTabs(id, page, (active) => {
+        // Popup auto-switch / explicit tab switch: repoint the session's
+        // active page and rebind the live viewer's screencast.
+        managed.page = active;
+        const s = managed.tabs.summary();
+        let url = '';
+        try { url = active.getRawPage().url(); } catch { /* closed */ }
+        void notifyActiveTabChanged(id, { url, index: s.activeIndex, count: s.count });
+      });
+      managed.tabs.attach();
+      sessions.set(id, managed);
 
       // Per-session human-input manager + handoff budget.
       sessionHumanInput.set(id, new HumanInputManager());
@@ -619,7 +718,7 @@ export function createHttpServer(
         catch { /* best-effort */ }
       }
 
-      res.json({
+      res.json(withTabInfo(req.params.id, {
         url: state.url,
         title: state.title,
         statusCode: nav.statusCode,
@@ -628,7 +727,7 @@ export function createHttpServer(
         scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -798,7 +897,7 @@ export function createHttpServer(
         iframeSignature = '';
       }
 
-      res.json({
+      res.json(withTabInfo(req.params.id, {
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
@@ -823,7 +922,7 @@ export function createHttpServer(
         // collision rate on repeating sibling lists (filter checkboxes
         // with identical aria-labels at different on-screen positions).
         fingerprints: fingerprintMap(state.selectorMap, state.selectorEntries),
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -834,6 +933,7 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const actionStart = Date.now();
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
     try {
       const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label, strategy } = req.body as {
@@ -951,12 +1051,13 @@ export function createHttpServer(
           } else {
             await page.dispatchKeyboardEnterAt(dispatchX, dispatchY);
           }
-          await settleForEffect(page.getRawPage());
-          const effectAfterAlt = await captureEffect(page.getRawPage());
-          const newStateAlt = await page.getState({
+          const obsAlt = await observeAfterAction(
+            req.params.id, page, effectBefore, actionStart,
+          );
+          const newStateAlt = await obsAlt.page.getState({
             useVision: false, includeConsole: true,
           });
-          res.json({
+          res.json(withTabInfo(req.params.id, {
             success: true,
             url: newStateAlt.url,
             title: newStateAlt.title,
@@ -965,11 +1066,12 @@ export function createHttpServer(
             pendingDialogs: newStateAlt.pendingDialogs,
             snap: { x: dispatchX, y: dispatchY, snapped: false, target: '' },
             strategy,
-            effect: diffEffect(effectBefore, effectAfterAlt),
+            effect: obsAlt.effect,
+            ...(obsAlt.newTab ? { newTab: obsAlt.newTab } : {}),
             fingerprints: fingerprintMap(
               newStateAlt.selectorMap, newStateAlt.selectorEntries,
             ),
-          });
+          }));
           return;
         }
 
@@ -1033,15 +1135,18 @@ export function createHttpServer(
         // surfaced in `snap` for the bridge to log as a diagnostic so
         // the brain can read what was actually clicked vs what it
         // expected.
-        await settleForEffect(page.getRawPage());
-        const effectAfter = await captureEffect(page.getRawPage());
-        const newState = await page.getState({ useVision: false, includeConsole: true });
+        const obs = await observeAfterAction(
+          req.params.id, page, effectBefore, actionStart,
+        );
+        const newState = await obs.page.getState({ useVision: false, includeConsole: true });
         // Resolve the snapped element to its DOM index so the Python
         // bridge can record `last_click_dom_index`. Cross-tool dead-
         // click guard then catches a follow-up `browser_click(N)` on
         // the SAME element after a `browser_click_at(V_n)` toggled it.
+        // Skipped when the click opened a new tab — the selectorMap now
+        // describes a different document.
         let domIndex: number | undefined;
-        if (snap.targetXpath) {
+        if (snap.targetXpath && !obs.newTab) {
           for (const [idx, el] of newState.selectorMap) {
             if (el.xpath === snap.targetXpath) {
               domIndex = idx;
@@ -1052,7 +1157,7 @@ export function createHttpServer(
         const snapWithIndex = domIndex !== undefined
           ? { ...snap, dom_index: domIndex }
           : snap;
-        res.json({
+        res.json(withTabInfo(req.params.id, {
           success: true,
           url: newState.url,
           title: newState.title,
@@ -1060,9 +1165,10 @@ export function createHttpServer(
           consoleErrors: newState.consoleErrors,
           pendingDialogs: newState.pendingDialogs,
           snap: snapWithIndex,
-          effect: diffEffect(effectBefore, effectAfter),
+          effect: obs.effect,
+          ...(obs.newTab ? { newTab: obs.newTab } : {}),
           fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
-        });
+        }));
         return;
       }
 
@@ -1242,6 +1348,9 @@ export function createHttpServer(
               );
             }
 
+            if (process.env.CLICK_DEBUG === '1') {
+              console.log(`[click_debug] dom-index pre-dispatch t=${Date.now() - actionStart}ms`);
+            }
             const snap = await page.clickInBbox(
               {
                 x0: dispatchBounds.x, y0: dispatchBounds.y,
@@ -1250,6 +1359,9 @@ export function createHttpServer(
               },
               { button, clickCount, expectedLabel: expectedLabel || undefined },
             );
+            if (process.env.CLICK_DEBUG === '1') {
+              console.log(`[click_debug] dom-index post-dispatch t=${Date.now() - actionStart}ms`);
+            }
 
             // labelMismatch is no longer a hard block (mirrors the
             // vision-bbox branch above). The snap already picked the
@@ -1257,19 +1369,27 @@ export function createHttpServer(
             // mismatch flag in the response for the bridge to log as
             // a diagnostic. Brain reads what was actually clicked and
             // adapts — no silent rejection.
-            await settleForEffect(page.getRawPage());
-            const effectAfter = await captureEffect(page.getRawPage());
-            const newState = await page.getState({
+            const obs = await observeAfterAction(
+              req.params.id, page, effectBefore, actionStart,
+            );
+            if (process.env.CLICK_DEBUG === '1') {
+              console.log(`[click_debug] dom-index post-observe t=${Date.now() - actionStart}ms newTab=${!!obs.newTab}`);
+            }
+            const newState = await obs.page.getState({
               useVision: false, includeConsole: true,
             });
+            if (process.env.CLICK_DEBUG === '1') {
+              console.log(`[click_debug] dom-index post-getState t=${Date.now() - actionStart}ms`);
+            }
             // Resolve the snapped element to its DOM index in the
             // post-click state. Falls back to the brain's [N] when the
             // snap targeted a different element (rare — usually means
             // grid-scan picked a sibling because the centre-element
             // didn't label-match). Either way the brain learns the
-            // identity.
+            // identity. Skipped when the click opened a new tab — the
+            // selectorMap now describes a different document.
             let domIndex: number | undefined;
-            if (snap.targetXpath) {
+            if (snap.targetXpath && !obs.newTab) {
               for (const [idx, el] of newState.selectorMap) {
                 if (el.xpath === snap.targetXpath) {
                   domIndex = idx;
@@ -1280,7 +1400,7 @@ export function createHttpServer(
             if (domIndex === undefined) domIndex = index;
             snapWithIndex = { ...snap, dom_index: domIndex };
 
-            res.json({
+            res.json(withTabInfo(req.params.id, {
               success: true,
               url: newState.url,
               title: newState.title,
@@ -1288,11 +1408,12 @@ export function createHttpServer(
               consoleErrors: newState.consoleErrors,
               pendingDialogs: newState.pendingDialogs,
               snap: snapWithIndex,
-              effect: diffEffect(effectBefore, effectAfter),
+              effect: obs.effect,
+              ...(obs.newTab ? { newTab: obs.newTab } : {}),
               fingerprints: fingerprintMap(
                 newState.selectorMap, newState.selectorEntries,
               ),
-            });
+            }));
             return;
           }
           // bounds unreadable — fall through to legacy path.
@@ -1314,24 +1435,26 @@ export function createHttpServer(
       }
 
       // Return updated state — no screenshot (nanobot discards it anyway, saves processing time)
-      await settleForEffect(page.getRawPage());
-      const effectAfter = await captureEffect(page.getRawPage());
-      const newState = await page.getState({ useVision: false, includeConsole: true });
-      res.json({
+      const obs = await observeAfterAction(
+        req.params.id, page, effectBefore, actionStart,
+      );
+      const newState = await obs.page.getState({ useVision: false, includeConsole: true });
+      res.json(withTabInfo(req.params.id, {
         success: true,
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
         consoleErrors: newState.consoleErrors,
         pendingDialogs: newState.pendingDialogs,
-        effect: diffEffect(effectBefore, effectAfter),
+        effect: obs.effect,
+        ...(obs.newTab ? { newTab: obs.newTab } : {}),
         // Fresh per-index fingerprints so the Python bridge's
         // element_fingerprints cache stays in sync after every click.
         // Without this, a follow-up DOM-index click on a re-rendered
         // page sends a STALE expected_fingerprint that may collide with
         // the new occupant of [N], silently misclicking.
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -1523,11 +1646,11 @@ export function createHttpServer(
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false });
-      res.json({
+      res.json(withTabInfo(req.params.id, {
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         effect: diffEffect(effectBefore, effectAfter),
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -1577,14 +1700,14 @@ export function createHttpServer(
         preBboxes,
         collectNewlyVisible: !isAbsoluteJump,
       });
-      res.json({
+      res.json(withTabInfo(req.params.id, {
         success: true,
         elements: newState.elementTree.clickableElementsToString(),
         prevScrollInfo: { scrollY: preY },
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
         probe,
         newly_visible,
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -1797,6 +1920,7 @@ export function createHttpServer(
     const page = getSession(req.params.id);
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
+    const actionStart = Date.now();
     try {
       const {
         selector: rawSelector, button, clickCount, linear, ensureVisible,
@@ -1815,15 +1939,20 @@ export function createHttpServer(
         : await page.clickSelector(selector, {
             button, clickCount, linear, ensureVisible,
           });
-      const newState = await page.getState({ useVision: false });
-      res.json({
+      // Selector clicks can open new tabs too. No effectBefore here —
+      // the response historically carries no effect field, and it stays
+      // that way unless a popup forces the synthesized url_changed.
+      const obs = await observeAfterAction(req.params.id, page, null, actionStart);
+      const newState = await obs.page.getState({ useVision: false });
+      res.json(withTabInfo(req.params.id, {
         success: true,
         clicked: result,
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),
+        ...(obs.newTab ? { newTab: obs.newTab, effect: obs.effect } : {}),
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
-      });
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -1854,6 +1983,101 @@ export function createHttpServer(
         // Fresh fingerprints for the post-back DOM.
         fingerprints: fingerprintMap(newState.selectorMap, newState.selectorEntries),
       });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** List this session's tabs (index, url, title, active). */
+  app.get('/session/:id/tabs', async (req, res) => {
+    const page = getSession(req.params.id); // touches lastAccessed
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const tabs = sessions.get(req.params.id)!.tabs;
+      const summary = tabs.summary();
+      const withTitles = await Promise.all(summary.tabs.map(async (t) => {
+        let title = '';
+        try {
+          title = await Promise.race([
+            tabs.tabs[t.index].getRawPage().title(),
+            new Promise<string>((r) => setTimeout(() => r(''), 800)),
+          ]);
+        } catch { /* closed */ }
+        return { ...t, title };
+      }));
+      res.json({ activeIndex: summary.activeIndex, count: summary.count, tabs: withTitles });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Switch the session's active tab. Response mirrors /navigate's
+   *  shape so the Python bridge can reuse its state formatting. */
+  app.post('/session/:id/tabs/activate', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const tabs = sessions.get(req.params.id)!.tabs;
+      const index = req.body?.index;
+      let active: PageWrapper;
+      try {
+        active = await tabs.switchTo(index);
+      } catch (e) {
+        res.status(400).json({ error: (e as Error).message, reason: 'bad_tab_index' });
+        return;
+      }
+      await SessionTabs.waitForTabReady(active);
+      const state = await active.getState({ useVision: false, includeConsole: true });
+      res.json(withTabInfo(req.params.id, {
+        success: true,
+        activeIndex: tabs.activeIndex,
+        url: state.url,
+        title: state.title,
+        elements: state.elementTree.clickableElementsToString(),
+        scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
+        consoleErrors: state.consoleErrors,
+        pendingDialogs: state.pendingDialogs,
+        fingerprints: fingerprintMap(state.selectorMap, state.selectorEntries),
+      }));
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Close a tab (default: the active one). Focus falls back to the
+   *  most recent remaining tab. Refuses to close the last tab — use
+   *  DELETE /session/:id to end the session. */
+  app.post('/session/:id/tabs/close', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const tabs = sessions.get(req.params.id)!.tabs;
+      const index = typeof req.body?.index === 'number' ? req.body.index : tabs.activeIndex;
+      const closingUrl = tabs.summary().tabs[index]?.url ?? '';
+      let active: PageWrapper;
+      try {
+        active = await tabs.closeTab(index);
+      } catch (e) {
+        const msg = (e as Error).message;
+        res.status(400).json({
+          error: msg === 'last_tab'
+            ? 'Cannot close the last tab — use DELETE /session/:id to end the session'
+            : msg,
+          reason: msg === 'last_tab' ? 'last_tab' : 'bad_tab_index',
+        });
+        return;
+      }
+      const state = await active.getState({ useVision: false, includeConsole: true });
+      res.json(withTabInfo(req.params.id, {
+        success: true,
+        closed: { index, url: closingUrl },
+        activeIndex: tabs.activeIndex,
+        url: state.url,
+        title: state.title,
+        elements: state.elementTree.clickableElementsToString(),
+        scrollInfo: { scrollY: state.scrollY, scrollHeight: state.scrollHeight, viewportHeight: state.viewportHeight },
+        fingerprints: fingerprintMap(state.selectorMap, state.selectorEntries),
+      }));
     } catch (err) {
       handleError(res, err);
     }
@@ -2566,11 +2790,12 @@ export function createHttpServer(
 
   /** Close a session. */
   app.delete('/session/:id', async (req, res) => {
-    const page = getSession(req.params.id);
-    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    const session = sessions.get(req.params.id);
+    if (!session) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      await page.close();
+      // Closes EVERY tab and releases the targetcreated listener.
+      await session.tabs.dispose();
       sessions.delete(req.params.id);
       disposeSessionHumanInput(req.params.id);
       res.json({ success: true });
