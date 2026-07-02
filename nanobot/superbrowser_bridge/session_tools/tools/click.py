@@ -441,6 +441,12 @@ class BrowserClickTool(Tool):
                 threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
+                # Also expire the cached-vision piggyback: build_text_only
+                # runs before the post-click prefetch lands, so without
+                # this the brain gets PRE-mutation bboxes stamped
+                # "[CACHED VISION — bboxes still valid]". The prefetch
+                # re-stamps _last_vision_ts when fresh bboxes arrive.
+                self.s._last_vision_ts = 0.0
                 self.s.log_activity(
                     f"click([{index}])(EPOCH_DIRTY)",
                     f"mutation_delta={mutation_delta} > {threshold}",
@@ -968,6 +974,9 @@ class BrowserClickAtTool(Tool):
                 threshold = 6
             if mutation_delta > threshold:
                 self.s._vision_epoch_response = None
+                # See browser_click: expire the cached-vision piggyback
+                # too, or build_text_only re-attaches pre-mutation bboxes.
+                self.s._last_vision_ts = 0.0
                 self.s.log_activity(
                     f"click_at{log_target}(EPOCH_DIRTY)",
                     f"mutation_delta={mutation_delta} > {threshold}",
