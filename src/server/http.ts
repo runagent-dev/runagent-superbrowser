@@ -520,7 +520,8 @@ export function createHttpServer(
    *  Popup targets are created near-synchronously with the click and
    *  settleForEffect already waited several hundred ms, so this is a
    *  short backstop, not the primary wait. */
-  const TAB_OPEN_GRACE_MS = parseInt(process.env.TAB_OPEN_GRACE_MS || '150', 10);
+  const TAB_OPEN_GRACE_RAW = parseInt(process.env.TAB_OPEN_GRACE_MS || '150', 10);
+  const TAB_OPEN_GRACE_MS = Number.isFinite(TAB_OPEN_GRACE_RAW) ? TAB_OPEN_GRACE_RAW : 150;
 
   interface PostActionObservation {
     /** Page to observe/report from — the NEW tab when one was adopted. */
@@ -537,6 +538,11 @@ export function createHttpServer(
    * effect is SYNTHESIZED as url_changed=true — without that, the
    * Python silent-click ladder reads mutation_delta≈0 on the old page
    * as a no-op and re-clicks via js/keyboard, opening a second popup.
+   *
+   * `effectBefore === null` (the /click-selector path) means the caller
+   * never carried an effect envelope — skip settleForEffect too, so
+   * rapid selector-click sequences (chess/puzzle solvers) keep their
+   * historical latency; the popup grace check alone costs ≤150ms.
    */
   async function observeAfterAction(
     sessionId: string,
@@ -544,7 +550,9 @@ export function createHttpServer(
     effectBefore: EffectSnapshot | null,
     actionStart: number,
   ): Promise<PostActionObservation> {
-    await settleForEffect(pageAtDispatch.getRawPage());
+    if (effectBefore) {
+      await settleForEffect(pageAtDispatch.getRawPage());
+    }
     const tabs = sessions.get(sessionId)?.tabs;
     const opened = tabs
       ? await tabs.waitForOpenedSince(actionStart, TAB_OPEN_GRACE_MS)
