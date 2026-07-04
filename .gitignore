@@ -21,8 +21,13 @@ coverage/
 workspace/.nanobot/
 workspace/memory/
 workspace/session/nanobot/workspace*/**/*.jsonl
-nanobot/workspace*/SOUL.md
+# NOTE: the per-role SOUL.md files ARE the agents' system prompts and are
+# force-included into the wheel (pyproject.toml). They MUST stay tracked so a
+# fresh `git clone` build ships them — do NOT ignore them. Runtime workspace
+# copies live in $HOME/.superbrowser, not here.
 nanobot/workspace*/learnings/
+nanobot/workspace*/memory/
+nanobot/workspace*/sessions/
 nanobot/workspace*/**/.nanobot/
 *.jsonl
 

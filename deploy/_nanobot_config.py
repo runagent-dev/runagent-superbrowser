@@ -21,6 +21,11 @@ and Docker, or delivered by runagent-serverless to ``/root/.env`` in the VM::
 A plain ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` (an older deploy, or a shell
 export) is accepted as a fallback.
 
+A complete config.json can instead be delivered verbatim as
+``NANOBOT_CONFIG_JSON_B64`` (base64 of the JSON). When present it REPLACES
+``~/.nanobot/config.json`` wholesale and the LLM_* bridge is skipped — this is how
+the dashboard's raw-config editor reaches the VM.
+
 nanobot, however, reads its model + provider key **only** from
 ``~/.nanobot/config.json``. Nothing runs ``nanobot onboard`` in the image, so
 without this step ``load_config`` returns its built-in defaults (no usable API
@@ -103,7 +108,9 @@ def _has_explicit_llm_env() -> bool:
     A bare ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` does NOT count — those are
     often exported globally and must not silently override a local onboard.
     """
-    return any((os.environ.get(k) or "").strip() for k in _EXPLICIT_LLM_ENV)
+    return bool((os.environ.get("NANOBOT_CONFIG_JSON_B64") or "").strip()) or any(
+        (os.environ.get(k) or "").strip() for k in _EXPLICIT_LLM_ENV
+    )
 
 
 def _config_has_usable_provider() -> bool:
@@ -146,6 +153,36 @@ def bootstrap_nanobot_config() -> bool:
     return ensure_nanobot_config()
 
 
+def _write_full_config_b64(raw_b64: str) -> bool:
+    """Write a base64-encoded *complete* nanobot config.json verbatim to
+    ``~/.nanobot/config.json`` (replace, not merge). Returns ``True`` on success;
+    never raises. Invalid base64 / JSON leaves any existing config untouched.
+    """
+    import base64
+    import json
+
+    path = os.path.expanduser("~/.nanobot/config.json")
+    try:
+        decoded = base64.b64decode(raw_b64).decode("utf-8")
+        data = json.loads(decoded)  # validate it's real JSON before replacing
+        if not isinstance(data, dict):
+            raise ValueError("nanobot config must be a JSON object")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)  # atomic
+        return True
+    except Exception as exc:  # noqa: BLE001 - never break the agent over config
+        try:
+            from loguru import logger
+
+            logger.warning("ensure_nanobot_config: could not write full config: {}", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 def ensure_nanobot_config() -> bool:
     """Merge the LLM env contract into ``~/.nanobot/config.json`` unconditionally.
 
@@ -161,6 +198,12 @@ def ensure_nanobot_config() -> bool:
     ``False`` when there's nothing to do. Never raises — on failure the agent
     falls back to whatever config already exists.
     """
+    # A full config.json delivered verbatim (base64) wins over the LLM_* bridge:
+    # write it as-is and skip the field merge. This is the dashboard raw-config path.
+    raw_b64 = (os.environ.get("NANOBOT_CONFIG_JSON_B64") or "").strip()
+    if raw_b64:
+        return _write_full_config_b64(raw_b64)
+
     info = _resolve()
     if not info:
         return False

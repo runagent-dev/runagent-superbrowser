@@ -46,8 +46,8 @@ def main() -> int:
     try:
         with sb:
             res = sb.run(
-                "Go to https://www.stubhub.com/ and Book 4 tickets in the upper for any Kevin gates show in nashvilee in the next five months and view ticket prices with estimated fees.",
-                url="https://www.stubhub.com/",
+                "Is there a one-bedroom room available at a five-star hotel in Cox’s Bazar on https://gozayaan.com/ I want to stay from July 8 to July 10.",
+                url="https://gozayaan.com/",
                 mode="browser",
             )
     except (ServerUnavailable, ServerStartError) as exc:
