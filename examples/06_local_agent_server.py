@@ -32,7 +32,7 @@ def main() -> int:
         persistent=True,          # reuse the container's per-user cookies/profiles
     )
 
-    res = sb.run("go to https://www.stubhub.com/ and Book 4 tickets in the upper for any Kevin Hart show in New York in the next three months and view ticket prices with estimated fees.", mode="browser")
+    res = sb.run("Is there a one-bedroom room available at a five-star hotel in Cox’s Bazar on https://gozayaan.com/ I want to stay from July 8 to July 10.", mode="browser")
     print(res.text)
     if not res.success and res.error:
         print(f"[error] {res.error}", file=sys.stderr)

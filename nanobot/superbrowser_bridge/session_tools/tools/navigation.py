@@ -190,6 +190,74 @@ class BrowserOpenTool(Tool):
         except Exception:
             return False
 
+    async def _rehydrate_state(self, session_id: str) -> dict[str, Any] | None:
+        """Re-capture a SETTLED /state until clickable elements appear.
+
+        Fixes the cold-Docker SPA race: TS /session/create runs getState the
+        instant navigate() resolves (no settle gate), so a heavy client-rendered
+        app that has not hydrated yet returns empty ``elements`` → empty
+        dom_hash (logged ``dom_hash=-``) → blank vision frame → 0 bboxes → the
+        agent can't click. Re-issues the SAME call browser_screenshot / the
+        vision prefetch already use
+        (GET /session/{id}/state?vision=true&bounds=true&settle=true; settle=true
+        drives waitForVisualStable TS-side), retrying within a small wall-clock
+        budget and stopping the instant ``elements`` is non-blank.
+
+        Returns the settled /state dict (which — unlike the create response —
+        also carries selectorEntries + devicePixelRatio + iframeSignature) or
+        None on exhaustion / dead session, in which case the caller falls back
+        to the original create capture (never worse than the status quo).
+
+        Tunables (opt-out convention mirrors SUPERBROWSER_BLANK_ESCALATE):
+          * ``SUPERBROWSER_HYDRATE_RETRY=0`` disables the recovery (caller gate).
+          * ``SUPERBROWSER_HYDRATE_MAX_ATTEMPTS`` caps probe count (default 4).
+          * ``SUPERBROWSER_HYDRATE_BUDGET_MS`` caps total wall-clock (default
+            4500) — a cold-container SPA's bundle fetch+parse+first-render
+            typically lands 1-4s after navigate() resolves.
+        """
+        import time as _time
+
+        try:
+            max_attempts = max(
+                1, int(os.environ.get("SUPERBROWSER_HYDRATE_MAX_ATTEMPTS", "4"))
+            )
+        except (TypeError, ValueError):
+            max_attempts = 4
+        try:
+            budget_s = max(
+                0.5,
+                float(os.environ.get("SUPERBROWSER_HYDRATE_BUDGET_MS", "4500")) / 1000.0,
+            )
+        except (TypeError, ValueError):
+            budget_s = 4.5
+
+        deadline = _time.monotonic() + budget_s
+        for attempt in range(max_attempts):
+            if _time.monotonic() >= deadline:
+                break
+            try:
+                r = await _request_with_backoff(
+                    "GET",
+                    f"{SUPERBROWSER_URL}/session/{session_id}/state",
+                    params={"vision": "true", "bounds": "true", "settle": "true"},
+                    timeout=6.0,
+                )
+            except Exception as exc:
+                # Connection/read error after backoff → session likely gone.
+                print(f"  [hydrate_retry] /state error attempt {attempt+1}: {type(exc).__name__}")
+                break
+            # _request_with_backoff does not raise on non-2xx; 404 = closed/expired.
+            if r.status_code != 200:
+                break
+            settled = r.json()
+            if (settled.get("elements") or "").strip():
+                print(f"  [hydrate_retry] elements appeared on attempt {attempt+1}")
+                return settled
+            if _time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.3)
+        return None
+
     async def execute(self, url: str | None = None, region: str | None = None, proxy: str | None = None, intent: str | None = None, tier: str | None = None, **kw: Any) -> Any:
         self.s.init_if_needed()
 
@@ -538,6 +606,69 @@ class BrowserOpenTool(Tool):
             activity = self.s.get_activity_summary()
             if activity:
                 caption += activity
+
+        # --- Cold-SPA first-open hydration recovery ---------------------
+        # /session/create captures the instant navigate() resolves, so a heavy
+        # SPA that has not hydrated (cold, headless, --disable-dev-shm-usage
+        # Docker Chromium is the canonical case) returns empty `elements` →
+        # blank vision → 0 bboxes → the agent can't click anything. When that
+        # happens, re-capture a SETTLED /state (the exact call browser_screenshot
+        # uses) and hand the vision model the hydrated frame + selector_entries
+        # instead. Warm/common case (elements already present) is skipped here →
+        # ZERO added latency. Only T1: T3's /state shim ignores query params and
+        # defaults vision off, and its open already handles readiness. A genuine
+        # HTTP-200 bot-block took the _page_looks_blank → T3 path above (which
+        # flips chosen_tier to "t3"), so this guard also can't mask a real block.
+        if (
+            chosen_tier == "t1"
+            and self.s.session_id
+            and data.get("screenshot")
+            and not (data.get("elements") or "").strip()
+            and (status_code is None or status_code == 200)
+            and os.environ.get("SUPERBROWSER_HYDRATE_RETRY", "1") not in ("0", "false", "no")
+        ):
+            settled = await self._rehydrate_state(self.s.session_id)
+            if settled and settled.get("screenshot") and (settled.get("elements") or "").strip():
+                entries = settled.get("selectorEntries") or []
+                dpr = float(settled.get("devicePixelRatio") or 1.0)
+                # Rename tagName → tag for the overlay (mirrors screenshot.py).
+                overlay_elements = [
+                    {
+                        "index": e.get("index"),
+                        "tag": e.get("tagName") or e.get("tag"),
+                        "role": e.get("role") or (e.get("attributes") or {}).get("role"),
+                        "bounds": e.get("bounds"),
+                    }
+                    for e in entries
+                    if e.get("bounds") and e.get("index") is not None
+                ]
+                _settled_url = settled.get("url") or actual_url
+                self.s.screenshots_taken += 1
+                if _settled_url:
+                    self.s.mark_screenshot_taken(
+                        _settled_url,
+                        self.s.hash_page_content(
+                            settled.get("elements", "") or data.get("title", "")
+                        ),
+                    )
+                print("  [hydrate_retry] re-captured settled state; arming DOM injectors")
+                return await self.s.build_tool_result_blocks(
+                    settled["screenshot"],
+                    caption,
+                    intent=intent or "observe opened page",
+                    url=_settled_url,
+                    elements=settled.get("elements"),
+                    iframe_signature=settled.get("iframeSignature") or "",
+                    elements_with_bounds=overlay_elements,
+                    device_pixel_ratio=dpr,
+                    # Arms the DOM-link/stateful bbox injection safety net that
+                    # is otherwise inert on the open path (create sends no
+                    # selectorEntries), backfilling clickable targets the vision
+                    # model omits.
+                    selector_entries=entries,
+                )
+            # recovery failed / still blank → fall through to the UNCHANGED
+            # terminal block below (same outcome as before this change).
 
         if data.get("screenshot"):
             self.s.screenshots_taken += 1
@@ -2173,6 +2304,27 @@ class BrowserEscalateTool(Tool):
         self.s.blocked_browser_open_count = 0
         self.s.log_activity(f"escalate(t1->t3 reason={reason or '?'})", f"new_sid={new_sid}")
         self.s.record_step("browser_escalate", t1_url, f"reason={reason or 'unspecified'} new_sid={new_sid}")
+
+        # Surface the t3 live-view URL so the human can watch the CDP screencast.
+        # browser_escalate was the ONLY t3 entry point that skipped this
+        # (browser_open t3, browser_solve_captcha, browser_ask_user all print
+        # it), and it DELETES the t1 session above — so the old
+        # /session/<t1-id>/view tab is dead with no rebind, leaving the user
+        # blind. On a hook-triggered escalation the :3101 viewer isn't running
+        # yet, so ensure_started() is required — a URL alone would 404.
+        # parent=<t1-id> wires the viewer's Done/Stuck human-input buttons.
+        if self.s.human_handoff_enabled and new_sid:
+            try:
+                from superbrowser_bridge.antibot import t3_viewer as _v
+                await _v.ensure_started()
+                _view_url = _v.view_url(new_sid, parent=session_id)
+                print(
+                    f"\n>> [HUMAN HANDOFF ENABLED — t3] Open this URL in your browser "
+                    f"and keep it open:\n>>   {_view_url}\n>> "
+                    f"If the agent needs help, you'll see a banner there."
+                )
+            except Exception as exc:
+                print(f"  [t3 viewer failed to start after escalate: {exc}]")
 
         return (
             f"[escalated_to_t3] Session migrated to Tier 3 (undetected "

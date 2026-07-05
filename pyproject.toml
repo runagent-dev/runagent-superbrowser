@@ -28,9 +28,12 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # released nanobot-ai from PyPI (not the dev git pin); floor+ceiling bound
-    # to the known-good 0.1.x line — 0.2.x may break the bridge.
-    "nanobot-ai>=0.1.5,<0.2",
+    # released nanobot-ai from PyPI. Pinned to the 0.2.x line to match local
+    # dev: 0.2.x ships the progress_hook worker loop that 0.1.x lacks, which the
+    # worker relies on for multi-step persistence (0.1.5 gives up markedly
+    # earlier on long browser flows). Bridge compatibility on 0.2.2 is verified —
+    # every superbrowser_bridge module imports and runs cleanly under it.
+    "nanobot-ai>=0.2.2,<0.3",
     "httpx>=0.28",
     "curl_cffi>=0.7",
     "patchright>=1.49",

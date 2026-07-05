@@ -33,7 +33,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl tini ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+# Real Google Chrome + Xvfb, so the browser matches the local `npm run dev`
+# stealth stack: real Chrome has a cleaner fingerprint than bundled Chromium,
+# and Tier-3 runs headful-under-Xvfb (far less detectable than headless). The
+# .deb pulls its own deps from the repo lists (still present in this layer).
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb wget \
+ && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+ && rm -f /tmp/chrome.deb \
+ && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix \
+ && rm -rf /var/lib/apt/lists/*
+
+# Browser identity, matched to the local .env stealth stack:
+#   T1 (TS puppeteer engine) -> PUPPETEER_EXECUTABLE_PATH (real Chrome)
+#   T3 (python patchright)   -> CHROME_PATH + T3_HEADLESS=0 + auto-Xvfb (headful)
+# T3 per-domain profiles persist under ~/.superbrowser/profiles (sb-superbrowser volume).
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+    CHROME_PATH=/usr/bin/google-chrome-stable \
+    T3_HEADLESS=0 \
+    T3_AUTO_XVFB=1 \
+    T3_XVFB_DISPLAY=:99 \
+    T3_PERSIST_PROFILE=1 \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     SUPERBROWSER_URL=http://127.0.0.1:3100 \
     PORT=3100 \
