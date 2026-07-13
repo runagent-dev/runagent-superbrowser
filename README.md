@@ -27,22 +27,87 @@ print(res.text)
 
 ---
 
-## Run it locally — or deploy to serverless
+## Run it — SDK, Docker, or npm
 
-- **Local**: `npm run dev` (starts the engine) + the Python SDK below.
-- **Serverless (callable from *every* RunAgent SDK)**: deploy with the `runagent` CLI —
+Three ways to run the same thing locally. Two moving parts: the **engine** (the
+TypeScript stealth-browser server on `:3100`) and the **SDK** (the Python brain
+that drives it). Pick the setup that fits you.
 
-  ```bash
-  runagent init my-browser --from-template superbrowser/default   # or: cd deploy
-  cp .env.example .env     # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
-  runagent deploy .        # prints an agent_id
-  ```
+### 1. Host engine + Python SDK — `npm run dev`
 
-  Then call it from Python/TS/Go/Rust/Dart/C# via
-  `RunAgentClient(agent_id, "run", local=False, persistent_memory=True).run(task="…")`.
-  On-demand micro-VMs, per-user persistent sessions. See
-  [deploy/README.md](deploy/README.md) and
-  [docs/sdk.md](docs/sdk.md#deploy-via-the-runagent-cli-callable-from-every-sdk).
+Run the engine on your host, drive it with the SDK in-process. This is
+[`examples/03_browser_mode.py`](examples/03_browser_mode.py).
+
+```bash
+npm install && npm run build            # once
+npm run dev                             # TS engine on :3100 (watch mode)
+python examples/03_browser_mode.py      # the SDK, in another shell
+```
+
+Or let the SDK start and stop the engine for you (what example 03 does — no
+second shell):
+
+```python
+from runagent_superbrowser import SuperBrowser
+
+with SuperBrowser(auto_start_server=True, server_cmd=["npm", "run", "dev"]) as sb:
+    print(sb.run("book a 4-star Sylhet hotel Sun–Thu", url="https://gozayaan.com", mode="browser").text)
+```
+
+### 2. Docker all-in-one — `docker compose`
+
+One container runs the engine **and** the orchestrator, exposed on `:8450` — no
+Node/Python/venv on the host, no RunAgent key. This is
+[`examples/07_local_docker.py`](examples/07_local_docker.py) (or `06`).
+
+```bash
+cp deploy/.env.example deploy/.env      # set the brain (below) + a provider key
+docker compose up -d --build            # agent server on :8450 (‑‑build after any Dockerfile change)
+python examples/07_local_docker.py      # the SDK talks to the container
+```
+
+```python
+sb = SuperBrowser(remote=False, local_agent_url="http://localhost:8450")
+print(sb.run("what's the top story on Hacker News?").text)
+```
+
+To make Docker's brain **identical to your host**, hand the container your
+nanobot config verbatim — it reproduces the model *and* its loop tuning — and
+leave `LLM_MODEL` unset (setting both would override the delivered model):
+
+```bash
+echo "NANOBOT_CONFIG_JSON_B64=$(base64 -w0 ~/.nanobot/config.json)" >> deploy/.env
+```
+
+### 3. uv — no manual venv, reproducible from the lockfile
+
+[`uv`](https://docs.astral.sh/uv/) builds an isolated env from `uv.lock` and runs
+either path above. `runagent` (needed only for the Docker/local-agent SDK) pins
+an old `websockets`; a `[tool.uv]` override reconciles it, so `uv sync` just works.
+
+```bash
+uv sync                                 # base SDK → in-process / npm-dev mode (example 03)
+uv sync --extra remote                  # + runagent → Docker / local-agent mode (examples 06, 07)
+uv run patchright install chromium      # host browser mode needs the stealth Chromium (skip for Docker-only)
+
+uv run python examples/03_browser_mode.py
+uv run python examples/07_local_docker.py
+```
+
+### Or deploy to serverless
+
+Callable from *every* RunAgent SDK (Python / TS / Go / Rust / Dart / C#), with
+on-demand micro-VMs and per-user persistent sessions:
+
+```bash
+runagent init my-browser --from-template superbrowser/default   # or: cd deploy
+cp .env.example .env     # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
+runagent deploy .        # prints an agent_id
+```
+
+Then `RunAgentClient(agent_id, "run", local=False, persistent_memory=True).run(task="…")`.
+See [deploy/README.md](deploy/README.md) and
+[docs/sdk.md](docs/sdk.md#deploy-via-the-runagent-cli-callable-from-every-sdk).
 
 ---
 
@@ -250,26 +315,19 @@ Then point `PUPPETEER_EXECUTABLE_PATH` at the binary:
 
 ### Or Docker (all-in-one agent server)
 
-One container runs the stealth browser engine **and** the agent orchestrator,
-exposed as a local RunAgent agent server on `:8450` — no Node/Python/venv on the
-host and no RunAgent account or key.
+One container runs the stealth browser engine **and** the agent orchestrator on
+`:8450` — no Node/Python/venv on the host, no RunAgent key. The run recipe is
+[above](#2-docker-all-in-one--docker-compose):
 
 ```bash
-cp deploy/.env.example deploy/.env   # set LLM_MODEL + OPENAI_API_KEY (or ANTHROPIC_API_KEY)
-docker compose up -d                 # ready when :8450/api/v1/health is healthy
+cp deploy/.env.example deploy/.env      # set the brain + a provider key
+docker compose up -d --build            # ready when :8450/api/v1/health is healthy
 ```
 
-Then from Python on the host (no API key):
-
-```python
-from runagent_superbrowser import SuperBrowser
-sb = SuperBrowser(remote=False, local_agent_url="http://localhost:8450")
-print(sb.run("what's the top story on Hacker News right now?").text)
-```
-
-The image bakes Node, Chromium, patchright's stealth Chromium, and the Python
-bridge. Compose persists `~/.superbrowser` (cookies/profiles) and `~/.nanobot`
-(orchestrator state) in named volumes across restarts. See
+The image bakes Node, real Google Chrome, patchright's stealth Chromium (+ Xvfb
+for headful Tier-3), and the Python bridge. Compose gives it `shm_size: 2gb`
+(Chrome renderer memory) and persists `~/.superbrowser` (cookies/profiles) and
+`~/.nanobot` (orchestrator state) in named volumes across restarts. See
 [docs/sdk.md → Local agent server (Docker)](docs/sdk.md) for the full picture
 (in-process vs local-agent vs remote).
 
@@ -293,6 +351,15 @@ pip install -r requirements.txt         # Python bridge (pinned dev lockfile)
 patchright install chromium
 playwright install-deps chromium        # Linux only
 npm start                               # engine on :3100 — no API key needed
+```
+
+**Prefer `uv`?** Skip the venv + `pip install -r` steps — `uv sync` builds the
+env from `uv.lock` and `uv run` runs anything in it:
+
+```bash
+uv sync --all-extras                    # base + puzzles + remote (runagent) + dev
+uv run patchright install chromium
+uv run pytest nanobot/superbrowser_bridge/tests   # the offline suite
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev + release workflow.

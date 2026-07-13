@@ -117,3 +117,13 @@ exclude = [
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+
+[tool.uv]
+# The `remote` extra pulls in `runagent`, which hard-pins `websockets==15.0.1`,
+# while `nanobot-ai` requires `websockets>=16.0,<17.0`. The two can't co-resolve.
+# runagent works fine on websockets 16 (stable `connect` API) — the Docker image
+# handles this by installing runagent with `--no-deps`. For uv we force websockets
+# into nanobot-ai's range so `uv sync` / `uv sync --extra remote` resolve cleanly.
+# (pip/hatchling ignore this section, so the Docker build + `pip install` are
+# unaffected.)
+override-dependencies = ["websockets>=16,<17"]
