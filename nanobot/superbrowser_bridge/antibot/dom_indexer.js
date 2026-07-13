@@ -69,11 +69,29 @@
   }
 
   function attrs(el) {
-    const keep = ['type', 'name', 'href', 'role', 'aria-label', 'placeholder', 'value'];
+    // Keep the attributes the Python vision pipeline reads for enrichment,
+    // stateful-control injection, and label resolution. `id`/`for` let it
+    // match a native control to its <label for=id>; the aria-* state attrs
+    // + live .checked/.selected feed _entry_is_active (T1 parity, see
+    // src/browser/dom-scripts.ts).
+    const keep = ['type', 'name', 'href', 'role', 'aria-label', 'placeholder',
+                  'value', 'id', 'for',
+                  'aria-checked', 'aria-pressed', 'aria-selected', 'aria-current'];
     const out = {};
     for (const k of keep) {
       const v = el.getAttribute(k);
       if (v != null && v !== '') out[k] = String(v).slice(0, 80);
+    }
+    // Live stateful properties — read the PROPERTY, not the attribute:
+    // getAttribute('checked') returns the initial HTML attr, which does not
+    // reflect a user toggle. `.checked`/`.selected`/`.indeterminate` do.
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const itype = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'input' && (itype === 'checkbox' || itype === 'radio')) {
+      out.checked = el.checked ? 'true' : 'false';
+      if (el.indeterminate) out.indeterminate = 'true';
+    } else if (tag === 'option') {
+      out.selected = el.selected ? 'true' : 'false';
     }
     return out;
   }

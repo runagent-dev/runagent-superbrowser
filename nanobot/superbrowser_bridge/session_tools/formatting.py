@@ -34,16 +34,13 @@ def _vision_alternatives_hint(
     bboxes = list(getattr(resp, "bboxes", []) or [])
     if not bboxes:
         return ""
-    ranked = sorted(
-        enumerate(bboxes, start=1),
-        key=lambda pair: (
-            0 if getattr(pair[1], "intent_relevant", False) else 1,
-            0 if getattr(pair[1], "clickable", False) else 1,
-            -float(getattr(pair[1], "confidence", 0.0) or 0.0),
-        ),
-    )
+    from vision_agent.schemas import bbox_render_rank  # type: ignore[import-not-found]
+    # Rank-position V_n — identical ordering to as_brain_text/get_bbox, so a
+    # suggested V_n resolves to the same element the brain would click and
+    # exclude_index (the just-tried vision_index) drops the right one.
+    ranked = sorted(bboxes, key=bbox_render_rank)
     picks: list[str] = []
-    for i, b in ranked:
+    for i, b in enumerate(ranked, start=1):
         if exclude_index is not None and i == exclude_index:
             continue
         label = (getattr(b, "label", "") or getattr(b, "role", "") or "").strip()

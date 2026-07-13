@@ -38,7 +38,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
-from vision_agent.schemas import BBox, SceneLayer, VisionResponse
+from vision_agent.schemas import (
+    BBox,
+    SceneLayer,
+    VisionResponse,
+    bbox_render_rank,
+)
 from superbrowser_bridge.antibot.ui_blockers import BlockerInfo
 
 
@@ -199,17 +204,7 @@ def _collect_blockers(
 
     # Vision bboxes marked blocker — ranked same as as_brain_text so the
     # [V_n] indices match.
-    def _rank(b: BBox) -> tuple[int, int, int, float]:
-        role_rank = 0 if b.role_in_scene == "blocker" else (
-            1 if b.role_in_scene == "target" else 2
-        )
-        return (
-            role_rank,
-            0 if b.intent_relevant else 1,
-            0 if b.clickable else 1,
-            -b.confidence,
-        )
-    ranked = sorted(vresp.bboxes, key=_rank)
+    ranked = sorted(vresp.bboxes, key=bbox_render_rank)
 
     vision_blockers: list[_Blocker] = []
     for i, b in enumerate(ranked, start=1):
@@ -485,18 +480,8 @@ def plan(
             except IndexError:
                 target_bbox = None
         if target_bbox is not None:
-            # Find this bbox in the ranked list.
-            def _rank(b: BBox) -> tuple[int, int, int, float]:
-                role_rank = 0 if b.role_in_scene == "blocker" else (
-                    1 if b.role_in_scene == "target" else 2
-                )
-                return (
-                    role_rank,
-                    0 if b.intent_relevant else 1,
-                    0 if b.clickable else 1,
-                    -b.confidence,
-                )
-            ranked = sorted(vresp.bboxes, key=_rank)
+            # Find this bbox in the ranked list (canonical V_n order).
+            ranked = sorted(vresp.bboxes, key=bbox_render_rank)
             for i, b in enumerate(ranked, start=1):
                 if b is target_bbox:
                     vidx_1 = i

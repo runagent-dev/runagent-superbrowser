@@ -10,12 +10,14 @@ session: `BrowserFormBeginTool`, `BrowserFormStatusTool`,
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
 import secrets
 import time
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
+from ..effects import _CHIP_SCAN_JS
 from ..formatting import _fetch_elements
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -212,6 +214,7 @@ class BrowserSelectTool(Tool):
         return True
 
     async def execute(self, session_id: str, index: int, value: str, **kw: Any) -> Any:
+        self.s._brain_turn_counter += 1
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/select",
@@ -226,6 +229,104 @@ class BrowserSelectTool(Tool):
             if elements:
                 data["elements"] = elements
         return self.s.build_text_only(data, f'Selected "{value}" in [{index}]')
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        label=StringSchema(
+            "The visible text of the chip/tag/token to remove (e.g. a selected "
+            "filter value 'Red', a react-select multi-value, or an email "
+            "recipient pill). Matched case-insensitively against the chip's text."
+        ),
+        required=["session_id", "label"],
+    )
+)
+class BrowserRemoveChipTool(Tool):
+    """Remove (deselect) a selected chip / tag / token / filter pill by its
+    label — the DESELECT path for multi-select widgets (react-select, MUI
+    Chips, tag inputs, recipient pills). Finds the chip, locates its × / remove
+    affordance, and clicks it through the real /click pipeline (humanization,
+    dead-click guard, undo ring all apply). Tier-agnostic (uses /evaluate +
+    /click; no new endpoint). For native <select multiple> use browser_select.
+    """
+
+    name = "browser_remove_chip"
+    description = (
+        "Deselect / remove a selected chip, tag, token, or filter pill by its "
+        "visible label (react-select multi-values, MUI Chips, tag inputs, "
+        "recipient pills). Clicks the chip's × button. Use this to UN-pick a "
+        "value from a multi-select or tag input."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(self, session_id: str, label: str, **kw: Any) -> Any:
+        self.s._brain_turn_counter += 1
+        print(f"\n>> browser_remove_chip(label={label!r})")
+        scan_js = _CHIP_SCAN_JS.replace("__LABEL__", _json.dumps(label or ""))
+        ev = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": scan_js},
+            timeout=15.0,
+        )
+        ev.raise_for_status()
+        body = ev.json()
+        res = (body.get("result") if isinstance(body, dict) else None) or {}
+        if not res.get("found"):
+            return (
+                f"[remove_chip_failed:{res.get('reason','not_found')}] No chip "
+                f"matching {label!r} was found. Take a browser_screenshot and "
+                f"click its × directly with browser_click_at(vision_index=V_n)."
+            )
+        try:
+            x, y = float(res["x"]), float(res["y"])
+        except (KeyError, TypeError, ValueError):
+            return f"[remove_chip_failed:bad_coords] scan returned {res}."
+
+        # Click the × through the bbox /click pipeline so humanization + the
+        # dead-click guard + undo ring all apply.
+        payload: dict[str, Any] = {"x": x, "y": y}
+        chip_rect = res.get("chip")
+        if isinstance(chip_rect, dict):
+            payload["bbox"] = chip_rect
+        await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/click",
+            json=payload,
+            timeout=10.0,
+        )
+
+        # Verify by re-scanning: chip should be gone.
+        ev2 = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": scan_js},
+            timeout=10.0,
+        )
+        res2 = (ev2.json().get("result") if isinstance(ev2.json(), dict) else None) or {}
+        gone = not res2.get("found")
+        caption = (
+            f"Removed chip {label!r} (deselected)."
+            if gone else
+            f"Clicked × on chip {label!r} but it may still be present — "
+            f"re-screenshot to confirm, or click its × via browser_click_at."
+        )
+        self.s.record_step(
+            "browser_remove_chip", f"label={label!r}",
+            "removed" if gone else "uncertain",
+        )
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only({"success": True, "removed": gone}, caption),
+        )
 
 
 @tool_parameters(
@@ -329,6 +430,7 @@ class BrowserSelectOptionTool(Tool):
         in_iframe: str | None = None,
         **kw: Any,
     ) -> str:
+        self.s._brain_turn_counter += 1
         iframe_note = f" in_iframe={in_iframe!r}" if in_iframe else ""
         if vision_index is not None:
             print(

@@ -32,29 +32,13 @@ _CHEVRON_TASK_STOPWORDS = frozenset({
 })
 
 
-def _replicate_bbox_rank(bbox: object) -> tuple[int, int, int, float]:
-    """Mirror VisionResponse._rank used by as_brain_text + get_bbox.
-
-    Kept inline so we don't reach into a private function on the
-    schemas module. If the upstream ranking changes, update both.
+def _replicate_bbox_rank(bbox: object) -> tuple:
+    """Delegate to the canonical ``bbox_render_rank`` so worker-hook V_n
+    hints match ``as_brain_text`` + ``get_bbox`` exactly. Thin named
+    wrapper kept for call-site clarity.
     """
-    role_in_scene = getattr(bbox, "role_in_scene", "") or ""
-    if role_in_scene == "blocker":
-        role_rank = 0
-    elif role_in_scene == "target":
-        role_rank = 1
-    else:
-        role_rank = 2
-    try:
-        confidence = float(getattr(bbox, "confidence", 0.5) or 0.5)
-    except (TypeError, ValueError):
-        confidence = 0.5
-    return (
-        role_rank,
-        0 if getattr(bbox, "intent_relevant", False) else 1,
-        0 if getattr(bbox, "clickable", False) else 1,
-        -confidence,
-    )
+    from vision_agent.schemas import bbox_render_rank  # type: ignore[import-not-found]
+    return bbox_render_rank(bbox)
 
 
 class BrowserWorkerHook(AgentHook):

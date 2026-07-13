@@ -793,7 +793,14 @@ export function createHttpServer(
       // capture and a subsequent click. We only update when vision is
       // requested — the brain's mental model is anchored to the last
       // screenshot, not to side-channel /state probes.
-      if (useVision) {
+      //
+      // pageref=keep opts OUT of the refresh: the Python bridge sets it on the
+      // BACKGROUND vision prefetch (not a brain-facing screenshot). Without the
+      // opt-out, a post-scroll prefetch would move the baseline to the new
+      // scroll position and the subsequent /click viewport-shift gate would see
+      // delta≈0 and fail to fire — the exact self-defeat this closes. Only a
+      // real screenshot (no pageref=keep) advances the baseline.
+      if (useVision && req.query.pageref !== 'keep') {
         try {
           const ref = await capturePageRef(page.getRawPage());
           page.setVisionPageRef(ref);
@@ -1551,8 +1558,12 @@ export function createHttpServer(
       const { index, text, clear, expected_fingerprint } = req.body as {
         index?: number; text?: string; clear?: boolean; expected_fingerprint?: string;
       };
-      if (index === undefined || !text) {
-        res.status(400).json({ error: 'index and text required' });
+      // Empty text IS allowed when clear !== false — that's the canonical
+      // clear-to-empty (delete everything in the field). Reject only a
+      // missing index, a non-string text, or an empty-text append (clear=false
+      // + text="" would be a pure no-op).
+      if (index === undefined || typeof text !== 'string' || (text === '' && clear === false)) {
+        res.status(400).json({ error: 'index and text required (empty text allowed only with clear=true to empty the field)' });
         return;
       }
 
@@ -1627,8 +1638,11 @@ export function createHttpServer(
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false, includeConsole: true });
 
-      // Empty before → typed_into_empty; non-empty before → cleared_and_typed.
-      const pretypeAction = pretypeValue ? 'cleared_and_typed' : 'typed_into_empty';
+      // Empty target → cleared_to_empty (the field was emptied). Otherwise
+      // empty before → typed_into_empty; non-empty before → cleared_and_typed.
+      const pretypeAction = text === ''
+        ? 'cleared_to_empty'
+        : (pretypeValue ? 'cleared_and_typed' : 'typed_into_empty');
 
       res.json({
         success: true,
@@ -1651,6 +1665,33 @@ export function createHttpServer(
     try {
       await page.sendKeys(req.body.keys);
       await new Promise((r) => setTimeout(r, 500));
+      await settleForEffect(page.getRawPage());
+      const effectAfter = await captureEffect(page.getRawPage());
+      const newState = await page.getState({ useVision: false });
+      res.json(withTabInfo(req.params.id, {
+        success: true,
+        elements: newState.elementTree.clickableElementsToString(),
+        effect: diffEffect(effectBefore, effectAfter),
+      }));
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Insert text at the focused element via CDP Input.insertText. Trusted
+   * event for rich-text editors that reject native-setter + execCommand
+   * writes. Caller focuses/clears the target first (Ctrl+A/Delete). */
+  app.post('/session/:id/insert-text', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    try {
+      const { text } = req.body as { text?: string };
+      if (typeof text !== 'string') {
+        res.status(400).json({ error: 'text (string) required' });
+        return;
+      }
+      await page.insertText(text);
       await settleForEffect(page.getRawPage());
       const effectAfter = await captureEffect(page.getRawPage());
       const newState = await page.getState({ useVision: false });

@@ -93,76 +93,40 @@ If `delegate_search_task` returns "insufficient info" or the answer needs action
 
 ## Decomposing multi-condition queries (REQUIRED)
 
-If the user's query has 2+ filters, conditions, or sequenced steps you MUST
-populate `task_checklist` when calling `delegate_browser_task`. The worker
-uses this to keep every constraint pinned to its tool result; without it,
-multi-filter queries reliably lose their tail items mid-run and the user
-gets a half-result.
+If the user's query has 2+ filters, conditions, or sequenced steps, spell out
+EVERY one as an explicit, ordered constraint **inside the `instructions`
+string** — that free text is the only thing the worker receives. There is no
+structured checklist argument and nothing auto-tracks progress: the worker
+turns your instructions into its own mental checklist and confirms each against
+on-screen evidence. Under-specify and multi-filter queries reliably lose their
+tail items mid-run and the user gets a half-result.
 
-Each item: `{label, kind, predicate}`.
+Write the instructions like a numbered constraint list, e.g.:
 
-- `label` (required): short human phrase — `"Oregon region"`, `"Price under $40"`, `"Pairs with fish"`. Shown in `[CHECKLIST]` lines.
-- `kind` (optional, default `"filter"`):
-    - `filter` — narrows results (region, price, type). Auto-flips from URL or page text.
-    - `action` — must perform an interaction (click submit, complete checkout). Usually `manual: true`.
-    - `extraction` — must read data off the page (top 3 prices, ratings list). Always `manual: true`.
-    - `navigation` — must reach a specific page. Usually `url_contains`.
-    - `verification` — confirm something is true after action. Usually `manual: true` after a `verify_fact` call.
-- `predicate` (optional but strongly recommended): how the item auto-completes. ANY listed match flips it to done.
-    - `url_contains: [str, ...]` — substring of the current URL (case-insensitive). **Best signal for filter constraints.**
-    - `url_param: {key: [values]}` — query-string match, e.g. `{"region_slug": ["oregon"]}` matches `?region_slug=oregon`. **Also great for filters.**
-    - `page_text: [str, ...]` — substring of rendered markdown OR any vision bbox label. **Only honoured for `verification` / `extraction` / `navigation` kinds.** Filter sidebars render every option's label as text, so `page_text=["Oregon"]` would falsely flip an Oregon filter constraint just because the listing page shows "Oregon" in its filter menu — therefore filter-kind constraints **ignore page_text** (they need URL or vision_active_label).
-    - `vision_active_label: [str, ...]` — vision saw a bbox with this label that ALSO carries a selected/active flag (e.g. an active filter chip). Strong signal; works for all kinds.
-    - `manual: true` — never auto-flips; the worker calls `browser_brief_mark` when it has evidence.
+> On klwines.com, find white wines meeting ALL of: (1) type = white wine,
+> (2) region = Oregon, (3) price under $40, (4) pairs with dessert, (5) pairs
+> with fish. Apply each as a filter, then return the top 3 as JSON
+> `[{title, price, url}]`. Confirm each filter actually took effect via the URL
+> slug (e.g. `white-wine`, `oregon`, `max_price=40`) or an active filter chip —
+> a filter option merely appearing in the sidebar is NOT proof it was applied.
 
-### Worked example
+Guidance that makes the worker reliable:
+- **Name the concrete signals.** For filters, list the likely URL slugs/params
+  (`white-wine`, `whitewine`, `region=oregon`, `max_price=40`) so the worker can
+  confirm from the URL — the strongest signal.
+- **Don't treat filter-sidebar text as proof.** A sidebar lists every option as
+  plain text, so "Oregon" showing on the page does NOT mean the Oregon filter is
+  active; tell the worker to confirm via a URL change or a selected/active chip
+  (vision marks these `active=true`).
+- **State the extraction format explicitly** (JSON shape, how many results).
+- **Order matters** — number steps that must run in sequence (log in → filter →
+  extract).
 
-> Query: "Find white wines from Oregon under $40 that pair with both dessert and fish on klwines.com"
+### When decomposition is overkill
 
-```python
-task_checklist=[
-    {"label": "White wine type", "kind": "filter",
-     "predicate": {"url_contains": ["white-wine"], "page_text": ["White Wine"]}},
-    {"label": "Oregon region", "kind": "filter",
-     "predicate": {"url_contains": ["oregon"], "page_text": ["Oregon"]}},
-    {"label": "Price under $40", "kind": "filter",
-     "predicate": {"url_param": {"max_price": ["40"]},
-                   "page_text": ["Under $40", "$0 - $40"]}},
-    {"label": "Pairs with dessert", "kind": "filter",
-     "predicate": {"page_text": ["dessert pairing", "Dessert"]}},
-    {"label": "Pairs with fish", "kind": "filter",
-     "predicate": {"page_text": ["fish pairing", "Fish"]}},
-    {"label": "Extract top 3 results", "kind": "extraction",
-     "predicate": {"manual": True}},
-]
-```
-
-### When NOT to send a checklist
-
-- Single-condition reads: `"summarize the homepage"`, `"what's on x.com today"`.
-- One-shot logins: `"log in and screenshot the dashboard"`.
-- Open-ended exploration with no enumerable conditions.
-
-For these, pass `task_checklist=null` (or omit it). The worker falls back to
-the legacy free-text behaviour with no overhead.
-
-### Predicate quality matters
-
-Predicates that never match leave the constraint stuck on `[open]` and the
-post-run handler reports `[INCOMPLETE_CHECKLIST]`, even when the worker did
-the right thing — so think about:
-- For URL filters, list the obvious slugs (`white-wine`, `whitewine`, plurals).
-- For text predicates (verification/extraction kinds only), list multiple visible phrasings (`"Under $40"`, `"$0 - $40"`, `"≤ $40"`).
-- Use `manual: true` for anything you can't reliably express as a substring rule.
-
-**Don't put `page_text` in filter predicates.** Filter sidebars list every
-option as plain text, which would auto-flip the constraint as soon as the
-listing page loads — even if the filter was never clicked. Use `url_contains`
-or `url_param` for filters, and `vision_active_label` for filter-chip
-selection state.
-
-If you genuinely don't know how a constraint will appear on the page, prefer
-`{manual: true}` over a wrong predicate — the worker can mark it explicitly.
+Single-condition reads (`"summarize the homepage"`, `"what's on x.com today"`),
+one-shot logins, and open-ended exploration need none of this — a plain
+sentence of instructions is enough.
 
 ## Authentication-aware delegation (browser tasks only)
 - The system auto-detects saved cookies and tells the worker to load them.

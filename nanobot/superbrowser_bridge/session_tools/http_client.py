@@ -84,8 +84,23 @@ def _is_t3_url(url: str) -> bool:
     return "/session/t3-" in url
 
 
+def _truthy(v: Any) -> bool:
+    """Coerce a query-param / body value to bool. Needed because query params
+    arrive as strings — ``bool("false")`` is truthy, so a plain ``bool()`` on a
+    ``"false"`` string would be wrong."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 async def _t3_dispatch_from_http(
-    method: str, url: str, *, json_body: dict[str, Any] | None,
+    method: str, url: str, *,
+    json_body: dict[str, Any] | None,
+    params: dict[str, Any] | None = None,
 ) -> _T3Response:
     """Parse the t3-routed URL + body and call T3SessionManager."""
     from superbrowser_bridge.antibot import interactive_session as _t3
@@ -100,7 +115,12 @@ async def _t3_dispatch_from_http(
         return _T3Response({"error": "bad t3 url"}, status_code=400)
     sid = parts[1]
     verb = parts[2] if len(parts) >= 3 else None
+    # Merge query params UNDER the JSON body (body wins on conflict). GET verbs
+    # like /state carry vision/bounds/pageref/settle here; POST verbs rarely do.
     body = dict(json_body or {})
+    if params:
+        for k, v in params.items():
+            body.setdefault(k, v)
 
     mgr = _t3.default()
     try:
@@ -117,7 +137,11 @@ async def _t3_dispatch_from_http(
             return _T3Response(data)
 
         if verb == "state":
-            data = await mgr.state(sid, use_vision=bool(body.get("vision", False)))
+            data = await mgr.state(
+                sid,
+                use_vision=_truthy(body.get("vision", False)),
+                bounds=_truthy(body.get("bounds", False)),
+            )
             return _T3Response(data)
 
         if verb == "screenshot":
@@ -140,9 +164,19 @@ async def _t3_dispatch_from_http(
 
         if verb == "click":
             if "bbox" in body or ("x" in body and "y" in body):
-                x = float(body.get("x", body.get("bbox", {}).get("x0", 0)))
-                y = float(body.get("y", body.get("bbox", {}).get("y0", 0)))
                 bbox = body.get("bbox")
+                # When the caller sends only a bbox (the normal vision-click
+                # path), seed x,y at the box CENTRE — not (x0, y0), which
+                # would dispatch the fallback click on the top-left corner.
+                # The snap eval in click_at refines this to the interactive
+                # element's centre when one overlaps the box.
+                if isinstance(bbox, dict):
+                    _cx = (float(bbox.get("x0", 0)) + float(bbox.get("x1", 0))) / 2.0
+                    _cy = (float(bbox.get("y0", 0)) + float(bbox.get("y1", 0))) / 2.0
+                else:
+                    _cx = _cy = 0.0
+                x = float(body.get("x", _cx))
+                y = float(body.get("y", _cy))
                 expected_label = body.get("expected_label") or body.get("label")
                 strategy = body.get("strategy") or "primary"
                 data = await mgr.click_at(
@@ -202,6 +236,10 @@ async def _t3_dispatch_from_http(
             else:
                 keys_list = []
             data = await mgr.keys(sid, keys_list)
+            return _T3Response(data)
+
+        if verb == "insert-text" or verb == "insert_text":
+            data = await mgr.insert_text(sid, body.get("text", ""))
             return _T3Response(data)
 
         if verb == "scroll":
@@ -277,6 +315,15 @@ async def _t3_dispatch_from_http(
 
         if verb == "select":
             data = await mgr.select(sid, int(body["index"]), body.get("value", ""))
+            return _T3Response(data)
+
+        if verb == "select_option" or verb == "select-option":
+            data = await mgr.select_option(
+                sid,
+                label=str(body.get("label", "") or ""),
+                value=str(body.get("value", "") or ""),
+                deselect=_truthy(body.get("deselect", False)),
+            )
             return _T3Response(data)
 
         if verb == "evaluate":
@@ -477,9 +524,12 @@ async def _request_with_backoff(
     classifies as a permanent outage and refuses to retry.
     """
     # Intercept t3 session URLs — route to the in-process patchright manager
-    # instead of the TS server.
+    # instead of the TS server. Pass `params` too: GET /state?vision&bounds
+    # carries its flags in the query string, and dropping them (the old bug)
+    # made T3 always run state() with vision=False / bounds=False → the whole
+    # DOM-surface + viewport gate silently no-op'd on T3.
     if _is_t3_url(url):
-        return await _t3_dispatch_from_http(method, url, json_body=json)
+        return await _t3_dispatch_from_http(method, url, json_body=json, params=params)
 
     import random
     last_exc: Exception | None = None

@@ -27,6 +27,7 @@ from .form import (
     BrowserFormCommitTool,
     BrowserFormPlanTool,
     BrowserFormStatusTool,
+    BrowserRemoveChipTool,
     BrowserSelectOptionTool,
     BrowserSelectTool,
     FieldStatus,
@@ -36,6 +37,7 @@ from .handoff import (
     BrowserRequestHelpTool,
 )
 from .input_text import (
+    BrowserEditTextAtTool,
     BrowserFixTextAtTool,
     BrowserKeysTool,
     BrowserTypeAtTool,

@@ -1139,6 +1139,14 @@ class BrowserScrollTool(Tool):
             direction or ("down" if pixels and pixels > 0 else None),
             extra=extra,
         )
+        # Page moved → the frozen epoch's V_n no longer map to these pixel
+        # coordinates (box_2d carries no scroll offset). Null it + bump the age
+        # counter; the piggyback in build_text_only re-attaches fresh
+        # post-scroll numbering when the prefetch lands in budget, otherwise the
+        # epoch stays nulled and the next click_at/type_at(V_n) is refused. Skip
+        # no-op scrolls so a locked-body retry loop keeps its WARNING flow.
+        if pre_y is not None and post_y != pre_y:
+            self.s.mark_epoch_dirty("scroll", bump_turn=True)
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
@@ -1661,6 +1669,9 @@ class BrowserScrollUntilTool(Tool):
         # Schedule a vision prefetch so the next browser_screenshot is
         # cached — same convention as the other scroll tools.
         self.s.advance_observation_token("scroll_until")
+        # Page moved → invalidate the frozen epoch (see BrowserScrollTool).
+        if scrolled:
+            self.s.mark_epoch_dirty("scroll_until", bump_turn=True)
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task, "\n".join(lines),
@@ -1886,6 +1897,9 @@ class BrowserScrollWithinTool(Tool):
             lines.append(str(data["elements"]))
 
         self.s.advance_observation_token("scroll_within")
+        # Popup/container moved → invalidate the frozen epoch (see BrowserScrollTool).
+        if scrolled:
+            self.s.mark_epoch_dirty("scroll_within", bump_turn=True)
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task, "\n".join(lines),
@@ -2005,6 +2019,9 @@ class BrowserScrollToBboxTool(Tool):
             f'V{vision_index}|"{clean_label(bbox_label)}"',
             caption,
         )
+        # Page/container moved → invalidate the frozen epoch (see BrowserScrollTool).
+        if scrolled:
+            self.s.mark_epoch_dirty("scroll_to_bbox", bump_turn=True)
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task, caption, state=self.s,

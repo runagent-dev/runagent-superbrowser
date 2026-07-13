@@ -22,13 +22,23 @@ BLOCKED_BROWSER_OPEN_HARD_STOP = 3
 
 # --- Atomic field-correction JS (tier-agnostic) -------------------------------
 # Runs inside /evaluate on either t1 (TS server) or t3 (patchright) to do the
-# full probe-write-verify cycle in a single synchronous tick. No intermediate
-# empty state where a framework re-render could race. Placeholders
-# __TARGET_X__ / __TARGET_Y__ / __TARGET_TEXT__ get string-replaced by the
-# Python caller with JSON-literal values.
+# full probe-compute-write-verify cycle in a single synchronous tick. No
+# intermediate empty state where a framework re-render could race. Placeholders
+# __TARGET_X__ / __TARGET_Y__ / __TARGET_TEXT__ / __MODE__ / __COUNT__ get
+# string-replaced by the Python caller — always go through
+# `render_atomic_text_js()` so none are left unfilled.
+#
+# __MODE__ selects how the final value is derived from the field's CURRENT value
+# (`before`), computed in-tick so a read-then-write can't race an autocomplete:
+#   'replace'     -> target = text              (full overwrite; the default)
+#   'append'      -> target = before + text     (type at the end)
+#   'delete_tail' -> target = before minus the last __COUNT__ chars (text ignored)
 _ATOMIC_FIX_TEXT_JS = """
 (() => {
-  const x = __TARGET_X__, y = __TARGET_Y__, target = __TARGET_TEXT__;
+  const x = __TARGET_X__, y = __TARGET_Y__;
+  const _rawText = __TARGET_TEXT__;
+  const _mode = __MODE__;
+  const _count = __COUNT__;
   let el = document.elementFromPoint(x, y);
   if (!el) return {ok: false, reason: 'no_element'};
 
@@ -124,10 +134,45 @@ _ATOMIC_FIX_TEXT_JS = """
     }
   }
   const before = isInput ? (el.value || '') : (el.innerText || '');
+
+  // Derive the final value from `before` in this same tick (race-free).
+  let target;
+  if (_mode === 'append') {
+    target = before + _rawText;
+  } else if (_mode === 'delete_tail') {
+    const _n = (typeof _count === 'number' && _count > 0) ? _count : 0;
+    target = _n > 0 ? before.slice(0, Math.max(0, before.length - _n)) : before;
+  } else {
+    target = _rawText;
+  }
+
+  // Detect a rich-text editor host so Python can pick an escalation path and
+  // the brain sees which framework it's dealing with. Cheap ancestor walk.
+  let editor = '';
+  {
+    let cur = el, d = 0;
+    while (cur && d < 4) {
+      try {
+        if (cur.classList) {
+          if (cur.classList.contains('ProseMirror')) { editor = 'prosemirror'; break; }
+          if (cur.classList.contains('ql-editor')) { editor = 'quill'; break; }
+          if (cur.classList.contains('DraftEditor-root')) { editor = 'draftjs'; break; }
+        }
+        if (cur.getAttribute) {
+          if (cur.getAttribute('data-slate-editor') !== null) { editor = 'slate'; break; }
+          if (cur.getAttribute('data-lexical-editor') !== null) { editor = 'lexical'; break; }
+        }
+      } catch (_) {}
+      cur = cur.parentElement;
+      d += 1;
+    }
+  }
+
   if (before === target) {
     return {ok: true, before, after: target, changed: false, tag,
             label: attrLabel, name: attrName, autocomplete: attrAutocomplete,
-            input_type: attrInputType};
+            input_type: attrInputType, is_editable: isEditable, editor,
+            method: 'skip_match', mode: _mode};
   }
   try { el.focus(); } catch (_) {}
   // Phase H: when `el` was found inside an iframe (descent above), its
@@ -149,6 +194,7 @@ _ATOMIC_FIX_TEXT_JS = """
                           : HTMLTextAreaElement.prototype;
   const _InputEventCtor = _ownerWin.InputEvent || InputEvent;
   const _EventCtor = _ownerWin.Event || Event;
+  let _method = '';
   try {
     if (isInput) {
       const proto = tag === 'textarea' ? _TextareaProto : _InputProto;
@@ -165,22 +211,175 @@ _ATOMIC_FIX_TEXT_JS = """
           try { tracker.setValue(''); } catch (_) {}
         }
         desc.set.call(el, target);
-        el.dispatchEvent(new _InputEventCtor('input', {bubbles: true, inputType: 'insertText', data: target}));
+        const _inputType = target.length < before.length ? 'deleteContentBackward' : 'insertText';
+        el.dispatchEvent(new _InputEventCtor('input', {bubbles: true, inputType: _inputType, data: target}));
         el.dispatchEvent(new _EventCtor('change', {bubbles: true}));
+        _method = 'native_setter';
       } else {
         el.value = target;
+        _method = 'value_prop';
       }
+      // Park the caret at the end so a follow-up browser_keys lands there
+      // instead of at position 0. Harmless no-op / throws on inputs that
+      // don't support selection (number/date/email) — swallow it.
+      try { el.setSelectionRange(target.length, target.length); } catch (_) {}
     } else if (isEditable) {
-      el.innerText = target;
-      el.dispatchEvent(new _InputEventCtor('input', {bubbles: true}));
+      // Rich-text editors (ProseMirror / Quill / Draft.js / Slate / Lexical)
+      // keep an internal document model and IGNORE (or revert) a raw innerText
+      // write. execCommand makes the BROWSER emit native beforeinput/input
+      // events the editor's own handlers consume, so the model updates. Select
+      // all existing content first so insertText replaces it. Fall back to a
+      // raw innerText write for plain contenteditables where execCommand no-ops.
+      const _doc = el.ownerDocument || document;
+      let _done = false;
+      try {
+        const _sel = _ownerWin.getSelection ? _ownerWin.getSelection() : null;
+        if (_sel) {
+          _sel.removeAllRanges();
+          const _r = _doc.createRange();
+          _r.selectNodeContents(el);
+          _sel.addRange(_r);
+        }
+        if (target === '') {
+          // Delete the (now fully-selected) contents.
+          _done = _doc.execCommand('delete', false);
+        } else {
+          _done = _doc.execCommand('insertText', false, target);
+        }
+        _method = 'execCommand';
+      } catch (_e) { _done = false; }
+      const _normCmp = (s) => (s || '').replace(/\\u200b/g, '').replace(/\\s+/g, ' ').trim();
+      if (!_done || _normCmp(el.innerText) !== _normCmp(target)) {
+        // execCommand didn't take (returned false, or the editor rejected it)
+        // — last-resort raw write so plain contenteditables never regress.
+        try {
+          el.innerText = target;
+          el.dispatchEvent(new _InputEventCtor('input', {bubbles: true, inputType: 'insertText', data: target}));
+          _method = _method === 'execCommand' ? 'execCommand+innerText' : 'innerText';
+        } catch (_e2) { /* keep whatever execCommand achieved */ }
+      }
     }
   } catch (e) {
-    return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag};
+    return {ok: false, reason: 'exception', error: String(e).slice(0, 120), before, tag,
+            is_editable: isEditable, editor, mode: _mode};
   }
   const after = isInput ? (el.value || '') : (el.innerText || '');
-  return {ok: after === target, before, after, changed: before !== after, tag,
+  // Rich-text editors normalize whitespace / add a trailing newline, so compare
+  // editable content loosely; inputs must match exactly (spaces are meaningful).
+  const _normOk = (s) => (s || '').replace(/\\u200b/g, '').replace(/\\s+/g, ' ').trim();
+  const _okFlag = isInput ? (after === target) : (_normOk(after) === _normOk(target));
+  return {ok: _okFlag, before, after, changed: before !== after, tag,
           label: attrLabel, name: attrName, autocomplete: attrAutocomplete,
-          input_type: attrInputType};
+          input_type: attrInputType, is_editable: isEditable, editor,
+          method: _method, mode: _mode};
+})()
+"""
+
+
+def render_atomic_text_js(
+    target_x: float,
+    target_y: float,
+    text: str | None,
+    *,
+    mode: str = "replace",
+    count: int = 0,
+) -> str:
+    """Substitute the atomic text-JS template for a target point + edit mode.
+
+    Always use this instead of hand-rolling ``.replace()`` chains — it fills
+    every placeholder (including ``__MODE__`` / ``__COUNT__``) so none is left
+    dangling in the emitted JS.
+
+    mode:
+      * ``'replace'``     — full overwrite (today's behavior; the default).
+      * ``'append'``      — ``before + text``.
+      * ``'delete_tail'`` — drop the last ``count`` characters (``text`` ignored).
+
+    Passing ``text=""`` with ``mode='replace'`` is the canonical clear-to-empty.
+    ``__MODE__`` / ``__COUNT__`` are substituted before ``__TARGET_TEXT__`` so a
+    user string that happens to contain a placeholder token can't be re-matched.
+    """
+    import json as _json
+
+    return (
+        _ATOMIC_FIX_TEXT_JS
+        .replace("__TARGET_X__", str(float(target_x)))
+        .replace("__TARGET_Y__", str(float(target_y)))
+        .replace("__MODE__", _json.dumps(str(mode)))
+        .replace("__COUNT__", str(int(count)))
+        .replace("__TARGET_TEXT__", _json.dumps("" if text is None else text))
+    )
+
+
+# --- Chip / token removal scan (tier-agnostic) --------------------------------
+# Finds a selected chip/tag/token/pill (react-select multiValue, MUI Chip,
+# filter pills, [role=listitem] tokens) whose text matches __LABEL__, locates
+# its remove affordance (×), and returns the click point + the chip's rect so
+# the caller can dispatch a real click through the /click bbox pipeline. Runs
+# via /evaluate → identical on t1 and t3. Returns {found, x, y, chip:{...}}.
+_CHIP_SCAN_JS = """
+(() => {
+  const LABEL = __LABEL__;
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const want = norm(LABEL);
+  const chipSelectors = [
+    '.MuiChip-root', '[class*="multiValue" i]', '[class*="chip" i]',
+    '[class*="tag" i]', '[class*="token" i]', '[class*="pill" i]',
+    '[role="listitem"]', '[data-tag-index]',
+  ];
+  const seen = new Set();
+  const chips = [];
+  for (const sel of chipSelectors) {
+    let nodes = [];
+    try { nodes = document.querySelectorAll(sel); } catch (_) { continue; }
+    for (const n of nodes) {
+      if (seen.has(n)) continue;
+      seen.add(n);
+      const r = n.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      const t = norm(n.innerText || n.textContent);
+      if (!t) continue;
+      if (want && !t.includes(want)) continue;
+      chips.push(n);
+    }
+  }
+  if (!chips.length) return {found: false, reason: 'no_chip'};
+  // Smallest matching chip = most specific.
+  chips.sort((a, b) => {
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    return (ra.width * ra.height) - (rb.width * rb.height);
+  });
+  const chip = chips[0];
+  const cr = chip.getBoundingClientRect();
+  const removeSel = [
+    '[aria-label*="remove" i]', '[aria-label*="delete" i]', '[aria-label*="clear" i]',
+    '[class*="remove" i]', '[class*="delete" i]', '[class*="MultiValueRemove" i]',
+    'button', 'svg', '[role="button"]',
+  ];
+  let rm = null;
+  for (const sel of removeSel) {
+    let c = null;
+    try { c = chip.querySelector(sel); } catch (_) { continue; }
+    if (c) {
+      const rr = c.getBoundingClientRect();
+      if (rr.width > 0 && rr.height > 0) { rm = c; break; }
+    }
+  }
+  let rx, ry;
+  if (rm) {
+    const rr = rm.getBoundingClientRect();
+    rx = (rr.left + rr.right) / 2; ry = (rr.top + rr.bottom) / 2;
+  } else {
+    // × is conventionally on the chip's right edge.
+    rx = cr.right - Math.min(12, cr.width * 0.15);
+    ry = (cr.top + cr.bottom) / 2;
+  }
+  return {
+    found: true, x: Math.round(rx), y: Math.round(ry),
+    chip: {x0: Math.round(cr.left), y0: Math.round(cr.top),
+           x1: Math.round(cr.right), y1: Math.round(cr.bottom)},
+    text: (chip.innerText || '').slice(0, 80), has_button: !!rm,
+  };
 })()
 """
 

@@ -82,6 +82,7 @@ class BrowserSetSliderTool(Tool):
         method: str | None = None,
         **kw: Any,
     ) -> str:
+        self.s._brain_turn_counter += 1
         try:
             parsed = json.loads(value_json)
         except (TypeError, ValueError) as exc:
@@ -219,6 +220,7 @@ class BrowserSetSliderAtTool(Tool):
         value_max: float | None = None,
         **kw: Any,
     ) -> str:
+        self.s._brain_turn_counter += 1
         # Share the same lock as browser_drag_slider_until: the CDP/patchright
         # cursor is session-scoped, parallel drags clobber each other.
         if self.s.slider_drag_lock is None:

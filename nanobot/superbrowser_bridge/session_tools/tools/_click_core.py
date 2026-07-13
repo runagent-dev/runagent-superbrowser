@@ -21,9 +21,162 @@ self-healing behaviour without duplicating ~130 lines of logic.
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
+
+
+# --- Shared epoch-target resolver + per-epoch scroll-anchor gate --------------
+# Every bbox-resolving tool (click_at, type_at, fix_text_at, select_option,
+# slider) resolves a V_n against the FROZEN vision epoch the brain last saw and
+# must reject it when the page has drifted underneath. The pieces below are the
+# single source of that logic so the checks stay identical across tools and both
+# tiers (t1 /evaluate + t3 patchright intercept share the same probe).
+
+# Max scrollY delta (CSS px) tolerated between the epoch's anchor and the live
+# page before a bbox is treated as stale. Mirrors the TS viewport_shift gate.
+VIEWPORT_SHIFT_PX = int(os.environ.get("VIEWPORT_SHIFT_PX") or "12")
+
+# Tiny read-only probe of the live scroll position. Works on both tiers.
+_SCROLL_PROBE_JS = "(() => ({y: Math.round(window.scrollY || window.pageYOffset || 0)}))()"
+
+
+async def probe_scroll_y(session_id: str) -> Optional[int]:
+    """Read the live page scrollY (CSS px) via /evaluate. Returns None on any
+    failure so callers can treat 'unknown' as 'don't block'."""
+    try:
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": _SCROLL_PROBE_JS},
+            timeout=8.0,
+        )
+        if r.status_code >= 400:
+            return None
+        body = r.json() or {}
+        res = body.get("result")
+        if isinstance(res, dict) and res.get("y") is not None:
+            return int(res["y"])
+    except Exception:
+        return None
+    return None
+
+
+async def check_scroll_anchor(
+    state: Any,
+    session_id: str,
+    resp: Any,
+    *,
+    fail_prefix: str,
+    verb: str,
+    vision_index: int,
+) -> Optional[str]:
+    """Per-epoch scroll gate: refuse a bbox dispatch when the page has scrolled
+    since the epoch `resp` was numbered.
+
+    The epoch is pinned to a specific scroll position (box_2d carries no scroll
+    offset), so a click/type against V_n after a scroll would land at the wrong
+    place. This closes the /evaluate-typed path (type_at/fix_text_at have no
+    TS-side viewport gate) and revives the effectively-dead t3 gate — one probe,
+    both tiers, all bbox tools. Returns a brain-facing error string when shifted
+    (and marks the epoch dirty), else None.
+
+    No-ops (returns None) when the response has no recorded anchor (-1), the gate
+    is disabled (EPOCH_SCROLL_GATE=0), or the live probe fails — never blocks a
+    dispatch on a probe hiccup.
+    """
+    if os.environ.get("EPOCH_SCROLL_GATE", "1") in ("0", "false", "no"):
+        return None
+    anchor = getattr(resp, "scroll_y", -1)
+    if anchor is None or anchor < 0:
+        return None
+    live = await probe_scroll_y(session_id)
+    if live is None:
+        return None
+    delta = abs(live - anchor)
+    if delta <= VIEWPORT_SHIFT_PX:
+        return None
+    try:
+        state.mark_epoch_dirty("viewport_shifted", session_id=session_id)
+    except Exception:
+        pass
+    return (
+        f"[{fail_prefix}:viewport_shifted] V{vision_index} was numbered at "
+        f"scrollY={anchor} but the page is now at scrollY={live} (Δ={delta}px); "
+        f"its bbox coordinates are stale. Call browser_screenshot to renumber the "
+        f"V_n list before {verb}."
+    )
+
+
+async def resolve_epoch_target(
+    state: Any,
+    session_id: str,
+    vision_index: int,
+    *,
+    fail_prefix: str,
+    verb: str,
+    extra_hint: str = "",
+) -> Union[tuple[float, float, Any, Any], str]:
+    """Resolve a V_n against the frozen vision epoch to a click point.
+
+    Returns ``(target_x, target_y, bbox, resp)`` on success, or a brain-facing
+    error STRING the caller returns verbatim. Consolidates the block duplicated
+    across the bbox tools: epoch response → get_bbox → turn-age gate → image-dims
+    → to_pixels(center) → scroll-anchor gate. ``fail_prefix`` is the bracketed
+    failure-tag stem (e.g. ``"type_at_failed"``); ``verb`` completes the "before
+    <verb>" hint ("clicking"/"typing"/"setting the value"); ``extra_hint`` is an
+    optional tool-specific tail appended to the epoch_too_old message.
+
+    (click_at keeps its own inline resolution — it interleaves blocker/dead-click
+    gates — but shares `check_scroll_anchor`.)
+    """
+    resp = state.vision_for_target_resolution()
+    if resp is None:
+        return (
+            f"[{fail_prefix}:no_vision] No recent vision response to resolve "
+            f"vision_index against. Call browser_screenshot first, or pass raw (x, y)."
+        )
+    bbox = resp.get_bbox(int(vision_index))
+    if bbox is None:
+        n = len(getattr(resp, "bboxes", []) or [])
+        return (
+            f"[{fail_prefix}:bad_vision_index] V{vision_index} is out of range "
+            f"(only {n} bboxes in the last vision response)."
+        )
+    try:
+        max_age = int(os.environ.get("VISION_MAX_AGE_TURNS") or "1")
+    except ValueError:
+        max_age = 1
+    if max_age > 0:
+        age = max(0, state._brain_turn_counter - 1 - state._vision_epoch_turn)
+        if age > max_age:
+            msg = (
+                f"[{fail_prefix}:epoch_too_old age_turns={age} max={max_age}] "
+                f"V{vision_index} resolves against a vision snapshot taken {age} "
+                f"actions ago; the page has likely changed and V{vision_index} may "
+                f"now point at a different element. Call browser_screenshot to "
+                f"refresh the V_n list before {verb}."
+            )
+            if extra_hint:
+                msg = f"{msg} {extra_hint}"
+            return msg
+    iw, ih = resp.image_width, resp.image_height
+    if iw <= 0 or ih <= 0:
+        return (
+            f"[{fail_prefix}:no_image_dims] Last vision response has no source image "
+            f"dimensions; cannot denormalize box_2d. Call browser_screenshot."
+        )
+    dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
+    x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
+    target_x = (x0 + x1) / 2
+    target_y = (y0 + y1) / 2
+    shift = await check_scroll_anchor(
+        state, session_id, resp,
+        fail_prefix=fail_prefix, verb=verb, vision_index=vision_index,
+    )
+    if shift:
+        return shift
+    return (target_x, target_y, bbox, resp)
 
 
 async def run_click_with_ladder(

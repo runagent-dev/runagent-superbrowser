@@ -27,6 +27,7 @@ from .tools import (
     BrowserDragSelectorsTool,
     BrowserDragSliderUntilTool,
     BrowserDragTool,
+    BrowserEditTextAtTool,
     BrowserEscalateTool,
     BrowserEvalTool,
     BrowserFixTextAtTool,
@@ -50,6 +51,7 @@ from .tools import (
     BrowserScreenshotTool,
     BrowserScrollToBboxTool,
     BrowserScrollTool,
+    BrowserRemoveChipTool,
     BrowserScrollUntilTool,
     BrowserScrollWithinTool,
     BrowserSelectOptionTool,
@@ -98,6 +100,7 @@ def register_session_tools(
         BrowserClickSelectorTool(state),   # CSS-selector click; supports in_iframe
         BrowserTypeAtTool(state),
         BrowserFixTextAtTool(state),
+        BrowserEditTextAtTool(state),
         BrowserTypeTool(state),
         BrowserKeysTool(state),
         BrowserScrollTool(state),
@@ -106,6 +109,7 @@ def register_session_tools(
         BrowserScrollWithinTool(state),    # in-popup/listbox scroll (requires container_selector)
         BrowserSelectTool(state),
         BrowserSelectOptionTool(state),
+        BrowserRemoveChipTool(state),
         BrowserFormPlanTool(state),
         BrowserEvalTool(state),
         BrowserRunScriptTool(state),

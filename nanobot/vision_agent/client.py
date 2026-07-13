@@ -927,9 +927,40 @@ def reset_vision_agent() -> None:
     _instance = None
 
 
+def bust_vision_cache(session_id: str) -> bool:
+    """Fire-and-forget evict every cached vision pass for ``session_id``.
+
+    Called by the bridge after an out-of-band DOM mutation (a mutating
+    ``browser_run_script`` / ``browser_eval``, a rewind) so a stale cached
+    pass can't be served for the changed page. Schedules the async
+    ``VisionCache.bust_session`` on the running loop and returns immediately;
+    returns ``False`` (no-op) when vision is uninitialized, the id is empty,
+    or there's no running loop (e.g. a synchronous unit test). Never raises.
+    """
+    if not session_id:
+        return False
+    try:
+        import asyncio as _asyncio
+
+        if _instance is None:
+            return False
+        cache = getattr(_instance, "_cache", None)
+        if cache is None:
+            return False
+        loop = _asyncio.get_running_loop()
+        loop.create_task(cache.bust_session(session_id))
+        return True
+    except RuntimeError:
+        # No running event loop — nothing to schedule onto.
+        return False
+    except Exception:
+        return False
+
+
 __all__ = [
     "VisionAgent",
     "dom_hash_of",
     "get_vision_agent",
     "reset_vision_agent",
+    "bust_vision_cache",
 ]

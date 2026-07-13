@@ -80,13 +80,8 @@ INJECT_JS = r"""
 
 
 def _build_atomic_js(target_x: float, target_y: float, target_text: str) -> str:
-    from superbrowser_bridge.session_tools import _ATOMIC_FIX_TEXT_JS
-    return (
-        _ATOMIC_FIX_TEXT_JS
-        .replace("__TARGET_X__", str(float(target_x)))
-        .replace("__TARGET_Y__", str(float(target_y)))
-        .replace("__TARGET_TEXT__", json.dumps(target_text))
-    )
+    from superbrowser_bridge.session_tools import render_atomic_text_js
+    return render_atomic_text_js(target_x, target_y, target_text, mode="replace")
 
 
 async def _read_value(client: httpx.AsyncClient, session_id: str, sel: str) -> str:

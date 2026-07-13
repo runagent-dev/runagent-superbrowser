@@ -287,6 +287,43 @@ export async function clearField(
     await dispatchKey(client, 'Delete');
     await new Promise((r) => setTimeout(r, 50));
   }
+
+  // Layer 4: React _valueTracker reconciliation. Layers 2-3 use raw keystrokes
+  // that do NOT reset el._valueTracker, so a controlled input can re-hydrate
+  // its old value on the next render (the field looks empty but React still
+  // "knows" the old string). Reset the tracker — and, if the keystrokes somehow
+  // left content behind, force-empty via the native setter. Idempotent on plain
+  // inputs; no-op on contenteditable.
+  try {
+    await page.evaluate(
+      (args: { x: number; y: number }) => {
+        const el = document.elementFromPoint(args.x, args.y);
+        if (!el) return;
+        const valEl = el as unknown as { value?: string };
+        if (typeof valEl.value !== 'string') return;
+        const tracker = (el as unknown as { _valueTracker?: { getValue?: () => string; setValue?: (v: string) => void } })._valueTracker;
+        if ((valEl.value || '') === '') {
+          if (tracker && typeof tracker.getValue === 'function' && typeof tracker.setValue === 'function') {
+            try { if (tracker.getValue() !== '') tracker.setValue(''); } catch (_e) { /* noop */ }
+          }
+          return;
+        }
+        try {
+          const tag = el.tagName;
+          const proto = tag === 'TEXTAREA'
+            ? Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+            : Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+          if (tracker && typeof tracker.setValue === 'function') { try { tracker.setValue(''); } catch (_e) { /* noop */ } }
+          if (proto && proto.set) {
+            proto.set.call(el, '');
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        } catch (_e) { /* best-effort */ }
+      },
+      { x, y },
+    );
+  } catch (_e) { /* best-effort */ }
 }
 
 function normalizeModifier(key: string): string {

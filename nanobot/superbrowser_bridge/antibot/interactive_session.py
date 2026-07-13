@@ -400,6 +400,33 @@ SESSION_MAX_LIFETIME_S = 2 * 60 * 60
 _DOM_INDEXER_PATH = Path(__file__).parent / "dom_indexer.js"
 
 
+# Cheap iframe-content signature for the vision cache key — mirrors T1's
+# iframeSignature (src/server/http.ts). Folds same-origin iframe form-field
+# values + scrollY into a short string so typing INSIDE an iframe changes the
+# key and can't serve a stale cached vision pass. Cross-origin frames throw on
+# contentDocument access and are skipped.
+_IFRAME_SIGNATURE_JS = r"""
+(() => {
+  try {
+    const parts = [];
+    const frames = document.querySelectorAll('iframe');
+    parts.push('n=' + frames.length);
+    frames.forEach((f, i) => {
+      try {
+        const d = f.contentDocument;
+        if (!d) return;
+        const vals = Array.from(d.querySelectorAll('input,textarea,select'))
+          .map(e => (e.value || '')).join('|');
+        parts.push(i + ':' + (d.body ? Math.round(d.body.scrollTop) : 0)
+                   + ':' + vals.slice(0, 200));
+      } catch (_) { /* cross-origin — skip */ }
+    });
+    return parts.join(';').slice(0, 500);
+  } catch (_) { return ''; }
+})()
+"""
+
+
 _XVFB_STARTED: bool = False
 
 
@@ -2319,6 +2346,7 @@ class T3SessionManager:
         *,
         use_vision: bool = False,
         include_screenshot: bool = True,
+        bounds: bool = False,
     ) -> dict[str, Any]:
         s = self._get(sid)
         url = s.page.url
@@ -2371,7 +2399,7 @@ class T3SessionManager:
             sig = f"{el.get('tag','')}|{el.get('text','')[:40]}|{el.get('attrs','')}"
             fingerprints[int(idx)] = hashlib.sha256(sig.encode()).hexdigest()[:16]
 
-        return {
+        out: dict[str, Any] = {
             "url": url,
             "title": title,
             "screenshot": screenshot_b64,
@@ -2380,6 +2408,52 @@ class T3SessionManager:
             "scrollInfo": scroll_info,
             "fingerprints": fingerprints,
         }
+
+        # T1-parity DOM surface for the Python vision pipeline. Only built when
+        # the caller asked for bounds (the screenshot / vision path) — a bare
+        # state poll skips it. Without this, _inject_stateful_control_bboxes,
+        # _enrich_bboxes_with_dom_metadata, the compound-row split and the DPR
+        # correction all silently no-op on T3 (they read selectorEntries /
+        # devicePixelRatio, which T3 never emitted before).
+        if bounds:
+            selector_entries: list[dict[str, Any]] = []
+            for el in elements:
+                bb = el.get("bbox") or [0, 0, 0, 0]
+                try:
+                    x0, y0, x1, y1 = (float(bb[0]), float(bb[1]),
+                                      float(bb[2]), float(bb[3]))
+                except (TypeError, ValueError, IndexError):
+                    x0 = y0 = x1 = y1 = 0.0
+                selector_entries.append({
+                    "index": el.get("index"),
+                    "tagName": el.get("tag"),
+                    "tag": el.get("tag"),
+                    "text": el.get("text") or "",
+                    "role": el.get("role") or "",
+                    "attributes": el.get("attrs") or {},
+                    "bounds": {
+                        "x": x0, "y": y0,
+                        "width": max(0.0, x1 - x0),
+                        "height": max(0.0, y1 - y0),
+                    },
+                })
+            dpr = 1.0
+            try:
+                dpr = float(await s.page.evaluate(
+                    "() => window.devicePixelRatio || 1"
+                ) or 1.0)
+            except Exception:
+                dpr = 1.0
+            iframe_sig = ""
+            try:
+                iframe_sig = str(await s.page.evaluate(_IFRAME_SIGNATURE_JS) or "")
+            except Exception:
+                iframe_sig = ""
+            out["selectorEntries"] = selector_entries
+            out["devicePixelRatio"] = dpr
+            out["iframeSignature"] = iframe_sig
+
+        return out
 
     def _render_elements_for_brain(self, elements: list[dict]) -> str:
         """Render the element list as the brain-readable string the TS side
@@ -2699,6 +2773,23 @@ class T3SessionManager:
         """
         s = self._get(sid)
         target_x, target_y = x, y
+        # When a bbox is supplied, seed the dispatch point at the box
+        # CENTER — not the caller's (x, y), which the HTTP shim defaults
+        # to the top-left corner (x0, y0) when only a bbox is posted. The
+        # snap eval below overrides this with the snapped element's centre
+        # on success; on a snap miss/throw we fall back to the box centre,
+        # matching Tier-1 `clickInBbox` (src/browser/page.ts) instead of
+        # landing on the upper-left corner.
+        if bbox is not None:
+            try:
+                _bx0 = float(bbox.get("x0"))
+                _by0 = float(bbox.get("y0"))
+                _bx1 = float(bbox.get("x1"))
+                _by1 = float(bbox.get("y1"))
+                target_x = (_bx0 + _bx1) / 2.0
+                target_y = (_by0 + _by1) / 2.0
+            except (TypeError, ValueError, AttributeError):
+                pass
         snapped = False
         snap_target = ""
         snap_info: Optional[dict] = None
@@ -2952,8 +3043,8 @@ class T3SessionManager:
                         # already guarded by the viewport_shifted check
                         # at 2730-2740 above. Carry snapped=False so the
                         # bridge logs the divergence as a diagnostic.
-                        target_x = float(snap_info.get("x", x))
-                        target_y = float(snap_info.get("y", y))
+                        target_x = float(snap_info.get("x", target_x))
+                        target_y = float(snap_info.get("y", target_y))
                         snapped = False
                         is_autocomplete_target = False
                         _found = snap_info.get("found") or {}
@@ -2961,8 +3052,8 @@ class T3SessionManager:
                             f"{_found.get('tag','')}:{_found.get('text','')[:40]}"
                         )
                     elif snap_info.get("ok") is True:
-                        target_x = float(snap_info.get("x", x))
-                        target_y = float(snap_info.get("y", y))
+                        target_x = float(snap_info.get("x", target_x))
+                        target_y = float(snap_info.get("y", target_y))
                         snapped = True
                         # Autocomplete-option flag — caller skips bezier
                         # cursor approach and teleports to avoid the
@@ -3577,6 +3668,13 @@ class T3SessionManager:
                         if (proto) {
                           const desc = Object.getOwnPropertyDescriptor(proto, 'value');
                           if (desc && desc.set) {
+                            // React 16+ tracker reset BEFORE the setter, or the
+                            // synthetic onChange short-circuits and React keeps
+                            // the old value (T1 clearField parity).
+                            const tracker = el._valueTracker;
+                            if (tracker && typeof tracker.setValue === 'function') {
+                              try { tracker.setValue(''); } catch (_e) {}
+                            }
                             desc.set.call(el, '');
                             el.dispatchEvent(new Event('input', {bubbles: true}));
                             el.dispatchEvent(new Event('change', {bubbles: true}));
@@ -3765,6 +3863,20 @@ class T3SessionManager:
                         pass
         except Exception as exc:
             return {"success": False, "error": str(exc)[:200]}
+        st = await self.state(sid)
+        return {"success": True, "elements": st["elements"]}
+
+    async def insert_text(self, sid: str, text: str) -> dict[str, Any]:
+        """CDP-trusted text insertion at the focused element (patchright
+        keyboard.insert_text — dispatches a real Input.insertText). For
+        rich-text editors that reject native-setter + execCommand writes.
+        The caller focuses/clears the target first; this inserts at the
+        current caret. T1 parity: src/browser/page.ts insertText()."""
+        s = self._get(sid)
+        try:
+            await s.page.keyboard.insert_text(text)
+        except Exception as exc:
+            return {"success": False, "error": f"insert_text failed: {str(exc)[:160]}"}
         st = await self.state(sid)
         return {"success": True, "elements": st["elements"]}
 
@@ -5004,6 +5116,66 @@ class T3SessionManager:
             return {"success": False, "error": str(exc)[:200]}
         st = await self.state(sid)
         return {"success": True, "elements": st["elements"]}
+
+    async def select_option(
+        self,
+        sid: str,
+        *,
+        label: str = "",
+        value: str = "",
+        deselect: bool = False,
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        """Minimal T3 port of /select_option (previously 501'd on t3). Handles
+        NATIVE <select> by visible option text/value; picks or (deselect=True)
+        removes the option, dispatching React-safe input/change. For custom
+        ARIA / react-select widgets t3 can't enumerate headlessly — directs the
+        caller to open the trigger and browser_click_at the option V_n."""
+        s = self._get(sid)
+        want = value or label
+        try:
+            js = r"""(args) => {
+              const norm = (t) => (t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const want = norm(args.want);
+              const deselect = args.deselect;
+              if (!want) return {ok: false, reason: 'no_value'};
+              for (const sel of document.querySelectorAll('select')) {
+                for (const opt of Array.from(sel.options)) {
+                  const ot = norm(opt.text), ov = norm(opt.value);
+                  if (ot === want || ov === want || ot.includes(want)) {
+                    if (deselect) {
+                      if (sel.multiple) opt.selected = false;
+                      else sel.selectedIndex = -1;
+                    } else {
+                      if (sel.multiple) opt.selected = true;
+                      else sel.value = opt.value;
+                    }
+                    sel.dispatchEvent(new Event('input', {bubbles: true}));
+                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                    return {ok: true, picked: opt.text};
+                  }
+                }
+              }
+              return {ok: false, reason: 'no_native_match'};
+            }"""
+            r = await s.page.evaluate(js, {"want": want, "deselect": deselect})
+            if isinstance(r, dict) and r.get("ok"):
+                st = await self.state(sid)
+                return {
+                    "success": True, "picked": r.get("picked"),
+                    "deselected": deselect, "elements": st["elements"],
+                }
+        except Exception as exc:
+            logger.debug("t3 select_option native path failed: %s", exc)
+        return {
+            "success": False,
+            "reason": "custom_widget_t3",
+            "error": (
+                "t3 select_option supports native <select> only. For a custom "
+                "dropdown: browser_click_at the trigger to open it, "
+                "browser_screenshot, then browser_click_at the option's V_n."
+            ),
+        }
 
     async def wait_for(
         self, sid: str, *, selector: Optional[str] = None, timeout_s: float = 10.0,

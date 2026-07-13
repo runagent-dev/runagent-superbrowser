@@ -3536,6 +3536,17 @@ export class PageWrapper {
     await pressKeyCombo(client, keys);
   }
 
+  /** Insert text at the focused element via CDP `Input.insertText`. This
+   * dispatches a trusted `beforeinput`/`input` that canvas- or model-backed
+   * rich-text editors (Google-Docs-style, some ProseMirror configs) accept
+   * when both the native setter and `execCommand` are ignored. The caller
+   * must focus (and usually clear via Ctrl+A/Delete) the target first — this
+   * inserts at the current selection/caret. */
+  async insertText(text: string): Promise<void> {
+    const client = await this.getCDPSession();
+    await client.send('Input.insertText', { text });
+  }
+
   // --- Scrolling ---
 
   // Robust window-scroll. `window.scrollBy` is a no-op on pages that lock

@@ -17,6 +17,7 @@ from .effects import (
     BLOCKED_BROWSER_OPEN_HARD_STOP,
     WorkerMustExitError,
     _ATOMIC_FIX_TEXT_JS,
+    render_atomic_text_js,
     _CAPTCHA_KEYWORDS,
     _CONTENT_HASH_LEN,
     _CURSOR_TOOL_NAMES,

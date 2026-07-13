@@ -179,6 +179,16 @@ class BBox(BaseModel):
             "is already ON' without clicking to test."
         ),
     )
+    is_mixed: bool = Field(
+        default=False,
+        description=(
+            "True when a tri-state control is in its INDETERMINATE / "
+            "'mixed' state (native input.indeterminate or aria-checked="
+            "'mixed') — e.g. a 'select all' checkbox with only some children "
+            "checked. Rendered as active=mixed; clicking usually cycles it to "
+            "fully-checked."
+        ),
+    )
     just_toggled: Optional[Literal["on", "off"]] = Field(
         default=None,
         description=(
@@ -740,6 +750,53 @@ class DomAnchor(BaseModel):
     box_2d: list[int] = Field(default_factory=lambda: [0, 0, 0, 0])
 
 
+def bbox_render_rank(b: Any) -> tuple[int, int, int, int, float]:
+    """Canonical ordering for rendering bboxes as [V_n] AND resolving V_n
+    back to a bbox — the SINGLE source of truth.
+
+    Every V_n producer MUST sort by this so the brain's V_n
+    (``as_brain_text``), the click/type resolver (``get_bbox``), the
+    DOM-enrichment cross-refs (``vision_pipeline._replicate_rank_for_
+    enrichment``), the worker-hook hints (``worker_hook._replicate_bbox_
+    rank``), the SoM overlays (``highlights`` / the vision-pipeline overlay
+    emit), the blocker/planner indices (``action_planner``) and the
+    click-refusal alternatives (``formatting._vision_alternatives_hint``)
+    all agree. Divergence here is the classic "brain clicks V5 but V5
+    resolves to a different element" bug.
+
+    Ordering (lowest tuple sorts first = V1):
+      1. DOM-injected safety-net boxes (``source == "dom"``) sort LAST. They
+         are backfill for links the vision model omitted — a safety net, not
+         a rival to vision's own targets. Under ``as_brain_text``'s cap they
+         truncate first, so a real (pixel-verified) vision box is never
+         evicted or out-ranked by an injected one. Pre-checked-control
+         injection does NOT set ``source``, so it keeps its normal rank.
+      2. Scene role: blocker (dismiss-first) < target < everything else.
+      3. intent-relevant before not.
+      4. clickable before not.
+      5. higher confidence first.
+    """
+    safety_net = 1 if getattr(b, "source", None) == "dom" else 0
+    role_in_scene = getattr(b, "role_in_scene", "") or ""
+    if role_in_scene == "blocker":
+        role_rank = 0
+    elif role_in_scene == "target":
+        role_rank = 1
+    else:
+        role_rank = 2
+    try:
+        confidence = float(getattr(b, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return (
+        safety_net,
+        role_rank,
+        0 if getattr(b, "intent_relevant", False) else 1,
+        0 if getattr(b, "clickable", False) else 1,
+        -confidence,
+    )
+
+
 class VisionResponse(BaseModel):
     """What the VisionAgent returns to the Python bridge."""
 
@@ -828,6 +885,13 @@ class VisionResponse(BaseModel):
     # CDP click dispatch lands in CSS pixel space. Default 1.0 keeps
     # existing call sites correct for the common DPR=1 config.
     _dpr: float = PrivateAttr(default=1.0)
+    # Page scrollY (CSS px) at the moment this response became brain-visible.
+    # Stamped via `with_scroll_anchor()` on the screenshot + prefetch paths so a
+    # later click_at/type_at(V_n) can cheaply re-probe window.scrollY and refuse
+    # to dispatch bbox coords that a scroll has since invalidated (the epoch is
+    # pinned to a specific scroll position; box_2d carries no scroll offset).
+    # -1 = "no anchor recorded" → the resolver skips the scroll gate.
+    _scroll_y: int = PrivateAttr(default=-1)
 
     def with_image_dims(
         self,
@@ -845,6 +909,17 @@ class VisionResponse(BaseModel):
                 self._dpr = 1.0
         return self
 
+    def with_scroll_anchor(self, scroll_y: int | float | None) -> "VisionResponse":
+        """Record the page scrollY this response was observed at. Pass the
+        value from ``scrollInfo.scrollY``; ``None`` leaves it unset (-1)."""
+        if scroll_y is None:
+            return self
+        try:
+            self._scroll_y = int(round(float(scroll_y)))
+        except (TypeError, ValueError):
+            self._scroll_y = -1
+        return self
+
     @property
     def image_width(self) -> int:
         return self._image_width
@@ -856,6 +931,10 @@ class VisionResponse(BaseModel):
     @property
     def dpr(self) -> float:
         return self._dpr
+
+    @property
+    def scroll_y(self) -> int:
+        return self._scroll_y
 
     @field_validator("summary", "relevant_text", "intent", mode="before")
     @classmethod
@@ -950,20 +1029,10 @@ class VisionResponse(BaseModel):
         ]
         flags_line = "Flags: " + "  ".join(flag_bits)
 
-        def _rank(b: BBox) -> tuple[int, int, int, float]:
-            # Blocker bboxes rank first so "dismiss cookie banner" never
-            # gets buried behind 20 content elements.
-            role_rank = 0 if b.role_in_scene == "blocker" else (
-                1 if b.role_in_scene == "target" else 2
-            )
-            return (
-                role_rank,
-                0 if b.intent_relevant else 1,
-                0 if b.clickable else 1,
-                -b.confidence,
-            )
-
-        ordered = sorted(self.bboxes, key=_rank)[:max_bboxes]
+        # Blocker bboxes rank first so "dismiss cookie banner" never gets
+        # buried; DOM-injected safety-net boxes rank last so they only fill
+        # slots real vision targets didn't claim. See bbox_render_rank.
+        ordered = sorted(self.bboxes, key=bbox_render_rank)[:max_bboxes]
         # Build identity → V_n map BEFORE rendering so DOM-enriched
         # cross-bbox refs (parent_expand_v, aria_controls_v) can be
         # resolved against the just-computed ordering. The enrichment
@@ -1006,7 +1075,9 @@ class VisionResponse(BaseModel):
             grp = getattr(b, "group_label", None)
             if grp:
                 extras.append(f"group={grp!r}")
-            if getattr(b, "is_active", False):
+            if getattr(b, "is_mixed", False):
+                extras.append("active=mixed")
+            elif getattr(b, "is_active", False):
                 extras.append("active=true")
             jt = getattr(b, "just_toggled", None)
             if jt in ("on", "off"):
@@ -1106,17 +1177,10 @@ class VisionResponse(BaseModel):
         """
         if vision_index_1based < 1:
             return None
-        def _rank(b: BBox) -> tuple[int, int, int, float]:
-            role_rank = 0 if b.role_in_scene == "blocker" else (
-                1 if b.role_in_scene == "target" else 2
-            )
-            return (
-                role_rank,
-                0 if b.intent_relevant else 1,
-                0 if b.clickable else 1,
-                -b.confidence,
-            )
-        ordered = sorted(self.bboxes, key=_rank)
+        # Same canonical ordering as as_brain_text so a downstream
+        # browser_click_at(vision_index=V_n) resolves to exactly the element
+        # the brain saw at [V_n]. See bbox_render_rank.
+        ordered = sorted(self.bboxes, key=bbox_render_rank)
         idx = vision_index_1based - 1
         if idx >= len(ordered):
             return None

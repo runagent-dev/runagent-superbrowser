@@ -605,13 +605,8 @@ async def _apply_atomic(
 ) -> tuple[bool, str]:
     """Fall back to the existing atomic rewrite by re-calling the
     `_ATOMIC_FIX_TEXT_JS` script with the corrected target value."""
-    from .session_tools import _ATOMIC_FIX_TEXT_JS
-    js = (
-        _ATOMIC_FIX_TEXT_JS
-        .replace("__TARGET_X__", str(float(target_x)))
-        .replace("__TARGET_Y__", str(float(target_y)))
-        .replace("__TARGET_TEXT__", json.dumps(target))
-    )
+    from .session_tools import render_atomic_text_js
+    js = render_atomic_text_js(target_x, target_y, target, mode="replace")
     result = await _run_evaluate(session_id, js, timeout=20.0)
     if not result.get("ok"):
         return False, ""

@@ -20,12 +20,109 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 
-from ..effects import _ATOMIC_FIX_TEXT_JS, _diff_text
+from ..effects import _ATOMIC_FIX_TEXT_JS, _diff_text, render_atomic_text_js
+from ._click_core import resolve_epoch_target
 from ..feedback import _feedback_gate
 from ..formatting import _fetch_elements
 from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
+
+
+async def _clear_via_keys_escalation(
+    session_id: str, target_x: float, target_y: float,
+) -> dict | None:
+    """Fallback clear when the atomic native-setter empty was reverted by a
+    controlled component. The field is already focused (the atomic JS ran
+    el.focus()); press Ctrl+A then Delete, reset the React ``_valueTracker``,
+    and re-probe. Returns a synthetic atomic-result dict ``{ok, before, after,
+    changed}`` or None if the escalation errored. Works on both tiers (/keys +
+    /evaluate exist on t1 and t3). One shot — the caller does not retry.
+    """
+    try:
+        for combo in ("Control+a", "Delete"):
+            await _request_with_backoff(
+                "POST",
+                f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+                json={"keys": combo},
+                timeout=10.0,
+            )
+        probe_js = (
+            "(() => { const el = document.elementFromPoint("
+            f"{float(target_x)}, {float(target_y)});"
+            " if (!el) return {ok:false, reason:'no_element'};"
+            " try { const t = el._valueTracker;"
+            " if (t && typeof t.setValue === 'function') t.setValue(''); } catch(e){}"
+            " const v = ('value' in el && el.value !== undefined)"
+            " ? (el.value || '') : (el.innerText || '');"
+            " return {ok: v === '', before: '', after: v, changed: true,"
+            " method: 'keys_clear'}; })()"
+        )
+        ev = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": probe_js},
+            timeout=10.0,
+        )
+        body = ev.json()
+        res = body.get("result") if isinstance(body, dict) else None
+        if isinstance(res, dict):
+            return res
+    except Exception as exc:
+        print(f"  [clear keys-escalation failed: {exc}]")
+    return None
+
+
+async def _insert_text_escalation(
+    session_id: str, target_x: float, target_y: float, text: str,
+) -> dict | None:
+    """Rich-text editor escalation when the atomic execCommand write was
+    reverted (``is_editable`` and not ``ok``). Focus via a real (trusted)
+    click → Ctrl+A to select all → clear (Delete for empty, else CDP
+    Input.insertText replaces the selection) → re-probe. Returns a synthetic
+    atomic-result dict or None. Both tiers: /click, /keys, /insert-text exist
+    on t1 and t3. One shot — the caller does not retry.
+    """
+    try:
+        await _request_with_backoff(
+            "POST", f"{SUPERBROWSER_URL}/session/{session_id}/click",
+            json={"x": float(target_x), "y": float(target_y)}, timeout=10.0,
+        )
+        await _request_with_backoff(
+            "POST", f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+            json={"keys": "Control+a"}, timeout=10.0,
+        )
+        if text == "":
+            await _request_with_backoff(
+                "POST", f"{SUPERBROWSER_URL}/session/{session_id}/keys",
+                json={"keys": "Delete"}, timeout=10.0,
+            )
+        else:
+            await _request_with_backoff(
+                "POST", f"{SUPERBROWSER_URL}/session/{session_id}/insert-text",
+                json={"text": text}, timeout=10.0,
+            )
+        probe_js = (
+            "(() => { const el = document.elementFromPoint("
+            f"{float(target_x)}, {float(target_y)});"
+            " if (!el) return {ok:false, reason:'no_element'};"
+            " const v = ('value' in el && el.value !== undefined)"
+            " ? (el.value || '') : (el.innerText || '');"
+            " const n = (s) => (s||'').replace(/\\u200b/g,'').replace(/\\s+/g,' ').trim();"
+            f" return {{ok: n(v) === n({_json_top.dumps(text)}), before: '',"
+            " after: v, changed: true, method: 'cdp_insert_text'}; })()"
+        )
+        ev = await _request_with_backoff(
+            "POST", f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": probe_js}, timeout=10.0,
+        )
+        body = ev.json()
+        res = body.get("result") if isinstance(body, dict) else None
+        if isinstance(res, dict):
+            return res
+    except Exception as exc:
+        print(f"  [insert_text escalation failed: {exc}]")
+    return None
 
 
 _AUTOCOMPLETE_SCAN_JS = """
@@ -217,9 +314,10 @@ async def _scan_autocomplete_suggestions(session_id: str) -> dict:
         text=StringSchema("Text to type into the field at that point."),
         clear=BooleanSchema(
             description=(
-                "Clear the field's existing value before typing (default: true). "
-                "Uses React/Vue-aware clear so controlled components replace "
-                "properly instead of appending."
+                "true (default): REPLACE the field's existing value (React/Vue-"
+                "safe overwrite). false: APPEND text to the end of the current "
+                "value instead. Pass text=\"\" with clear=true to EMPTY the "
+                "field (delete everything)."
             ),
             default=True,
         ),
@@ -230,11 +328,13 @@ class BrowserTypeAtTool(Tool):
     """Type at a vision bbox (V_n) or (x, y) coordinate. The bbox analogue
     of `browser_type(index, text)`.
 
-    Checks the field's current value before typing — three outcomes the
-    LLM sees in the return:
+    Checks the field's current value before typing — outcomes the LLM sees
+    in the return:
       - `skip_match`: field already contains the target text; no change.
-      - `cleared_and_typed`: field had different content, cleared + typed.
+      - `cleared_and_typed`: field had different content, replaced it.
       - `typed_into_empty`: field was empty, typed directly.
+      - `appended`: clear=false, text added to the end of the existing value.
+      - `cleared_to_empty`: text="", the field was emptied.
 
     Prefer this over `browser_click_at(V_n)` + `browser_keys([...])`,
     which appends at the cursor and turns `old|` + typing `new` into
@@ -244,9 +344,10 @@ class BrowserTypeAtTool(Tool):
     name = "browser_type_at"
     description = (
         "Type text into the input at a vision bbox (vision_index=V_n) or "
-        "(x, y) coords. Probes the field's current value first and clears "
-        "it (React-safe) before typing. Replaces click_at + keys for "
-        "bbox-targeted typing — no more concatenation bugs."
+        "(x, y) coords. clear=true (default) REPLACES the field; clear=false "
+        "APPENDS; text=\"\" empties it. Probes the current value first and "
+        "writes React-safe. Replaces click_at + keys for bbox-targeted "
+        "typing — no more concatenation bugs."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -279,60 +380,26 @@ class BrowserTypeAtTool(Tool):
         target_y: float
         label: str
         if vision_index is not None:
-            current_label = f"V{vision_index}"
-            resp = self.s.vision_for_target_resolution()
-            if resp is None:
-                return (
-                    "[type_at_failed:no_vision] No recent vision response "
-                    "to resolve vision_index against. Take a screenshot "
-                    "first, or pass raw (x, y)."
-                )
-            bbox = resp.get_bbox(int(vision_index))
-            if bbox is None:
-                return (
-                    f"[type_at_failed:bad_vision_index] V{vision_index} "
-                    f"is out of range (only {len(resp.bboxes)} bboxes in "
-                    "the last vision response)."
-                )
-            # Phase 1.3 turn-based age gate (mirrors BrowserClickAtTool).
-            try:
-                import os as _os_local
-                _max_age = int(
-                    _os_local.environ.get("VISION_MAX_AGE_TURNS") or "1"
-                )
-            except ValueError:
-                _max_age = 1
-            if _max_age > 0:
-                _age = max(
-                    0,
-                    self.s._brain_turn_counter - 1
-                    - self.s._vision_epoch_turn,
-                )
-                if _age > _max_age:
-                    return (
-                        f"[type_at_failed:epoch_too_old age_turns={_age} "
-                        f"max={_max_age}] V{vision_index} resolves "
-                        f"against a vision snapshot taken {_age} actions "
-                        f"ago. Call browser_screenshot to refresh before "
-                        f"typing. NOTE: if a sibling browser_type_at in "
-                        f"this same turn returned [not_input], this V_n "
-                        f"is likely also a date/time picker trigger or "
-                        f"value-bearing button — use browser_click_at("
-                        f"vision_index={vision_index}) to open the "
-                        f"popup, then screenshot. See SOUL.md \"Date & "
-                        f"time pickers\"."
-                    )
-            iw, ih = resp.image_width, resp.image_height
-            if iw <= 0 or ih <= 0:
-                return (
-                    "[type_at_failed:no_image_dims] Last vision response "
-                    "has no source image dimensions; cannot denormalize "
-                    "box_2d. Take a fresh screenshot."
-                )
-            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
-            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
-            target_x = (x0 + x1) / 2
-            target_y = (y0 + y1) / 2
+            # Shared epoch resolver: no_vision / bad_index / age gate /
+            # image-dims / to_pixels(center) / per-epoch scroll-anchor gate.
+            # The scroll gate is the fix for the /evaluate-typed path, which
+            # has no TS-side viewport gate — a scroll between screenshot and
+            # type_at would otherwise write at the pre-scroll coordinates.
+            resolved = await resolve_epoch_target(
+                self.s, session_id, int(vision_index),
+                fail_prefix="type_at_failed",
+                verb="typing",
+                extra_hint=(
+                    "NOTE: if a sibling browser_type_at in this same turn "
+                    "returned [not_input], this V_n is likely also a date/time "
+                    "picker trigger or value-bearing button — use "
+                    f"browser_click_at(vision_index={vision_index}) to open the "
+                    "popup, then screenshot. See SOUL.md \"Date & time pickers\"."
+                ),
+            )
+            if isinstance(resolved, str):
+                return resolved
+            target_x, target_y, _bbox, _resp = resolved
             label = f"V{vision_index}"
             print(f"\n>> browser_type_at(V{vision_index}, text={text[:30]!r})")
         elif x is not None and y is not None:
@@ -347,13 +414,14 @@ class BrowserTypeAtTool(Tool):
         # through a dedicated /type-at endpoint (t3-only). Mechanism is
         # identical to browser_fix_text_at: atomic probe → native-setter
         # write → dispatched input/change events → confirm-read.
-        import json as _json
-        atomic_js = _ATOMIC_FIX_TEXT_JS.replace(
-            "__TARGET_X__", str(float(target_x))
-        ).replace(
-            "__TARGET_Y__", str(float(target_y))
-        ).replace(
-            "__TARGET_TEXT__", _json.dumps(text)
+        #   clear=True  (default) → replace the field's value (overwrite).
+        #   clear=False           → append to the existing value (no more
+        #                           silent concatenation surprises — the caller
+        #                           opted in). The final value is computed from
+        #                           the live `before` inside the same JS tick.
+        _mode = "replace" if clear else "append"
+        atomic_js = render_atomic_text_js(
+            target_x, target_y, text, mode=_mode,
         )
         ev = await _request_with_backoff(
             "POST",
@@ -409,12 +477,20 @@ class BrowserTypeAtTool(Tool):
         before = str(result.get("before", "") or "")
         after = str(result.get("after", "") or "")
         changed = bool(result.get("changed"))
+        is_clear = (text == "" and clear)
+        is_append = (not clear and text != "")
 
         if not changed:
             caption = (
+                f"Field at {label} was already empty — no change needed."
+                if is_clear else
                 f"Field at {label} already contained {text!r} — no typing "
                 f"needed. Proceed to next action."
             )
+        elif is_clear:
+            caption = f"Cleared field at {label} (was {before!r})."
+        elif is_append:
+            caption = f'Appended "{text}" at {label} (now: {after!r}).'
         elif before:
             caption = (
                 f'Typed "{text}" at {label} (replaced existing '
@@ -426,7 +502,12 @@ class BrowserTypeAtTool(Tool):
         self.s.record_step(
             "browser_type_at",
             f"{label}, text={text[:30]!r}",
-            "skip_match" if not changed else ("cleared_and_typed" if before else "typed_into_empty"),
+            (
+                "skip_match" if not changed else
+                "cleared_to_empty" if is_clear else
+                "appended" if is_append else
+                ("cleared_and_typed" if before else "typed_into_empty")
+            ),
         )
         synthetic_data = {
             "success": True,
@@ -435,8 +516,9 @@ class BrowserTypeAtTool(Tool):
             "changed": changed,
         }
         # Post-type semantic verification. Returns a caption suffix and
-        # may have already corrected the field in place.
-        if changed:
+        # may have already corrected the field in place. Skipped on a pure
+        # clear-to-empty (nothing to correct toward).
+        if changed and not is_clear:
             from ...type_verify import verify_and_correct
             field_meta = {
                 "label": str(result.get("label", "") or ""),
@@ -459,9 +541,9 @@ class BrowserTypeAtTool(Tool):
 
         # Post-type autocomplete scan. Surfaces any visible suggestion
         # list inline + sets last_type_at so the dead-type guard can
-        # catch a re-type into the same field.
+        # catch a re-type into the same field. Skipped on a pure clear.
         scan: dict = {"suggestions": [], "detected": False}
-        if changed:
+        if changed and not is_clear:
             scan = await _scan_autocomplete_suggestions(session_id)
         suggestions: list[dict] = scan.get("suggestions") or []
         detected: bool = bool(scan.get("detected"))
@@ -546,7 +628,11 @@ class BrowserFixTextAtTool(Tool):
         "Atomically set an input / textarea / contenteditable to a target "
         "text value. Reads the current content, reports the diff, writes "
         "the correction in one step. Use this to fix typos or replace "
-        "stale field values without multi-step click + clear + retype."
+        "stale field values without multi-step click + clear + retype. "
+        "Pass text=\"\" to EMPTY a field (delete all its content) — this is "
+        "the canonical way to clear an input; it dispatches a React/Vue-safe "
+        "clear and, if a controlled component re-hydrates, escalates to "
+        "Ctrl+A+Delete automatically."
     )
 
     def __init__(self, state: BrowserSessionState):
@@ -565,31 +651,22 @@ class BrowserFixTextAtTool(Tool):
         y: float | None = None,
         **kw: Any,
     ) -> Any:
+        # Age the vision epoch across this mutation (mirrors type_at).
+        self.s._brain_turn_counter += 1
         if text is None:
             text = ""
 
-        # Resolve target point.
+        # Resolve target point via the shared epoch resolver (adds the same
+        # age gate + scroll-anchor gate the other bbox tools use).
         if vision_index is not None:
-            resp = self.s.vision_for_target_resolution()
-            if resp is None:
-                return (
-                    "[fix_text_at_failed:no_vision] No recent vision response "
-                    "to resolve vision_index against. Take a screenshot first "
-                    "or pass raw (x, y)."
-                )
-            bbox = resp.get_bbox(int(vision_index))
-            if bbox is None:
-                return (
-                    f"[fix_text_at_failed:bad_vision_index] V{vision_index} "
-                    f"out of range (only {len(resp.bboxes)} bboxes)."
-                )
-            iw, ih = resp.image_width, resp.image_height
-            if iw <= 0 or ih <= 0:
-                return "[fix_text_at_failed:no_image_dims] take a fresh screenshot."
-            dpr_val = float(getattr(resp, "dpr", 1.0) or 1.0)
-            x0, y0, x1, y1 = bbox.to_pixels(iw, ih, dpr=dpr_val)
-            target_x = (x0 + x1) / 2
-            target_y = (y0 + y1) / 2
+            resolved = await resolve_epoch_target(
+                self.s, session_id, int(vision_index),
+                fail_prefix="fix_text_at_failed",
+                verb="setting the value",
+            )
+            if isinstance(resolved, str):
+                return resolved
+            target_x, target_y, _bbox, _resp = resolved
             label = f"V{vision_index}"
         elif x is not None and y is not None:
             target_x = float(x)
@@ -606,13 +683,10 @@ class BrowserFixTextAtTool(Tool):
         # exists on t3. Doing the full op in a single evaluate is also
         # race-free: elementFromPoint → native setter → confirm-read all
         # happen within one synchronous JS tick.
-        import json as _json
-        atomic_js = _ATOMIC_FIX_TEXT_JS.replace(
-            "__TARGET_X__", str(float(target_x))
-        ).replace(
-            "__TARGET_Y__", str(float(target_y))
-        ).replace(
-            "__TARGET_TEXT__", _json.dumps(text)
+        # fix_text_at always REPLACES (writes the exact target value in one
+        # React/Vue-safe op). Pass text="" to empty the field.
+        atomic_js = render_atomic_text_js(
+            target_x, target_y, text, mode="replace",
         )
         ev = await _request_with_backoff(
             "POST",
@@ -629,21 +703,45 @@ class BrowserFixTextAtTool(Tool):
             return f"[fix_text_at_failed] unexpected evaluate shape: {type(result).__name__}"
 
         if not result.get("ok"):
-            return (
-                f"[fix_text_at_failed:{result.get('reason','unknown')}] at "
-                f"{label}. detail={result}"
-            )
+            # Clear-to-empty (text="") that the native setter couldn't make
+            # stick — some controlled components re-hydrate the old value.
+            # Escalate ONCE via focus→Ctrl+A→Delete→tracker-reset, then re-probe.
+            if text == "" and str(result.get("after", "") or "") != "":
+                escalated = await _clear_via_keys_escalation(
+                    session_id, target_x, target_y,
+                )
+                if isinstance(escalated, dict):
+                    result = escalated
+            # Rich-text editor that reverted even the execCommand write
+            # (canvas / model-backed editors): escalate ONCE to a CDP-trusted
+            # Input.insertText via /insert-text.
+            if not result.get("ok") and result.get("is_editable"):
+                esc2 = await _insert_text_escalation(
+                    session_id, target_x, target_y, text,
+                )
+                if isinstance(esc2, dict):
+                    result = esc2
+            if not result.get("ok"):
+                return (
+                    f"[fix_text_at_failed:{result.get('reason','unknown')}] at "
+                    f"{label}. detail={result}"
+                )
 
         before = str(result.get("before", "") or "")
         after = str(result.get("after", "") or "")
         changed = bool(result.get("changed"))
         diff = _diff_text(before, after) if changed else "no change"
+        is_clear = text == ""
 
         if not changed:
             caption = (
+                f"Field at {label} was already empty — no change needed."
+                if is_clear else
                 f"Field at {label} already contained {text!r} — no change "
                 f"needed. Proceed."
             )
+        elif is_clear:
+            caption = f"Cleared field at {label} (was {before!r})."
         else:
             caption = (
                 f"Fixed {label}: {before!r} → {after!r}\n"
@@ -653,7 +751,7 @@ class BrowserFixTextAtTool(Tool):
         self.s.record_step(
             "browser_fix_text_at",
             f"{label}, target={text[:30]!r}",
-            diff,
+            "cleared_to_empty" if (is_clear and changed) else diff,
         )
         # Wrap result in the same shape build_text_only expects.
         synthetic_data = {
@@ -663,7 +761,10 @@ class BrowserFixTextAtTool(Tool):
             "changed": changed,
             "diff": diff,
         }
-        if changed:
+        # Skip the post-type verify/correct pass when clearing to empty —
+        # there is nothing to "correct" toward, and the corrector would try
+        # to re-type the (empty) target.
+        if changed and not is_clear:
             from ...type_verify import verify_and_correct
             field_meta = {
                 "label": str(result.get("label", "") or ""),
@@ -683,6 +784,159 @@ class BrowserFixTextAtTool(Tool):
                 synthetic_data["auto_corrected"] = True
                 synthetic_data["corrected_to"] = outcome.corrected_to
             caption += outcome.caption_suffix
+        _vision_task = _schedule_vision_prefetch(self.s, session_id)
+        return await _append_fresh_vision(
+            _vision_task,
+            self.s.build_text_only(synthetic_data, caption),
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        session_id=StringSchema("Session ID"),
+        op=StringSchema(
+            "Edit operation: 'delete_tail' removes the last `count` characters "
+            "from the field; 'append' adds `text` to the end."
+        ),
+        vision_index=IntegerSchema(
+            description="1-based vision bbox V_n of the field.", nullable=True,
+        ),
+        x=NumberSchema(
+            description="X (CSS px). Ignored when vision_index is set.",
+            nullable=True,
+        ),
+        y=NumberSchema(
+            description="Y (CSS px). Ignored when vision_index is set.",
+            nullable=True,
+        ),
+        count=IntegerSchema(
+            description="delete_tail: number of trailing characters to delete "
+            "(default 1).",
+            nullable=True,
+        ),
+        text=StringSchema(
+            "append: the text to add to the end of the field.", nullable=True,
+        ),
+        required=["session_id", "op"],
+    )
+)
+class BrowserEditTextAtTool(Tool):
+    """Positional text edit at a vision bbox (V_n) or (x, y): delete the last
+    N characters, or append to the end — WITHOUT overwriting the whole field.
+
+    The final value is computed from the field's live value inside one atomic
+    JS tick (via the shared _ATOMIC_FIX_TEXT_JS template), so a read-then-write
+    can't race a debounced re-render. Works on both t1 and t3 (routes through
+    /evaluate). For a full overwrite use browser_fix_text_at; to empty a field
+    use browser_fix_text_at(text="").
+    """
+
+    name = "browser_edit_text_at"
+    description = (
+        "Edit text at a field without replacing all of it. op='delete_tail' "
+        "deletes the last `count` characters; op='append' adds `text` to the "
+        "end. Use browser_fix_text_at(text=...) to replace the whole value, "
+        "or browser_fix_text_at(text=\"\") to empty it."
+    )
+
+    def __init__(self, state: BrowserSessionState):
+        self.s = state
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        session_id: str,
+        op: str,
+        vision_index: int | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        count: int | None = 1,
+        text: str | None = None,
+        **kw: Any,
+    ) -> Any:
+        sync_block = await self.s.ensure_vision_synced(reason="browser_edit_text_at")
+        if sync_block:
+            return sync_block
+        self.s._brain_turn_counter += 1
+
+        op_norm = (op or "").strip().lower()
+        if op_norm not in ("delete_tail", "append"):
+            return (
+                "[edit_text_at_failed:bad_op] op must be 'delete_tail' or "
+                "'append'. To replace the whole value use browser_fix_text_at."
+            )
+        if op_norm == "append" and not text:
+            return "[edit_text_at_failed:bad_args] op='append' needs a non-empty text."
+        try:
+            n = int(count) if count is not None else 1
+        except (TypeError, ValueError):
+            n = 1
+        if op_norm == "delete_tail" and n <= 0:
+            return "[edit_text_at_failed:bad_args] delete_tail needs count >= 1."
+
+        # Resolve target point (shared epoch resolver → age + scroll gates).
+        if vision_index is not None:
+            resolved = await resolve_epoch_target(
+                self.s, session_id, int(vision_index),
+                fail_prefix="edit_text_at_failed", verb="editing",
+            )
+            if isinstance(resolved, str):
+                return resolved
+            target_x, target_y, _bbox, _resp = resolved
+            label = f"V{vision_index}"
+        elif x is not None and y is not None:
+            target_x, target_y = float(x), float(y)
+            label = f"({int(target_x)},{int(target_y)})"
+        else:
+            return "[edit_text_at_failed:bad_args] Provide vision_index or both x and y."
+
+        print(f"\n>> browser_edit_text_at({label}, op={op_norm}, count={n})")
+        atomic_js = render_atomic_text_js(
+            target_x, target_y, text or "", mode=op_norm, count=n,
+        )
+        ev = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": atomic_js},
+            timeout=20.0,
+        )
+        ev.raise_for_status()
+        payload = ev.json()
+        result = (
+            payload.get("result") if isinstance(payload, dict) else None
+        ) or {}
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = (
+                (result or {}).get("reason", "unknown")
+                if isinstance(result, dict) else "bad_shape"
+            )
+            return f"[edit_text_at_failed:{reason}] at {label}. detail={result}"
+
+        before = str(result.get("before", "") or "")
+        after = str(result.get("after", "") or "")
+        changed = bool(result.get("changed"))
+        if op_norm == "delete_tail":
+            caption = (
+                f"Deleted last {n} char(s) at {label}: {before!r} → {after!r}."
+                if changed else
+                f"Field at {label} unchanged (nothing left to delete)."
+            )
+        else:
+            caption = (
+                f'Appended "{text}" at {label} (now: {after!r}).'
+                if changed else f"Field at {label} unchanged."
+            )
+        self.s.record_step(
+            "browser_edit_text_at",
+            f"{label}, op={op_norm} count={n}",
+            "changed" if changed else "no_change",
+        )
+        synthetic_data = {
+            "success": True, "before": before, "after": after, "changed": changed,
+        }
         _vision_task = _schedule_vision_prefetch(self.s, session_id)
         return await _append_fresh_vision(
             _vision_task,
@@ -910,6 +1164,8 @@ class BrowserKeysTool(Tool):
 
     async def execute(self, session_id: str, keys: str, **kw: Any) -> Any:
         print(f"\n>> browser_keys({keys})")
+        # Keys can submit / navigate / edit — age the vision epoch across it.
+        self.s._brain_turn_counter += 1
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/keys",

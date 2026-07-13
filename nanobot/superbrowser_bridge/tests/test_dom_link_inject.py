@@ -221,6 +221,38 @@ def test_intra_pass_dedup() -> None:
     print("✓ test_intra_pass_dedup")
 
 
+def test_injected_box_never_outranks_real_vision_target() -> None:
+    """Regression: a DOM-injected src=dom safety-net box must sort BELOW a
+    real (vision-emitted) box even when the injected one is intent_relevant
+    and the real one is not — so it can never evict or out-rank a real
+    target under as_brain_text's cap. Guards the source demotion added to
+    bbox_render_rank (the fix for the "brain clicks the wrong box" regression
+    where a keyword-matched injected link jumped above real vision targets).
+    """
+    from vision_agent.schemas import bbox_render_rank
+
+    real = BBox(label="Some content link", box_2d=[500, 100, 520, 300],
+                clickable=True, role_in_scene="unknown",
+                intent_relevant=False, confidence=0.9)
+    injected = BBox(label="Buy now", box_2d=[100, 100, 140, 300],
+                    clickable=True, role_in_scene="unknown",
+                    intent_relevant=True, confidence=0.55)
+    injected.source = "dom"
+    # Rank tuple: real (source=None) sorts strictly before injected (src=dom),
+    # despite the injected box being intent_relevant with the same role.
+    assert bbox_render_rank(real) < bbox_render_rank(injected), (
+        bbox_render_rank(real), bbox_render_rank(injected))
+    # End-to-end through the real renderer + resolver: V1 is the real box,
+    # the injected one tails, and get_bbox mirrors as_brain_text exactly.
+    resp = VisionResponse(bboxes=[injected, real], summary="page")
+    resp.with_image_dims(IW, IH, dpr=DPR)
+    text = resp.as_brain_text()
+    v1 = next(line for line in text.splitlines() if "[V1]" in line)
+    assert "content link" in v1, text
+    assert resp.get_bbox(1) is real and resp.get_bbox(2) is injected
+    print("✓ test_injected_box_never_outranks_real_vision_target")
+
+
 def _run_all() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

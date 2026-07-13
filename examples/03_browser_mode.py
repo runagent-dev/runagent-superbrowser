@@ -46,9 +46,9 @@ def main() -> int:
     try:
         with sb:
             res = sb.run(
-                "Is there a one-bedroom room available at a five-star hotel in Cox’s Bazar on https://gozayaan.com/ I want to stay from July 8 to July 10.",
-                url="https://gozayaan.com/",
-                mode="browser",
+                "Complete a multiplication quiz on https://www.coolmath4kids.com/, covering multiplication facts for 11-12. The quiz should consist of 10 questions, with unlimited time allowed for each. The goal is to achieve a perfect score of 10 out of 10.",
+                url="https://www.coolmath4kids.com/",
+                mode="browser",  #it also can be "auto" 
             )
     except (ServerUnavailable, ServerStartError) as exc:
         print("Could not start/reach the browser engine:\n ", exc)

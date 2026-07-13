@@ -137,14 +137,12 @@ def build_som_screenshot(
     # Rank identically to VisionResponse.as_brain_text: intent_relevant
     # first, then clickable, then by confidence desc. Keep original
     # enumeration so ties break deterministically.
+    from vision_agent.schemas import bbox_render_rank  # type: ignore[import-not-found]
     ranked = sorted(
         enumerate(bboxes),
-        key=lambda ib: (
-            0 if getattr(ib[1], "intent_relevant", False) else 1,
-            0 if getattr(ib[1], "clickable", False) else 1,
-            -float(getattr(ib[1], "confidence", 0.0) or 0.0),
-            ib[0],
-        ),
+        # Canonical V_n order + original index as a stable tie-break so the
+        # SoM overlay labels line up with as_brain_text.
+        key=lambda ib: (*bbox_render_rank(ib[1]), ib[0]),
     )[:max_boxes]
     elements: list[dict[str, object]] = []
     for v_idx, (_, b) in enumerate(ranked, start=1):

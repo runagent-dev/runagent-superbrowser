@@ -26,6 +26,90 @@ from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 
 
+# Cheap page probe bracketing a script so we can detect DOM/URL/scroll changes
+# the script made — /script and /evaluate emit no `effect` envelope, so without
+# this a mutating script leaves the frozen vision epoch, current_url and cached
+# bboxes all stale and the next click_at(V_n) lands on a pre-script element.
+_PROBE_JS = (
+    "(() => ({url: location.href, y: Math.round(window.scrollY || 0), "
+    "n: document.getElementsByTagName('*').length}))()"
+)
+
+
+async def _page_probe(session_id: str) -> dict | None:
+    """Read {url, scrollY, element_count}. None on failure."""
+    try:
+        r = await _request_with_backoff(
+            "POST", f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": _PROBE_JS}, timeout=8.0,
+        )
+        if r.status_code >= 400:
+            return None
+        res = (r.json() or {}).get("result")
+        if isinstance(res, dict):
+            return res
+    except Exception:
+        return None
+    return None
+
+
+def _probe_changed(pre: dict | None, post: dict | None) -> bool:
+    """True when url changed, scrollY moved > 12px, or the element count moved
+    by more than MUTATION_DIRTY_THRESHOLD."""
+    if not pre or not post:
+        return False
+    if str(pre.get("url")) != str(post.get("url")):
+        return True
+    try:
+        if abs(int(post.get("y", 0)) - int(pre.get("y", 0))) > 12:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        thresh = int(os.environ.get("MUTATION_DIRTY_THRESHOLD") or "6")
+    except ValueError:
+        thresh = 6
+    try:
+        if abs(int(post.get("n", 0)) - int(pre.get("n", 0))) > thresh:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+async def _invalidate_after_script(
+    state: Any, session_id: str, pre: dict | None,
+    *, tool_name: str, mutates_forced: bool = False,
+) -> dict | None:
+    """Post-probe a script; when it changed the page (or mutates=true), null the
+    vision epoch, bump the turn counter, record the post-script URL, bust the
+    vision cache, clear stale fingerprints, and schedule a fresh prefetch — so a
+    following click_at/type_at(V_n) can't resolve a pre-script bbox. Returns the
+    post-probe. No-op on a read-only script that changed nothing (keeps the
+    encouraged read-only verify loop free of forced re-screenshots)."""
+    post = await _page_probe(session_id)
+    if not (mutates_forced or _probe_changed(pre, post)):
+        return post
+    post_url = (post or {}).get("url") or state.current_url
+    try:
+        state.mark_epoch_dirty(
+            tool_name, bump_turn=True, record_url=post_url,
+            bust_cache=True, session_id=session_id,
+        )
+    except Exception:
+        pass
+    try:
+        state.element_fingerprints = {}
+    except Exception:
+        pass
+    try:
+        from ..vision_pipeline import _schedule_vision_prefetch
+        _schedule_vision_prefetch(state, session_id)
+    except Exception:
+        pass
+    return post
+
+
 def _consec_script_abort_threshold() -> int:
     """Consecutive browser_eval / browser_run_script calls (no intervening
     cursor success) after which the worker is HARD-aborted.
@@ -89,6 +173,10 @@ class BrowserEvalTool(Tool):
                 f"(tune/disable via SUPERBROWSER_MAX_CONSEC_SCRIPTS)."
             )
         print(f"\n>> browser_eval({script[:60]}...)")
+        # browser_eval is read-only by intent, but nothing enforces that — a
+        # script CAN mutate/navigate. Bracket it with a probe so an actual
+        # change still invalidates the vision epoch (see _invalidate_after_script).
+        _pre = await _page_probe(session_id)
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
@@ -101,6 +189,7 @@ class BrowserEvalTool(Tool):
         result_str = json.dumps(result, indent=2, ensure_ascii=False)[:5000] if isinstance(result, (dict, list)) else str(result)[:5000]
         self.s.log_activity(f"eval({script[:40]}...)", result_str[:60])
         self.s.record_step("browser_eval", script[:60], result_str[:100])
+        await _invalidate_after_script(self.s, session_id, _pre, tool_name="eval")
         # Surface the script-usage advisory when the brain is on a
         # 2+ eval/run_script streak with clickable bboxes available.
         try:
@@ -297,6 +386,7 @@ class BrowserRunScriptTool(Tool):
             payload["timeout"] = timeout
 
         client_timeout = max(120.0, (timeout or 60000) / 1000 + 10)
+        _pre = await _page_probe(session_id)
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/script",
@@ -367,6 +457,14 @@ class BrowserRunScriptTool(Tool):
         parts.append(f"Duration: {duration}ms")
         self.s.log_activity(f"run_script(ok, {duration}ms)", str(result)[:60] if result else "void")
         self.s.record_step("browser_run_script", script[:60], str(result)[:100] if result else "void")
+        # Invalidate the vision epoch BEFORE the checkpoint so record_url has
+        # updated current_url — otherwise a JS navigation would checkpoint the
+        # PRE-script URL as "success". mutates=true always invalidates (a
+        # value-only DOM write may not change the element count).
+        await _invalidate_after_script(
+            self.s, session_id, _pre,
+            tool_name="run_script", mutates_forced=bool(mutates),
+        )
         self.s.record_checkpoint(self.s.current_url, "", f"run_script(ok, {duration}ms)")
 
         # Auto-include updated elements so agent sees current page state

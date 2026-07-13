@@ -353,6 +353,17 @@ def _apply_just_toggled_marker(
         return 0
     if not resp or not getattr(resp, "bboxes", None):
         return 0
+    # Clear any stale just_toggled FIRST — the vision cache returns a shallow
+    # copy that shares the SAME bbox objects (cache.py), so a marker stamped two
+    # actions ago would otherwise re-surface on a cache-reuse and re-fire the
+    # worker_hook filter-toggle "re-click to undo" hint on a page where nothing
+    # was toggled this turn. Runs before every early return below.
+    for _b in resp.bboxes:
+        try:
+            if getattr(_b, "just_toggled", None) is not None:
+                _b.just_toggled = None
+        except Exception:
+            pass
     prior_label = (getattr(state, "last_click_target_label", "") or "").strip()
     prior_box = getattr(state, "last_click_target_box_2d", None)
     prior_active = getattr(state, "last_click_target_active_state", None)
@@ -625,28 +636,14 @@ def _detect_misclick_flip(resp: Any, state: Any) -> int:
         return 1
 
 
-def _replicate_rank_for_enrichment(b: Any) -> tuple[int, int, int, float]:
-    """Mirror VisionResponse._rank used by as_brain_text/get_bbox.
-
-    Kept inline so we don't import a private helper out of schemas.
+def _replicate_rank_for_enrichment(b: Any) -> tuple:
+    """Delegate to the canonical ``bbox_render_rank`` so the enrichment
+    cross-refs (``child_of=V``, ``controls=V``) use the exact ordering
+    ``as_brain_text``/``get_bbox`` use. Thin named wrapper kept for
+    call-site clarity.
     """
-    role_in_scene = getattr(b, "role_in_scene", "") or ""
-    if role_in_scene == "blocker":
-        role_rank = 0
-    elif role_in_scene == "target":
-        role_rank = 1
-    else:
-        role_rank = 2
-    try:
-        confidence = float(getattr(b, "confidence", 0.5) or 0.5)
-    except (TypeError, ValueError):
-        confidence = 0.5
-    return (
-        role_rank,
-        0 if getattr(b, "intent_relevant", False) else 1,
-        0 if getattr(b, "clickable", False) else 1,
-        -confidence,
-    )
+    from vision_agent.schemas import bbox_render_rank  # type: ignore[import-not-found]
+    return bbox_render_rank(b)
 
 
 def _apply_compound_row_split(
@@ -873,6 +870,17 @@ def _entry_is_active(attrs: dict) -> bool:
     return bool(ac and ac != "false")
 
 
+def _entry_is_mixed(attrs: dict) -> bool:
+    """True when a tri-state control is INDETERMINATE ('mixed'). Sourced from
+    native input.indeterminate or aria-checked='mixed'. Distinct from active."""
+    if not isinstance(attrs, dict):
+        return False
+    return (
+        (attrs.get("indeterminate") or "").lower() == "true"
+        or (attrs.get("aria-checked") or "").lower() == "mixed"
+    )
+
+
 def _resolve_control_label(
     entry: dict,
     selector_entries: list[dict],
@@ -957,6 +965,7 @@ def _inject_stateful_control_bboxes(
     image_h: int,
     dpr: float,
     task_instruction: str | None,
+    interacted_dom_indices: set | None = None,
 ) -> int:
     """Guarantee every stateful form control has a clickable bbox with a
     correct ``is_active`` — inject one when vision omitted it, refresh state
@@ -1025,6 +1034,27 @@ def _inject_stateful_control_bboxes(
     ) in ("1", "true", "yes")
     task_kw = _task_keywords(task_instruction)
 
+    # Controls the brain toggled this session keep a clickable V_n even when
+    # inactive (so an unchecked box can be re-checked, and its just_toggled=off
+    # can be confirmed). Radio-group widening: also keep the same-name siblings,
+    # because "deselecting" a radio means clicking a sibling, which needs a V_n.
+    interacted_idx: set = interacted_dom_indices or set()
+    interacted_names: set[str] = set()
+    if interacted_idx:
+        for _e in selector_entries:
+            if _e.get("index") in interacted_idx:
+                _nm = ((_e.get("attributes") or {}).get("name") or "").strip()
+                if _nm:
+                    interacted_names.add(_nm)
+
+    def _entry_recently_interacted(entry: dict) -> bool:
+        if not interacted_idx and not interacted_names:
+            return False
+        if entry.get("index") in interacted_idx:
+            return True
+        nm = ((entry.get("attributes") or {}).get("name") or "").strip()
+        return bool(nm and nm in interacted_names)
+
     touched = 0
     # (relevance, ex0, ey0, ex1, ey1, kind, label, active, dom_index)
     candidates: list[tuple[int, float, float, float, float, str, str, bool, Any]] = []
@@ -1038,8 +1068,11 @@ def _inject_stateful_control_bboxes(
         ex0, ey0, ex1, ey1 = rect
         attrs = entry.get("attributes") or {}
         active = _entry_is_active(attrs)
-        # Pre-selected options only: an unselected <option> is vision's job.
-        if (entry.get("tagName") or "").lower() == "option" and not active:
+        mixed = _entry_is_mixed(attrs)
+        # Pre-selected options only: an unselected <option> is vision's job —
+        # unless the brain just interacted with it (keep its V_n).
+        if ((entry.get("tagName") or "").lower() == "option" and not active
+                and not _entry_recently_interacted(entry)):
             continue
         # Viewport guard — bounds + screenshot come from the same /state
         # response, so an off-image centre means the control isn't on screen.
@@ -1066,6 +1099,7 @@ def _inject_stateful_control_bboxes(
             existing = resp.bboxes[best_idx]
             try:
                 existing.is_active = active
+                existing.is_mixed = mixed
                 if getattr(existing, "dom_index", None) is None:
                     existing.dom_index = entry.get("index")
                 touched += 1
@@ -1073,13 +1107,19 @@ def _inject_stateful_control_bboxes(
                 pass
             continue
 
-        # No existing box → injection candidate (gated on active state).
-        if not active and not inject_inactive:
+        # No existing box → injection candidate. Inject when active, when
+        # BBOX_STATEFUL_INJECT_INACTIVE is on, OR when the brain recently
+        # toggled this control (so an unchecked box keeps its clickable V_n).
+        if not active and not inject_inactive and not _entry_recently_interacted(entry):
             continue
         label = _resolve_control_label(entry, selector_entries, kind)
         relevance = _label_task_relevance(label, task_kw)
+        # A recently-interacted control is task-relevant by construction —
+        # floor its relevance so it survives the max_new cap.
+        if _entry_recently_interacted(entry):
+            relevance = max(relevance, 1)
         candidates.append(
-            (relevance, ex0, ey0, ex1, ey1, kind, label, active, entry.get("index"))
+            (relevance, ex0, ey0, ex1, ey1, kind, label, active, entry.get("index"), mixed)
         )
 
     # Inject the most task-relevant candidates first, capped so a control-dense
@@ -1087,7 +1127,7 @@ def _inject_stateful_control_bboxes(
     max_new = _stateful_control_max()
     candidates.sort(key=lambda c: -c[0])
     injected = 0
-    for relevance, ex0, ey0, ex1, ey1, kind, label, active, dom_index in candidates:
+    for relevance, ex0, ey0, ex1, ey1, kind, label, active, dom_index, mixed in candidates:
         if injected >= max_new:
             break
         # Re-check IoU against boxes injected earlier in THIS pass so two
@@ -1119,6 +1159,7 @@ def _inject_stateful_control_bboxes(
             # is_active / dom_index are DOM-derived (never vision-emitted);
             # set them post-construction, mirroring the enrichment pass.
             new_bbox.is_active = active
+            new_bbox.is_mixed = mixed
             new_bbox.dom_index = dom_index
         except Exception:
             continue
@@ -1226,10 +1267,11 @@ def _inject_dom_link_bboxes(
 
     Ranking (anti-nav-chrome-flood): task-keyword-relevant labels first,
     then boxes OUTSIDE the top/bottom 10% chrome bands, then top-to-
-    bottom. Injected boxes carry confidence=0.55 so they sort toward the
-    tail of `as_brain_text`'s capped render — a safety net, not a rival
-    to vision's own targets — and `source='dom'` (rendered `src=dom`)
-    so provenance is visible.
+    bottom. Injected boxes are stamped `source='dom'` (rendered `src=dom`)
+    which `bbox_render_rank` demotes to the TAIL of `as_brain_text`'s
+    capped render — a genuine safety net that truncates first and never
+    evicts or out-ranks vision's own targets. `confidence=0.55` is a
+    secondary within-tail tiebreak, not the mechanism.
 
     Mutates ``resp.bboxes`` in place; returns the count injected. Safe
     no-op when the env flag is off or inputs are unusable.
@@ -1355,9 +1397,10 @@ def _inject_dom_link_bboxes(
                 box_2d=[ymin, xmin, ymax, xmax],
                 clickable=True,
                 role=kind,
-                # Low confidence by design: sorts injected boxes toward
-                # the tail of as_brain_text's ranking so they never
-                # displace vision's own targets, only extend coverage.
+                # Within-tail tiebreak only. The tail placement itself comes
+                # from source='dom' (set below), which bbox_render_rank
+                # demotes beneath every real vision box — so injected boxes
+                # extend coverage without ever displacing vision's targets.
                 confidence=0.55,
                 role_in_scene="unknown",
                 intent_relevant=relevance > 0,
@@ -1433,13 +1476,10 @@ async def _push_vision_bboxes(
         return
     # Mirror the rank order of as_brain_text() so the overlay's V_n
     # labels line up with what the brain sees in tool output.
+    from vision_agent.schemas import bbox_render_rank  # type: ignore[import-not-found]
     ordered = sorted(
         getattr(resp, "bboxes", []),
-        key=lambda b: (
-            0 if getattr(b, "intent_relevant", False) else 1,
-            0 if getattr(b, "clickable", False) else 1,
-            -getattr(b, "confidence", 0.0),
-        ),
+        key=bbox_render_rank,
     )
     payload_bboxes: list[dict[str, Any]] = []
     for i, b in enumerate(ordered, start=1):
@@ -1573,7 +1613,15 @@ def _schedule_vision_prefetch(
             # screenshot. Avoids the cold-page bbox-above-text race.
             # State flag is one-shot: consume it here so subsequent
             # mid-session prefetches don't re-pay the cost.
-            params: dict[str, str] = {"vision": "true", "bounds": "true"}
+            # pageref=keep: this is a BACKGROUND prefetch, not a brain-facing
+            # screenshot. Without it, the TS side refreshes its viewport-shift
+            # baseline (setVisionPageRef) to the CURRENT scroll on every
+            # prefetch — so a post-scroll prefetch defeats the /click gate
+            # (it sees delta≈0 vs the just-refreshed ref). The brain's V_n are
+            # anchored to the last SCREENSHOT, so only a screenshot updates it.
+            params: dict[str, str] = {
+                "vision": "true", "bounds": "true", "pageref": "keep",
+            }
             if getattr(state, "_needs_visual_settle", False):
                 params["settle"] = "true"
                 try:
@@ -1642,6 +1690,13 @@ def _schedule_vision_prefetch(
                 task_instruction=state.task_instruction or None,
             )
             resp.with_image_dims(img_w, img_h, dpr=dpr_val)
+            # Pin the scroll position this pass was numbered at so a later
+            # click_at/type_at(V_n) can detect a scroll-since-screenshot and
+            # refuse stale bbox coords (the per-epoch scroll-anchor gate).
+            try:
+                resp.with_scroll_anchor((data.get("scrollInfo") or {}).get("scrollY"))
+            except Exception:
+                pass
             # v2-C: post-vision DOM enrichment. When vision merged a
             # compound row (parent control + chevron in one bbox), the
             # selectorEntries from the same /state response give us the
@@ -1688,6 +1743,7 @@ def _schedule_vision_prefetch(
                     img_h,
                     dpr_val,
                     state.task_instruction,
+                    interacted_dom_indices=state.prune_interacted_controls(),
                 )
             except Exception as exc:
                 print(f"  [stateful_control_inject prefetch failed: {exc}]")

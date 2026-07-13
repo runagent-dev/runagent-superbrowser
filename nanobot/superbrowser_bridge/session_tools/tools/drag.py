@@ -43,6 +43,7 @@ class BrowserDragTool(Tool):
     async def execute(self, session_id: str, startX: float, startY: float, endX: float, endY: float, steps: int | None = None, **kw: Any) -> str:
         print(f"\n>> browser_drag(({startX},{startY}) -> ({endX},{endY}))")
         self.s.actions_since_screenshot += 1
+        self.s._brain_turn_counter += 1
         self.s.consecutive_click_calls = 0
 
         payload: dict[str, Any] = {

@@ -141,6 +141,14 @@ class BrowserSessionState:
         self.last_click_target_active_state: bool | None = None
         self.last_click_target_label: str = ""
         self.last_click_target_box_2d: list[int] | None = None
+        # Stateful controls (checkbox/radio/switch/option) the brain has
+        # interacted with THIS session, keyed by dom_index. Lets the injection
+        # keep a clickable V_n for a control the brain just toggled OFF — which
+        # vision omits (inactive) on a fresh pass, and which the plain injection
+        # skips (only active controls are injected). Without this, "uncheck →
+        # re-screenshot → confirm active=false / re-check" loses the V_n.
+        # {key: {label, box_2d, dom_index, name, turn}}. Pruned by TTL in turns.
+        self.recently_interacted_controls: dict[str, dict] = {}
         # Cross-tool element identity. Resolved DOM index of the last
         # click target — populated by every click path that knows the
         # index (BrowserClickTool from `index` arg; BrowserClickAtTool
@@ -560,6 +568,32 @@ class BrowserSessionState:
         # Drop cross-tool element identity tracking — a new session
         # starts with no recorded last click.
         self.last_click_dom_index = None
+        # Interacted-control registry is per-session — a new page has its own
+        # controls / dom indices.
+        self.recently_interacted_controls = {}
+
+    def _snapshot_vision_epoch(self) -> None:
+        """Point the epoch at the CURRENT `_last_vision_response` and stamp
+        it with wall-time + turn counter.
+
+        Deliberately does NOT touch the cross-tool same-element guard
+        (`last_click_dom_index`). A full re-observation (a screenshot) goes
+        through `freeze_vision_epoch`, which also releases that guard; the
+        piggyback path (`build_text_only`, which re-shows the latest vision
+        numbering WITHOUT a user-visible screenshot) calls this directly so
+        it keeps the numbering-the-brain-sees ≡ numbering-the-resolver-uses
+        invariant without spuriously permitting an immediate re-click.
+        """
+        self._vision_epoch_response = self._last_vision_response
+        self._vision_epoch_url = self._last_vision_url or self.current_url or ""
+        self._vision_epoch_id += 1
+        # Phase 1.3: stamp the epoch with wall + turn counter so the
+        # freshness gate can reject clicks against an epoch that's older
+        # than VISION_MAX_AGE_TURNS mutating actions ago. Reset epoch_turn
+        # to current counter — the brain just saw this numbering, so
+        # zero turns elapsed since the snapshot it's reasoning on.
+        self._vision_epoch_taken_at = time.time()
+        self._vision_epoch_turn = self._brain_turn_counter
 
     def freeze_vision_epoch(self) -> None:
         """Snapshot `_last_vision_response` as the current epoch.
@@ -578,22 +612,60 @@ class BrowserSessionState:
         — `state.current_url` will no longer match `_vision_epoch_url`
         and the epoch falls through to the live response.
         """
-        self._vision_epoch_response = self._last_vision_response
-        self._vision_epoch_url = self._last_vision_url or self.current_url or ""
-        self._vision_epoch_id += 1
-        # Phase 1.3: stamp the epoch with wall + turn counter so the
-        # freshness gate can reject clicks against an epoch that's older
-        # than VISION_MAX_AGE_TURNS mutating actions ago. Reset epoch_turn
-        # to current counter — the brain just saw this screenshot, so
-        # zero turns elapsed since the snapshot it's reasoning on.
-        self._vision_epoch_taken_at = time.time()
-        self._vision_epoch_turn = self._brain_turn_counter
+        self._snapshot_vision_epoch()
         # Cross-tool same-element guard releases on any fresh vision
         # epoch — the brain has re-observed the page, so a deliberate
         # toggle-off via DOM-index click on the previously-bbox-clicked
         # element is now permitted. Without this clear, the brain would
         # be permanently blocked from re-clicking after screenshot.
         self.last_click_dom_index = None
+
+    def mark_epoch_dirty(
+        self,
+        reason: str,
+        *,
+        bump_turn: bool = False,
+        record_url: str | None = None,
+        bust_cache: bool = False,
+        session_id: str | None = None,
+    ) -> None:
+        """Invalidate the frozen vision epoch after an out-of-band page change.
+
+        Centralizes the idiom copy-pasted across navigate / tabs / EPOCH_DIRTY:
+        null the frozen epoch AND expire the cached-vision piggyback so the next
+        ``click_at`` / ``type_at(V_n)`` can't resolve against a pre-change bbox
+        list, and the next ``build_text_only`` won't re-attach stale
+        "[CACHED VISION]" bboxes. The post-action prefetch re-stamps
+        ``_last_vision_ts`` once fresh bboxes land.
+
+        Options (all off by default → pure epoch-null, matching the legacy
+        inline idiom):
+          * ``bump_turn``  — advance the brain-turn counter so the age gate
+            ages this epoch out even when the tool wouldn't otherwise count as a
+            turn (scroll, run_script, eval).
+          * ``record_url`` — update ``current_url`` so the URL-mismatch guard in
+            ``vision_for_target_resolution`` can fire after a JS navigation the
+            TS effect envelope wouldn't otherwise surface.
+          * ``bust_cache`` — evict this session's vision-cache entries (fire and
+            forget) so a mutated DOM can't be served a pre-mutation cached pass.
+        """
+        self._vision_epoch_response = None
+        self._last_vision_ts = 0.0
+        if bump_turn:
+            self._brain_turn_counter += 1
+        if record_url:
+            self.record_url(record_url)
+        if bust_cache:
+            sid = session_id or getattr(self, "session_id", "") or ""
+            try:
+                from vision_agent import bust_vision_cache
+                bust_vision_cache(sid)
+            except Exception:
+                pass
+        try:
+            self.log_activity(f"epoch_dirty({reason})", "vision epoch invalidated")
+        except Exception:
+            pass
 
     def vision_for_target_resolution(self) -> Any:
         """Return the vision response V-index readers (click_at /
@@ -1153,6 +1225,70 @@ class BrowserSessionState:
         )
         if target_dom_index is not None:
             self.last_click_dom_index = int(target_dom_index)
+        # A non-None active state is the signature of a stateful control
+        # (checkbox/radio/switch/option). Remember it so the injection keeps a
+        # clickable V_n after the brain toggles it OFF (see the field comment).
+        if target_active_state is not None:
+            self._register_interacted_control(
+                label=target_label,
+                box_2d=target_box_2d,
+                dom_index=target_dom_index,
+            )
+
+    # Bounded, TTL'd registry of controls the brain has toggled this session.
+    INTERACTED_CONTROL_TTL_TURNS = 8
+    INTERACTED_CONTROL_MAX = 16
+
+    def _register_interacted_control(
+        self,
+        *,
+        label: str = "",
+        box_2d: list[int] | None = None,
+        dom_index: int | None = None,
+        name: str = "",
+    ) -> None:
+        """Record a stateful control the brain just interacted with."""
+        if dom_index is not None:
+            key = f"idx:{int(dom_index)}"
+        elif box_2d:
+            cx = (int(box_2d[0]) + int(box_2d[2])) // 2 if len(box_2d) >= 4 else 0
+            cy = (int(box_2d[1]) + int(box_2d[3])) // 2 if len(box_2d) >= 4 else 0
+            key = f"lbl:{(label or '').lower()[:40]}:{cx // 10}:{cy // 10}"
+        else:
+            key = f"lbl:{(label or '').lower()[:40]}"
+        self.recently_interacted_controls[key] = {
+            "label": label or "",
+            "box_2d": list(box_2d) if box_2d else None,
+            "dom_index": int(dom_index) if dom_index is not None else None,
+            "name": name or "",
+            "turn": self._brain_turn_counter,
+        }
+        # Evict oldest beyond the cap.
+        if len(self.recently_interacted_controls) > self.INTERACTED_CONTROL_MAX:
+            oldest = sorted(
+                self.recently_interacted_controls.items(),
+                key=lambda kv: kv[1].get("turn", 0),
+            )
+            drop = len(self.recently_interacted_controls) - self.INTERACTED_CONTROL_MAX
+            for k, _ in oldest[:drop]:
+                self.recently_interacted_controls.pop(k, None)
+
+    def prune_interacted_controls(self) -> set[int]:
+        """Drop expired entries (older than INTERACTED_CONTROL_TTL_TURNS turns)
+        and return the set of still-live interacted dom_indices. Called by the
+        stateful-control injection so a just-toggled-OFF control keeps its V_n
+        for a few turns while the brain confirms the new state."""
+        cutoff = self._brain_turn_counter - self.INTERACTED_CONTROL_TTL_TURNS
+        live: dict[str, dict] = {}
+        idxs: set[int] = set()
+        for k, v in self.recently_interacted_controls.items():
+            if v.get("turn", 0) >= cutoff:
+                live[k] = v
+                di = v.get("dom_index")
+                if isinstance(di, int) and di >= 0:
+                    idxs.add(di)
+        self.recently_interacted_controls = live
+        return idxs
 
     def advance_observation_token(self, source: str = "") -> None:
         """No-op shim retained so kept tools (click_selector,
@@ -1447,6 +1583,7 @@ class BrowserSessionState:
         device_pixel_ratio: float = 1.0,
         selector_entries: list[dict] | None = None,
         iframe_signature: str = "",
+        scroll_info: dict | None = None,
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -1521,6 +1658,16 @@ class BrowserSessionState:
                     image_height=img_h,
                     task_instruction=self.task_instruction or None,
                 )
+                # analyze() sets image dims but NOT dpr (it takes no dpr arg),
+                # so the sync-screenshot epoch would otherwise carry dpr=1.0 and
+                # mis-scale click_at/type_at coords on HiDPI viewports (the
+                # prefetch path already sets it). Re-stamp dims WITH dpr here,
+                # and pin the scroll anchor for the per-epoch scroll gate.
+                try:
+                    resp.with_image_dims(img_w, img_h, dpr=device_pixel_ratio)
+                    resp.with_scroll_anchor((scroll_info or {}).get("scrollY"))
+                except Exception as exc:
+                    print(f"  [dpr/scroll_anchor build_blocks failed: {exc}]")
                 # v2-C: compound-row sub-bbox split. Safety net for when
                 # vision merged a parent control + chevron into one
                 # bbox — the selectorEntries from the screenshot tool
@@ -1571,6 +1718,7 @@ class BrowserSessionState:
                         img_h,
                         device_pixel_ratio,
                         self.task_instruction,
+                        interacted_dom_indices=self.prune_interacted_controls(),
                     )
                 except Exception as exc:
                     print(f"  [stateful_control_inject build_blocks failed: {exc}]")
@@ -1734,6 +1882,20 @@ class BrowserSessionState:
         actual_url = data.get("url") or ""
         if actual_url and actual_url != self.current_url:
             self.record_url(actual_url)
+        # Keep _last_dom_hash fresh off the post-action element list so the
+        # dead-click guard's `same_dom` check reflects the live DOM, not prefetch
+        # latency (two different-target clicks on a page that DID change would
+        # otherwise read same_dom=True → a false dead-click strike). The funnel
+        # hash omits iframe_signature (unavailable here) while the prefetch hash
+        # includes it; a mismatch makes the guard read "DOM changed", which
+        # UNDER-fires the block — the safe direction.
+        _elems = data.get("elements")
+        if isinstance(_elems, str) and _elems:
+            try:
+                from vision_agent import dom_hash_of as _dhf
+                self._last_dom_hash = _dhf(_elems, "")
+            except Exception:
+                pass
         parts = [prefix]
         if data.get("url"):
             parts.append(f"Page: {data['url']}")
@@ -1818,6 +1980,15 @@ class BrowserSessionState:
         cached = self._fresh_vision_text(data.get("url", ""))
         if cached:
             result += f"\n\n{cached}"
+            # Freeze the epoch to the numbering we JUST piggybacked so a
+            # follow-up browser_click_at(vision_index=V_n) resolves against
+            # exactly this list — not a newer background prefetch that would
+            # renumber it (the V_n-drift bug where the brain sees list B but
+            # the resolver uses frozen list A). `_fresh_vision_text` renders
+            # `_last_vision_response`, and `_snapshot_vision_epoch` pins the
+            # epoch to that same object. Snapshot only — no screenshot was
+            # taken, so we must not release the same-element re-click guard.
+            self._snapshot_vision_epoch()
         if self.action_count >= 5:
             result += (
                 "\n\n[HINT: Keep using browser_click_at(vision_index=V_n) / "

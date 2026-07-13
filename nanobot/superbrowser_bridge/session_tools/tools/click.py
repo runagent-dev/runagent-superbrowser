@@ -30,6 +30,7 @@ from ..http_client import SUPERBROWSER_URL, _request_with_backoff
 from ..state import BrowserSessionState
 from ..vision_pipeline import _append_fresh_vision, _schedule_vision_prefetch
 from ._click_core import (
+    check_scroll_anchor,
     lookup_postcondition,
     maybe_scroll_bbox_into_view,
     run_click_with_ladder,
@@ -666,6 +667,50 @@ class BrowserClickAtTool(Tool):
                     f"is out of range (only {len(resp.bboxes)} bboxes in "
                     "the last vision response)."
                 )
+            # Phase 1.3 turn-based age gate. Mirrors browser_type_at
+            # (input_text.py:297) — the code has long CLAIMED clicks do this
+            # but never did, so a stale V_n resolved and dispatched anyway.
+            # Refuse to resolve a V_n against a vision snapshot older than
+            # VISION_MAX_AGE_TURNS mutating actions: on dynamic pages
+            # (accordions/filters/SPAs) the list renumbers and V_n would
+            # land on a different element. With the piggyback now freezing
+            # the epoch on every mutating-tool reply (state._snapshot_vision_
+            # epoch), this stays quiet in normal flow and only fires when the
+            # brain clicks without fresh numbering for >max turns.
+            try:
+                import os as _os_local
+                _max_age = int(_os_local.environ.get("VISION_MAX_AGE_TURNS") or "1")
+            except ValueError:
+                _max_age = 1
+            if _max_age > 0:
+                _age = max(
+                    0,
+                    self.s._brain_turn_counter - 1 - self.s._vision_epoch_turn,
+                )
+                if _age > _max_age:
+                    print(f"  [click_at rejected: epoch_too_old age={_age} max={_max_age}]")
+                    return (
+                        f"[click_at_failed:epoch_too_old age_turns={_age} "
+                        f"max={_max_age}] V{vision_index} resolves against a "
+                        f"vision snapshot taken {_age} actions ago; the page "
+                        f"has likely changed and V{vision_index} may now point "
+                        f"at a different element. Call browser_screenshot to "
+                        f"refresh the V_n list, then click the target on the "
+                        f"fresh screenshot."
+                    )
+            # Per-epoch scroll-anchor gate — refuse a bbox click when the page
+            # has scrolled since this epoch was numbered (box_2d carries no
+            # scroll offset, so stale coords would land on the wrong element).
+            # Shared with type_at/fix_text_at; belt-and-braces alongside the TS
+            # viewport_shift gate (which a background prefetch can defeat).
+            _shift = await check_scroll_anchor(
+                self.s, session_id, resp,
+                fail_prefix="click_at_failed", verb="clicking",
+                vision_index=int(vision_index),
+            )
+            if _shift:
+                print(f"  [click_at rejected: {_shift.split(']')[0]}]")
+                return _shift
             # Blocker gate — if the scene has an active blocker layer
             # (cookie banner, modal, consent dialog) and this bbox lives
             # in a different layer, refuse. The planner must dismiss

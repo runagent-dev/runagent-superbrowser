@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import os
 
-from .client import VisionAgent, dom_hash_of, dom_text_hash_of, get_vision_agent
+from .client import (
+    VisionAgent,
+    bust_vision_cache,
+    dom_hash_of,
+    dom_text_hash_of,
+    get_vision_agent,
+)
 from .schemas import BBox, PageFlags, VisionResponse
 
 
@@ -56,6 +62,7 @@ __all__ = [
     "PageFlags",
     "VisionAgent",
     "VisionResponse",
+    "bust_vision_cache",
     "dom_hash_of",
     "dom_text_hash_of",
     "get_vision_agent",

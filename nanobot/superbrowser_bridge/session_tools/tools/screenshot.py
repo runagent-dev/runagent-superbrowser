@@ -111,6 +111,10 @@ class BrowserScreenshotTool(Tool):
                 # merged into a parent row bbox and inject the missing
                 # sub-bbox.
                 selector_entries=entries,
+                # Scroll position this screenshot was taken at → pins the
+                # epoch's scroll anchor so a later click_at/type_at can
+                # detect a scroll-since-screenshot and refuse stale coords.
+                scroll_info=data.get("scrollInfo"),
             )
         return caption
 
