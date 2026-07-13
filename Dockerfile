@@ -58,6 +58,7 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     SUPERBROWSER_URL=http://127.0.0.1:3100 \
     PORT=3100 \
     HEADLESS=true \
+    VISION_CACHE_TTL_SEC=30 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/venv/bin:$PATH" \

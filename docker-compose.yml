@@ -29,6 +29,13 @@ services:
       - ./downloads:/tmp/superbrowser/downloads   # downloaded files land on the host
     cap_add:
       - SYS_ADMIN            # Chromium's namespace sandbox (or use a seccomp profile)
+    shm_size: 2gb            # Chrome renderer shared memory. Default /dev/shm is 64MB;
+                             # T3 patchright launches (unlike T1) do NOT pass
+                             # --disable-dev-shm-usage, so a heavy DOM under headful
+                             # Chrome can exhaust 64MB → renderer crash → the in-memory
+                             # TS session Map is wiped on the restart:unless-stopped
+                             # cycle → mid-task 404. Host /dev/shm is ~half of RAM, so
+                             # this is a PARITY fix as much as hardening.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8450/api/v1/health"]
       interval: 15s

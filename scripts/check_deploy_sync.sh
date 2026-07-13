@@ -54,5 +54,30 @@ else
 fi
 
 echo ""
+echo "== docker/host behavior parity =="
+# Config drift between the host .env (in-process mode) and deploy/.env + Dockerfile
+# (local-agent mode) is what makes Docker diverge from `npm run dev`. Guard the
+# behavior-affecting knobs so they can't silently drift again. (Dead/no-op knobs
+# — SUPERBROWSER_CLICK_MODE, SUPERBROWSER_VISION_REFRESH_S — are intentionally NOT
+# checked; adding them would be cargo-cult.)
+chk "VISION_CACHE_TTL_SEC baked into the image (never dropped from deploy/.env)" \
+    "grep -Eq '^[[:space:]]*VISION_CACHE_TTL_SEC=' Dockerfile"
+chk "compose sets shm_size (Chrome renderer memory / mid-task crash guard)" \
+    "grep -Eq '^[[:space:]]*shm_size:' docker-compose.yml"
+# Residential proxy is a tier-1 fallback: if it's ACTIVE (uncommented) in root
+# .env it must also be ACTIVE in deploy/.env, else Docker loses the fallback tier
+# on WAF blocks and dead-ends on walled sites the host clears.
+root_proxy_active() { [ -f .env ] && grep -Eq '^[[:space:]]*PROXY_POOL_RESIDENTIAL=' .env; }
+deploy_proxy_active() { [ -f deploy/.env ] && grep -Eq '^[[:space:]]*PROXY_POOL_RESIDENTIAL=' deploy/.env; }
+chk "proxy-tier parity (root .env active ⇒ deploy/.env active)" \
+    "! root_proxy_active || deploy_proxy_active"
+# Brain parity: if deploy/.env delivers the host config verbatim (B64), LLM_MODEL
+# must be UNSET there or deploy/main.py's model= kwarg overrides the B64 model.
+deploy_has_b64() { [ -f deploy/.env ] && grep -Eq '^[[:space:]]*NANOBOT_CONFIG_JSON_B64=.+' deploy/.env; }
+deploy_llm_model_active() { [ -f deploy/.env ] && grep -Eq '^[[:space:]]*LLM_MODEL=' deploy/.env; }
+chk "brain parity (deploy/.env B64 config ⇒ LLM_MODEL unset)" \
+    "! deploy_has_b64 || ! deploy_llm_model_active"
+
+echo ""
 echo "================  $pass passed, $fail failed  ================"
 [ "$fail" -eq 0 ]

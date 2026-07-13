@@ -8,8 +8,15 @@ it reuses RunAgentClient(local=True), the same interface as remote mode.
 Prerequisites:
   - pip install 'runagent-superbrowser[remote]'
   - Start the container:
-        cp deploy/.env.example deploy/.env   # set LLM_MODEL + OPENAI_API_KEY
+        cp deploy/.env.example deploy/.env   # set the brain (see below) + OPENAI_API_KEY
         docker compose up -d                 # agent server on :8450
+
+Matching the host brain (so Docker behaves like `npm run dev`): the container's
+brain comes from deploy/.env. For an EXACT match to your in-process host runs,
+deliver your whole nanobot config verbatim and leave LLM_MODEL unset:
+        echo "NANOBOT_CONFIG_JSON_B64=$(base64 -w0 ~/.nanobot/config.json)" >> deploy/.env
+This reproduces the model AND its loop tuning (maxToolIterations, maxTokens, …).
+Setting LLM_MODEL alongside it overrides the B64 model — see deploy/.env.example.
 
 Run:
     python examples/06_local_agent_server.py
@@ -32,7 +39,7 @@ def main() -> int:
         persistent=True,          # reuse the container's per-user cookies/profiles
     )
 
-    res = sb.run("Is there a one-bedroom room available at a five-star hotel in Cox’s Bazar on https://gozayaan.com/ I want to stay from July 8 to July 10.", mode="browser")
+    res = sb.run("Is there a one-bedroom room available at a five-star hotel in Cox’s Bazar on https://gozayaan.com/ I want to stay from July 8 to July 10. Find me three hotel suggestion.", mode="browser")
     print(res.text)
     if not res.success and res.error:
         print(f"[error] {res.error}", file=sys.stderr)
