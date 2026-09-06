@@ -8,7 +8,7 @@
 // one), confirms the engine is built, ensures a .env exists, and pings the
 // running server. Exits non-zero only on a critical failure (Node < 20).
 
-import { existsSync, copyFileSync } from 'node:fs';
+import { existsSync, copyFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { platform, homedir } from 'node:os';
@@ -121,11 +121,28 @@ function checkServer() {
   });
 }
 
+function checkConfig() {
+  // Additive: report the unified config.json if present (superbrowser-config).
+  const configPath = process.env.SUPERBROWSER_CONFIG || join(homedir(), '.superbrowser', 'config.json');
+  if (!existsSync(configPath)) {
+    line(OK, `config: none at ${configPath} (zero-config; \`superbrowser-config init\` to create)`);
+    return;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    const profile = raw.profile || '(auto-detected)';
+    line(OK, `config: ${configPath} (profile: ${profile})`);
+  } catch (e) {
+    line(WARN, `config at ${configPath} is not valid JSON: ${e.message}`);
+  }
+}
+
 console.log('SuperBrowser doctor — Node/TS side\n');
 const nodeOk = checkNode();
 checkChrome();
 checkBuild();
 checkEnv();
+checkConfig();
 await checkServer();
 console.log(
   nodeOk

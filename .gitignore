@@ -34,3 +34,8 @@ nanobot/workspace*/**/.nanobot/
 todo/
 
 eval/*
+# Web console build artifacts
+console/node_modules/
+console/dist/
+console/tsconfig.tsbuildinfo
+nanobot/superbrowser_gateway/console_dist/

@@ -84,7 +84,24 @@ jobs:
       - name: Tests
         # Non-blocking until the suite is proven hermetic in CI.
         continue-on-error: true
-        run: pytest nanobot/superbrowser_bridge/tests -q
+        run: >-
+          pytest -q
+          nanobot/superbrowser_bridge/tests
+          nanobot/superbrowser_config/tests
+          nanobot/superbrowser_gateway/tests
+          nanobot/runagent_superbrowser/tests
+
+  parity-guards:
+    name: parity guards (config envmap / presets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Cross-language tables (Python JSON <-> TS twins) must stay byte-equivalent.
+      # The deploy-sync guard needs the sibling runagent repos and stays local-only.
+      - run: bash scripts/check_config_parity.sh
 
   python-lockfile:
     name: py lockfile lane (drift check)

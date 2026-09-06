@@ -15,12 +15,23 @@ services:
       - "8450:8450"               # the agent server — the only port clients use
       - "127.0.0.1:3100:3100"     # live browser viewer (TS engine) — host-only
       - "127.0.0.1:3101:3101"     # T3 (patchright) viewer — host-only, tier-3 runs
+      # Chat gateway + web console (opt-in, see GATEWAY_ENABLED below). Host-only
+      # by default; front it with a TLS proxy before exposing publicly.
+      # - "127.0.0.1:8460:8460"
+    # To bake the WhatsApp/Discord channel SDKs into the image, build with:
+    #   docker compose build --build-arg GATEWAY_EXTRAS=gateway
+    # (Telegram + the console work without it.)
     env_file:
       - deploy/.env          # LLM_MODEL + OPENAI_API_KEY / ANTHROPIC_API_KEY (+ optional features)
     environment:
       - SUPERBROWSER_URL=http://127.0.0.1:3100
       - PORT=3100
       - HEADLESS=true
+      # Opt-in chat gateway (WhatsApp/Telegram/Discord + console on :8460).
+      # Uncomment, publish 8460 above, then `superbrowser-gateway setup` inside
+      # the container (or edit ~/.superbrowser/config.json on the sb-superbrowser
+      # volume). Default off → the container behaves exactly as before.
+      # - GATEWAY_ENABLED=1
       # NOTE: the container never needs a RunAgent (rau_) key. That key matters
       # only for the host SDK when remote=True (which bypasses this container).
     volumes:

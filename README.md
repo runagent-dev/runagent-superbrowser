@@ -6,7 +6,22 @@
 
 **The browser your agent won't get blocked on.**
 
-[Quick start](#quick-start) · [Examples](#examples) · [What it does](#what-it-does) · [Config](#configuration)
+<p>
+  <a href="https://pypi.org/project/runagent-superbrowser/"><img src="https://img.shields.io/pypi/v/runagent-superbrowser?style=flat-square&color=FF4D00&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
+  <a href="https://www.npmjs.com/package/runagent-superbrowser"><img src="https://img.shields.io/badge/npm-runagent--superbrowser-FF4D00?style=flat-square&logo=npm&logoColor=white" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-FF4D00?style=flat-square" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/Node-20+-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node 20+">
+  <img src="https://img.shields.io/badge/Docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker ready">
+</p>
+<p>
+  <img src="https://img.shields.io/badge/WhatsApp-25D366?style=flat-square&logo=whatsapp&logoColor=white" alt="WhatsApp">
+  <img src="https://img.shields.io/badge/Telegram-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram">
+  <img src="https://img.shields.io/badge/Discord-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord">
+  <img src="https://img.shields.io/badge/Cloudflare_%C2%B7_Akamai_%C2%B7_DataDome-solved-FF4D00?style=flat-square" alt="Captchas solved">
+</p>
+
+[Run it](#run-it--sdk-docker-or-npm) · [Chat & console](#drive-it-from-a-chat-app) · [Examples](#examples) · [What it does](#what-it-does) · [Config](#configuration) · [Docs](#documentation)
 
 </div>
 
@@ -181,15 +196,22 @@ with SuperBrowser(auto_start_server=True) as sb:   # spawns the engine, tears it
     res = sb.run("…", mode="browser")
 ```
 
-### Async + CLI
+### Async, streaming, cancel + CLI
 
 ```python
 res = await SuperBrowser().arun("…", mode="fetch")
+
+# Stream step-level events, and cancel from anywhere (even another thread/process).
+res = sb.run("book the cheapest DAC→BKK flight", mode="browser", task_handle="trip-1")
+sb.cancel("trip-1")            # cooperatively unwinds — no orphaned task in Docker
+sb.tasks()                     # list what's running
 ```
 
 ```bash
 superbrowser-run "what's trending on github this week" --mode fetch
 superbrowser-run "book the cheapest DAC→BKK flight" --mode browser --auto-start-server
+superbrowser-run --tasks                     # list running tasks
+superbrowser-run --cancel trip-1             # cancel one
 ```
 
 > Model + API keys come from `~/.nanobot/config.json` (`nanobot onboard`); vision
@@ -204,29 +226,57 @@ for advanced use — see [Examples](#examples).
 
 ## Drive it from a chat app
 
-Plug SuperBrowser into **WhatsApp, Telegram, Discord, Slack** (also DingTalk, Lark, QQ — the SDKs are already vendored). Type a task in chat, the agent runs it in the cloud, and when it hits a captcha **your phone buzzes with a live-view link** — tap, swipe, the session resumes on the same cookies.
+Talk to SuperBrowser from **WhatsApp, Telegram, or Discord**. Type a task in
+chat, the agent runs it and replies with the answer **plus a screenshot** — and
+when it hits a captcha or login wall, **your phone gets a live-view link**: tap,
+solve, the session resumes on the same cookies and stays logged in.
 
 ```
 You (WhatsApp):  "book me a Khulna hotel under $40/night, check-in Apr 23"
 
-  SuperBrowser:  Searching gozayaan.com...
-                 Filtering 4-star, under $40...
-                 [hit a captcha] → tap here: https://browser.runagent.cloud/v/abc
-                                ↑ you tap once, swipe slider, done
+  SuperBrowser:  On it — searching gozayaan.com…
+                 [captcha] tap to solve: https://browser.example.com/session/abc/view
+                           ↑ you tap once, swipe the slider, done
 
-  SuperBrowser:  Found 3 hotels. Top pick: Hotel Castle Salam,
-                 $34/night, 4.2★. Want me to book?
+  SuperBrowser:  Found 3 under $40. Top pick: Hotel Castle Salam, $34/night, 4.2★.
+                 [screenshot of the results]  Want me to book it?
 
 You (WhatsApp):  "yes, my card on file"
 ```
 
-Wire it up in one env var:
+Turnkey — no code:
 
 ```bash
-HANDOFF_WEBHOOK_URL=https://your-bot.example.com/webhooks/handoff
+pip install "runagent-superbrowser[gateway]"
+superbrowser-config init            # brain LLM key + Gemini VISION key
+superbrowser-gateway setup          # enable WhatsApp / Telegram / Discord
+superbrowser-gateway login whatsapp # scan the QR
+superbrowser-gateway                # run it — web console at http://127.0.0.1:8460
 ```
 
-The webhook receives `{viewUrl, captchaType, pageTitle, screenshot, caption}` — forward that to whichever messenger SDK you're using. WebSocket events (`awaiting_human`, `captcha_active`, `captcha_done`) push updates with snapshot replay so late subscribers see the same state. Cookies persist per task, so the human only solves once per site.
+### The web console — no terminal needed
+
+A bundled web console (served on `:8460`) does the whole setup from the browser:
+scan the WhatsApp QR, approve who's allowed to talk to the agent, watch live
+tasks, manage saved logins, and edit config — all live.
+
+<p align="center">
+<img src="assets/console/dashboard.png" width="49%" alt="Console dashboard — gateway/engine/channel health gauges, live sessions, active tasks" />
+&nbsp;
+<img src="assets/console/onboarding.png" width="49%" alt="Console onboarding — machine detection, brain + vision keys, WhatsApp QR pairing, allowlist" />
+</p>
+
+<div align="center"><sub>Dashboard (health gauges + live tasks) · Onboarding (channel setup + WhatsApp QR). White canvas, volcanic-orange industrial UI.</sub></div>
+
+Logins persist — the agent starts already signed in next time. Run one instance
+per WhatsApp number with `--home`.
+
+→ [examples/09_channels_quickstart.md](examples/09_channels_quickstart.md) ·
+[docs/gateway.md](docs/gateway.md) · [docs/identity.md](docs/identity.md)
+
+*(Building your own bridge instead? The engine still fires
+`HANDOFF_WEBHOOK_URL` with `{url, caption, screenshot, …}` on every human
+handoff — the gateway is just the batteries-included consumer.)*
 
 ---
 
@@ -237,7 +287,9 @@ The webhook receives `{viewUrl, captchaType, pageTitle, screenshot, caption}` �
 - **Picks the cheapest engine that works.** httpx for plain pages, Puppeteer for SPAs, curl_cffi for TLS-blocked APIs, undetected Chromium for the hard targets, Wayback as a fallback. One tool call, the router does the rest.
 - **Stops LLM failure patterns at the tool layer.** No more `"khulnakhulna, bangladesh"` from a missed autocomplete. No more "let me check Google" mid-task. No more re-typing into a closed dropdown.
 - **Keeps your reasoning model cheap.** A dedicated tiny vision model labels screenshots into `[V1]`, `[V2]` boxes. Your expensive LLM never sees raw pixels.
-- **Hands off to a human when stuck.** Live-view URL fires through a webhook to WhatsApp / Slack / Telegram. User taps once, session resumes on the same cookies.
+- **Hands off to a human when stuck.** Captcha, login, or an approval gate — a live-view link lands in the user's **WhatsApp / Telegram / Discord** chat. They tap once, and the session resumes on the same cookies.
+- **Logs in once, stays logged in.** The human logs into a site through the handoff link; the session is saved so the next task starts already signed in — good for checkouts and account pages. ([docs/identity.md](docs/identity.md))
+- **Won't leave orphans.** Kill the SDK mid-task and the browser task unwinds instead of running on inside Docker; there's an explicit cancel + task-list API too.
 
 ---
 
@@ -433,6 +485,13 @@ config when you set an explicit `LLM_*` var or haven't onboarded yet, so a stray
 exported key never clobbers a deliberate `nanobot onboard`. Details:
 [docs/sdk.md → Configuration & `.env`](docs/sdk.md#configuration--env).
 
+**Prefer one config file?** `superbrowser-config init` writes
+`~/.superbrowser/config.json` with a machine profile (`local` / `vm` / `docker`)
+and just the keys you need — a laptop needs only the brain key + `VISION_API_KEY`.
+It projects into the same env vars, so `.env` and the shell still win. Full
+reference + the precedence rules: [docs/CONFIG.md](docs/CONFIG.md). Security
+notes (tokens, saved logins, viewer exposure): [SECURITY.md](SECURITY.md).
+
 ### Engine knobs
 
 Zero config required. The knobs that matter most:
@@ -445,9 +504,26 @@ Zero config required. The knobs that matter most:
 | `VISION_API_KEY` + `VISION_MODEL` | Cheap dedicated vision model. Keeps image tokens off your reasoning LLM bill. |
 | `PROXY_POOL` + `PROXY_POOL_RESIDENTIAL` | Datacenter + residential pools. Hardened domains auto-promote to residential. |
 | `TOKEN` | Bearer auth. Set this for anything not on localhost. |
+| `SUPERBROWSER_IDENTITY_JAR=1` | "Log in once, stay logged in" — persist a site's full login so later tasks start signed in. See [docs/identity.md](docs/identity.md). |
 | `SUPERBROWSER_TASK_ID` | Scope key for the cookie jar. Pass a stable ID for warm starts. |
 
-Full reference: [`.env.example`](.env.example). Deep dive on Tier-3 stealth + persistent profiles: [`STEALTH.md`](STEALTH.md).
+Full reference: [`.env.example`](.env.example) · unified `config.json` + machine profiles: [docs/CONFIG.md](docs/CONFIG.md) · Tier-3 stealth deep dive: [`STEALTH.md`](STEALTH.md).
+
+---
+
+## Documentation
+
+| Guide | What's in it |
+|---|---|
+| [docs/sdk.md](docs/sdk.md) | Python SDK — modes, in-process vs Docker vs serverless, streaming, config precedence |
+| [docs/CONFIG.md](docs/CONFIG.md) | Unified `config.json`, machine profiles (`local`/`vm`/`docker`), env precedence, `superbrowser-config` |
+| [docs/gateway.md](docs/gateway.md) | Chat channels (WhatsApp/Telegram/Discord) + web console, multi-number, Docker opt-in, tunnels |
+| [docs/identity.md](docs/identity.md) | "Log in once, stay logged in" — the identity jar, login handoff, threat model |
+| [docs/data-layout.md](docs/data-layout.md) | Everything under `~/.superbrowser/` — cookies, identities, profiles, how to wipe it |
+| [STEALTH.md](STEALTH.md) | Tier-3 (real Chrome + Xvfb) stealth, persistent profiles, the anti-detection stack |
+| [SECURITY.md](SECURITY.md) | Token model, saved-login exposure, live-view/tunnel guidance, gateway binding rules |
+| [deploy/README.md](deploy/README.md) | Serverless deploy via the RunAgent CLI, callable from every RunAgent SDK |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, the two-halves layout, running the tests |
 
 ---
 
@@ -459,4 +535,4 @@ Full reference: [`.env.example`](.env.example). Deep dive on Tier-3 stealth + pe
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).

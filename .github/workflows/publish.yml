@@ -84,8 +84,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Node is needed to build the web console (console/ → console_dist), which
+      # the wheel packages. The hatch hook also runs it during `python -m build`;
+      # doing it explicitly first makes the build deterministic and lets us smoke
+      # the artifact.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: cd console && npm ci && npm run build
       - run: pip install build
       - run: python -m build
+      - name: Smoke — console packaged + config CLI runs
+        run: |
+          pip install dist/*.whl
+          python -c "import importlib.resources as r; p = r.files('superbrowser_gateway')/'console_dist'/'index.html'; assert p.is_file(), 'console_dist not packaged'; print('console packaged OK')"
+          superbrowser-config validate
       - name: Publish to PyPI
         if: ${{ inputs.dry_run != true }}
         uses: pypa/gh-action-pypi-publish@release/v1

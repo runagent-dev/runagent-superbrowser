@@ -16,7 +16,14 @@ RUN npm ci                                  # incl. dev deps — tsc is needed t
 COPY tsconfig.json ./
 COPY src/ ./src/
 COPY bin/ ./bin/
-RUN npm run build && npm prune --omit=dev   # compile to build/, then drop dev deps
+RUN npm run build                            # compile TS engine to build/
+
+# Build the web console (Vite) here where Node exists, so the Python runtime
+# stage can package the prebuilt dist without a Node toolchain.
+COPY console/ ./console/
+RUN cd console && npm ci --no-audit --no-fund && npm run build
+
+RUN npm prune --omit=dev                     # drop the engine's dev deps
 
 # ---------- Stage 2: runtime ----------
 FROM node:20-slim
@@ -65,7 +72,8 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     HOME=/home/app \
     RUNAGENT_CACHE_DIR=/home/app/.runagent \
     PLAYWRIGHT_BROWSERS_PATH=/home/app/.cache/ms-playwright \
-    GIT_PYTHON_REFRESH=quiet
+    GIT_PYTHON_REFRESH=quiet \
+    SUPERBROWSER_PROFILE=docker
 
 WORKDIR /app
 
@@ -90,9 +98,20 @@ COPY package.json ./
 # co-resolves to 0.41 (mcp accepts >=0.27, runagent's fastapi 0.115 wants <0.42),
 # websockets to 16.x — then (2) install runagent itself with --no-deps so its
 # websockets pin can't veto nanobot-ai. The explicit deps mirror runagent's set.
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE hatch_build.py ./
 COPY nanobot/ ./nanobot/
-RUN pip install "." \
+# The console was built in the Node stage; drop its dist where the wheel's
+# hatch artifacts expect it. With the dist already present (and console/ source
+# absent here), the build hook is a no-op — no Node needed in this stage.
+COPY --from=ts-build /app/nanobot/superbrowser_gateway/console_dist/ ./nanobot/superbrowser_gateway/console_dist/
+ENV SUPERBROWSER_SKIP_CONSOLE_BUILD=1
+# Optional chat-gateway channel SDKs (WhatsApp/neonize + Discord). Empty by
+# default → the image is byte-for-byte the original; `--build-arg
+# GATEWAY_EXTRAS=gateway` bakes them in. `superbrowser-gateway` + Telegram are
+# in the base package regardless. The prebuilt console_dist rides along under
+# nanobot/ so the console serves without Node in the image.
+ARG GATEWAY_EXTRAS=""
+RUN pip install ".${GATEWAY_EXTRAS:+[$GATEWAY_EXTRAS]}" \
       "fastapi==0.115.12" "uvicorn==0.34.1" "sqlalchemy==2.0.41" \
       "jsonpath-ng==1.7.0" "GitPython>=3.1.43" "inquirer>=3.4.0" \
  && pip install --no-deps "runagent>=0.1.40" \

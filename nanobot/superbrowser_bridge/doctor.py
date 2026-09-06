@@ -119,6 +119,56 @@ def _check_server() -> None:
     _print(WARN, f"TS engine not reachable at {SERVER_URL} — start it with `superbrowser` (or `npm start`)")
 
 
+def _check_config() -> None:
+    """Report the unified config.json + detected machine profile (additive)."""
+    try:
+        from superbrowser_config import config_path, detect_profile, load, validate_config
+    except Exception:  # noqa: BLE001 - config package optional/older install
+        return
+    raw = load()
+    if raw is None:
+        _print(OK, f"config: none at {config_path()} (zero-config mode; `superbrowser-config init` to create)")
+    else:
+        _model, warnings, errors = validate_config(raw)
+        if errors:
+            _print(WARN, f"config invalid: {'; '.join(errors)}")
+        elif warnings:
+            _print(WARN, f"config: {'; '.join(warnings)}")
+        else:
+            _print(OK, f"config valid at {config_path()}")
+    try:
+        _print(OK, f"machine profile: {detect_profile()}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _check_gateway() -> None:
+    """Report chat-gateway readiness when it's enabled (additive)."""
+    try:
+        from superbrowser_config import load
+    except Exception:  # noqa: BLE001
+        return
+    gw = ((load() or {}).get("gateway") or {})
+    if not gw.get("enabled"):
+        return
+    try:
+        import superbrowser_gateway  # noqa: F401
+
+        _print(OK, "gateway package importable")
+    except Exception:  # noqa: BLE001
+        _print(WARN, 'gateway enabled but not importable — pip install "runagent-superbrowser[gateway]"')
+        return
+    channels = gw.get("channels") or {}
+    enabled = [name for name, section in channels.items() if isinstance(section, dict) and section.get("enabled")]
+    _print(OK if enabled else WARN, f"gateway channels enabled: {', '.join(enabled) or 'none'}")
+    import importlib.util as _u
+
+    if "whatsapp" in enabled and _u.find_spec("neonize") is None:
+        _print(WARN, 'whatsapp enabled but neonize missing — pip install "runagent-superbrowser[gateway]"')
+    if "discord" in enabled and _u.find_spec("discord") is None:
+        _print(WARN, 'discord enabled but discord.py missing — pip install "runagent-superbrowser[gateway]"')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="superbrowser-doctor", description=__doc__)
     parser.add_argument("--fix", action="store_true", help="install the patchright Chromium if missing")
@@ -128,9 +178,11 @@ def main() -> None:
     critical_ok = True
     critical_ok &= _check_python()
     critical_ok &= _check_nanobot()
+    _check_config()
     _check_bridge_deps()
     _check_browser(args.fix)
     _check_server()
+    _check_gateway()
 
     print()
     if critical_ok:

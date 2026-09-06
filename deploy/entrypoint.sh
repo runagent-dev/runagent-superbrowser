@@ -15,12 +15,25 @@ SERVE_PORT="${RUNAGENT_PORT:-8450}"
 CRASH_LOOP_MAX="${SUPERVISOR_CRASH_LOOP_MAX:-3}"
 CRASH_LOOP_WINDOW="${SUPERVISOR_CRASH_LOOP_WINDOW:-60}"
 
+# Optional chat gateway (WhatsApp/Telegram/Discord + web console). Default OFF —
+# when unset, every line below behaves exactly as before. Enable with
+# GATEWAY_ENABLED=1 (and publish 127.0.0.1:8460 in compose). The gateway posts
+# human-handoff links to the engine's HANDOFF_WEBHOOK_URL, so default it to the
+# gateway's own sink when enabled and not already set.
+GATEWAY_ENABLED="${GATEWAY_ENABLED:-0}"
+GATEWAY_PORT="${SB_GATEWAY_CONSOLE_PORT:-8460}"
+if [ "$GATEWAY_ENABLED" = "1" ] && [ -z "${HANDOFF_WEBHOOK_URL:-}" ]; then
+  export HANDOFF_WEBHOOK_URL="http://127.0.0.1:${GATEWAY_PORT}/api/hooks/handoff"
+fi
+
 log() { echo "[entrypoint] $*" >&2; }
 
 ENGINE_PID=""
 SERVE_PID=""
+GATEWAY_PID=""
 shutdown() {
   log "shutting down"
+  [ -n "$GATEWAY_PID" ] && kill -TERM "$GATEWAY_PID" 2>/dev/null || true
   [ -n "$SERVE_PID" ] && kill -TERM "$SERVE_PID" 2>/dev/null || true
   [ -n "$ENGINE_PID" ] && kill -TERM "$ENGINE_PID" 2>/dev/null || true
 }
@@ -56,6 +69,12 @@ start_serve() {
   SERVE_PID=$!
 }
 
+start_gateway() {
+  log "starting chat gateway on :${GATEWAY_PORT} (GATEWAY_ENABLED=1)"
+  superbrowser-gateway --console-port "${GATEWAY_PORT}" --bind "${SB_GATEWAY_BIND:-127.0.0.1}" &
+  GATEWAY_PID=$!
+}
+
 # 1. Register the all-zeros agent in the local DB so `runagent serve` passes its
 #    agent-id validation. Idempotent, no network, no API key. Feed /dev/null so
 #    the "update existing agent?" prompt (fires when already registered) can't
@@ -73,6 +92,18 @@ if ! wait_for_engine; then
   exit 1
 fi
 start_serve
+
+# 2b. Optionally boot the chat gateway (default off). It is auxiliary infra: a
+#     gateway crash never takes the container down — the supervisor just
+#     restarts it in place so the engine + serve keep running.
+if [ "$GATEWAY_ENABLED" = "1" ]; then
+  if command -v superbrowser-gateway >/dev/null 2>&1; then
+    start_gateway
+  else
+    log "GATEWAY_ENABLED=1 but superbrowser-gateway is not installed (build the image with the gateway extra) — skipping"
+    GATEWAY_ENABLED=0
+  fi
+fi
 
 # 3. Supervisor loop: poll both children, restart a dead one in place, and only
 #    give up (take the container down) when a child crash-loops. Rationale: the
@@ -129,5 +160,13 @@ while true; do
     wait "$SERVE_PID" 2>/dev/null || true
     log "runagent serve died — restarting in place (${serve_restarts}/${CRASH_LOOP_MAX} in window)"
     start_serve
+  fi
+
+  # Gateway (optional): restart in place on exit; never crash-loop the
+  # container (it's not a core service). Backoff is implicit via the 2s poll.
+  if [ "$GATEWAY_ENABLED" = "1" ] && [ -n "$GATEWAY_PID" ] && ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+    wait "$GATEWAY_PID" 2>/dev/null || true
+    log "chat gateway died — restarting in place"
+    start_gateway
   fi
 done
