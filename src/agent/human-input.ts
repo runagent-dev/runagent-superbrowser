@@ -33,6 +33,8 @@ export interface HumanInputRequest {
   /** Which fields are needed for 'credentials' / 'card' type. */
   fields?: string[];
   timestamp: number;
+  /** How long the agent will wait (ms) — the live-view UI counts this down. */
+  timeoutMs?: number;
 }
 
 export interface HumanInputResponse {
@@ -83,6 +85,7 @@ export class HumanInputManager {
       options: options?.options,
       fields: options?.fields,
       timestamp: Date.now(),
+      timeoutMs: timeout,
     };
 
     // Wait for response

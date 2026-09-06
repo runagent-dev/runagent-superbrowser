@@ -36,6 +36,12 @@ from .handoff import (
     BrowserAskUserTool,
     BrowserRequestHelpTool,
 )
+from .human_assist_tools import (
+    BrowserForgetSiteTool,
+    BrowserLoginHandoffTool,
+    BrowserRememberSiteTool,
+    BrowserRequestApprovalTool,
+)
 from .input_text import (
     BrowserEditTextAtTool,
     BrowserFixTextAtTool,

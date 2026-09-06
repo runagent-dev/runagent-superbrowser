@@ -49,6 +49,7 @@ class BrowserWorkerHook(AgentHook):
         self.max_iterations = max_iterations
         self._last_budget_warning_at: int = -1  # iteration of last warning
         self._captcha_guidance_given: bool = False
+        self._login_guidance_given: bool = False
         self._captcha_solve_attempts: int = 0
         self._captcha_escalation_pending: bool = False
         self._captcha_escalation_turns: int = 0
@@ -265,6 +266,35 @@ class BrowserWorkerHook(AgentHook):
                     "method='auto') to solve it. "
                     "Do NOT report LOGIN REQUIRED for bot protection "
                     "pages.]"
+                )
+
+        # --- Detect real login walls (distinct from bot-protection) ------
+        # Bot-protection interstitials are handled above; THIS block fires on
+        # genuine sign-in requirements and points at the human login handoff
+        # (link to the user's chat, identity persisted on success). One-shot.
+        if self.state.session_id and not self._login_guidance_given:
+            recent_steps = self.state.step_history[-3:] if self.state.step_history else []
+            login_signals = [
+                "sign in to continue", "log in to continue", "login required",
+                "please sign in", "please log in", "session expired",
+                "input[type=password]", "password field",
+            ]
+            looks_like_login = any(
+                any(sig in (step.get("result", "") or "").lower() for sig in login_signals)
+                for step in recent_steps
+            )
+            if looks_like_login:
+                self._login_guidance_given = True
+                sid = self.state.session_id
+                guidance_parts.append(
+                    "[GUIDANCE: A real sign-in appears to be required. NEVER "
+                    "invent or guess credentials. If the task depends on being "
+                    f"logged in, call browser_login_handoff(session_id='{sid}') "
+                    "— the user gets a live-view link in their chat, logs in "
+                    "themselves, and the session identity is saved so future "
+                    "tasks skip this. If a saved identity was loaded but the "
+                    "wall is back, the identity is stale — the same call "
+                    "refreshes it.]"
                 )
 
         # --- Tier auto-escalation (t1 → t3) -----------------------------

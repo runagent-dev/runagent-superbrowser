@@ -203,6 +203,16 @@ export const humanHandoffStrategy: CaptchaStrategy = {
       // only want a thumbnail can upscale; ones that don't can ignore.
       screenshot,
       screenshotMimeType: screenshot ? 'image/jpeg' : undefined,
+      // Payload v2 (additive — old consumers ignore unknown keys): lets the
+      // channels gateway treat this uniformly with Python-initiated asks and
+      // answer text replies on the user's behalf.
+      assistType: 'captcha',
+      requestId: `assist-${ctx.sessionId || 'anon'}-${Date.now().toString(36)}`,
+      tier: 't1',
+      replyHint: {
+        humanInputUrl: `${(ctx.publicBaseUrl || '').replace(/\/$/, '')}/session/${ctx.sessionId}/human-input`,
+        expectsText: false,
+      },
     });
 
     const message =

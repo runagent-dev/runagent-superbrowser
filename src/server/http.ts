@@ -30,6 +30,7 @@ import { feedbackBus } from '../agent/feedback-bus.js';
 import { fingerprintMap, invertFingerprintMap, fingerprintElement } from '../browser/fingerprint.js';
 import { getDomainStats, hostKey } from '../browser/captcha/domain-stats.js';
 import { loadDomainCookies, saveDomainCookies } from '../browser/captcha/cookie-jar.js';
+import { deleteIdentity, listIdentities, loadIdentity, maybeRefreshIdentity, saveIdentity } from '../browser/identity-jar.js';
 import { coordBand } from '../agent/step-observation.js';
 import { captureEffect, diffEffect, settleForEffect, type EffectSnapshot, type EffectDelta } from './effect.js';
 import { SessionTabs } from '../browser/tab-manager.js';
@@ -633,6 +634,17 @@ export function createHttpServer(
         // "verified" request on load and we skip the captcha entirely.
         // No-op when SUPERBROWSER_COOKIE_JAR!=1 or no entry exists.
         try {
+          // Identity FIRST, then the bot-protection jar — so a UA-pinned
+          // cf_clearance from the jar wins over any stale copy in identity.
+          const restoredId = await loadIdentity(page.getRawPage(), req.body.url);
+          if (restoredId > 0) {
+            process.stderr.write(
+              `[identity] restored ${restoredId} cookie(s) for ${hostKey(req.body.url)} ` +
+              `on session ${id}\n`,
+            );
+          }
+        } catch { /* best-effort — gated off unless SUPERBROWSER_IDENTITY_JAR=1 */ }
+        try {
           const restored = await loadDomainCookies(page.getRawPage(), req.body.url);
           if (restored > 0) {
             process.stderr.write(
@@ -663,6 +675,13 @@ export function createHttpServer(
       ) {
         try { await saveDomainCookies(page.getRawPage(), req.body.url); }
         catch { /* best-effort */ }
+        // Keep an EXISTING identity fresh after a successful nav. Double-gated
+        // (SUPERBROWSER_IDENTITY_AUTOSAVE=1) and refresh-only — saveIdentity is
+        // called by the endpoint on login; this never creates one implicitly.
+        if (process.env.SUPERBROWSER_IDENTITY_AUTOSAVE === '1') {
+          try { await maybeRefreshIdentity(page.getRawPage(), req.body.url); }
+          catch { /* best-effort */ }
+        }
       }
 
       res.json({
@@ -700,6 +719,15 @@ export function createHttpServer(
       // a human, restore those bot-protection cookies first so the site
       // recognizes us on the way in.
       try {
+        const restoredId = await loadIdentity(page.getRawPage(), url);
+        if (restoredId > 0) {
+          process.stderr.write(
+            `[identity] restored ${restoredId} cookie(s) for ${hostKey(url)} ` +
+            `on session ${req.params.id} (navigate)\n`,
+          );
+        }
+      } catch { /* best-effort — gated off unless SUPERBROWSER_IDENTITY_JAR=1 */ }
+      try {
         const restored = await loadDomainCookies(page.getRawPage(), url);
         if (restored > 0) {
           process.stderr.write(
@@ -724,6 +752,10 @@ export function createHttpServer(
       ) {
         try { await saveDomainCookies(page.getRawPage(), url); }
         catch { /* best-effort */ }
+        if (process.env.SUPERBROWSER_IDENTITY_AUTOSAVE === '1') {
+          try { await maybeRefreshIdentity(page.getRawPage(), url); }
+          catch { /* best-effort */ }
+        }
       }
 
       res.json(withTabInfo(req.params.id, {
@@ -736,6 +768,43 @@ export function createHttpServer(
         consoleErrors: state.consoleErrors,
         pendingDialogs: state.pendingDialogs,
       }));
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /**
+   * Identity jar — "log in once, stay logged in".
+   * Saves the FULL cookie set for the current page's domain so the login
+   * persists across sessions. Gated on SUPERBROWSER_IDENTITY_JAR=1; no-op
+   * (saved:false) otherwise. Behind the same tokenAuth as every route.
+   */
+  app.post('/session/:id/identity/save', async (req, res) => {
+    const page = getSession(req.params.id);
+    if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+    try {
+      const raw = page.getRawPage();
+      const url = (req.body && req.body.url) || raw.url();
+      const count = await saveIdentity(raw, url);
+      res.json({ saved: count > 0, domain: hostKey(url), cookieCount: count });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** List saved identities (domains the browser can auto-log-into). */
+  app.get('/identity', (_req, res) => {
+    try {
+      res.json({ identities: listIdentities() });
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  /** Forget a saved identity for a domain. */
+  app.delete('/identity/:domain', (req, res) => {
+    try {
+      res.json({ deleted: deleteIdentity(req.params.domain) });
     } catch (err) {
       handleError(res, err);
     }

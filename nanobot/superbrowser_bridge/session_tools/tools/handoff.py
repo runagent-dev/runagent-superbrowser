@@ -43,6 +43,54 @@ class BrowserAskUserTool(Tool):
     def __init__(self, state: BrowserSessionState):
         self.s = state
 
+    async def _notify_assist(
+        self,
+        session_id: str,
+        question: str,
+        input_type: str | None,
+        view_url: str,
+        tier: str,
+        timeout_ms: int,
+        screenshot_b64: str | None = None,
+    ) -> None:
+        """Record + webhook-notify the ask via the human-assist framework.
+
+        Best-effort: the ask itself blocks on the engine either way; this only
+        makes sure a channels gateway (or the terminal banner) surfaces it.
+        """
+        try:
+            from ...human_assist.emitter import build_payload, notify_gateway
+            from ...human_assist.models import HumanAssistRequest
+            from ...human_assist.store import default_store
+
+            assist_type = (input_type or "text").lower()
+            if assist_type not in ("captcha", "login", "otp", "approval", "text"):
+                assist_type = "otp" if assist_type in ("credentials", "card") else "text"
+            request = HumanAssistRequest(
+                type=assist_type,
+                session_id=session_id,
+                view_url=view_url,
+                question=question,
+                task_id=self.s.task_id or "",
+                tier=tier,
+                page_url=self.s.current_url or "",
+                timeout_s=timeout_ms / 1000.0,
+            )
+            default_store().save(request)
+            reply_hint = {
+                "humanInputUrl": f"{SUPERBROWSER_URL}/session/{session_id}/human-input",
+                "expectsText": assist_type in ("otp", "text", "approval"),
+            } if tier == "t1" else None
+            delivered = await notify_gateway(
+                build_payload(request, screenshot_b64=screenshot_b64, reply_hint=reply_hint)
+            )
+            if delivered:
+                request.transition("notified")
+                request.notify_count += 1
+                default_store().save(request)
+        except Exception:  # noqa: BLE001 - notification must never break the ask
+            pass
+
     async def execute(
         self,
         session_id: str,
@@ -55,6 +103,10 @@ class BrowserAskUserTool(Tool):
         # simpler on t3 — we poll for a state change on the captcha
         # widget and resume when it clears. For now, return the URL and a
         # short wait loop so the user has ~3 min to interact.
+        # Same default the TS HumanInputManager uses; both branches honor the
+        # env override so a channels gateway can grant humans more time.
+        ask_timeout_ms = int(os.environ.get("SUPERBROWSER_ASK_TIMEOUT_MS", str(5 * 60 * 1000)))
+
         if self.s.backend == "t3":
             try:
                 from superbrowser_bridge.antibot import t3_viewer as _v
@@ -64,11 +116,12 @@ class BrowserAskUserTool(Tool):
                 await _v.ensure_started()
                 view = _v.view_url(session_id)
                 print(f"\n[HUMAN HANDOFF — t3] Open {view} in your browser.")
-                # Poll every 3s for up to 5 min for the captcha to clear.
+                await self._notify_assist(session_id, question, input_type, view, "t3", ask_timeout_ms)
+                # Poll every 3s for the captcha to clear.
                 mgr = _t3mgr.default()
                 import asyncio as _asyncio
                 import time as _time
-                deadline = _time.time() + 5 * 60
+                deadline = _time.time() + ask_timeout_ms / 1000
                 cleared = False
                 while _time.time() < deadline:
                     await _asyncio.sleep(3.0)
@@ -86,8 +139,8 @@ class BrowserAskUserTool(Tool):
                     )
                 return (
                     f"[human_handoff_timeout] No state change detected after "
-                    f"5 min at {view}. You can call browser_ask_user again or "
-                    f"proceed with done(success=False)."
+                    f"{ask_timeout_ms // 60000} min at {view}. You can call "
+                    f"browser_ask_user again or proceed with done(success=False)."
                 )
             except Exception as exc:
                 print(f"[t3 human handoff error: {exc}]")
@@ -132,14 +185,18 @@ class BrowserAskUserTool(Tool):
             f"'Done' button when finished."
         )
 
-        # Five-minute timeout matches HumanInputManager's default; the TS
-        # server holds the HTTP connection open until the user replies or
-        # the timer fires, so client-side we just wait.
-        timeout_ms = 5 * 60 * 1000
+        # The TS server holds the HTTP connection open until the user replies
+        # or the timer fires, so client-side we just wait.
+        timeout_ms = ask_timeout_ms
         self.s.record_step(
             "browser_ask_user",
             f"type={ht}",
             f"view_url={view_url}",
+        )
+        # Chat-side notification (gateway webhook; banner fallback) so
+        # Python-initiated asks reach the user like TS captcha handoffs do.
+        await self._notify_assist(
+            session_id, question, ht, view_url, "t1", timeout_ms, screenshot_b64=screenshot_b64
         )
         try:
             async with httpx.AsyncClient(timeout=timeout_ms / 1000 + 10) as client:

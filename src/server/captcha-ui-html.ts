@@ -768,10 +768,10 @@ export function renderCaptchaViewHtml({ sessionId, token }: ViewParams): string 
               : 'Action needed:';
             instructMsg.textContent = instructionFor(captchaType);
             instructEl.classList.add('visible');
-            // The agent surfaces a 5-min timeout; show it counting down.
+            // Count down the agent's real timeout when it sent one, else 5 min.
             if (!countdownInterval && newPending.id !== pendingSeenAt) {
               pendingSeenAt = newPending.id;
-              startCountdown(5 * 60 * 1000);
+              startCountdown(newPending.timeoutMs || 5 * 60 * 1000);
             }
           } else {
             // Pending cleared. If we ever saw a request, this means the

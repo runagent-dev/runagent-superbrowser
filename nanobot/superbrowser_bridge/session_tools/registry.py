@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 from .tools import (
     BrowserAskUserTool,
     BrowserCaptchaScreenshotTool,
+    BrowserForgetSiteTool,
+    BrowserLoginHandoffTool,
+    BrowserRememberSiteTool,
+    BrowserRequestApprovalTool,
     BrowserChessMoveTool,
     BrowserClickAtTool,
     BrowserClickSelectorTool,
@@ -135,6 +139,10 @@ def register_session_tools(
         BrowserAskUserTool(state),
         BrowserVerifyFactTool(state),
         BrowserRequestHelpTool(state),
+        BrowserLoginHandoffTool(state),    # human logs in via live view; identity persisted
+        BrowserRequestApprovalTool(state), # yes/no gate before irreversible actions
+        BrowserRememberSiteTool(state),    # explicit identity capture
+        BrowserForgetSiteTool(state),      # wipe identity/profile/jar for a domain
         BrowserEscalateTool(state),        # t1 → t3 migration
         BrowserPlanNextStepsTool(state),   # hierarchical planner
         BrowserFormBeginTool(state),       # Phase 2.1: form-fill orchestration
