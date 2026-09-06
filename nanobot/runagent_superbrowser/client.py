@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
+from . import lifecycle
 from ._capture import run_and_capture, stream_and_capture
 from ._runtime import build_orchestrator
 from .framing import frame_task, parse_output
@@ -67,10 +69,37 @@ def _load_project_dotenv() -> None:
     try:
         from dotenv import find_dotenv, load_dotenv
     except ImportError:  # dotenv optional — env can still come from the shell
-        return
-    path = find_dotenv(usecwd=True)
-    if path:
-        load_dotenv(path)
+        pass
+    else:
+        path = find_dotenv(usecwd=True)
+        if path:
+            load_dotenv(path)
+    # Product config (~/.superbrowser/config.json) projects into env AFTER
+    # dotenv and fills only still-unset keys, so shell env and .env keep
+    # precedence. Fail-open: a missing/broken superbrowser_config never
+    # blocks the SDK.
+    try:
+        from superbrowser_config import apply_to_env
+
+        apply_to_env()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _watch_cancel(handle: str, run_task: "asyncio.Future") -> None:
+    """Cancel ``run_task`` when the lifecycle registry flags ``handle``.
+
+    Polling (0.5s) keeps this decoupled from the run internals; the poll cost
+    is negligible next to LLM steps.
+    """
+    try:
+        while not run_task.done():
+            if lifecycle.cancelled(handle):
+                run_task.cancel()
+                return
+            await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        pass
 
 
 def _drive_async_gen(factory):
@@ -153,6 +182,8 @@ class SuperBrowser:
         )
         self._local_client = None
         self._local_stream_client_obj = None
+        self._aux_clients: dict[str, Any] = {}
+        self._entrypoints_cache: set[str] | None = None
 
         self.model = model
         self.auto_start_server = auto_start_server
@@ -187,9 +218,19 @@ class SuperBrowser:
         force_browser: bool = False,
         enable_human_handoff: bool = True,
         timeout: float | None = None,
+        task_handle: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> RunResult:
         """Synchronous entry point. Raises if called from a running event loop —
-        use :meth:`arun` there."""
+        use :meth:`arun` there.
+
+        ``task_handle`` names the run in the lifecycle registry so another
+        thread (or, in local-agent mode, another process) can ``cancel()`` it;
+        one is generated when omitted and returned on ``RunResult.task_handle``.
+        ``on_event`` receives progress events on the local-agent streaming
+        transport (ignored elsewhere — use :meth:`stream`/:meth:`astream` for
+        full event streams).
+        """
         if self.remote:
             try:
                 asyncio.get_running_loop()
@@ -206,7 +247,13 @@ class SuperBrowser:
                 asyncio.get_running_loop()
             except RuntimeError:
                 return self._run_local_agent(
-                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                    task,
+                    mode=mode,
+                    url=url,
+                    output_schema=output_schema,
+                    timeout=timeout,
+                    task_handle=task_handle,
+                    on_event=on_event,
                 )
             raise RuntimeError(
                 "SuperBrowser.run() cannot be called from inside a running event "
@@ -224,6 +271,7 @@ class SuperBrowser:
                     force_browser=force_browser,
                     enable_human_handoff=enable_human_handoff,
                     timeout=timeout,
+                    task_handle=task_handle,
                 )
             )
         raise RuntimeError(
@@ -241,6 +289,8 @@ class SuperBrowser:
         force_browser: bool = False,
         enable_human_handoff: bool = True,
         timeout: float | None = None,
+        task_handle: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> RunResult:
         if self.remote:
             loop = asyncio.get_running_loop()
@@ -255,7 +305,13 @@ class SuperBrowser:
             return await loop.run_in_executor(
                 None,
                 lambda: self._run_local_agent(
-                    task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
+                    task,
+                    mode=mode,
+                    url=url,
+                    output_schema=output_schema,
+                    timeout=timeout,
+                    task_handle=task_handle,
+                    on_event=on_event,
                 ),
             )
         orch, framed, classification = await self._build_inprocess(
@@ -275,21 +331,41 @@ class SuperBrowser:
             write_usage_json,
         )
 
+        handle = task_handle or lifecycle.new_handle()
+        lifecycle.register(handle, task, transport="in-process")
+
         text, raw, error, success = "", "", None, False
+        cancelled_by_client = False
         try:
             with track_task(orch.task_id):
-                text, raw = await run_and_capture(
-                    orch.bot,
-                    framed,
-                    orch.session_key,
-                    hooks=[orch.hook, UsageHook("orchestrator")],
-                    timeout=timeout,
+                lifecycle.note_orch_task_id(handle, orch.task_id)
+                # The watcher converts a cancel() from another thread into a
+                # plain asyncio cancellation of the run task.
+                run_task = asyncio.ensure_future(
+                    run_and_capture(
+                        orch.bot,
+                        framed,
+                        orch.session_key,
+                        hooks=[orch.hook, UsageHook("orchestrator")],
+                        timeout=timeout,
+                    )
                 )
+                watcher = asyncio.ensure_future(_watch_cancel(handle, run_task))
+                try:
+                    text, raw = await run_task
+                finally:
+                    watcher.cancel()
             success = bool(text)
             if not success and error is None:
                 error = "the agent returned no answer"
         except asyncio.TimeoutError:
             error = f"task timed out after {timeout}s"
+        except asyncio.CancelledError:
+            if not lifecycle.cancelled(handle):
+                lifecycle.finish(handle, "cancelled")
+                raise  # the caller cancelled arun itself — propagate
+            cancelled_by_client = True
+            error = "cancelled by client"
         except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -297,6 +373,10 @@ class SuperBrowser:
                 orch.memory.write_task_summary(success=success)
             except Exception:  # noqa: BLE001 - best-effort summary
                 pass
+            lifecycle.finish(
+                handle,
+                "cancelled" if cancelled_by_client else ("done" if success else "error"),
+            )
 
         # Aggregate per-task token usage (orchestrator + worker(s) + vision),
         # persist it, then drop the registry entry. Best-effort — never fail the run.
@@ -319,6 +399,8 @@ class SuperBrowser:
             output_tokens=usage.output_tokens if usage is not None else 0,
             total_tokens=usage.total_tokens if usage is not None else 0,
             usage=usage.to_dict() if usage is not None else None,
+            task_handle=handle,
+            cancelled=cancelled_by_client,
         )
 
     # ----- streaming (progress / step events) -----
@@ -383,6 +465,7 @@ class SuperBrowser:
         force_browser: bool = False,
         enable_human_handoff: bool = True,
         timeout: float | None = None,
+        task_handle: str | None = None,
     ) -> AsyncIterator[dict]:
         """Stream a task as step-level events, ending with a ``result`` event.
 
@@ -390,14 +473,18 @@ class SuperBrowser:
         ``classification`` / ``status`` / ``thinking`` / ``tool`` / ``tool_hint``
         / ``message`` for progress, then a final ``{"type": "result", ...}``
         mirroring :class:`RunResult`. Works in remote, local-agent, and
-        in-process modes.
+        in-process modes. ``task_handle`` registers the run for
+        :meth:`cancel` / :meth:`tasks` (in-process and local-agent modes).
         """
         if self.remote:
             async for ev in self._astream_via_client(self._remote_stream_client, task, mode, url):
                 yield ev
             return
         if self.local_agent:
-            async for ev in self._astream_via_client(self._local_stream_client, task, mode, url):
+            async for ev in self._astream_via_client(
+                self._local_stream_client, task, mode, url,
+                timeout=timeout, task_handle=task_handle,
+            ):
                 yield ev
             return
 
@@ -420,31 +507,67 @@ class SuperBrowser:
             write_usage_json,
         )
 
+        handle = task_handle or lifecycle.new_handle()
+        lifecycle.register(handle, task, transport="in-process")
+
         final: dict | None = None
+        cancelled_by_client = False
+        agen = None
         try:
             with track_task(orch.task_id):
-                async for ev in stream_and_capture(
+                lifecycle.note_orch_task_id(handle, orch.task_id)
+                agen = stream_and_capture(
                     orch.bot,
                     framed,
                     orch.session_key,
                     hooks=[orch.hook, UsageHook("orchestrator")],
                     timeout=timeout,
-                ):
+                )
+                async for ev in agen:
+                    if lifecycle.cancelled(handle):
+                        cancelled_by_client = True
+                        break
                     if ev.get("type") == "result":
                         final = ev
                     else:
                         yield ev
         finally:
+            # ALWAYS close the inner generator — this is the deterministic
+            # cancel point. stream_and_capture's finally does run.cancel() +
+            # await run, stopping the browser task. Closing must happen on
+            # EVERY exit path: an internal cancel (cancelled_by_client), a
+            # normal finish (no-op on an exhausted generator), AND — critically
+            # — an external GeneratorExit from a consumer calling gen.close()
+            # (how deploy/main.py's cooperative cancel unwinds the run). If we
+            # only closed on cancelled_by_client, the external-close path would
+            # leave the run task to non-deterministic GC and the browser task
+            # could keep running.
+            if agen is not None:
+                try:
+                    await agen.aclose()
+                except Exception:  # noqa: BLE001 - already unwinding
+                    pass
             try:
                 orch.memory.write_task_summary(success=bool(final and final.get("success")))
             except Exception:  # noqa: BLE001 - best-effort summary
                 pass
+            lifecycle.finish(
+                handle,
+                "cancelled"
+                if cancelled_by_client
+                else ("done" if final and final.get("success") else "error"),
+            )
 
         usage = snapshot(orch.task_id)
         if usage is not None:
             write_usage_json(usage)
         pop(orch.task_id)
 
+        if cancelled_by_client:
+            final = {
+                "type": "result", "text": "", "raw_content": "",
+                "success": False, "error": "cancelled by client",
+            }
         final = final or {
             "type": "result", "text": "", "raw_content": "",
             "success": False, "error": "the agent returned no answer",
@@ -466,6 +589,8 @@ class SuperBrowser:
             "output_tokens": usage.output_tokens if usage is not None else 0,
             "total_tokens": usage.total_tokens if usage is not None else 0,
             "usage": usage.to_dict() if usage is not None else None,
+            "task_handle": handle,
+            "cancelled": cancelled_by_client,
         }
 
     def stream(
@@ -478,6 +603,7 @@ class SuperBrowser:
         force_browser: bool = False,
         enable_human_handoff: bool = True,
         timeout: float | None = None,
+        task_handle: str | None = None,
     ) -> Iterator[dict]:
         """Synchronous streaming. Raises if called from a running event loop —
         use :meth:`astream` there. Yields the same events as :meth:`astream`."""
@@ -488,6 +614,10 @@ class SuperBrowser:
             input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
             if url is not None:
                 input_kwargs["url"] = url
+            if timeout is not None:
+                input_kwargs["timeout"] = timeout
+            if self.local_agent and task_handle and "cancel" in self._server_entrypoints():
+                input_kwargs["client_task_id"] = task_handle
             yield from client.run_stream(**input_kwargs)
             return
         # In-process: drive the async generator from a sync caller.
@@ -499,6 +629,7 @@ class SuperBrowser:
                     task, mode=mode, url=url, output_schema=output_schema,
                     force_browser=force_browser,
                     enable_human_handoff=enable_human_handoff, timeout=timeout,
+                    task_handle=task_handle,
                 )
             )
             return
@@ -507,21 +638,42 @@ class SuperBrowser:
             "loop; use `async for ev in SuperBrowser.astream(...)` instead."
         )
 
-    async def _astream_via_client(self, client_factory, task: str, mode: str, url: str | None):
+    async def _astream_via_client(
+        self,
+        client_factory,
+        task: str,
+        mode: str,
+        url: str | None,
+        *,
+        timeout: float | None = None,
+        task_handle: str | None = None,
+    ):
         """Bridge a runagent ``RunAgentClient`` sync streaming generator to async
         by stepping it in the default executor (the socket I/O is blocking)."""
         client = client_factory()
         input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
         if url is not None:
             input_kwargs["url"] = url
+        if timeout is not None:
+            input_kwargs["timeout"] = timeout
+        if self.local_agent and task_handle and "cancel" in self._server_entrypoints():
+            input_kwargs["client_task_id"] = task_handle
         loop = asyncio.get_running_loop()
         done = object()
         iterator = await loop.run_in_executor(None, lambda: client.run_stream(**input_kwargs))
-        while True:
-            chunk = await loop.run_in_executor(None, lambda: next(iterator, done))
-            if chunk is done:
-                break
-            yield chunk
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, lambda: next(iterator, done))
+                if chunk is done:
+                    break
+                yield chunk
+        finally:
+            # aclose()/GC of this generator closes the socket iterator, which
+            # drops the WS and lets the server unwind the task.
+            try:
+                iterator.close()
+            except Exception:  # noqa: BLE001 - already unwinding
+                pass
 
     def _remote_stream_client(self):
         if self._remote_stream_client_obj is None:
@@ -610,6 +762,10 @@ class SuperBrowser:
         input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
         if url is not None:
             input_kwargs["url"] = url
+        if timeout is not None:
+            # main.py:run has accepted `timeout` since the first release —
+            # safe to forward unconditionally.
+            input_kwargs["timeout"] = timeout
         try:
             payload = client.run(**input_kwargs)
         except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
@@ -661,20 +817,55 @@ class SuperBrowser:
         url: str | None = None,
         output_schema: Any | None = None,
         timeout: float | None = None,
+        task_handle: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> RunResult:
         """Execute against a local ``runagent serve`` agent server (the all-in-one
         Docker container) via ``RunAgentClient(local=True)``. No API key required.
 
+        Default transport is the run_stream WebSocket (see
+        :meth:`_run_local_agent_via_stream`) — a dying client drops the socket
+        and the server unwinds the task, so force-killed SDK processes no
+        longer orphan work inside Docker. ``SUPERBROWSER_RUN_TRANSPORT=rest``
+        restores the classic HTTP path (documented residual risk: SIGKILL of a
+        REST client leaves the task running to completion).
+
         Unlike remote mode, ``output_schema`` IS parsed locally here — we own both
         ends of the round-trip and the engine returns the answer text.
         """
+        transport = (os.environ.get("SUPERBROWSER_RUN_TRANSPORT") or "stream").strip().lower()
+        if transport != "rest":
+            return self._run_local_agent_via_stream(
+                task,
+                mode=mode,
+                url=url,
+                output_schema=output_schema,
+                timeout=timeout,
+                task_handle=task_handle,
+                on_event=on_event,
+            )
+
         client = self._local_runagent_client()
+        handle = task_handle or lifecycle.new_handle()
+        supports_cancel = "cancel" in self._server_entrypoints()
         input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
         if url is not None:
             input_kwargs["url"] = url
+        if timeout is not None:
+            input_kwargs["timeout"] = timeout
+        if supports_cancel:
+            # Old containers would TypeError on the unknown kwarg — only send
+            # it when the architecture probe shows the cancel entrypoint.
+            input_kwargs["client_task_id"] = handle
+            lifecycle.register(handle, task, transport="rest-local")
+            from . import _reaper
+
+            _reaper.install(self)
         try:
             payload = client.run(**input_kwargs)
         except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
+            if supports_cancel:
+                lifecycle.finish(handle, "error")
             return RunResult(
                 text="",
                 success=False,
@@ -684,8 +875,100 @@ class SuperBrowser:
                 error=f"{type(exc).__name__}: {exc}",
                 raw_content="",
                 classification=None,
+                task_handle=handle if supports_cancel else "",
             )
+        if supports_cancel:
+            lifecycle.finish(handle, "done")
         result = self._result_from_remote(payload, mode)
+        if supports_cancel and not result.task_handle:
+            result.task_handle = handle
+        if output_schema is not None and result.success and result.data is None:
+            result.data = parse_output(result.text, output_schema)
+        return result
+
+    def _run_local_agent_via_stream(
+        self,
+        task: str,
+        *,
+        mode: Mode = "auto",
+        url: str | None = None,
+        output_schema: Any | None = None,
+        timeout: float | None = None,
+        task_handle: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> RunResult:
+        """Default local-agent transport: drive ``run_stream`` and aggregate the
+        final ``result`` event.
+
+        Why streaming for a blocking ``run()``: the WebSocket is the lifeline.
+        SIGKILL/crash of this process drops the socket; the server notices on
+        its next send and cancels the underlying task (verified chain:
+        socket_utils WebSocketDisconnect → async-gen close → _capture cancel).
+        The client-side watchdog (`timeout + 30s`) is a backstop on top of the
+        server's own asyncio.wait_for; it only advances between events, which
+        arrive every LLM step.
+        """
+        client = self._local_stream_client()
+        handle = task_handle or lifecycle.new_handle()
+        supports_cancel = "cancel" in self._server_entrypoints()
+        input_kwargs: dict[str, Any] = {"task": task, "mode": mode}
+        if url is not None:
+            input_kwargs["url"] = url
+        if timeout is not None:
+            input_kwargs["timeout"] = timeout
+        if supports_cancel:
+            input_kwargs["client_task_id"] = handle
+        lifecycle.register(handle, task, transport="stream-local")
+
+        deadline = (time.monotonic() + timeout + 30.0) if timeout else None
+        final: dict | None = None
+        error: str | None = None
+        iterator = None
+        try:
+            iterator = client.run_stream(**input_kwargs)
+            for ev in iterator:
+                if isinstance(ev, dict):
+                    if ev.get("type") == "result":
+                        final = ev
+                    elif on_event is not None:
+                        try:
+                            on_event(ev)
+                        except Exception:  # noqa: BLE001 - observer must not kill the run
+                            pass
+                if deadline is not None and time.monotonic() > deadline:
+                    error = f"task timed out after {timeout}s (client watchdog)"
+                    break
+        except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if iterator is not None:
+                # Closing the iterator closes the WS; if the task is still
+                # running server-side, that unwinds it.
+                try:
+                    iterator.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if final is not None and final.get("cancelled"):
+                lifecycle.finish(handle, "cancelled")
+            else:
+                lifecycle.finish(handle, "error" if (error and final is None) else "done")
+
+        if final is None:
+            return RunResult(
+                text="",
+                success=False,
+                task_id="",
+                mode=mode,
+                data=None,
+                error=error or "the agent returned no result",
+                raw_content="",
+                classification=None,
+                task_handle=handle,
+            )
+        payload = {k: v for k, v in final.items() if k != "type"}
+        result = self._result_from_remote(payload, mode)
+        if not result.task_handle:
+            result.task_handle = handle
         if output_schema is not None and result.success and result.data is None:
             result.data = parse_output(result.text, output_schema)
         return result
@@ -712,6 +995,96 @@ class SuperBrowser:
             )
         return self._local_client
 
+    # ----- task lifecycle (cancel / list) -----
+
+    def _server_entrypoints(self) -> set[str]:
+        """Entrypoint tags exposed by the local agent server, from its
+        ``/architecture`` endpoint. Cached for the client's lifetime; empty on
+        any failure so callers degrade to the pre-cancel behavior (and never
+        send ``client_task_id`` to an old container that would TypeError)."""
+        if self._entrypoints_cache is not None:
+            return self._entrypoints_cache
+        tags: set[str] = set()
+        try:
+            import json as _json
+            import urllib.request
+
+            host, port = _split_url(self.local_agent_url or "")
+            url = f"http://{host}:{port}/api/v1/agents/{self.local_agent_id}/architecture"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = _json.load(resp)
+            for entry in (data.get("data") or {}).get("entrypoints") or []:
+                tag = entry.get("tag")
+                if tag:
+                    tags.add(str(tag))
+        except Exception:  # noqa: BLE001 - unreachable/old server -> degrade
+            pass
+        self._entrypoints_cache = tags
+        return tags
+
+    def _entrypoint_client(self, tag: str):
+        """A cached RunAgentClient for an auxiliary local entrypoint
+        (``cancel`` / ``tasks``)."""
+        cached = self._aux_clients.get(tag)
+        if cached is not None:
+            return cached
+        from runagent import RunAgentClient
+
+        host, port = _split_url(self.local_agent_url or "")
+        client = RunAgentClient(
+            agent_id=self.local_agent_id,
+            entrypoint_tag=tag,
+            local=True,
+            host=host,
+            port=port,
+            user_id=self.user_id,
+            persistent_memory=self.persistent,
+        )
+        self._aux_clients[tag] = client
+        return client
+
+    def cancel(self, task_handle: str) -> bool:
+        """Request cooperative cancellation of a running task.
+
+        - in-process: flips the local registry's cancel event; the run unwinds
+          within ~a poll tick / next stream event.
+        - local-agent (Docker): calls the server's ``cancel`` entrypoint
+          (new images only — returns False against an old container).
+        - remote: unsupported in v1 — returns False.
+
+        Returns True when a live task matched.
+        """
+        if not task_handle:
+            return False
+        if self.remote:
+            return False
+        if self.local_agent:
+            if "cancel" not in self._server_entrypoints():
+                return False
+            try:
+                payload = self._entrypoint_client("cancel").run(client_task_id=task_handle)
+            except Exception:  # noqa: BLE001 - server gone -> nothing to cancel
+                return False
+            return bool(isinstance(payload, dict) and payload.get("cancelled"))
+        return lifecycle.request_cancel(task_handle)
+
+    def tasks(self) -> list[dict[str, Any]]:
+        """List known tasks (running first).
+
+        Local-agent mode queries the server's ``tasks`` entrypoint (the
+        authoritative registry lives in the server process); everything else
+        reads the process-local registry.
+        """
+        if self.local_agent and "tasks" in self._server_entrypoints():
+            try:
+                payload = self._entrypoint_client("tasks").run()
+            except Exception:  # noqa: BLE001 - fall back to the local view
+                return lifecycle.list_tasks()
+            if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+                return payload["tasks"]
+            return []
+        return lifecycle.list_tasks()
+
     @staticmethod
     def _result_from_remote(payload: Any, mode: str) -> RunResult:
         """Wrap the in-VM ``main.py:run`` dict (already deserialized by
@@ -732,6 +1105,8 @@ class SuperBrowser:
                 output_tokens=int(payload.get("output_tokens") or (usage or {}).get("output_tokens") or 0),
                 total_tokens=int(payload.get("total_tokens") or (usage or {}).get("total_tokens") or 0),
                 usage=usage,
+                task_handle=str(payload.get("task_handle") or ""),
+                cancelled=bool(payload.get("cancelled")),
             )
         text = "" if payload is None else str(payload)
         return RunResult(

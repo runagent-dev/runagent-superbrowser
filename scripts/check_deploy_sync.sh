@@ -31,6 +31,8 @@ chk "deploy/main.py imports bridge package-first"  "grep -q 'from runagent_super
 chk "deploy/main.py has sibling fallback import"   "grep -q 'from _nanobot_config import ensure_nanobot_config' '$MAIN'"
 chk "_runtime.py bootstraps nanobot config"        "grep -q 'bootstrap_nanobot_config()' nanobot/runagent_superbrowser/_runtime.py"
 chk "deploy config has run + run_stream"           "grep -q '\"run_stream\"' deploy/runagent.config.json && grep -q '\"run\"' deploy/runagent.config.json"
+chk "deploy config has cancel + tasks"             "grep -q '\"cancel\"' deploy/runagent.config.json && grep -q '\"tasks\"' deploy/runagent.config.json"
+chk "deploy/main.py has lifecycle entrypoints"     "grep -q 'def cancel(client_task_id)' '$MAIN' && grep -q 'def tasks()' '$MAIN'"
 chk "deploy/.gitignore excludes .env"              "grep -qx '.env' deploy/.gitignore"
 
 echo ""
@@ -39,6 +41,7 @@ if [ -d "$TPL_DIR" ]; then
   chk "template _nanobot_config.py == package" "diff -q '$SB' '$TPL_DIR/_nanobot_config.py' >/dev/null"
   chk "template main.py == deploy/main.py"     "diff -q '$MAIN' '$TPL_DIR/main.py' >/dev/null"
   chk "template config has run + run_stream"   "grep -q '\"run_stream\"' '$TPL_DIR/runagent.config.json'"
+  chk "template config has cancel + tasks"     "grep -q '\"cancel\"' '$TPL_DIR/runagent.config.json' && grep -q '\"tasks\"' '$TPL_DIR/runagent.config.json'"
 else
   skip "runagent template checks" "$TPL_DIR"
 fi
@@ -49,6 +52,7 @@ if [ -d "$SRV_DIR" ]; then
   chk "serverless _nanobot_config.py == package"        "diff -q '$SB' '$SRV_DIR/_nanobot_config.py' >/dev/null"
   chk "serverless superbrowser-main.py == deploy/main.py" "diff -q '$MAIN' '$SRV_DIR/superbrowser-main.py' >/dev/null"
   chk "serverless config has run + run_stream"          "grep -q '\"run_stream\"' '$SRV_DIR/superbrowser.config.json'"
+  chk "serverless config has cancel + tasks"            "grep -q '\"cancel\"' '$SRV_DIR/superbrowser.config.json' && grep -q '\"tasks\"' '$SRV_DIR/superbrowser.config.json'"
 else
   skip "serverless checks" "$SRV_DIR"
 fi

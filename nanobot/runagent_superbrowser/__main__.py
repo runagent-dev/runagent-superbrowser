@@ -16,7 +16,18 @@ def main(argv: list[str] | None = None) -> int:
         prog="superbrowser-run",
         description="Run a task with the SuperBrowser agent (fetch, browser, or auto).",
     )
-    parser.add_argument("task", nargs="+", help="the goal, in plain language")
+    parser.add_argument("task", nargs="*", help="the goal, in plain language")
+    parser.add_argument(
+        "--tasks",
+        action="store_true",
+        help="list known tasks (local-agent mode queries the server) and exit",
+    )
+    parser.add_argument(
+        "--cancel",
+        metavar="HANDLE",
+        default=None,
+        help="cancel a running task by its handle (see --tasks / RunResult.task_handle) and exit",
+    )
     parser.add_argument(
         "--mode",
         choices=["auto", "fetch", "browser"],
@@ -59,7 +70,6 @@ def main(argv: list[str] | None = None) -> int:
 
     from .client import SuperBrowser
 
-    task = " ".join(ns.task)
     sb = SuperBrowser(
         server_url=ns.server_url,
         auto_start_server=ns.auto_start_server,
@@ -71,6 +81,22 @@ def main(argv: list[str] | None = None) -> int:
         base_url=ns.base_url,
         local_agent_url=ns.local_agent_url,
     )
+
+    if ns.tasks:
+        for record in sb.tasks():
+            print(
+                f"{record.get('handle', '?'):16} {record.get('state', '?'):11} "
+                f"{record.get('elapsed_s', 0):>8}s  {record.get('task', '')}"
+            )
+        return 0
+    if ns.cancel:
+        ok = sb.cancel(ns.cancel)
+        print(f"cancel {ns.cancel}: {'requested' if ok else 'no matching running task'}")
+        return 0 if ok else 1
+    if not ns.task:
+        parser.error("a task is required (or use --tasks / --cancel)")
+
+    task = " ".join(ns.task)
     try:
         res = sb.run(task, mode=ns.mode, url=ns.url, timeout=ns.timeout)
     finally:

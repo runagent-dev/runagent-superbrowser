@@ -93,8 +93,44 @@ def _has_llm_credentials() -> bool:
     )
 
 
-def run(task, mode="auto", url=None, output_schema=None, timeout=None):
-    """Run a browser task and return a JSON-serializable RunResult dict."""
+def _lifecycle():
+    """The SDK's process-local task registry, or None on an old SDK.
+
+    ``runagent serve`` runs every entrypoint in this one process, so the
+    registry a ``run``/``run_stream`` call registers into is the same module
+    state the ``cancel``/``tasks`` entrypoints consult.
+    """
+    try:
+        from runagent_superbrowser import lifecycle
+
+        return lifecycle
+    except Exception:  # noqa: BLE001 - old SDK without lifecycle support
+        return None
+
+
+def _cancelled_payload(mode, client_task_id):
+    return {
+        "text": "",
+        "success": False,
+        "data": None,
+        "error": "cancelled by client",
+        "cancelled": True,
+        "task_id": None,
+        "task_handle": client_task_id,
+        "mode": mode,
+        "classification": None,
+    }
+
+
+def run(task, mode="auto", url=None, output_schema=None, timeout=None, client_task_id=None):
+    """Run a browser task and return a JSON-serializable RunResult dict.
+
+    ``client_task_id`` (optional, sent only by SDKs that probed this server's
+    ``cancel`` entrypoint): registers the run in the lifecycle registry and
+    drives it through the streaming path, checking for a cooperative cancel
+    between events. When absent — every old SDK — behavior is byte-identical
+    to the classic path below.
+    """
     if not _has_llm_credentials():
         return {
             "text": "",
@@ -108,6 +144,36 @@ def run(task, mode="auto", url=None, output_schema=None, timeout=None):
             "mode": mode,
             "classification": None,
         }
+
+    lc = _lifecycle() if client_task_id else None
+    if lc is not None:
+        lc.register(client_task_id, task, transport="serve-run")
+        gen = _client().stream(task, mode=mode, url=url, output_schema=output_schema, timeout=timeout)
+        final = None
+        try:
+            for event in gen:
+                if lc.cancelled(client_task_id):
+                    lc.finish(client_task_id, "cancelled")
+                    return _cancelled_payload(mode, client_task_id)
+                if isinstance(event, dict) and event.get("type") == "result":
+                    final = event
+        finally:
+            # Closing the generator unwinds the in-process run (astream's
+            # finally cancels the underlying task) — nothing keeps running.
+            try:
+                gen.close()
+            except Exception:  # noqa: BLE001
+                pass
+        lc.finish(client_task_id, "done" if (final and final.get("success")) else "error")
+        if final is None:
+            payload = _cancelled_payload(mode, client_task_id)
+            payload["cancelled"] = False
+            payload["error"] = "the agent returned no result"
+            return payload
+        payload = {k: v for k, v in final.items() if k != "type"}
+        payload.setdefault("mode", mode)
+        payload["task_handle"] = client_task_id
+        return payload
 
     result = _client().run(
         task,
@@ -132,7 +198,27 @@ def run(task, mode="auto", url=None, output_schema=None, timeout=None):
     }
 
 
-async def run_stream(task, mode="auto", url=None, output_schema=None, timeout=None):
+def cancel(client_task_id):
+    """Cooperatively cancel a running task registered under ``client_task_id``.
+
+    Returns ``{"supported": bool, "cancelled": bool}`` — ``supported=False``
+    means the installed SDK predates the lifecycle registry.
+    """
+    lc = _lifecycle()
+    if lc is None:
+        return {"supported": False, "cancelled": False}
+    return {"supported": True, "cancelled": lc.request_cancel(client_task_id)}
+
+
+def tasks():
+    """List tasks known to this server process (running first)."""
+    lc = _lifecycle()
+    if lc is None:
+        return {"supported": False, "tasks": []}
+    return {"supported": True, "tasks": lc.list_tasks()}
+
+
+async def run_stream(task, mode="auto", url=None, output_schema=None, timeout=None, client_task_id=None):
     """Stream a browser task as step-level events, ending with a result event.
 
     Yields JSON-serializable dicts (see ``SuperBrowser.astream``): progress events
@@ -140,6 +226,11 @@ async def run_stream(task, mode="auto", url=None, output_schema=None, timeout=No
     {"type": "result", ...} matching the ``run`` payload. The vsock runner
     serializes each yielded item and frames the stream over the WebSocket back to
     the SDK.
+
+    ``client_task_id`` (optional) registers the run for the ``cancel``/``tasks``
+    entrypoints; the loop checks for a cooperative cancel between events. A
+    client disconnect (SIGKILL included) closes this generator, which unwinds
+    the task regardless — client_task_id only adds the *explicit* cancel path.
 
     Degrades gracefully: if the installed runagent_superbrowser SDK predates
     streaming (no ``astream``), this runs the task and yields a single result.
@@ -164,17 +255,43 @@ async def run_stream(task, mode="auto", url=None, output_schema=None, timeout=No
     loop = asyncio.get_running_loop()
     sb = await loop.run_in_executor(None, _client)
 
-    if hasattr(sb, "astream"):
-        async for event in sb.astream(
-            task, mode=mode, url=url, output_schema=output_schema, timeout=timeout
-        ):
-            yield event
-    else:
-        # Old SDK without streaming: degrade to a single result event.
-        result = await loop.run_in_executor(
-            None,
-            lambda: run(task, mode=mode, url=url, output_schema=output_schema, timeout=timeout),
-        )
-        result = dict(result)
-        result["type"] = "result"
-        yield result
+    lc = _lifecycle() if client_task_id else None
+    if lc is not None:
+        lc.register(client_task_id, task, transport="serve-stream")
+
+    try:
+        if hasattr(sb, "astream"):
+            agen = sb.astream(task, mode=mode, url=url, output_schema=output_schema, timeout=timeout)
+            try:
+                async for event in agen:
+                    if lc is not None and lc.cancelled(client_task_id):
+                        lc.finish(client_task_id, "cancelled")
+                        yield {"type": "result", **_cancelled_payload(mode, client_task_id)}
+                        return
+                    yield event
+            finally:
+                # Deterministic cancel point: closing the inner generator runs
+                # its finally (run.cancel() + await run), stopping the browser
+                # task. This fires on every exit path — normal finish, cooperative
+                # cancel, and a client-disconnect GeneratorExit. It must be
+                # bullet-proof: an aclose() that raised (e.g. a contextvars token
+                # reset in a foreign Context) would escape as an unretrieved task
+                # exception and corrupt teardown. The run is already unwinding, so
+                # swallow any non-cancellation error and let the original unwind
+                # (GeneratorExit / CancelledError, which are BaseExceptions) win.
+                try:
+                    await agen.aclose()
+                except Exception:  # noqa: BLE001 - teardown must never surface
+                    pass
+        else:
+            # Old SDK without streaming: degrade to a single result event.
+            result = await loop.run_in_executor(
+                None,
+                lambda: run(task, mode=mode, url=url, output_schema=output_schema, timeout=timeout),
+            )
+            result = dict(result)
+            result["type"] = "result"
+            yield result
+    finally:
+        if lc is not None:
+            lc.finish(client_task_id, "done")

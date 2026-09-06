@@ -43,6 +43,13 @@ class RunResult:
             ``None`` when accounting was unavailable. Populated for in-process
             runs; remote/Docker modes surface it only when the deployed runtime
             returns it.
+        task_handle: The lifecycle handle (``task-<hex8>``) this run was
+            registered under — pass it to :meth:`SuperBrowser.cancel` from
+            another thread/process, or find it in :meth:`SuperBrowser.tasks`.
+            Empty when the execution path had no lifecycle support (e.g.
+            remote mode, or an old agent server).
+        cancelled: ``True`` when the run ended because a client requested
+            cancellation (``error`` is then ``"cancelled by client"``).
     """
 
     text: str
@@ -57,6 +64,8 @@ class RunResult:
     output_tokens: int = 0
     total_tokens: int = 0
     usage: dict[str, Any] | None = None
+    task_handle: str = ""
+    cancelled: bool = False
 
     def __bool__(self) -> bool:  # `if result:` reads as "did it work?"
         return self.success

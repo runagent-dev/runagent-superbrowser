@@ -127,6 +127,17 @@ async def stream_and_capture(
     error: str | None = None
     timed_out = False
     deadline = (time.monotonic() + timeout) if timeout else None
+    # Emit a liveness heartbeat when the bus has been quiet this long. The
+    # orchestrator publishes nothing to its bus while it is blocked on a
+    # delegated worker (a ``search`` / ``browser`` sub-agent runs its OWN loop —
+    # potentially minutes of real work — on a separate session). Without a
+    # heartbeat the stream looks dead during that stretch, so a consumer's
+    # idle-timeout can't distinguish a busy delegation from a truly hung run and
+    # aborts a healthy task. The heartbeat only fills genuine gaps: any real
+    # event resets the timer below.
+    heartbeat_s = 15.0
+    start = time.monotonic()
+    last_emit = start
     try:
         # Single consumer of the bus: consume_outbound() returns pending messages
         # immediately and only times out once the bus is empty, so we drain every
@@ -140,6 +151,10 @@ async def stream_and_capture(
                 if deadline and time.monotonic() > deadline:
                     timed_out = True
                     break
+                now = time.monotonic()
+                if now - last_emit >= heartbeat_s:
+                    last_emit = now
+                    yield {"type": "heartbeat", "elapsed": round(now - start, 1)}
                 continue
             except Exception:  # noqa: BLE001 - bus closed/errored; stop consuming
                 if run.done():
@@ -151,10 +166,12 @@ async def stream_and_capture(
             if md.get("_progress"):
                 ev = _progress_event(msg.content, md)
                 if ev is not None:
+                    last_emit = time.monotonic()
                     yield ev
                 continue
             if msg.content:
                 captured.append(msg.content)
+                last_emit = time.monotonic()
                 yield {"type": "message", "text": msg.content}
 
         if timed_out:

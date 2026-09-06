@@ -233,7 +233,24 @@ def track_task(task_id: str) -> Iterator["TaskUsage"]:
     try:
         yield tu
     finally:
-        _current_task.reset(token)
+        # This block can be unwound from a *different* contextvars Context than
+        # the one ``.set()`` ran in — e.g. when the enclosing async generator is
+        # torn down via ``aclose()`` (on a client disconnect or timeout), the
+        # GeneratorExit is thrown in from an ``async_generator_athrow`` task,
+        # which runs in a copied Context. ``ContextVar`` tokens are Context-bound,
+        # so ``reset(token)`` then raises ``ValueError: created in a different
+        # Context``. That escaping error corrupts the whole teardown chain
+        # (it surfaces as an "unretrieved task exception"). Usage accounting is
+        # best-effort and must NEVER break stream cleanup, so degrade safely: the
+        # foreign Context is a throwaway copy, so clearing the var in it is
+        # sufficient, and the original Context is discarded with its task.
+        try:
+            _current_task.reset(token)
+        except ValueError:
+            try:
+                _current_task.set(None)
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
 
 
 def record_brain(

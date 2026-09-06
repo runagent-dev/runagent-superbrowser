@@ -13,7 +13,9 @@
   "agent_architecture": {
     "entrypoints": [
       { "file": "main.py", "module": "run", "tag": "run" },
-      { "file": "main.py", "module": "run_stream", "tag": "run_stream" }
+      { "file": "main.py", "module": "run_stream", "tag": "run_stream" },
+      { "file": "main.py", "module": "cancel", "tag": "cancel" },
+      { "file": "main.py", "module": "tasks", "tag": "tasks" }
     ]
   },
   "env_vars": {},
