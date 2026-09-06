@@ -91,3 +91,26 @@ etc. from the environment — config.json simply fills those in. The full env
 reference is `.env.example`. Dead knobs `BROWSER_PROFILE`/`COOKIE_DIR` were
 removed; `~/.superbrowser/` is the single data umbrella (see
 [data-layout.md](data-layout.md)).
+
+## Research switches (evaluation harness only)
+
+The experiments under `eval/` (see `eval/PROTOCOL.md`) toggle individual mechanisms through env vars.
+Every switch reproduces production behaviour when unset, is read per run by the harness, and is
+recorded in the run's record. None of them belong in a production `config.json`.
+
+| Env | Values (default first) | Effect |
+|---|---|---|
+| `SUPERBROWSER_MEMORY_POLICY` | `ledger` \| `full` \| `fifo` \| `summary` \| `ledger_noevict` | Memory-retention policy of the MemoryHook. `ledger` is the six-phase eviction loop + injected Ledger (byte-identical to before). `full` keeps everything, `fifo` keeps the last K turns, `summary` keeps the last K turns plus one regenerated LLM summary of older turns (same host model, booked as usage role `compressor`), `ledger_noevict` injects the Ledger without evicting. |
+| `SUPERBROWSER_MEMORY_RECENT_K` | `5` | Verbatim recent window in assistant-anchored turns (also Phase 6's `keep_last_turns`). |
+| `SUPERBROWSER_MEMORY_KEEP_SCREENSHOTS` | `2` \| `all` | Screenshots kept verbatim in the live context. |
+| `SUPERBROWSER_MEMORY_BUDGET_TOKENS` | unset | History budget: caps the summary and, for `ledger`, shrinks the rendered Ledger (facts → dead-ends → checkpoints → episodic) to fit. |
+| `ABLATE_DEAD_END_MEMORY` | `0` \| `1` | `1`: failures are not recorded as dead-ends, no `DEAD_ENDS` sections, no `[DEAD_ENDS_HERE]` injections, no cross-task dead targets. |
+| `ABLATE_VISION_REUSE` | `0` \| `1` | `1`: no background vision prefetch, vision cache TTL 0, vision epoch expires after every mutating turn, no `[CACHED VISION]` piggyback (`FRESH_VISION_SECONDS=0`). |
+| `FRESH_VISION_SECONDS` | `10` | Age limit for piggybacking the last vision response onto mutating-tool results (previously hardcoded). |
+| `ABLATE_CLICK_LADDER` | `0` \| `1` | `1`: no js/keyboard escalation after a silent primary click (`CLICK_LADDER_AUTO=0`). The TypeScript selector cascade is gated separately by `SUPERBROWSER_CLICK_TIERS=tier1`. |
+| `SUPERBROWSER_SNAP_STRATEGY` | `chevron` \| `center` \| `dom_alt` | Sub-element resolver used by the bbox snapper (TypeScript server and the T3 mirror; the server reads it at startup). `center` = naive area snapper, `dom_alt` = DOM-name-first without chevron heuristics. |
+| `SUPERBROWSER_TOPOLOGY` | `orchestrator` \| `flat` | Read by the eval runner only: `flat` drives the browser worker directly (same tools, memory hook, budgets; no orchestrator). |
+| `SUPERBROWSER_EVAL_DISTRACTOR_TOKENS` | `0` | Memory-pressure ladder: appends a deterministic, marker-free pseudo-DOM block of this many tokens to every tool result. |
+| `SUPERBROWSER_CROSS_TASK_MEMORY` | `1` \| `0` | `0`: no site-model ingest at goal time and no site-model merge at task end (paired arms cannot seed each other). |
+| `SUPERBROWSER_SITE_MODELS_DIR` | `/tmp/superbrowser/site_models` | Location of the cross-task site-model store. |
+| `SUPERBROWSER_TRACE_VISION` / `SUPERBROWSER_TRACE_CLICKS` / `SUPERBROWSER_TRACE_SCREENSHOTS` / `SUPERBROWSER_EVAL_CONTEXT_DUMP` | `0` | Per-run JSONL traces next to the task ledger (`vision_calls.jsonl`, `clicks.jsonl`, `screenshots/index.jsonl` + prefetch screenshots, `live_context.jsonl.gz` + `context_size` events). |

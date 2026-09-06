@@ -145,3 +145,148 @@ def read_context_dump(path: Path) -> list[dict[str, Any]]:
     except (OSError, EOFError):
         pass
     return rows
+
+
+# =========================================================================
+# Memory-pressure ladder (eval E3): deterministic distractor observations
+# =========================================================================
+_DISTRACTOR_TOKENS_ENV = "SUPERBROWSER_EVAL_DISTRACTOR_TOKENS"
+
+# Vocabulary deliberately avoids every marker the memory passes / worker hook
+# key on ([SESSION_STATE, [ELEMENTS, DEAD_ENDS_HERE, [GUIDANCE], failure
+# tokens, [Vn], index=) so a distractor block is inert for the ledger arm's
+# targeted collapses and for the analyzers' tag counters.
+_DX_TAGS = ("div", "span", "section", "article", "nav", "aside", "footer", "header", "li", "p", "figure")
+_DX_CLASSES = ("layout-grid", "promo-strip", "media-card", "sidebar-module", "legal-notice", "tracking-pixel",
+               "cookie-preferences", "newsletter-teaser", "breadcrumb-shell", "hero-banner", "sponsor-slot",
+               "recommendation-rail", "ad-slot", "flex-wrap", "sticky-footer", "region-picker")
+_DX_WORDS = ("seasonal", "featured", "trending", "sponsored", "related", "recently", "viewed", "editorial",
+             "gallery", "carousel", "notice", "update", "preferences", "membership", "rewards", "delivery",
+             "returns", "support", "careers", "investors", "accessibility", "sitemap", "regional", "offers")
+
+
+def distractor_tokens_per_step() -> int:
+    raw = os.environ.get(_DISTRACTOR_TOKENS_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _token_len(text: str) -> int:
+    try:
+        from nanobot.utils.helpers import estimate_message_tokens
+
+        return int(estimate_message_tokens({"role": "tool", "content": text}))
+    except Exception:
+        return max(1, len(text) // 4)
+
+
+def generate_distractor_block(seed: str, n_tokens: int) -> str:
+    """Deterministic pseudo-DOM page-context block of ~n_tokens tokens."""
+    import hashlib
+    import random
+
+    if n_tokens <= 0:
+        return ""
+    rng = random.Random(int(hashlib.sha256(seed.encode()).hexdigest(), 16))
+    lines = [f"\n\n[PAGE_CONTEXT_SNAPSHOT id={hashlib.sha1(seed.encode()).hexdigest()[:8]} nodes={rng.randint(40, 400)}]"]
+    text = "\n".join(lines)
+    guard = 0
+    while _token_len(text) < n_tokens and guard < 4000:
+        guard += 1
+        tag = rng.choice(_DX_TAGS)
+        cls = rng.choice(_DX_CLASSES)
+        words = " ".join(rng.choice(_DX_WORDS) for _ in range(rng.randint(2, 6)))
+        x, y, w, h = rng.randint(0, 1280), rng.randint(0, 4000), rng.randint(20, 900), rng.randint(10, 300)
+        lines.append(f'<{tag} class="{cls} {rng.choice(_DX_CLASSES)}" data-qa="{cls}-{rng.randint(1, 999)}"'
+                     f' role=region aria-label="{words}" x={x},y={y} w={w},h={h}>')
+        text = "\n".join(lines)
+    return text
+
+
+class DistractorHook:
+    """AgentHook that appends a distractor block to THIS iteration's tool
+    results (after they were produced, before the memory policy sees them
+    next iteration). Inert unless SUPERBROWSER_EVAL_DISTRACTOR_TOKENS > 0."""
+
+    def __init__(self, memory: Any, tokens_per_step: int) -> None:
+        self.memory = memory
+        self.tokens_per_step = tokens_per_step
+        self.task_id = getattr(memory, "task_id", "task")
+        self.seed_salt = os.environ.get("SUPERBROWSER_EVAL_SEED", "0")
+
+    # nanobot AgentHook surface (only after_iteration does anything)
+    async def before_run(self, context: Any) -> None:  # pragma: no cover - interface
+        return None
+
+    async def after_run(self, context: Any) -> None:  # pragma: no cover - interface
+        return None
+
+    async def on_error(self, context: Any) -> None:  # pragma: no cover - interface
+        return None
+
+    async def on_finally(self, context: Any) -> None:  # pragma: no cover - interface
+        return None
+
+    async def before_iteration(self, context: Any) -> None:
+        return None
+
+    async def before_execute_tools(self, context: Any) -> None:  # pragma: no cover - interface
+        return None
+
+    async def after_iteration(self, context: Any) -> None:
+        if self.tokens_per_step <= 0:
+            return
+        try:
+            ids = {tc.id if hasattr(tc, "id") else (tc.get("id") if isinstance(tc, dict) else None)
+                   for tc in (context.tool_calls or [])}
+        except Exception:
+            ids = set()
+        ids.discard(None)
+        messages = context.messages or []
+        touched = 0
+        tokens = 0
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if m.get("role") != "tool":
+                break
+            if ids and m.get("tool_call_id") not in ids:
+                continue
+            seed = f"{self.task_id}:{self.seed_salt}:{context.iteration}:{m.get('tool_call_id') or i}"
+            block = generate_distractor_block(seed, self.tokens_per_step)
+            content = m.get("content")
+            if isinstance(content, str):
+                m["content"] = content + block
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": block})
+            else:
+                m["content"] = block
+            touched += 1
+            tokens += _token_len(block)
+        if touched:
+            try:
+                self.memory.events.log("distractor_appended", {"iter": context.iteration, "count": touched,
+                                                               "tokens": tokens, "per_step": self.tokens_per_step})
+            except Exception:
+                pass
+
+
+def eval_worker_hooks(memory: Any) -> list[Any]:
+    """Hooks the delegation adds right after the memory hook — empty unless
+    an eval-only env is set, so production hook lists are unchanged."""
+    hooks: list[Any] = []
+    n = distractor_tokens_per_step()
+    if n > 0:
+        try:
+            from nanobot.agent.hook import AgentHook
+
+            class _DistractorAgentHook(DistractorHook, AgentHook):  # type: ignore[misc]
+                pass
+
+            hooks.append(_DistractorAgentHook(memory, n))
+        except Exception:
+            hooks.append(DistractorHook(memory, n))
+    return hooks

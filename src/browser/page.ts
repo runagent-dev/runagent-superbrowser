@@ -1028,10 +1028,15 @@ export class PageWrapper {
     candidates?: number;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
+    // Research ablation (eval E6): alternative sub-element resolvers. Read
+    // per call so a restarted server picks the env up; 'chevron' (unset)
+    // is the production snapper below.
+    const snapStrategy = (process.env.SUPERBROWSER_SNAP_STRATEGY || 'chevron').toLowerCase();
     const snap = await this.page.evaluate(
       (args: {
         b: { x0: number; y0: number; x1: number; y1: number };
         expectedLabel: string;
+        strategy: string;
       }) => {
         const b = args.b;
         const SEL = 'a,button,input,select,textarea,'
@@ -1105,6 +1110,116 @@ export class PageWrapper {
           }
           return '/' + parts.join('/');
         };
+        // ---- Ablation strategies (eval E6) -------------------------------
+        // 'center'  : naive area-weighted snapper — interactive element
+        //             under the bbox centre, else the largest-overlap
+        //             interactive in the bbox; no label / chevron weights.
+        // 'dom_alt' : DOM-name-first — among interactives overlapping the
+        //             bbox pick the one whose accessible name best matches
+        //             the vision label (exact > substring, ties -> smallest
+        //             area); else the centre hit; else largest overlap.
+        //             No chevron heuristics.
+        if (args.strategy === 'center' || args.strategy === 'dom_alt') {
+          const overlapOf = (el: Element): number => {
+            const r = el.getBoundingClientRect();
+            const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
+            const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
+            return ix * iy;
+          };
+          const cands = new Set<Element>();
+          for (let i = 1; i < 5; i++) {
+            for (let j = 1; j < 5; j++) {
+              const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
+              const py = b.y0 + ((b.y1 - b.y0) * j) / 5;
+              let st: Element[] = [];
+              try { st = document.elementsFromPoint(px, py); } catch { st = []; }
+              for (const el of st) {
+                const hit = (el as Element).closest(SEL);
+                if (hit && overlapOf(hit) > 0) cands.add(hit);
+              }
+            }
+          }
+          let centreHit: Element | null = null;
+          try {
+            for (const el of document.elementsFromPoint(cx, cy)) {
+              if (el === document.documentElement || el === document.body) break;
+              const hit = (el as Element).closest(SEL);
+              if (hit) { centreHit = hit; break; }
+            }
+          } catch { centreHit = null; }
+          const finish = (el: Element | null, method: string, labelScore?: number) => {
+            if (!el) {
+              return {
+                x: cx, y: cy, snapped: false, method, candidates: cands.size,
+                target: undefined as string | undefined,
+                targetXpath: undefined as string | undefined,
+                isAutocompleteOption: false,
+                native_select: undefined as boolean | undefined,
+                label_score: undefined as number | undefined,
+              };
+            }
+            const r = el.getBoundingClientRect();
+            return {
+              x: Math.round(r.left + r.width / 2),
+              y: Math.round(r.top + r.height / 2),
+              snapped: true,
+              method,
+              candidates: cands.size,
+              target: describe(el) as string | undefined,
+              targetXpath: xpathOf(el) as string | undefined,
+              isAutocompleteOption: isAutocompleteOptionEl(el),
+              native_select: (el.tagName.toLowerCase() === 'select' ? true : undefined) as boolean | undefined,
+              label_score: labelScore,
+            };
+          };
+          if (args.strategy === 'center') {
+            if (centreHit) return finish(centreHit, 'center_pinpoint');
+            let bestEl: Element | null = null;
+            let bestA = 0;
+            for (const el of cands) {
+              const a = overlapOf(el);
+              if (a > bestA) { bestA = a; bestEl = el; }
+            }
+            return finish(bestEl, bestEl ? 'center_largest_area' : 'center_fallback');
+          }
+          // dom_alt
+          const norm = (t: string) => t.replace(/\s+/g, ' ').trim().toLowerCase();
+          const nameOf = (el: Element): string => {
+            const he = el as HTMLElement;
+            return norm(he.getAttribute('aria-label') || he.getAttribute('title')
+              || (he as HTMLInputElement).value || he.textContent || '');
+          };
+          const want = norm(args.expectedLabel || '');
+          if (want.length >= 2) {
+            let bestEl: Element | null = null;
+            let bestScore = 0;
+            let bestA = Number.POSITIVE_INFINITY;
+            for (const el of cands) {
+              const n = nameOf(el);
+              if (!n) continue;
+              let score = 0;
+              if (n === want) score = 3;
+              else if (n.includes(want) || want.includes(n)) score = 2;
+              if (score === 0) continue;
+              const r = el.getBoundingClientRect();
+              const a = r.width * r.height;
+              if (score > bestScore || (score === bestScore && a < bestA)) {
+                bestScore = score; bestA = a; bestEl = el;
+              }
+            }
+            if (bestEl) return finish(bestEl, 'dom_alt_name_match', bestScore === 3 ? 1.0 : 0.7);
+          }
+          if (centreHit) return finish(centreHit, 'dom_alt_pinpoint');
+          let bestEl: Element | null = null;
+          let bestA = 0;
+          for (const el of cands) {
+            const a = overlapOf(el);
+            if (a > bestA) { bestA = a; bestEl = el; }
+          }
+          return finish(bestEl, bestEl ? 'dom_alt_largest_area' : 'dom_alt_fallback');
+        }
+        // ---- end ablation strategies ---------------------------------------
+
         // 1. Pinpoint: click the bbox centre. Sanity-check that SOMETHING
         //    is rendered there (not transparent padding, not off-page).
         //    If the centre hits any element at all — even a wrapping
@@ -1668,7 +1783,7 @@ export class PageWrapper {
         //    no visual confirmation.
         return { x: cx, y: cy, snapped: false, method: 'fallback', candidates: seenCandidates.size };
       },
-      { b: bbox, expectedLabel },
+      { b: bbox, expectedLabel, strategy: snapStrategy },
     );
 
     // labelMismatch is ADVISORY ONLY — we used to skip dispatch here

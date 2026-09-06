@@ -483,9 +483,9 @@ class BrowserSelectOptionTool(Tool):
                     f"retry."
                 )
             try:
-                max_age_turns = int(
-                    os.environ.get("VISION_MAX_AGE_TURNS") or "1"
-                )
+                from ..ablations import vision_max_age_turns as _vmat
+
+                max_age_turns = _vmat()
             except ValueError:
                 max_age_turns = 1
             if max_age_turns > 0:

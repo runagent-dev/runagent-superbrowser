@@ -682,7 +682,8 @@ class BrowserClickAtTool(Tool):
             # brain clicks without fresh numbering for >max turns.
             try:
                 import os as _os_local
-                _max_age = int(_os_local.environ.get("VISION_MAX_AGE_TURNS") or "1")
+                from ..ablations import vision_max_age_turns as _vmat
+                _max_age = _vmat()
             except ValueError:
                 _max_age = 1
             if _max_age > 0:

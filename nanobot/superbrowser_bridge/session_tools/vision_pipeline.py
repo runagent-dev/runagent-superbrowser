@@ -1577,7 +1577,9 @@ def _schedule_vision_prefetch(
     # background prefetch entirely (forcing the synchronous vision path) for the
     # "- asynchronous vision prefetch" row of the Table 1 ablations. Callers
     # already treat None as "no prefetch scheduled", so no caller change needed.
-    if os.environ.get("VISION_ASYNC_PREFETCH", "1") in ("0", "false", "no"):
+    from .ablations import async_prefetch_enabled
+
+    if not async_prefetch_enabled():
         return None
     try:
         from vision_agent import (  # type: ignore[import-not-found]

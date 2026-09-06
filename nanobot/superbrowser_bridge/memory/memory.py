@@ -63,10 +63,17 @@ class Memory:
         *,
         session_key: str,
         role: Role = "orchestrator",
+        policy: "MemoryPolicyConfig | None" = None,
     ) -> None:
         self.task_id = task_id
         self.session_key = session_key
         self.role: Role = role
+        # Retention policy + eval ablation flags, read from env ONCE per
+        # Memory (SUPERBROWSER_MEMORY_POLICY, ABLATE_DEAD_END_MEMORY,
+        # SUPERBROWSER_CROSS_TASK_MEMORY). Defaults reproduce production.
+        from .policy import MemoryPolicyConfig
+
+        self.policy: MemoryPolicyConfig = policy or MemoryPolicyConfig.from_env()
         self.events = EventLog(task_id)
         self.store = LedgerStore(task_id)
         # Hydrate from disk if a ledger.json exists for this task_id;
@@ -112,9 +119,15 @@ class Memory:
                 "role": self.role,
                 "session_key": self.session_key,
                 "resumed": self.ledger.step_count > 0,
+                **self.policy.to_dict(),
             },
         )
-        hook = MemoryHook(self)
+        hook = MemoryHook(
+            self,
+            keep_last_screenshots=self.policy.keep_screenshots,
+            keep_recent_turns=self.policy.recent_k,
+            policy=self.policy,
+        )
         # Phase 4 — pass the bot reference into the hook so its
         # before_iteration can poll ``session.metadata["_last_summary"]``
         # for AutoCompact writes and absorb them into episodic memory.
@@ -137,7 +150,7 @@ class Memory:
         # planning, workers get URL-tagged dead-ends materialized into
         # their slice so Phase 5 B1's [DEAD_ENDS_HERE ...] block fires
         # on the very first navigation to a known-dangerous URL.
-        if goal:
+        if goal and self.policy.cross_task:
             try:
                 import re
 
@@ -313,6 +326,8 @@ class Memory:
     ) -> None:
         if not description:
             return
+        if not self.policy.dead_ends:  # eval E4: failures are not remembered as dead-ends
+            return
         if subgoal is None:
             subgoal = self.ledger.subgoal or None
         # Default URL to the ledger's current_url if the caller didn't
@@ -370,6 +385,8 @@ class Memory:
         """
         if not url:
             return []
+        if not self.policy.inject_dead_ends:  # fifo/full/summary arms and the dead-end ablation
+            return []
         target = _normalize_url_for_match(url)
         return [
             d
@@ -407,8 +424,13 @@ class Memory:
 
     # ----- consumption -----
 
-    def render_for_llm(self, *, role: Role | None = None) -> str:
-        return self.ledger.render(role or self.role)
+    def render_for_llm(self, *, role: Role | None = None, **caps: int) -> str:
+        """Render the ledger; ``caps`` (max_facts, max_dead_ends, ...) are the
+        optional section caps used by the eval budget sweep. Dead-end memory
+        ablation renders without the DEAD_ENDS sections."""
+        if not self.policy.dead_ends:
+            caps = {**caps, "max_dead_ends": 0}
+        return self.ledger.render(role or self.role, **caps)
 
     def recall(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
         """Grep-based lookup across facts, episodes, and steps.
@@ -554,7 +576,10 @@ class Memory:
 
             _logger.debug("task_summary.json write failed: {}", exc)
 
-        # 2. Site model merge
+        # 2. Site model merge (skipped when cross-task memory is disabled so
+        #    one evaluation run cannot seed the next one on the same domain)
+        if not self.policy.cross_task:
+            return
         try:
             written = SiteModelStore.merge_from_ledger(
                 self.ledger, success=success

@@ -51,6 +51,7 @@ Schema (one file per domain):
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -63,7 +64,9 @@ if TYPE_CHECKING:
     from .ledger import Ledger
 
 
-_BASE_DIR = Path("/tmp/superbrowser/site_models")
+# Cross-task store location. ``SUPERBROWSER_SITE_MODELS_DIR`` lets the eval
+# harness isolate it per experiment (paired arms must not seed each other).
+_BASE_DIR = Path(os.environ.get("SUPERBROWSER_SITE_MODELS_DIR") or "/tmp/superbrowser/site_models")
 _MAX_NOTES = 20
 _MAX_DEAD_TARGETS = 30
 

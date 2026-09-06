@@ -1179,11 +1179,20 @@ CRITICAL RULES:
         # accumulate under by_role["worker"]. Purely additive to the hook list.
         from superbrowser_bridge.usage import UsageHook
 
+        # Eval-only hooks (memory-pressure distractors) sit right after the
+        # memory hook; the list is empty unless an eval env var is set.
+        try:
+            from superbrowser_bridge.memory.eval_instrumentation import eval_worker_hooks
+
+            _eval_hooks = eval_worker_hooks(worker_memory)
+        except Exception:  # noqa: BLE001 - instrumentation must never break a run
+            _eval_hooks = []
+
         try:
             result = await worker.run(
                 prompt,
                 session_key=session_key,
-                hooks=[worker_memory_hook, worker_hook, UsageHook("worker")],
+                hooks=[worker_memory_hook, *_eval_hooks, worker_hook, UsageHook("worker")],
             )
             content = result.content
 

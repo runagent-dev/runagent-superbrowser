@@ -548,12 +548,36 @@ class Ledger:
 
     # ----- rendering -----
 
-    def render(self, role: Role = "orchestrator") -> str:
-        if role == "worker":
-            return self.slice_for_worker(self.subgoal or None)
-        return self._render_full()
+    def render(
+        self,
+        role: Role = "orchestrator",
+        *,
+        max_facts: int = _RENDER_MAX_FACTS,
+        max_dead_ends: int = _RENDER_MAX_DEAD_ENDS,
+        max_checkpoints: int = _RENDER_MAX_CHECKPOINTS,
+        max_episodic: int = _RENDER_MAX_EPISODIC,
+    ) -> str:
+        """Render the ledger for ``role``.
 
-    def _render_full(self) -> str:
+        The section caps default to the module constants (byte-identical
+        output when omitted); the eval harness lowers them to fit an explicit
+        history budget, and ``max_dead_ends=0`` removes the DEAD_ENDS sections
+        entirely (dead-end memory ablation).
+        """
+        caps = dict(max_facts=max_facts, max_dead_ends=max_dead_ends,
+                    max_checkpoints=max_checkpoints, max_episodic=max_episodic)
+        if role == "worker":
+            return self.slice_for_worker(self.subgoal or None, **caps)
+        return self._render_full(**caps)
+
+    def _render_full(
+        self,
+        *,
+        max_facts: int = _RENDER_MAX_FACTS,
+        max_dead_ends: int = _RENDER_MAX_DEAD_ENDS,
+        max_checkpoints: int = _RENDER_MAX_CHECKPOINTS,
+        max_episodic: int = _RENDER_MAX_EPISODIC,
+    ) -> str:
         parts: list[str] = [_TRUST_LEDGER_INSTRUCTION]
 
         if self.goal:
@@ -579,7 +603,7 @@ class Ledger:
                     -(f.last_referenced_at or f.timestamp),
                 ),
             )
-            shown = sorted_facts[:_RENDER_MAX_FACTS]
+            shown = sorted_facts[:max_facts]
             for f in shown:
                 tag = f" [subgoal={f.subgoal}]" if f.subgoal else ""
                 cat = f" ({f.category})" if f.category and f.category != "observation" else ""
@@ -598,14 +622,14 @@ class Ledger:
                 if d.url and _normalize_url_for_match(d.url) == cur_key
             ]
             other = [d for d in self.dead_ends if d not in here]
-            if here:
+            if here and max_dead_ends > 0:
                 parts.append(f"DEAD_ENDS ON CURRENT URL ({self.current_url}):")
-                for d in here[-_RENDER_MAX_DEAD_ENDS:]:
+                for d in here[-max_dead_ends:]:
                     cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
                     parts.append(f"  - {d.description}{cause}")
-            if other:
+            if other and max_dead_ends > 0:
                 parts.append("DEAD_ENDS (other URLs):")
-                shown_dead = other[-_RENDER_MAX_DEAD_ENDS:]
+                shown_dead = other[-max_dead_ends:]
                 for d in shown_dead:
                     cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
                     url_part = f" @{d.url}" if d.url else ""
@@ -614,7 +638,7 @@ class Ledger:
 
         if self.checkpoints:
             parts.append("CHECKPOINTS:")
-            shown_cp = self.checkpoints[-_RENDER_MAX_CHECKPOINTS:]
+            shown_cp = self.checkpoints[-max_checkpoints:]
             # Group by kind so "where did I log in?" reads at a glance.
             by_kind: dict[str, list[Checkpoint]] = {}
             for c in shown_cp:
@@ -633,13 +657,21 @@ class Ledger:
 
         if self.episodic:
             parts.append("EPISODIC:")
-            shown_ep = self.episodic[-_RENDER_MAX_EPISODIC:]
+            shown_ep = self.episodic[-max_episodic:]
             for e in shown_ep:
                 parts.append(f"  - {e}")
 
         return "\n".join(parts) if parts else "(empty ledger)"
 
-    def slice_for_worker(self, subgoal_id: str | None) -> str:
+    def slice_for_worker(
+        self,
+        subgoal_id: str | None,
+        *,
+        max_facts: int = _RENDER_MAX_FACTS,
+        max_dead_ends: int = _RENDER_MAX_DEAD_ENDS,
+        max_checkpoints: int = _RENDER_MAX_CHECKPOINTS,
+        max_episodic: int = _RENDER_MAX_EPISODIC,
+    ) -> str:
         """A focused view for the worker session.
 
         Includes only what the worker needs to execute the current
@@ -668,7 +700,7 @@ class Ledger:
             relevant_facts.sort(
                 key=lambda f: -(f.last_referenced_at or f.timestamp),
             )
-            for f in relevant_facts[: _RENDER_MAX_FACTS // 2]:
+            for f in relevant_facts[: max_facts // 2]:
                 cat = f" ({f.category})" if f.category and f.category != "observation" else ""
                 parts.append(f"  - {f.key} = {f.value}{cat}")
 
@@ -678,9 +710,9 @@ class Ledger:
             d for d in self.dead_ends
             if d.url and _normalize_url_for_match(d.url) == cur_key
         ]
-        if here:
+        if here and max_dead_ends > 0:
             parts.append(f"DEAD_ENDS ON CURRENT URL ({self.current_url}):")
-            for d in here[-_RENDER_MAX_DEAD_ENDS // 2 :]:
+            for d in here[-(max_dead_ends // 2 or 1):]:
                 cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
                 parts.append(f"  - {d.description}{cause}")
 
@@ -689,9 +721,9 @@ class Ledger:
             for d in self.dead_ends
             if (d.subgoal is None or d.subgoal == active_subgoal) and d not in here
         ]
-        if relevant_dead:
+        if relevant_dead and max_dead_ends > 0:
             parts.append("DEAD_ENDS:")
-            for d in relevant_dead[-_RENDER_MAX_DEAD_ENDS // 2 :]:
+            for d in relevant_dead[-(max_dead_ends // 2 or 1):]:
                 cause = f" [{d.cause}]" if d.cause and d.cause != "unknown" else ""
                 url_part = f" @{d.url}" if d.url else ""
                 parts.append(f"  - {d.description}{cause}{url_part}")

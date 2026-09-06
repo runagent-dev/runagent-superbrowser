@@ -2065,7 +2065,18 @@ class BrowserSessionState:
     # it onto mutating-tool replies. Short enough that the brain doesn't
     # click stale bboxes; long enough to cover a rapid click-scroll-click
     # sequence where no fresh vision has landed yet.
-    FRESH_VISION_SECONDS = 10.0
+    FRESH_VISION_SECONDS = 10.0  # default; see _fresh_vision_window()
+
+    @staticmethod
+    def _fresh_vision_window() -> float:
+        """Piggyback window in seconds — ``FRESH_VISION_SECONDS`` env (default
+        10.0); 0 under ``ABLATE_VISION_REUSE=1`` (eval: no perception reuse)."""
+        try:
+            from .ablations import fresh_vision_seconds
+
+            return fresh_vision_seconds(BrowserSessionState.FRESH_VISION_SECONDS)
+        except Exception:
+            return BrowserSessionState.FRESH_VISION_SECONDS
 
     def _fresh_vision_text(self, tool_url: str) -> str:
         """Return cached vision's brain_text when safe to attach, else "".
@@ -2081,7 +2092,8 @@ class BrowserSessionState:
         resp = self._last_vision_response
         if resp is None:
             return ""
-        if (time.time() - self._last_vision_ts) > self.FRESH_VISION_SECONDS:
+        window = self._fresh_vision_window()
+        if window <= 0 or (time.time() - self._last_vision_ts) > window:
             return ""
         # URL match — normalize to just scheme+host+path (ignore query
         # churn that doesn't meaningfully change the page).

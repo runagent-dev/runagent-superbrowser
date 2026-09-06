@@ -144,7 +144,9 @@ async def resolve_epoch_target(
             f"(only {n} bboxes in the last vision response)."
         )
     try:
-        max_age = int(os.environ.get("VISION_MAX_AGE_TURNS") or "1")
+        from ..ablations import vision_max_age_turns
+
+        max_age = vision_max_age_turns()
     except ValueError:
         max_age = 1
     if max_age > 0:
@@ -247,10 +249,9 @@ async def run_click_with_ladder(
         postcondition.get("kind") == "dom_mutated"
         and not getattr(state._last_action_queue, "actions", None)
     )
-    if (
-        is_silent_default
-        and os.environ.get("CLICK_LADDER_AUTO", "1") != "0"
-    ):
+    from ..ablations import click_ladder_auto_enabled
+
+    if is_silent_default and click_ladder_auto_enabled():
         for alt_strategy in ("js", "keyboard"):
             try:
                 if session_id.startswith("t3-"):

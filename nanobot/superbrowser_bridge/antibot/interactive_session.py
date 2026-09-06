@@ -2932,8 +2932,78 @@ class T3SessionManager:
                         }
                         return false;
                       };
-                      // Phase 1: bbox centre snap.
                       const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+                      // Research ablation (eval E6) — mirrors src/browser/page.ts:
+                      // 'center' = naive area snapper, 'dom_alt' = DOM-name-first.
+                      if (args.strategy === 'center' || args.strategy === 'dom_alt') {
+                        const overlapOf = (el) => {
+                          const r = el.getBoundingClientRect();
+                          const ix = Math.max(0, Math.min(r.right, b.x1) - Math.max(r.left, b.x0));
+                          const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
+                          return ix * iy;
+                        };
+                        const cands = new Set();
+                        for (let i = 1; i < 5; i++) {
+                          for (let j = 1; j < 5; j++) {
+                            const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
+                            const py = b.y0 + ((b.y1 - b.y0) * j) / 5;
+                            let st = [];
+                            try { st = document.elementsFromPoint(px, py); } catch (e) { st = []; }
+                            for (const el of st) {
+                              const hit = el.closest ? el.closest(SEL) : null;
+                              if (hit && overlapOf(hit) > 0) cands.add(hit);
+                            }
+                          }
+                        }
+                        let centreHit = null;
+                        try {
+                          for (const el of document.elementsFromPoint(cx, cy)) {
+                            if (el === document.documentElement || el === document.body) break;
+                            const hit = el.closest ? el.closest(SEL) : null;
+                            if (hit) { centreHit = hit; break; }
+                          }
+                        } catch (e) { centreHit = null; }
+                        const finish = (el, method, labelScore) => {
+                          if (!el) return null;
+                          const r = el.getBoundingClientRect();
+                          return {
+                            ok: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+                            tag: el.tagName.toLowerCase(), text: (el.textContent || '').slice(0, 40),
+                            snapped: true, labelScore: (labelScore === undefined ? 1 : labelScore),
+                            method: method, candidates: cands.size,
+                            isAutocompleteOption: isAutocompleteOptionEl(el),
+                          };
+                        };
+                        const largest = () => {
+                          let bestEl = null, bestA = 0;
+                          for (const el of cands) { const a = overlapOf(el); if (a > bestA) { bestA = a; bestEl = el; } }
+                          return bestEl;
+                        };
+                        if (args.strategy === 'center') {
+                          if (centreHit) return finish(centreHit, 'center_pinpoint');
+                          return finish(largest(), 'center_largest_area');
+                        }
+                        const norm = (t) => (t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const nameOf = (el) => norm((el.getAttribute && el.getAttribute('aria-label')) || (el.getAttribute && el.getAttribute('title')) || el.value || el.textContent || '');
+                        const want = norm(args.expectedLabel || '');
+                        if (want.length >= 2) {
+                          let bestEl = null, bestScore = 0, bestA = Infinity;
+                          for (const el of cands) {
+                            const n = nameOf(el);
+                            if (!n) continue;
+                            let score = 0;
+                            if (n === want) score = 3; else if (n.includes(want) || want.includes(n)) score = 2;
+                            if (score === 0) continue;
+                            const r = el.getBoundingClientRect();
+                            const a = r.width * r.height;
+                            if (score > bestScore || (score === bestScore && a < bestA)) { bestScore = score; bestA = a; bestEl = el; }
+                          }
+                          if (bestEl) return finish(bestEl, 'dom_alt_name_match', bestScore === 3 ? 1.0 : 0.7);
+                        }
+                        if (centreHit) return finish(centreHit, 'dom_alt_pinpoint');
+                        return finish(largest(), 'dom_alt_largest_area');
+                      }
+                      // Phase 1: bbox centre snap.
                       const centreEl = document.elementFromPoint(cx, cy);
                       if (centreEl) {
                         const interactive = centreEl.closest ? centreEl.closest(SEL) : null;
@@ -3026,6 +3096,7 @@ class T3SessionManager:
                             "y1": float(bbox.get("y1", y)),
                         },
                         "expectedLabel": _exp_label,
+                        "strategy": (os.environ.get("SUPERBROWSER_SNAP_STRATEGY") or "chevron").lower(),
                     },
                 )
                 if isinstance(snap_info, dict):

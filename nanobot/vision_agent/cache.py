@@ -39,6 +39,19 @@ class _Entry:
     stored_at: float
 
 
+def _cache_ttl_s() -> float:
+    """TTL for cached vision responses. ``VISION_CACHE_TTL_SEC`` (default 60);
+    ``ABLATE_VISION_REUSE=1`` (eval "no perception reuse" arm) forces 0 so
+    every lookup misses. Kept local: vision_agent must not import the bridge."""
+    if os.environ.get("ABLATE_VISION_REUSE", "").lower() in ("1", "true", "yes", "on"):
+        return 0.0
+    raw = os.environ.get("VISION_CACHE_TTL_SEC")
+    try:
+        return float(raw) if raw not in (None, "") else 60.0
+    except ValueError:
+        return 60.0
+
+
 class VisionCache:
     def __init__(self, *, max_size: int = 200, ttl_s: float = 60.0) -> None:
         # TTL default dropped from 300s → 60s: a 5-minute cache made
@@ -56,9 +69,10 @@ class VisionCache:
 
     @classmethod
     def from_env(cls) -> "VisionCache":
+        # see module-level _cache_ttl_s: honours ABLATE_VISION_REUSE (eval E5)
         return cls(
             max_size=int(os.environ.get("VISION_CACHE_SIZE") or "200"),
-            ttl_s=float(os.environ.get("VISION_CACHE_TTL_SEC") or "60"),
+            ttl_s=_cache_ttl_s(),
         )
 
     async def bust(self, key: CacheKey) -> None:

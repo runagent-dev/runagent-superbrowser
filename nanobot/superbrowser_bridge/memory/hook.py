@@ -687,6 +687,9 @@ class MemoryHook(AgentHook):
         "_last_autocompact_hash",
         "_bot",
         "_ctx_dump",
+        "_policy",
+        "_policy_impl",
+        "_dead_end_seen",
     )
 
     def __init__(
@@ -700,9 +703,18 @@ class MemoryHook(AgentHook):
         keep_last_thinking: int = _DEFAULT_KEEP_LAST_THINKING,
         gut_threshold: int = _DEFAULT_GUT_THRESHOLD,
         keep_recent_turns: int = _DEFAULT_KEEP_RECENT_TURNS,
+        policy: Any | None = None,
     ) -> None:
         super().__init__()
         self.memory = memory
+        # Retention policy (eval E2). ``ledger`` (the default) keeps the
+        # code path below untouched; the other policies short-circuit
+        # before_iteration through ``policy.py``.
+        from .policy import MemoryPolicyConfig, build_policy
+
+        self._policy = policy if policy is not None else MemoryPolicyConfig()
+        self._policy_impl = build_policy(self._policy)
+        self._dead_end_seen: set[str] = set()
         self.keep_last_screenshots = keep_last_screenshots
         self.keep_last_failures = keep_last_failures
         self.keep_last_element_lists = keep_last_element_lists
@@ -788,6 +800,15 @@ class MemoryHook(AgentHook):
     async def before_iteration(self, context: AgentHookContext) -> None:
         # Eval-only: size of the live context BEFORE any pass ran.
         _est_before = self._ctx_dump.estimate(context.messages) if self._ctx_dump is not None else None
+        # Matched memory policies (eval E2): anything but ``ledger`` bypasses
+        # the six-phase loop below entirely.
+        if self._policy_impl is not None:
+            try:
+                await self._policy_impl.apply(self, context)
+            except Exception as exc:  # noqa: BLE001 - a policy bug must not kill the run
+                logger.debug("MemoryHook policy {} failed: {}", self._policy.name, exc)
+            self._finish_iteration_instrumentation(context, _est_before, policy=self._policy.name)
+            return
         # Ablation toggles (default off → full eviction + structured ledger).
         # Set by the eval ablation harness (eval/run_ablations.py) to isolate a
         # single mechanism for Table 1; production runs never set these.
@@ -991,7 +1012,7 @@ class MemoryHook(AgentHook):
         # back-patch and failure-collapse so the ledger reflects the
         # latest dead-end additions on the same turn.
         try:
-            ledger_text = "" if _ablate_ledger else self.memory.render_for_llm()
+            ledger_text = "" if _ablate_ledger else self._render_ledger_text()
             ok = (not _ablate_ledger) and _refresh_ledger_in_system_message(
                 context.messages, ledger_text
             )
@@ -1007,6 +1028,24 @@ class MemoryHook(AgentHook):
         except Exception as exc:
             logger.debug("MemoryHook ledger-injection failed: {}", exc)
         self._finish_iteration_instrumentation(context, _est_before, policy="ledger")
+
+    def _render_ledger_text(self) -> str:
+        """Rendered ledger block; capped to the history budget only when the
+        eval harness sets SUPERBROWSER_MEMORY_BUDGET_TOKENS (default: unchanged)."""
+        text = self.memory.render_for_llm()
+        if self._policy.budget_tokens is None:
+            return text
+        from .policy import cap_ledger_render
+
+        capped, caps = cap_ledger_render(self.memory, text, self._policy.budget_tokens)
+        if caps is not None:
+            try:
+                self.memory.events.log("ledger_capped", {"role": self.memory.role,
+                                                         "budget_tokens": self._policy.budget_tokens,
+                                                         "caps": caps, "chars": len(capped)})
+            except Exception:
+                pass
+        return capped
 
     def _finish_iteration_instrumentation(
         self, context: AgentHookContext, est_before: dict[str, Any] | None, *, policy: str,
