@@ -132,11 +132,13 @@ def classify_failure(*, success: bool | None, stop_reason: str | None, final_ans
         return "api_error"
     if stop_reason == "timeout":
         return "timeout"
-    if tags.get("captcha_unsolved") or tags.get("human_handoff_timeout"):
+    low = text.lower()
+    if tags.get("captcha_unsolved") or tags.get("human_handoff_timeout") or "captcha_unsolved" in low or "human_handoff_timeout" in low:
         return "captcha_unsolved"
     if _GEO_RE.search(text):
         return "geo_blocked"
-    if tags.get("network_blocked") or tags.get("cf_interstitial") or "bot" in text.lower()[:400]:
+    if (tags.get("network_blocked") or tags.get("cf_interstitial") or "network_blocked" in low
+            or "cf_interstitial" in low or "bot" in low[:400]):
         return "bot_block"
     if _SITE_DOWN_RE.search(text):
         return "site_unavailable"
