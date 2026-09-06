@@ -397,3 +397,44 @@ def lookup_postcondition(
     if os.environ.get("VERIFY_DEFAULT", "1") != "0":
         return {"kind": "dom_mutated"}
     return None
+
+
+def trace_click_outcome(state: Any, *, tool: str, target: str, data: dict | None,
+                        verify_note: str, vision_index: int | None = None,
+                        label: str | None = None) -> None:
+    """Research trace of one landed click (no-op unless SUPERBROWSER_TRACE_CLICKS=1).
+
+    Combines the server's snap/effect envelope with the escalation outcome so
+    first-path / recovery success can be computed without parsing prose.
+    """
+    try:
+        from ..tracing import click_trace_enabled, trace_click
+
+        if not click_trace_enabled():
+            return
+        data = data or {}
+        snap = data.get("snap") if isinstance(data.get("snap"), dict) else {}
+        effect = data.get("effect") if isinstance(data.get("effect"), dict) else {}
+        note = verify_note or ""
+        strategy = "primary"
+        if "[click_escalated strategy=" in note:
+            strategy = note.split("[click_escalated strategy=", 1)[1].split("]", 1)[0].strip()
+        trace_click(
+            state,
+            tool=tool, target=target, vision_index=vision_index, label=label,
+            ok=bool(data.get("success", True)) and not data.get("error"),
+            error=data.get("error"),
+            snapped=snap.get("snapped"), method=snap.get("method"),
+            label_score=snap.get("label_score"), chevron_score=snap.get("chevron_score"),
+            candidates=snap.get("candidates"), label_mismatch=bool(snap.get("labelMismatch")),
+            snap_target=(snap.get("target") or "")[:120] if isinstance(snap.get("target"), str) else None,
+            warning=snap.get("warning"), tried=data.get("tried"),
+            strategy=strategy,
+            escalated="[click_escalated" in note,
+            silent="[click_silent" in note,
+            verify_miss="[VERIFY_MISS" in note,
+            url_changed=bool(effect.get("url_changed")),
+            mutation_delta=effect.get("mutation_delta"),
+        )
+    except Exception:
+        pass

@@ -34,6 +34,7 @@ from ._click_core import (
     lookup_postcondition,
     maybe_scroll_bbox_into_view,
     run_click_with_ladder,
+    trace_click_outcome,
 )
 
 
@@ -485,6 +486,8 @@ class BrowserClickTool(Tool):
                 alt_bbox=None,
                 postcondition=postcond,
             )
+        trace_click_outcome(self.s, tool="browser_click", target=f"[{index}]", data=data,
+                            verify_note=verify_note)
         # Mirror of the no-effect / label-mismatch surfacing in
         # browser_click_at — DOM-index clicks share the same silent-miss
         # failure mode (label_mismatch=True / snapped=False / no DOM
@@ -1291,6 +1294,9 @@ class BrowserClickAtTool(Tool):
             alt_bbox=alt_bbox,
             postcondition=postcond,
         )
+        trace_click_outcome(self.s, tool="browser_click_at", target=log_target, data=data,
+                            verify_note=verify_note, vision_index=vision_index,
+                            label=(payload.get("expected_label") if isinstance(payload, dict) else None))
 
         # Surface silent click failures to the brain. Without this, the
         # TS-side label_mismatch / snapped=False / mutation_delta=0

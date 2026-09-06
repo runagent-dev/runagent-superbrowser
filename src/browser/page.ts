@@ -1014,6 +1014,18 @@ export class PageWrapper {
      *  dispatches (hint-only policy) — value-set via dispatchClick
      *  transfers focus, which the brain may need for Tab navigation. */
     native_select?: boolean;
+    /** Research instrumentation (additive): which resolver phase produced
+     *  the click point — 'pinpoint' (Phase 1 centre hit), 'grid_scan'
+     *  (Phase 2 best composite candidate), 'grid_scan_low_confidence'
+     *  (Phase 2 winner failed the label match), 'fallback' (raw bbox
+     *  centre, nothing interactive found). */
+    method?: string;
+    /** Phase 2 winner's label score (1.0 exact … 0.05 mismatch). */
+    label_score?: number;
+    /** Phase 2 winner's chevron score (0 = not an expand control). */
+    chevron_score?: number;
+    /** Number of distinct interactive candidates Phase 2 considered. */
+    candidates?: number;
   }> {
     const expectedLabel = (options?.expectedLabel || '').trim();
     const snap = await this.page.evaluate(
@@ -1405,6 +1417,7 @@ export class PageWrapper {
             x: dispatchX,
             y: dispatchY,
             snapped: true,
+            method: 'pinpoint',
             target: describe(interactive),
             warning,
             targetXpath: xpathOf(interactive),
@@ -1560,6 +1573,8 @@ export class PageWrapper {
         let bestArea = 0;
         let bestComposite = 0;
         let bestLabelScore = 0;
+        let bestChevronScore = 0;
+        const seenCandidates = new Set<Element>();
         for (let i = 1; i < 5; i++) {
           for (let j = 1; j < 5; j++) {
             const px = b.x0 + ((b.x1 - b.x0) * i) / 5;
@@ -1574,6 +1589,7 @@ export class PageWrapper {
               const iy = Math.max(0, Math.min(r.bottom, b.y1) - Math.max(r.top, b.y0));
               const area = ix * iy;
               if (area <= 0) continue;
+              seenCandidates.add(hit);
               const cs = isRowBbox ? chevronScoreOf(hit) : 0;
               const ls = labelScoreOf(hit);
               // Composite scoring: area dominates, chevron only nudges
@@ -1592,6 +1608,7 @@ export class PageWrapper {
                 bestComposite = composite;
                 bestArea = area;
                 bestLabelScore = ls;
+                bestChevronScore = cs;
                 best = hit;
               }
             }
@@ -1614,6 +1631,10 @@ export class PageWrapper {
               x: Math.round(r.left + r.width / 2),
               y: Math.round(r.top + r.height / 2),
               snapped: false,
+              method: 'grid_scan_low_confidence',
+              label_score: bestLabelScore,
+              chevron_score: bestChevronScore,
+              candidates: seenCandidates.size,
               target: describe(best),
               targetXpath: xpathOf(best),
               labelMismatch: true,
@@ -1630,6 +1651,10 @@ export class PageWrapper {
             x: Math.round(r.left + r.width / 2),
             y: Math.round(r.top + r.height / 2),
             snapped: true,
+            method: 'grid_scan',
+            label_score: bestLabelScore,
+            chevron_score: bestChevronScore,
+            candidates: seenCandidates.size,
             target: describe(best),
             targetXpath: xpathOf(best),
             isAutocompleteOption: isAutocompleteOptionEl(best),
@@ -1641,7 +1666,7 @@ export class PageWrapper {
         // 3. Hard fallback: click the raw centre anyway. snapped=false
         //    so the UI crosshair shows amber — operator can see we had
         //    no visual confirmation.
-        return { x: cx, y: cy, snapped: false };
+        return { x: cx, y: cy, snapped: false, method: 'fallback', candidates: seenCandidates.size };
       },
       { b: bbox, expectedLabel },
     );
@@ -3182,6 +3207,7 @@ export class PageWrapper {
     warning?: string;
     iframe_chain?: string[];
     native_select?: boolean;
+    method?: string;
   }> {
     const cx = Math.round((bbox.x0 + bbox.x1) / 2);
     const cy = Math.round((bbox.y0 + bbox.y1) / 2);
@@ -3314,6 +3340,7 @@ export class PageWrapper {
       x: dispatchX,
       y: dispatchY,
       snapped: true,
+      method: `iframe_${snap.method || 'pinpoint'}`,
       target: snap.target,
       targetXpath: snap.targetXpath,
       warning: 'target_in_iframe_resolved',

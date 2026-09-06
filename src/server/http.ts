@@ -1019,6 +1019,7 @@ export function createHttpServer(
 
     const actionStart = Date.now();
     const effectBefore: EffectSnapshot = await captureEffect(page.getRawPage());
+    let legacyTried: string[] | undefined;
     try {
       const { index, x, y, bbox, button, clickCount, expected_fingerprint, expected_label, strategy } = req.body as {
         index?: number;
@@ -1513,6 +1514,9 @@ export function createHttpServer(
           });
           return;
         }
+        // Research instrumentation: which cascade tiers were attempted
+        // (['cdp'] | ['cdp','puppeteer'] | ['cdp','puppeteer','js']).
+        legacyTried = r.tried;
       } else {
         res.status(400).json({ error: 'index or x,y required' });
         return;
@@ -1525,6 +1529,7 @@ export function createHttpServer(
       const newState = await obs.page.getState({ useVision: false, includeConsole: true });
       res.json(withTabInfo(req.params.id, {
         success: true,
+        ...(legacyTried ? { tried: legacyTried } : {}),
         url: newState.url,
         title: newState.title,
         elements: newState.elementTree.clickableElementsToString(),

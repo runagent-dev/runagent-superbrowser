@@ -868,6 +868,17 @@ class BrowserSessionState:
         # Mirror into the ledger so render_for_llm and resumption see
         # the live URL without reaching back into BrowserSessionState.
         self._memory.update_current_url(url)
+        # Observability: url visits (with the running count) so revisit /
+        # regression rates can be computed exactly from events.jsonl
+        # instead of being reconstructed from step urls.
+        try:
+            self._memory.events.log(
+                "url_visit",
+                {"url": url, "visits": self.url_visit_counts[norm],
+                 "regression": self.is_regression(url), "action_count": self.action_count},
+            )
+        except Exception:  # pragma: no cover - logging is best effort
+            pass
 
     def record_checkpoint(self, url: str, title: str, action: str) -> None:
         """Record a progress checkpoint (successful meaningful step).
@@ -1153,6 +1164,8 @@ class BrowserSessionState:
             and not same_target
         ):
             prior = self.last_click_target or "(prior click)"
+            self._log_guard_event("same_element_blocked", target=click_target, dom_index=dom_index,
+                                  prior=prior)
             return (
                 f"[same_element_blocked dom_index={dom_index}] You "
                 f"already clicked this element via {prior} and the "
@@ -1177,6 +1190,8 @@ class BrowserSessionState:
             # the strike count cleanly.
             self.consecutive_dead_clicks = 0
             self.last_click_target = ""
+            self._log_guard_event("dead_click_blocked", target=click_target, dom_index=dom_index,
+                                  strikes=self.MAX_CONSECUTIVE_SAME_TARGET)
             return (
                 f"[dead_click_blocked] {click_target} has been clicked "
                 f"{self.MAX_CONSECUTIVE_SAME_TARGET} times in a row with "
@@ -1190,6 +1205,15 @@ class BrowserSessionState:
                 "are isTrusted=false and bot-detected."
             )
         return None
+
+    def _log_guard_event(self, kind: str, **fields: Any) -> None:
+        """Observability for the click guards (dead-click / same-element):
+        one events.jsonl record per refusal so revisit and loop rates can
+        be computed exactly. Best effort, never raises."""
+        try:
+            self._memory.events.log(kind, {"url": self.current_url, "action_count": self.action_count, **fields})
+        except Exception:  # pragma: no cover
+            pass
 
     def register_click_attempt(
         self,
@@ -1561,7 +1585,7 @@ class BrowserSessionState:
         print(f"  [activity log saved: {activity_path}]")
         return content
 
-    def save_screenshot(self, b64: str, label: str = "") -> str:
+    def save_screenshot(self, b64: str, label: str = "", *, source: str = "sync") -> str:
         self.step_counter += 1
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         fn = f"{self.step_counter:03d}-{label}.jpg" if label else f"{self.step_counter:03d}.jpg"
@@ -1569,6 +1593,23 @@ class BrowserSessionState:
         with open(path, "wb") as f:
             f.write(base64.b64decode(b64))
         print(f"  [screenshot saved: {path}]")
+        # Research trace: an ordered index next to the files so the eval
+        # harness (WebJudge, trace picker) can map screenshots to steps
+        # and URLs without parsing filenames. No-op unless enabled.
+        if os.environ.get("SUPERBROWSER_TRACE_SCREENSHOTS", "").lower() in ("1", "true", "yes", "on"):
+            try:
+                import json as _json
+                import time as _time
+
+                with open(os.path.join(SCREENSHOT_DIR, "index.jsonl"), "a", encoding="utf-8") as idx:
+                    idx.write(_json.dumps({
+                        "idx": self.step_counter, "ts": _time.time(), "file": fn, "source": source,
+                        "label": label, "url": self.current_url, "session_id": self.session_id,
+                        "action_count": getattr(self, "action_count", None),
+                        "vision_calls": self.vision_calls,
+                    }, ensure_ascii=False, default=str) + "\n")
+            except OSError:
+                pass
         return path
 
     async def build_tool_result_blocks(
@@ -1761,6 +1802,12 @@ class BrowserSessionState:
                 self._last_vision_url = effective_url or self.current_url or ""
                 self.vision_calls += 1
                 self.actions_since_screenshot = 0
+                try:  # research trace (no-op unless SUPERBROWSER_TRACE_VISION=1)
+                    from .tracing import trace_vision
+                    trace_vision(self, path="sync", url=effective_url, dom_hash=dh or self._last_dom_hash,
+                                 dom_text_hash=dth, resp=resp, intent=effective_intent)
+                except Exception:
+                    pass
                 # Freeze this response as the current epoch. The brain
                 # is about to see `as_brain_text()` output — subsequent
                 # V_n references MUST resolve to this snapshot, not to
@@ -1843,6 +1890,12 @@ class BrowserSessionState:
         """
         self.vision_calls += 1
         self.actions_since_screenshot = 0
+        try:  # research trace (no-op unless SUPERBROWSER_TRACE_VISION=1)
+            from .tracing import trace_vision
+            trace_vision(self, path="legacy_image", url=self.current_url, dom_hash=self._last_dom_hash,
+                         dom_text_hash=None, resp=None, intent=None)
+        except Exception:
+            pass
         label = caption.split("\n")[0][:30].replace(" ", "-").replace("/", "_")
 
         final_b64 = b64

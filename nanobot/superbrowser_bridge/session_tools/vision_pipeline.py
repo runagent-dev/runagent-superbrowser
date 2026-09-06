@@ -1780,6 +1780,20 @@ def _schedule_vision_prefetch(
             state._last_vision_url = (data.get("url", "") or state.current_url or "")
             state._last_dom_hash = dh or state._last_dom_hash
             state.vision_calls += 1
+            # Research trace: persist the prefetch screenshot too (default
+            # runs only save brain-facing screenshots). WebJudge scores one
+            # screenshot per action, so the eval harness turns this on.
+            if os.environ.get("SUPERBROWSER_TRACE_SCREENSHOTS", "").lower() in ("1", "true", "yes", "on"):
+                try:
+                    state.save_screenshot(b64, "prefetch", source="prefetch")
+                except Exception:
+                    pass
+            try:  # research trace (no-op unless SUPERBROWSER_TRACE_VISION=1)
+                from .tracing import trace_vision
+                trace_vision(state, path="prefetch", url=data.get("url", "") or state.current_url,
+                             dom_hash=dh, dom_text_hash=dth, resp=resp, intent=state._last_intent)
+            except Exception:
+                pass
             # Push the fresh bboxes to live viewers immediately —
             # without this, overlay only updates on the next
             # screenshot tool call, so the user sees bboxes lag by

@@ -686,6 +686,7 @@ class MemoryHook(AgentHook):
         "_last_seen_messages",
         "_last_autocompact_hash",
         "_bot",
+        "_ctx_dump",
     )
 
     def __init__(
@@ -722,6 +723,18 @@ class MemoryHook(AgentHook):
         # Bot reference for AutoCompact ingestion (reads session.metadata).
         # Set by Memory.attach via _bind_bot below.
         self._bot: Any | None = None
+        # Eval-only live-context recorder (SUPERBROWSER_EVAL_CONTEXT_DUMP=1);
+        # None in production, so the default path pays nothing.
+        self._ctx_dump: Any | None = None
+        try:
+            from .eval_instrumentation import ContextDumper, context_dump_enabled
+
+            if context_dump_enabled():
+                self._ctx_dump = ContextDumper(
+                    memory.events.path.parent, role=memory.role, bot_getter=lambda: self._bot,
+                )
+        except Exception:  # pragma: no cover - instrumentation must never break construction
+            self._ctx_dump = None
 
     def _bind_bot(self, bot: Any) -> None:
         """Called by Memory.attach so AutoCompact ingestion can find the session."""
@@ -773,6 +786,8 @@ class MemoryHook(AgentHook):
             logger.debug("autocompact ingestion failed: {}", exc)
 
     async def before_iteration(self, context: AgentHookContext) -> None:
+        # Eval-only: size of the live context BEFORE any pass ran.
+        _est_before = self._ctx_dump.estimate(context.messages) if self._ctx_dump is not None else None
         # Ablation toggles (default off → full eviction + structured ledger).
         # Set by the eval ablation harness (eval/run_ablations.py) to isolate a
         # single mechanism for Table 1; production runs never set these.
@@ -991,6 +1006,40 @@ class MemoryHook(AgentHook):
                 )
         except Exception as exc:
             logger.debug("MemoryHook ledger-injection failed: {}", exc)
+        self._finish_iteration_instrumentation(context, _est_before, policy="ledger")
+
+    def _finish_iteration_instrumentation(
+        self, context: AgentHookContext, est_before: dict[str, Any] | None, *, policy: str,
+    ) -> None:
+        """Eval-only tail: record what the policy left in the live context.
+
+        No-op unless SUPERBROWSER_EVAL_CONTEXT_DUMP=1. Writes one gzip'd
+        JSONL row (text-only messages) and a ``context_size`` event with the
+        estimated prompt tokens before/after the passes ran.
+        """
+        if self._ctx_dump is None:
+            return
+        try:
+            after = self._ctx_dump.estimate(context.messages)
+            self._ctx_dump.dump(
+                iteration=context.iteration, policy=policy, messages=context.messages,
+                before=est_before, after=after,
+            )
+            self.memory.events.log(
+                "context_size",
+                {
+                    "iter": context.iteration,
+                    "role": self.memory.role,
+                    "policy": policy,
+                    "n_messages": len(context.messages),
+                    "est_before": (est_before or {}).get("est_tokens"),
+                    "est_after": after.get("est_tokens"),
+                    "images_before": (est_before or {}).get("image_blocks"),
+                    "images_after": after.get("image_blocks"),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - never break the loop
+            logger.debug("MemoryHook context dump failed: {}", exc)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         # Phase 3: stash a reference to the message list so the worker

@@ -249,14 +249,17 @@ def harvest_memory_dirs(run_dir: Path, role_task_ids: list[str]) -> list[str]:
 
 
 def index_screenshots(run_dir: Path) -> int:
+    """Count screenshots; write a fallback index only if the bridge did not
+    (it writes ``index.jsonl`` itself when SUPERBROWSER_TRACE_SCREENSHOTS=1)."""
     d = run_dir / "screenshots"
     if not d.exists():
         return 0
     files = sorted(p for p in d.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
-    with (d / "index.jsonl").open("w", encoding="utf-8") as f:
-        for i, p in enumerate(files):
-            f.write(json.dumps({"idx": i, "file": p.name, "bytes": p.stat().st_size,
-                                "mtime": p.stat().st_mtime}) + "\n")
+    if not (d / "index.jsonl").exists():
+        with (d / "index.jsonl").open("w", encoding="utf-8") as f:
+            for i, p in enumerate(files):
+                f.write(json.dumps({"idx": i, "file": p.name, "bytes": p.stat().st_size,
+                                    "mtime": p.stat().st_mtime, "source": "unknown"}) + "\n")
     return len(files)
 
 

@@ -67,3 +67,23 @@ def test_count_tags_counts_escalations_per_occurrence():
     ]}]
     tags = count_tags(tr)
     assert tags["click_escalated"] == 1 and tags["no_effect"] == 1 and tags["dead_click_blocked"] == 1
+
+
+def test_harvest_uses_vision_and_click_traces_when_present(tmp_path):
+    vision = [
+        {"ts": 1, "path": "sync", "url": "u1", "dom_hash": "a", "dom_text_hash": "x", "cached": False, "ok": True},
+        {"ts": 2, "path": "prefetch", "url": "u1", "dom_hash": "a", "dom_text_hash": "x", "cached": True, "ok": True},
+        {"ts": 3, "path": "prefetch", "url": "u2", "dom_hash": "b", "dom_text_hash": "y", "cached": False, "ok": True},
+    ]
+    clicks = [{"ts": 1, "tool": "browser_click_at", "strategy": "primary", "escalated": False, "silent": False},
+              {"ts": 2, "tool": "browser_click_at", "strategy": "js", "escalated": True, "silent": False}]
+    run_dir = make_run_dir(tmp_path, task_id="t3", vision_calls=vision, clicks=clicks,
+                           judges={"webjudge": True}, extra_events=[
+                               {"ts": 5, "type": "context_size", "iter": 0, "role": "worker", "policy": "ledger",
+                                "est_before": 50000, "est_after": 42000},
+                               {"ts": 6, "type": "url_visit", "url": "u2", "visits": 2, "regression": True}])
+    rec = build_record(run_dir)
+    assert rec.counts["vision_calls"] == 3 and rec.counts["vision_calls_source"] == "vision_calls.jsonl"
+    assert rec.counts["vision_cache_hits"] == 1 and rec.counts["clicks_logged"] == 2
+    assert rec.artifacts["has_vision_trace"] and rec.artifacts["has_click_trace"]
+    assert rec.tokens["context_est_after_peak"] == 42000
