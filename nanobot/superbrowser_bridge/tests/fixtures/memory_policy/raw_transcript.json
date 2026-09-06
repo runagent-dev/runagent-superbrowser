@@ -1,0 +1,740 @@
+[
+ [
+  {
+   "role": "system",
+   "content": "You are the browser worker. SOUL text."
+  },
+  {
+   "role": "user",
+   "content": "Go to https://shop.example.com/ and find a red 2019 Corolla under $20,000."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "browser_screenshot",
+      "arguments": "{}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 1"
+    }
+   ],
+   "reasoning_content": "reason 1"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_1",
+   "name": "browser_screenshot",
+   "content": [
+    {
+     "type": "text",
+     "text": "[VISION intent=observe page_type=search_results cached=false model=vision dur=900ms]\n[V1] Search box [V2] Red filter [V3] Year ▼\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/ title=Page 0 step=1]\nElements: 12 interactive\n\nPage body text for step 1."
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_2",
+     "type": "function",
+     "function": {
+      "name": "browser_list_elements",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_2",
+   "name": "browser_list_elements",
+   "content": "[ELEMENTS 8 shown of 8]\n[0] <button> Option 0\n[1] <button> Option 1\n[2] <button> Option 2\n[3] <button> Option 3\n[4] <button> Option 4\n[5] <button> Option 5\n[6] <button> Option 6\n[7] <button> Option 7\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/ title=Page 0 step=2]\nElements: 12 interactive\n\nPage body text for step 2."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_3",
+     "type": "function",
+     "function": {
+      "name": "browser_click_at",
+      "arguments": "{\"vision_index\": 2, \"expected_label\": \"Red\"}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 3"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_3",
+   "name": "browser_click_at",
+   "content": "[click_at_failed:blocker_active layer=L0_banner] A blocker layer is on top of content.\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/ title=Page 0 step=3]\nElements: 12 interactive\n\nPage body text for step 3."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_4a",
+     "type": "function",
+     "function": {
+      "name": "browser_type_at",
+      "arguments": "{\"vision_index\": 1, \"text\": \"corolla\"}"
+     }
+    },
+    {
+     "id": "call_4b",
+     "type": "function",
+     "function": {
+      "name": "browser_keys",
+      "arguments": "{\"keys\": \"Enter\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_4a",
+   "name": "browser_type_at",
+   "content": "typed corolla"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_4b",
+   "name": "browser_keys",
+   "content": "pressed Enter\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/ title=Page 0 step=4]\nElements: 12 interactive\n\nPage body text for step 4."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "Reading results at step 5.",
+   "tool_calls": [
+    {
+     "id": "call_5",
+     "type": "function",
+     "function": {
+      "name": "browser_get_markdown",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_5",
+   "name": "browser_get_markdown",
+   "content": [
+    {
+     "type": "text",
+     "text": "# Results\n2019 Corolla red $18,500 — listing 42 (step 5)"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_6",
+     "type": "function",
+     "function": {
+      "name": "browser_scroll",
+      "arguments": "{\"direction\": \"down\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_6",
+   "name": "browser_scroll",
+   "content": "scrolled 600px\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla title=Page 1 step=6]\nElements: 12 interactive\n\nPage body text for step 6."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_7",
+     "type": "function",
+     "function": {
+      "name": "browser_screenshot",
+      "arguments": "{}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 7"
+    }
+   ],
+   "reasoning_content": "reason 7"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_7",
+   "name": "browser_screenshot",
+   "content": [
+    {
+     "type": "text",
+     "text": "[VISION intent=observe page_type=search_results cached=false model=vision dur=900ms]\n[V1] Search box [V2] Red filter [V3] Year ▼\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla title=Page 1 step=7]\nElements: 12 interactive\n\nPage body text for step 7."
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_8",
+     "type": "function",
+     "function": {
+      "name": "browser_list_elements",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_8",
+   "name": "browser_list_elements",
+   "content": "[ELEMENTS 8 shown of 8]\n[0] <button> Option 0\n[1] <button> Option 1\n[2] <button> Option 2\n[3] <button> Option 3\n[4] <button> Option 4\n[5] <button> Option 5\n[6] <button> Option 6\n[7] <button> Option 7\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla title=Page 1 step=8]\nElements: 12 interactive\n\nPage body text for step 8."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_9",
+     "type": "function",
+     "function": {
+      "name": "browser_click_at",
+      "arguments": "{\"vision_index\": 2, \"expected_label\": \"Red\"}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 9"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_9",
+   "name": "browser_click_at",
+   "content": "Clicked V2 snapped→(120,340) button.filter-red\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla title=Page 1 step=9]\nElements: 12 interactive\n\nPage body text for step 9."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_10a",
+     "type": "function",
+     "function": {
+      "name": "browser_type_at",
+      "arguments": "{\"vision_index\": 1, \"text\": \"corolla\"}"
+     }
+    },
+    {
+     "id": "call_10b",
+     "type": "function",
+     "function": {
+      "name": "browser_keys",
+      "arguments": "{\"keys\": \"Enter\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_10a",
+   "name": "browser_type_at",
+   "content": "typed corolla"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_10b",
+   "name": "browser_keys",
+   "content": "HTTP 403 Forbidden while loading results\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla title=Page 1 step=10]\nElements: 12 interactive\n\nPage body text for step 10."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "Reading results at step 11.",
+   "tool_calls": [
+    {
+     "id": "call_11",
+     "type": "function",
+     "function": {
+      "name": "browser_get_markdown",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_11",
+   "name": "browser_get_markdown",
+   "content": [
+    {
+     "type": "text",
+     "text": "# Results\n2019 Corolla red $18,500 — listing 42 (step 11)"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_12",
+     "type": "function",
+     "function": {
+      "name": "browser_scroll",
+      "arguments": "{\"direction\": \"down\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_12",
+   "name": "browser_scroll",
+   "content": "scrolled 600px\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla&color=red title=Page 2 step=12]\nElements: 12 interactive\n\nPage body text for step 12."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_13",
+     "type": "function",
+     "function": {
+      "name": "browser_screenshot",
+      "arguments": "{}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 13"
+    }
+   ],
+   "reasoning_content": "reason 13"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_13",
+   "name": "browser_screenshot",
+   "content": [
+    {
+     "type": "text",
+     "text": "[VISION intent=observe page_type=search_results cached=false model=vision dur=900ms]\n[V1] Search box [V2] Red filter [V3] Year ▼\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla&color=red title=Page 2 step=13]\nElements: 12 interactive\n\nPage body text for step 13."
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "content": "[GUIDANCE] mid-run operator note: stay on the same site."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_14",
+     "type": "function",
+     "function": {
+      "name": "browser_list_elements",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_14",
+   "name": "browser_list_elements",
+   "content": "[ELEMENTS 8 shown of 8]\n[0] <button> Option 0\n[1] <button> Option 1\n[2] <button> Option 2\n[3] <button> Option 3\n[4] <button> Option 4\n[5] <button> Option 5\n[6] <button> Option 6\n[7] <button> Option 7\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla&color=red title=Page 2 step=14]\nElements: 12 interactive\n\nPage body text for step 14."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_15",
+     "type": "function",
+     "function": {
+      "name": "browser_click_at",
+      "arguments": "{\"vision_index\": 2, \"expected_label\": \"Red\"}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 15"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_15",
+   "name": "browser_click_at",
+   "content": "[click_at_failed:blocker_active layer=L0_banner] A blocker layer is on top of content.\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla&color=red title=Page 2 step=15]\nElements: 12 interactive\n\nPage body text for step 15."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_16a",
+     "type": "function",
+     "function": {
+      "name": "browser_type_at",
+      "arguments": "{\"vision_index\": 1, \"text\": \"corolla\"}"
+     }
+    },
+    {
+     "id": "call_16b",
+     "type": "function",
+     "function": {
+      "name": "browser_keys",
+      "arguments": "{\"keys\": \"Enter\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_16a",
+   "name": "browser_type_at",
+   "content": "typed corolla"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_16b",
+   "name": "browser_keys",
+   "content": "pressed Enter\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/search?q=corolla&color=red title=Page 2 step=16]\nElements: 12 interactive\n\nPage body text for step 16."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "Reading results at step 17.",
+   "tool_calls": [
+    {
+     "id": "call_17",
+     "type": "function",
+     "function": {
+      "name": "browser_get_markdown",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_17",
+   "name": "browser_get_markdown",
+   "content": [
+    {
+     "type": "text",
+     "text": "# Results\n2019 Corolla red $18,500 — listing 42 (step 17)"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_18",
+     "type": "function",
+     "function": {
+      "name": "browser_scroll",
+      "arguments": "{\"direction\": \"down\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_18",
+   "name": "browser_scroll",
+   "content": "[VERIFY_MISS kind=dom_mutated reason=no_change]\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 3 step=18]\nElements: 12 interactive\n\nPage body text for step 18."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_19",
+     "type": "function",
+     "function": {
+      "name": "browser_screenshot",
+      "arguments": "{}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 19"
+    }
+   ],
+   "reasoning_content": "reason 19"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_19",
+   "name": "browser_screenshot",
+   "content": [
+    {
+     "type": "text",
+     "text": "[VISION intent=observe page_type=search_results cached=false model=vision dur=900ms]\n[V1] Search box [V2] Red filter [V3] Year ▼\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 3 step=19]\nElements: 12 interactive\n\nPage body text for step 19."
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_20",
+     "type": "function",
+     "function": {
+      "name": "browser_list_elements",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_20",
+   "name": "browser_list_elements",
+   "content": "[ELEMENTS 8 shown of 8]\n[0] <button> Option 0\n[1] <button> Option 1\n[2] <button> Option 2\n[3] <button> Option 3\n[4] <button> Option 4\n[5] <button> Option 5\n[6] <button> Option 6\n[7] <button> Option 7\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 3 step=20]\nElements: 12 interactive\n\nPage body text for step 20."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_21",
+     "type": "function",
+     "function": {
+      "name": "browser_click_at",
+      "arguments": "{\"vision_index\": 2, \"expected_label\": \"Red\"}"
+     }
+    }
+   ],
+   "thinking_blocks": [
+    {
+     "type": "thinking",
+     "thinking": "think 21"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_21",
+   "name": "browser_click_at",
+   "content": "Clicked V2 snapped→(120,340) button.filter-red\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 3 step=21]\nElements: 12 interactive\n\nPage body text for step 21."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_22a",
+     "type": "function",
+     "function": {
+      "name": "browser_type_at",
+      "arguments": "{\"vision_index\": 1, \"text\": \"corolla\"}"
+     }
+    },
+    {
+     "id": "call_22b",
+     "type": "function",
+     "function": {
+      "name": "browser_keys",
+      "arguments": "{\"keys\": \"Enter\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_22a",
+   "name": "browser_type_at",
+   "content": "typed corolla"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_22b",
+   "name": "browser_keys",
+   "content": "pressed Enter\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 3 step=22]\nElements: 12 interactive\n\nPage body text for step 22."
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "Reading results at step 23.",
+   "tool_calls": [
+    {
+     "id": "call_23",
+     "type": "function",
+     "function": {
+      "name": "browser_get_markdown",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_23",
+   "name": "browser_get_markdown",
+   "content": [
+    {
+     "type": "text",
+     "text": "# Results\n2019 Corolla red $18,500 — listing 42 (step 23)"
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+     }
+    }
+   ]
+  }
+ ],
+ [
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_24",
+     "type": "function",
+     "function": {
+      "name": "browser_scroll",
+      "arguments": "{\"direction\": \"down\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_24",
+   "name": "browser_scroll",
+   "content": "scrolled 600px\n[SESSION_STATE session_id=session-1 url=https://shop.example.com/listing/42 title=Page 4 step=24]\nElements: 12 interactive\n\nPage body text for step 24."
+  }
+ ]
+]
