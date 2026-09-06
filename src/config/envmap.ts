@@ -1,0 +1,86 @@
+/**
+ * Config-path → env-var projection table — marker-wrapped verbatim copy of
+ * nanobot/superbrowser_config/envmap.json. Edit BOTH files together;
+ * scripts/check_config_parity.sh fails CI when they drift.
+ *
+ * Group-skip semantics: a rule with multiple env keys fills ALL of them or
+ * NONE — if any key is already set in the environment the rule is skipped
+ * (a half-filled TOKEN/SUPERBROWSER_TOKEN pair would break bridge auth, and
+ * a desktop session's DISPLAY must never be repointed at Xvfb).
+ */
+
+export interface EnvRule {
+  path: string;
+  env: string[];
+  kind: 'str' | 'int' | 'boolWord' | 'boolFlag' | 'listComma' | 'chromeAuto';
+  secret?: boolean;
+}
+
+export const ENV_RULES: EnvRule[] =
+  // ENVMAP_JSON_START
+  [
+    { "path": "engine.port", "env": ["PORT"], "kind": "int" },
+    { "path": "engine.url", "env": ["SUPERBROWSER_URL"], "kind": "str" },
+    { "path": "engine.token", "env": ["TOKEN", "SUPERBROWSER_TOKEN"], "kind": "str", "secret": true },
+    { "path": "engine.headless", "env": ["HEADLESS"], "kind": "boolWord" },
+    { "path": "engine.downloadDir", "env": ["DOWNLOAD_DIR"], "kind": "str" },
+    { "path": "engine.chromePath", "env": ["PUPPETEER_EXECUTABLE_PATH"], "kind": "chromeAuto" },
+    { "path": "engine.concurrency.maxConcurrent", "env": ["CONCURRENT"], "kind": "int" },
+    { "path": "engine.concurrency.maxQueued", "env": ["QUEUED"], "kind": "int" },
+    { "path": "engine.concurrency.defaultTimeoutMs", "env": ["TIMEOUT"], "kind": "int" },
+    { "path": "engine.concurrency.maxSessions", "env": ["MAX_SESSIONS"], "kind": "int" },
+    { "path": "engine.concurrency.rateLimitPerMin", "env": ["RATE_LIMIT"], "kind": "int" },
+    { "path": "engine.concurrency.taskTimeoutMs", "env": ["TASK_TIMEOUT"], "kind": "int" },
+    { "path": "engine.cors.enabled", "env": ["CORS"], "kind": "boolWord" },
+    { "path": "engine.cors.allowOrigin", "env": ["CORS_ALLOW_ORIGIN"], "kind": "str" },
+    { "path": "engine.firewall.allow", "env": ["FIREWALL_ALLOW_LIST"], "kind": "listComma" },
+    { "path": "engine.firewall.deny", "env": ["FIREWALL_DENY_LIST"], "kind": "listComma" },
+    { "path": "brain.provider", "env": ["LLM_PROVIDER"], "kind": "str" },
+    { "path": "brain.model", "env": ["LLM_MODEL"], "kind": "str" },
+    { "path": "brain.apiKey", "env": ["LLM_API_KEY"], "kind": "str", "secret": true },
+    { "path": "brain.baseUrl", "env": ["LLM_BASE_URL"], "kind": "str" },
+    { "path": "vision.enabled", "env": ["VISION_ENABLED"], "kind": "boolFlag" },
+    { "path": "vision.provider", "env": ["VISION_PROVIDER"], "kind": "str" },
+    { "path": "vision.model", "env": ["VISION_MODEL"], "kind": "str" },
+    { "path": "vision.apiKey", "env": ["VISION_API_KEY"], "kind": "str", "secret": true },
+    { "path": "vision.baseUrl", "env": ["VISION_BASE_URL"], "kind": "str" },
+    { "path": "vision.cacheSize", "env": ["VISION_CACHE_SIZE"], "kind": "int" },
+    { "path": "vision.maxTokens", "env": ["VISION_MAX_TOKENS"], "kind": "int" },
+    { "path": "vision.maxBboxes", "env": ["VISION_MAX_BBOXES"], "kind": "int" },
+    { "path": "vision.timeoutMs", "env": ["VISION_TIMEOUT_MS"], "kind": "int" },
+    { "path": "vision.somOverlay", "env": ["VISION_SOM_OVERLAY"], "kind": "boolFlag" },
+    { "path": "vision.cacheTtlSec", "env": ["VISION_CACHE_TTL_SEC"], "kind": "int" },
+    { "path": "captcha.provider", "env": ["CAPTCHA_PROVIDER"], "kind": "str" },
+    { "path": "captcha.apiKey", "env": ["CAPTCHA_API_KEY"], "kind": "str", "secret": true },
+    { "path": "antibot.cookieJar", "env": ["SUPERBROWSER_COOKIE_JAR"], "kind": "boolFlag" },
+    { "path": "antibot.cookieJarPath", "env": ["SUPERBROWSER_COOKIE_JAR_PATH"], "kind": "str" },
+    { "path": "antibot.captchaPolicy", "env": ["SUPERBROWSER_CAPTCHA_POLICY"], "kind": "str" },
+    { "path": "antibot.maxHumanHandoffs", "env": ["SUPERBROWSER_MAX_HUMAN_HANDOFFS"], "kind": "int" },
+    { "path": "antibot.proxyPool", "env": ["PROXY_POOL"], "kind": "str", "secret": true },
+    { "path": "antibot.proxyPoolResidential", "env": ["PROXY_POOL_RESIDENTIAL"], "kind": "str", "secret": true },
+    { "path": "antibot.learningReads", "env": ["LEARNING_READS_ENABLED"], "kind": "boolFlag" },
+    { "path": "t3.chromePath", "env": ["CHROME_PATH"], "kind": "chromeAuto" },
+    { "path": "t3.chromeChannel", "env": ["CHROME_CHANNEL"], "kind": "str" },
+    { "path": "t3.persistProfile", "env": ["T3_PERSIST_PROFILE"], "kind": "boolFlag" },
+    { "path": "t3.profileRoot", "env": ["T3_PROFILE_ROOT"], "kind": "str" },
+    { "path": "t3.profileMaxMb", "env": ["T3_PROFILE_MAX_MB"], "kind": "int" },
+    { "path": "t3.headless", "env": ["T3_HEADLESS"], "kind": "boolFlag" },
+    { "path": "t3.autoXvfb", "env": ["T3_AUTO_XVFB"], "kind": "boolFlag" },
+    { "path": "t3.xvfbDisplay", "env": ["T3_XVFB_DISPLAY", "DISPLAY"], "kind": "str" },
+    { "path": "t3.viewerPort", "env": ["SUPERBROWSER_T3_VIEWER_PORT"], "kind": "int" },
+    { "path": "t3.disableHttp2", "env": ["T3_DISABLE_HTTP2"], "kind": "boolFlag" },
+    { "path": "t3.cfWaitS", "env": ["T3_CF_WAIT_S"], "kind": "int" },
+    { "path": "t3.cfSolverWaitS", "env": ["T3_CF_SOLVER_WAIT_S"], "kind": "int" },
+    { "path": "t3.uaProfile", "env": ["T3_UA_PROFILE"], "kind": "str" },
+    { "path": "publicHost", "env": ["SUPERBROWSER_PUBLIC_HOST", "PUBLIC_BASE_URL"], "kind": "str" },
+    { "path": "handoff.webhookUrl", "env": ["HANDOFF_WEBHOOK_URL"], "kind": "str" },
+    { "path": "handoff.timeoutMs", "env": ["SUPERBROWSER_HANDOFF_TIMEOUT_MS"], "kind": "int" },
+    { "path": "handoff.askTimeoutMs", "env": ["SUPERBROWSER_ASK_TIMEOUT_MS"], "kind": "int" },
+    { "path": "handoff.loginTimeoutMs", "env": ["SUPERBROWSER_LOGIN_HANDOFF_TIMEOUT_MS"], "kind": "int" },
+    { "path": "identities.enabled", "env": ["SUPERBROWSER_IDENTITY_JAR"], "kind": "boolFlag" },
+    { "path": "identities.autosave", "env": ["SUPERBROWSER_IDENTITY_AUTOSAVE"], "kind": "boolFlag" },
+    { "path": "identities.ttlDays", "env": ["SUPERBROWSER_IDENTITY_TTL_DAYS"], "kind": "int" },
+    { "path": "identities.encryptionKey", "env": ["SUPERBROWSER_IDENTITY_KEY"], "kind": "str", "secret": true }
+  ]
+  // ENVMAP_JSON_END
+  ;

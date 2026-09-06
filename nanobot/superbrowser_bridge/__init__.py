@@ -30,4 +30,15 @@ except ImportError:
     # python-dotenv not installed — fine, env must be set in the shell.
     pass
 
+# Product config (~/.superbrowser/config.json) projects into env AFTER dotenv
+# and fills only still-unset keys — shell env and .env keep precedence. Covers
+# entry paths that import the bridge without constructing SuperBrowser
+# (`nanobot run`, MCP, superbrowser-agent). Fail-open by design.
+try:
+    from superbrowser_config import apply_to_env as _sb_apply_config
+
+    _sb_apply_config()
+except Exception:  # noqa: BLE001 - config projection must never break imports
+    pass
+
 del _os, _Path

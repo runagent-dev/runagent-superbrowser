@@ -5,6 +5,9 @@
  */
 
 import 'dotenv/config';
+// Must stay directly after dotenv: projects ~/.superbrowser/config.json into
+// still-unset env vars (no-op when the file doesn't exist).
+import './config/apply.js';
 import { BrowserEngine } from './browser/engine.js';
 import { LLMProvider } from './llm/provider.js';
 import { createServer } from 'http';
