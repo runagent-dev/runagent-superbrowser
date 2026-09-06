@@ -58,9 +58,13 @@ class RunSpec:
     def run_id(self) -> str:
         return make_run_id(self.experiment, self.arm.name, self.task.task_id, self.seed)
 
+    server_url: str | None = None
+
     def env(self) -> dict[str, str]:
         env = dict(self.protocol.env())
         env.update(self.arm.env)
+        if self.server_url:
+            env["SUPERBROWSER_URL"] = self.server_url
         env.update({
             "SUPERBROWSER_EVAL_CAPTURE_DIR": str(self.run_dir / "workers"),
             "SUPERBROWSER_SCREENSHOT_DIR": str(self.run_dir / "screenshots"),
@@ -160,7 +164,7 @@ async def finish_run(spec: RunSpec, *, judges: Sequence[str], no_judge: bool) ->
 
 def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: dict[str, str] | None,
             resume: bool, no_judge: bool, judges: Sequence[str], dry_run: bool,
-            log_dir: Path) -> list[RunResultSummary]:
+            log_dir: Path, server_port: int | None = None) -> list[RunResultSummary]:
     out: list[RunResultSummary] = []
     if dry_run:
         for i, s in enumerate(specs, 1):
@@ -174,15 +178,15 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
               f"pins: {specs[0].protocol.env() if specs else {}}")
         return out
     log_dir.mkdir(parents=True, exist_ok=True)
-    servers = ServerManager(manage=manage_server, log_dir=log_dir, assumed_env=assumed_server_env)
+    servers = ServerManager(manage=manage_server, log_dir=log_dir, assumed_env=assumed_server_env, port=server_port)
     try:
         for i, s in enumerate(specs, 1):
             if resume and (s.run_dir / "run_record.json").exists():
                 rec = RunRecord.read(s.run_dir)
                 out.append(RunResultSummary(s.run_id, "skipped", rec.success, rec.timing.get("wall_s"), "resume"))
                 continue
-            servers.ensure(s.arm.ts_env)
-            print(f"\n=== [{i}/{len(specs)}] {s.run_id} ===")
+            s.server_url = servers.ensure(s.arm.ts_env)
+            print(f"\n=== [{i}/{len(specs)}] {s.run_id} ===  server={s.server_url}")
             t0 = time.time()
             rc, note = launch_run(s, log_to=s.run_dir / "run.log")
             if rc is None:
@@ -220,7 +224,9 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--judges", default=",".join(JUDGE_NAMES))
     ap.add_argument("--no-judge", action="store_true")
-    ap.add_argument("--manage-server", action="store_true", help="let the harness restart the TS server per arm env")
+    ap.add_argument("--manage-server", action="store_true",
+                    help="let the harness run its OWN TS server (free port unless --server-port) and restart it per arm env")
+    ap.add_argument("--server-port", type=int, default=None, help="port for the harness-managed server")
     ap.add_argument("--assume-server-env", default="", help="k=v,k=v the running server was started with")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -246,7 +252,7 @@ def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[A
           f"model={model} out={args.out} protocol={protocol.hash()}")
     results = execute(specs, manage_server=args.manage_server, assumed_server_env=assumed, resume=args.resume,
                       no_judge=args.no_judge, judges=judges, dry_run=args.dry_run,
-                      log_dir=Path(args.out) / experiment / "_logs")
+                      log_dir=Path(args.out) / experiment / "_logs", server_port=args.server_port)
     if not args.dry_run:
         print("\n" + summarize(results))
         print(f"results: {results_path(Path(args.out), experiment)}")

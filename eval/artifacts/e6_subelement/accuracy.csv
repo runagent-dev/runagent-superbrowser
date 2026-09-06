@@ -1,0 +1,67 @@
+condition,strategy,family,n,k,accuracy,wilson_low,wilson_high
+exact,center,ALL control,4,4,1,0.510109,1
+exact,center,ALL non-control,31,31,1,0.889745,1
+exact,center,datepicker_arrow,5,5,1,0.565518,1
+exact,center,disclosure_triangle,5,5,1,0.565518,1
+exact,center,label_chevron,5,5,1,0.565518,1
+exact,center,label_chevron (control),1,1,1,0.206549,1
+exact,center,nested_card_action,5,5,1,0.565518,1
+exact,center,nested_card_action (control),1,1,1,0.206549,1
+exact,center,row_checkbox,6,6,1,0.609666,1
+exact,center,split_button,5,5,1,0.565518,1
+exact,center,split_button (control),2,2,1,0.34238,1
+exact,chevron,ALL control,4,4,1,0.510109,1
+exact,chevron,ALL non-control,31,31,1,0.889745,1
+exact,chevron,datepicker_arrow,5,5,1,0.565518,1
+exact,chevron,disclosure_triangle,5,5,1,0.565518,1
+exact,chevron,label_chevron,5,5,1,0.565518,1
+exact,chevron,label_chevron (control),1,1,1,0.206549,1
+exact,chevron,nested_card_action,5,5,1,0.565518,1
+exact,chevron,nested_card_action (control),1,1,1,0.206549,1
+exact,chevron,row_checkbox,6,6,1,0.609666,1
+exact,chevron,split_button,5,5,1,0.565518,1
+exact,chevron,split_button (control),2,2,1,0.34238,1
+exact,dom_alt,ALL control,4,4,1,0.510109,1
+exact,dom_alt,ALL non-control,31,31,1,0.889745,1
+exact,dom_alt,datepicker_arrow,5,5,1,0.565518,1
+exact,dom_alt,disclosure_triangle,5,5,1,0.565518,1
+exact,dom_alt,label_chevron,5,5,1,0.565518,1
+exact,dom_alt,label_chevron (control),1,1,1,0.206549,1
+exact,dom_alt,nested_card_action,5,5,1,0.565518,1
+exact,dom_alt,nested_card_action (control),1,1,1,0.206549,1
+exact,dom_alt,row_checkbox,6,6,1,0.609666,1
+exact,dom_alt,split_button,5,5,1,0.565518,1
+exact,dom_alt,split_button (control),2,2,1,0.34238,1
+merged_row,center,ALL control,4,4,1,0.510109,1
+merged_row,center,ALL non-control,31,21,0.677419,0.50141,0.814306
+merged_row,center,datepicker_arrow,5,0,0,0,0.434482
+merged_row,center,disclosure_triangle,5,5,1,0.565518,1
+merged_row,center,label_chevron,5,5,1,0.565518,1
+merged_row,center,label_chevron (control),1,1,1,0.206549,1
+merged_row,center,nested_card_action,5,5,1,0.565518,1
+merged_row,center,nested_card_action (control),1,1,1,0.206549,1
+merged_row,center,row_checkbox,6,6,1,0.609666,1
+merged_row,center,split_button,5,0,0,0,0.434482
+merged_row,center,split_button (control),2,2,1,0.34238,1
+merged_row,chevron,ALL control,4,4,1,0.510109,1
+merged_row,chevron,ALL non-control,31,20,0.645161,0.46948,0.788833
+merged_row,chevron,datepicker_arrow,5,0,0,0,0.434482
+merged_row,chevron,disclosure_triangle,5,5,1,0.565518,1
+merged_row,chevron,label_chevron,5,5,1,0.565518,1
+merged_row,chevron,label_chevron (control),1,1,1,0.206549,1
+merged_row,chevron,nested_card_action,5,5,1,0.565518,1
+merged_row,chevron,nested_card_action (control),1,1,1,0.206549,1
+merged_row,chevron,row_checkbox,6,5,0.833333,0.436497,0.969947
+merged_row,chevron,split_button,5,0,0,0,0.434482
+merged_row,chevron,split_button (control),2,2,1,0.34238,1
+merged_row,dom_alt,ALL control,4,4,1,0.510109,1
+merged_row,dom_alt,ALL non-control,31,21,0.677419,0.50141,0.814306
+merged_row,dom_alt,datepicker_arrow,5,0,0,0,0.434482
+merged_row,dom_alt,disclosure_triangle,5,5,1,0.565518,1
+merged_row,dom_alt,label_chevron,5,5,1,0.565518,1
+merged_row,dom_alt,label_chevron (control),1,1,1,0.206549,1
+merged_row,dom_alt,nested_card_action,5,5,1,0.565518,1
+merged_row,dom_alt,nested_card_action (control),1,1,1,0.206549,1
+merged_row,dom_alt,row_checkbox,6,6,1,0.609666,1
+merged_row,dom_alt,split_button,5,0,0,0,0.434482
+merged_row,dom_alt,split_button (control),2,2,1,0.34238,1

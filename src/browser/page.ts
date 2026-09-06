@@ -1140,13 +1140,29 @@ export class PageWrapper {
             }
           }
           let centreHit: Element | null = null;
+          let centreContainer: Element | null = null;
           try {
             for (const el of document.elementsFromPoint(cx, cy)) {
               if (el === document.documentElement || el === document.body) break;
+              if (!centreContainer) centreContainer = el as Element;
               const hit = (el as Element).closest(SEL);
               if (hit) { centreHit = hit; break; }
             }
           } catch { centreHit = null; }
+          // Same DOM awareness the production snapper has: interactive
+          // DESCENDANTS of the element under the centre that overlap the
+          // bbox are candidates too (a 16-point grid misses a small control
+          // at the row's edge). Without this the alternatives would be
+          // strawmen rather than reasonable baselines.
+          if (centreContainer && !centreHit) {
+            let scope: Element | null = centreContainer;
+            for (let depth = 0; scope && depth < 3; depth += 1) {
+              const found = Array.from(scope.querySelectorAll(SEL)).slice(0, 60)
+                .filter((el) => overlapOf(el) > 0);
+              if (found.length) { for (const el of found) cands.add(el); break; }
+              scope = scope.parentElement;
+            }
+          }
           const finish = (el: Element | null, method: string, labelScore?: number) => {
             if (!el) {
               return {

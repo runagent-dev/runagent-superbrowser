@@ -1,0 +1,7 @@
+condition,arm_a,arm_b,n_pairs,both_success,a_only,b_only,both_fail,p_value,diff,diff_ci_low,diff_ci_high
+exact,center,chevron,35,35,0,0,0,1,0,0,0
+exact,center,dom_alt,35,35,0,0,0,1,0,0,0
+exact,chevron,dom_alt,35,35,0,0,0,1,0,0,0
+merged_row,center,chevron,35,24,1,0,10,1,0.0285714,0,0.0857143
+merged_row,center,dom_alt,35,25,0,0,10,1,0,0,0
+merged_row,chevron,dom_alt,35,24,0,1,10,1,-0.0285714,-0.0857143,0

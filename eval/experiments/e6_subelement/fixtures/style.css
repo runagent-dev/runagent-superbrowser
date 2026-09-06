@@ -1,0 +1,25 @@
+body { font-family: system-ui, sans-serif; margin: 24px; width: 1100px; }
+.row { display: flex; align-items: center; justify-content: space-between; border: 1px solid #ddd; padding: 10px 14px; margin: 8px 0; width: 520px; background: #fafafa; }
+.row .label { font-size: 16px; }
+.chev { width: 26px; height: 26px; border: 1px solid #999; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+.chev.tiny { width: 18px; height: 18px; font-size: 9px; }
+.card { border: 1px solid #ccc; border-radius: 8px; padding: 14px; width: 320px; margin: 10px 0; position: relative; }
+.card h3 { margin: 0 0 6px; font-size: 16px; }
+.card .meta { color: #666; font-size: 13px; }
+.card .act { position: absolute; right: 10px; top: 10px; width: 28px; height: 28px; border: 1px solid #888; background: #fff; border-radius: 14px; cursor: pointer; }
+.card .act.tiny { width: 20px; height: 20px; right: 8px; top: 8px; font-size: 10px; }
+.split { display: inline-flex; margin: 8px 0; }
+.split .main { padding: 10px 18px; border: 1px solid #555; background: #eef; }
+.split .caret { padding: 10px 8px; border: 1px solid #555; border-left: none; background: #eef; }
+.split .caret.tiny { padding: 10px 4px; font-size: 10px; }
+.cal { display: inline-flex; align-items: center; gap: 12px; border: 1px solid #aaa; padding: 8px 12px; margin: 8px 0; }
+.cal .month { font-weight: 600; min-width: 140px; text-align: center; }
+.cal .nav { width: 24px; height: 24px; border: 1px solid #777; background: #fff; }
+.cal .nav.tiny { width: 16px; height: 16px; font-size: 9px; }
+details { border: 1px solid #ccc; padding: 6px 10px; margin: 8px 0; width: 460px; }
+summary { cursor: pointer; }
+label.checkrow { display: flex; align-items: center; justify-content: space-between; width: 420px; border: 1px solid #ddd; padding: 10px 12px; margin: 8px 0; }
+.link-row { display: flex; align-items: center; justify-content: space-between; width: 520px; padding: 10px 14px; border: 1px solid #ddd; margin: 8px 0; }
+.link-row a { font-size: 16px; }
+.deco { color: #999; font-size: 12px; }
+.spacer { height: 30px; }

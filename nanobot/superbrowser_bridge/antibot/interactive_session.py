@@ -2955,14 +2955,23 @@ class T3SessionManager:
                             }
                           }
                         }
-                        let centreHit = null;
+                        let centreHit = null, centreContainer = null;
                         try {
                           for (const el of document.elementsFromPoint(cx, cy)) {
                             if (el === document.documentElement || el === document.body) break;
+                            if (!centreContainer) centreContainer = el;
                             const hit = el.closest ? el.closest(SEL) : null;
                             if (hit) { centreHit = hit; break; }
                           }
                         } catch (e) { centreHit = null; }
+                        if (centreContainer && !centreHit) {
+                          let scope = centreContainer;
+                          for (let depth = 0; scope && depth < 3; depth += 1) {
+                            const found = Array.from(scope.querySelectorAll(SEL)).slice(0, 60).filter((el) => overlapOf(el) > 0);
+                            if (found.length) { for (const el of found) cands.add(el); break; }
+                            scope = scope.parentElement;
+                          }
+                        }
                         const finish = (el, method, labelScore) => {
                           if (!el) return null;
                           const r = el.getBoundingClientRect();

@@ -99,8 +99,14 @@ export function validateUrl(url: string): { valid: boolean; error?: string } {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
 
-    // Block known internal hosts
-    if (BLOCKED_HOSTS.includes(host)) {
+    // Block known internal hosts. The research harness serves its offline
+    // fixture pages (eval/experiments/e6_subelement) from a loopback HTTP
+    // server; SUPERBROWSER_ALLOW_LOCAL_FIXTURES=1 lets a harness-started
+    // server reach loopback hosts ONLY (private ranges and metadata endpoints
+    // stay blocked). Never set it on a production server.
+    const allowLoopbackFixtures = process.env.SUPERBROWSER_ALLOW_LOCAL_FIXTURES === '1'
+      && (host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1');
+    if (BLOCKED_HOSTS.includes(host) && !allowLoopbackFixtures) {
       return { valid: false, error: 'Navigation to internal hosts is not allowed' };
     }
 
