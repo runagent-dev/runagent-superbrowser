@@ -4,9 +4,9 @@ You're looking at **two different "twos."** Both are intentional. This doc expla
 
 ```
 # for each model: set agents.defaults.model in ~/.nanobot/config.json, then
-python -m eval.run_eval --seeds 3
-# rescue (CN models): SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --label <m>_rescue
-python -m eval.analyzer && python -m eval.figures.make_figure && python -m eval.figures.make_appendix_traces
+python -m eval.experiments.modelsplit.run_eval --seeds 3
+# rescue (CN models): SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.experiments.modelsplit.run_eval --label <m>_rescue
+python -m eval.experiments.modelsplit.analyzer && python -m eval.experiments.modelsplit.figures.make_figure && python -m eval.experiments.modelsplit.figures.make_appendix_traces
 ```
 
 - **Two phases**: *collect* (`run_eval`, run once per model) → *aggregate* (`analyzer` + figures, run once at the very end).
@@ -18,15 +18,15 @@ python -m eval.analyzer && python -m eval.figures.make_figure && python -m eval.
 
 ```
 PHASE 1: COLLECT  (repeat per model — writes raw data to eval/runs/)
-   edit config.json → python -m eval.run_eval        ┐
-   edit config.json → python -m eval.run_eval        │  one invocation = ONE model,
-   edit config.json → python -m eval.run_eval        │  all tasks × all seeds
+   edit config.json → python -m eval.experiments.modelsplit.run_eval        ┐
+   edit config.json → python -m eval.experiments.modelsplit.run_eval        │  one invocation = ONE model,
+   edit config.json → python -m eval.experiments.modelsplit.run_eval        │  all tasks × all seeds
    ... (once per model; + rescue runs for CN models) ┘
 
 PHASE 2: AGGREGATE  (run ONCE, after every model is collected)
-   python -m eval.analyzer            → results/*.csv
-   python -m eval.figures.make_figure → paper figure + table
-   python -m eval.figures.make_appendix_traces → appendix traces
+   python -m eval.experiments.modelsplit.analyzer            → results/*.csv
+   python -m eval.experiments.modelsplit.figures.make_figure → paper figure + table
+   python -m eval.experiments.modelsplit.figures.make_appendix_traces → appendix traces
 ```
 
 Phase 1 is **data collection**. Phase 2 turns the collected data into the figure. You don't interleave
@@ -41,7 +41,7 @@ the process. There's no per-model flag — a single `run_eval` invocation tests 
 file *right now*. So you test models by hand-looping:
 
 1. Edit `~/.nanobot/config.json` → set the model.
-2. `python -m eval.run_eval --seeds 3` (runs **all** active tasks × 3 seeds for that one model).
+2. `python -m eval.experiments.modelsplit.run_eval --seeds 3` (runs **all** active tasks × 3 seeds for that one model).
 3. Repeat for the next model.
 
 Each invocation auto-labels its output by the active model, so runs never collide:
@@ -64,7 +64,7 @@ This is the other "two." For each **Chinese** model you run `run_eval` a **secon
 flag:
 
 ```bash
-SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --label kimi_rescue
+SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.experiments.modelsplit.run_eval --label kimi_rescue
 ```
 
 - `SUPERBROWSER_EVAL_SCHEMA_REMINDER=1` prepends a short paragraph to the Worker prompt that simply
@@ -95,9 +95,9 @@ chain**, which is exactly what `&&` expresses ("run the next only if the previou
 
 | Command | Reads | Writes |
 |---|---|---|
-| `python -m eval.analyzer` | `eval/runs/**` (all transcripts) | `eval/results/per_call.csv`, `per_model.csv` |
-| `python -m eval.figures.make_figure` | `eval/results/per_model.csv` | `paper/figures/fig_modelsplit.tex`, `fig_rescue.tex`, `paper/tables/tab_toolselection.tex` |
-| `python -m eval.figures.make_appendix_traces` | `eval/runs/**` | `paper/appendix/traces_modelsplit.tex` |
+| `python -m eval.experiments.modelsplit.analyzer` | `eval/runs/**` (all transcripts) | `eval/results/per_call.csv`, `per_model.csv` |
+| `python -m eval.experiments.modelsplit.figures.make_figure` | `eval/results/per_model.csv` | `paper/figures/fig_modelsplit.tex`, `fig_rescue.tex`, `paper/tables/tab_toolselection.tex` |
+| `python -m eval.experiments.modelsplit.figures.make_appendix_traces` | `eval/runs/**` | `paper/appendix/traces_modelsplit.tex` |
 
 `make_figure` **needs the CSV** that `analyzer` produces — hence it runs after. `&&` just means "stop if
 something fails" so you don't plot a stale CSV. You can also run them separately; the chain is only a
@@ -118,27 +118,27 @@ source venv/bin/activate
 # --- Phase 1: collect (edit config.json between each) ---
 # US models — base run only:
 #   set agents.defaults.model = "gpt-5.5"      then:
-python -m eval.run_eval --seeds 3
+python -m eval.experiments.modelsplit.run_eval --seeds 3
 #   set agents.defaults.model = "claude-opus-4-8"   then:
-python -m eval.run_eval --seeds 3
+python -m eval.experiments.modelsplit.run_eval --seeds 3
 #   set ... "gemini-3-pro" ...                 then:
-python -m eval.run_eval --seeds 3
+python -m eval.experiments.modelsplit.run_eval --seeds 3
 #   set ... "nemotron-3-super" ...             then:
-python -m eval.run_eval --seeds 3
+python -m eval.experiments.modelsplit.run_eval --seeds 3
 
 # CN models — base run AND rescue run each:
 #   set ... "moonshot/kimi-k2" ...             then:
-python -m eval.run_eval --seeds 3
-SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --seeds 3 --label kimi_rescue
+python -m eval.experiments.modelsplit.run_eval --seeds 3
+SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.experiments.modelsplit.run_eval --seeds 3 --label kimi_rescue
 #   set ... "qwen3-max" ...                    then:
-python -m eval.run_eval --seeds 3
-SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --seeds 3 --label qwen_rescue
+python -m eval.experiments.modelsplit.run_eval --seeds 3
+SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.experiments.modelsplit.run_eval --seeds 3 --label qwen_rescue
 #   set ... "z-ai/glm-5" ...                   then:
-python -m eval.run_eval --seeds 3
-SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --seeds 3 --label glm_rescue
+python -m eval.experiments.modelsplit.run_eval --seeds 3
+SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.experiments.modelsplit.run_eval --seeds 3 --label glm_rescue
 
 # --- Phase 2: aggregate (once) ---
-python -m eval.analyzer && python -m eval.figures.make_figure && python -m eval.figures.make_appendix_traces
+python -m eval.experiments.modelsplit.analyzer && python -m eval.experiments.modelsplit.figures.make_figure && python -m eval.experiments.modelsplit.figures.make_appendix_traces
 
 # --- build the paper ---
 cd ../paper && latexmk -pdf main.tex

@@ -21,13 +21,13 @@ Outcome classes (exhaustive, mutually exclusive):
 
 Metrics (schema_fidelity etc.) are defined in the README/plan; see _run_metrics.
 
-Usage:  python -m eval.analyzer [--runs eval/runs] [--out eval/results]
+Usage:  python -m eval.experiments.modelsplit.analyzer [--runs eval/runs] [--out eval/results]
 """
 from __future__ import annotations
 
-from . import _bootstrap  # noqa: F401
+from eval import _bootstrap  # noqa: F401
 from . import models as model_registry
-from ._bootstrap import REPO_ROOT
+from eval._bootstrap import REPO_ROOT
 
 import argparse
 import csv
@@ -349,7 +349,7 @@ def analyze(runs_dir: Path, out_dir: Path, task=None):
     runs = load_runs(runs_dir, task=task)
     if not runs:
         scope = f" for task={task!r}" if task and task != "all" else ""
-        print(f"[error] no runs found under {runs_dir}{scope}. Run `python -m eval.run_eval` first.")
+        print(f"[error] no runs found under {runs_dir}{scope}. Run `python -m eval.experiments.modelsplit.run_eval` first.")
         return
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -5,7 +5,7 @@ LLM / vision model / budgets fixed (paper: "same LLM, same vision model, same
 budgets"). Each config is one row of Table 1; success + tokens/iter are filled
 in by ``eval/figures/make_ablation_table.py`` afterwards.
 
-Each config is launched as a SUBPROCESS of ``python -m eval.run_eval`` with the
+Each config is launched as a SUBPROCESS of ``python -m eval.experiments.modelsplit.run_eval`` with the
 config's toggle env vars merged in, so:
   * module-level env reads in superbrowser_bridge see the value, and
   * configs are fully isolated from one another.
@@ -22,16 +22,16 @@ Two kinds of toggle:
     ``--manage-server`` to let it stop/start the server itself.
 
 Usage (from the repo root, venv active, TS server running in DEFAULT state):
-    python -m eval.run_ablations --tasks "petfinder_rabbits,bestbuy_qled_240hz_monitor" --seeds 2
-    python -m eval.run_ablations --list
-    python -m eval.run_ablations --only no_eviction --tasks ... --seeds 2
-    python -m eval.run_ablations --manage-server --tasks ... --seeds 2   # auto-manage server
-Then:  python -m eval.figures.make_ablation_table
+    python -m eval.experiments.modelsplit.run_ablations --tasks "petfinder_rabbits,bestbuy_qled_240hz_monitor" --seeds 2
+    python -m eval.experiments.modelsplit.run_ablations --list
+    python -m eval.experiments.modelsplit.run_ablations --only no_eviction --tasks ... --seeds 2
+    python -m eval.experiments.modelsplit.run_ablations --manage-server --tasks ... --seeds 2   # auto-manage server
+Then:  python -m eval.experiments.modelsplit.figures.make_ablation_table
 """
 from __future__ import annotations
 
-from . import _bootstrap  # noqa: F401  (sets sys.path, loads .env into os.environ)
-from ._bootstrap import REPO_ROOT, read_active_model
+from eval import _bootstrap  # noqa: F401  (sets sys.path, loads .env into os.environ)
+from eval._bootstrap import REPO_ROOT, read_active_model
 
 import argparse
 import os
@@ -154,7 +154,7 @@ def _print_ts_instructions(ts: list[tuple[str, dict]], args) -> None:
         print(f"  # 1) in the server shell (repo root):")
         print(f"  npm run build && {envstr} node build/index.js")
         print(f"  # 2) in this shell:")
-        print(f"  python -m eval.run_ablations --only {name} "
+        print(f"  python -m eval.experiments.modelsplit.run_ablations --only {name} "
               f"--tasks {args.tasks!r} --seeds {args.seeds} --out {args.out}{extra}")
         print(f"  # 3) afterwards restore the default server:  npm start\n")
     print("Or re-run the whole sweep with --manage-server to automate the restarts.")
@@ -241,7 +241,7 @@ def main():
     else:
         _run_manual(selected, args)
 
-    print("\nNext: python -m eval.figures.make_ablation_table   "
+    print("\nNext: python -m eval.experiments.modelsplit.figures.make_ablation_table   "
           "(fills paper/tables/tab1_ablations.tex)")
 
 

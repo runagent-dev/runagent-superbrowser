@@ -16,13 +16,13 @@ flags what's pending. The caption is left byte-identical unless --annotate-n is
 passed (then an interim-n note is appended, opt-in, so 2x2 numbers are never
 misread as the full 20-task/3-seed sweep).
 
-Usage:  python -m eval.figures.make_ablation_table [--runs ...] [--table ...]
+Usage:  python -m eval.experiments.modelsplit.figures.make_ablation_table [--runs ...] [--table ...]
                                                     [--annotate-n] [--verify]
 """
 from __future__ import annotations
 
-from .. import _bootstrap  # noqa: F401
-from .._bootstrap import REPO_ROOT
+from eval import _bootstrap  # noqa: F401
+from eval._bootstrap import REPO_ROOT
 
 import argparse
 import json
@@ -210,7 +210,7 @@ def main():
                   f"(iters={full['iters']})")
     if not by_cfg:
         print(f"[error] no ablation runs under {args.runs} and no --full-run. "
-              f"Run `python -m eval.run_ablations` first.")
+              f"Run `python -m eval.experiments.modelsplit.run_ablations` first.")
         return
 
     table_path = Path(args.table)

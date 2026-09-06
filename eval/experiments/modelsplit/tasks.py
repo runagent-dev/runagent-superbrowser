@@ -4,7 +4,7 @@ Replace the placeholders with your five tasks, written exactly like the ones you
 run through ``nanobot/test_superbrowser.py``: a natural-language instruction plus
 an optional starting URL.
 
-``reference`` is an optional success rubric the LLM judge (eval/oracles.py) scores
+``reference`` is an optional success rubric the LLM judge (eval/experiments/modelsplit/oracles.py) scores
 the orchestrator's final answer against. If omitted, the judge falls back to the
 instruction's implied success criteria. A good rubric states what a correct,
 non-fabricated answer must contain.

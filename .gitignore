@@ -33,7 +33,17 @@ nanobot/workspace*/**/.nanobot/
 
 todo/
 
-eval/*
+# Research evaluation suite (eval/): source, benchmarks, docs and small
+# artifacts are tracked; raw run data is regenerable and stays out of git.
+eval/runs/
+eval/runs_*/
+eval/results/
+eval/token_runs/
+eval/excluded_runs/
+eval/**/__pycache__/
+# the global *.jsonl rule above must not hide the frozen benchmark task files
+!eval/benchmarks/*.jsonl
+!eval/tests/fixtures/**/*.jsonl
 # Web console build artifacts
 console/node_modules/
 console/dist/

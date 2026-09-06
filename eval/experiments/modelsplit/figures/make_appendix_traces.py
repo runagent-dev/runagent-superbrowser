@@ -8,14 +8,14 @@ paper/appendix/traces_modelsplit.tex (lstlisting blocks) as direct evidence for
 
 Always writes a valid (possibly placeholder) file so \\input never breaks.
 
-Usage:  python -m eval.figures.make_appendix_traces [--runs ...] [--out ...]
+Usage:  python -m eval.experiments.modelsplit.figures.make_appendix_traces [--runs ...] [--out ...]
 """
 from __future__ import annotations
 
-from .. import _bootstrap  # noqa: F401
-from .._bootstrap import REPO_ROOT
-from .. import analyzer as az
-from .. import models as model_registry
+from eval import _bootstrap  # noqa: F401
+from eval._bootstrap import REPO_ROOT
+from eval.experiments.modelsplit import analyzer as az
+from eval.experiments.modelsplit import models as model_registry
 
 import argparse
 import json
@@ -106,7 +106,7 @@ def emit(found) -> str:
         out.append("")
     if not any_block:
         out.append(r"% No Chinese-model failure traces found yet — run the eval first:")
-        out.append(r"%   (edit ~/.nanobot/config.json to a CN model) python -m eval.run_eval")
+        out.append(r"%   (edit ~/.nanobot/config.json to a CN model) python -m eval.experiments.modelsplit.run_eval")
         out.append(r"\emph{(Trace listings will appear here once Chinese-model eval runs are available.)}")
     return "\n".join(out) + "\n"
 

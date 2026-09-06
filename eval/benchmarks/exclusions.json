@@ -1,0 +1,26 @@
+{
+  "_doc": "Pre-registered exclusion rules and hand exclusions for the frozen hard split. Fill BEFORE running an arm comparison; never after seeing one arm's outcome. Every entry needs a reason. E0 reports results with and without these.",
+  "rules": [
+    {
+      "id": "site_unavailable",
+      "description": "Start URL returns 5xx / DNS failure / connection reset in every paired arm on the same day",
+      "adjudication": "deterministic marker in all arms"
+    },
+    {
+      "id": "geo_blocked",
+      "description": "Site serves a region block page from the evaluation region in every paired arm",
+      "adjudication": "deterministic marker in all arms"
+    },
+    {
+      "id": "captcha_unsolved",
+      "description": "Captcha challenge not cleared by solver in every paired arm",
+      "adjudication": "deterministic marker in all arms"
+    }
+  ],
+  "task_exclusions": [],
+  "legacy_66_task_reconciliation": {
+    "status": "open",
+    "owner": "user",
+    "note": "List here the task_ids that made up the paper's 66-task run (or the rule that removed 8 tasks from the 74-task hard split) once known."
+  }
+}

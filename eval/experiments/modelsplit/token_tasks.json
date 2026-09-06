@@ -1,0 +1,44 @@
+[
+  {
+    "id": "petfinder_rabbits",
+    "instruction": "Go to https://www.petfinder.com/ and show me the list of young male English Spot rabbits available for adoption in Chicago, IL, within 50 miles. Do it very carefully. Don't use any check learning tool.",
+    "url": "https://www.petfinder.com/",
+    "mode": "browser"
+  },
+  {
+    "id": "trip_shanghai_beijing",
+    "instruction": "Go to https://us.trip.com/ and Select a high speed train ticket with a departure time before 18:00 from Shanghai to Beijing at 3 July.",
+    "url": "https://us.trip.com/",
+    "mode": "auto"
+  },
+  {
+    "id": "accuweather_so2_cork",
+    "instruction": "Go to https://www.accuweather.com/ and find the SO2 (sulfur dioxide) air quality reading over the past hour for Maine North, County Cork, Ireland. Use browser tools.",
+    "url": "https://www.accuweather.com/",
+    "mode": "browser"
+  },
+  {
+    "id": "bestbuy_8k_samsung_openbox",
+    "instruction": "Go to https://www.bestbuy.com/ and browse 8K Samsung TVs that are Open-Box.",
+    "url": "https://www.bestbuy.com/",
+    "mode": "browser"
+  },
+  {
+    "id": "bestbuy_qled_240hz_monitor",
+    "instruction": "Go to https://www.bestbuy.com/ and search for a 33-to-49-inch QLED gaming monitor with a 240Hz refresh rate priced between $1000 and $2000.",
+    "url": "https://www.bestbuy.com/",
+    "mode": "browser"
+  },
+  {
+    "id": "wineaccess_oregon_top_critic_wine",
+    "instruction": "Go to https://www.wineaccess.com/ and find the highest critic-scored red or white wine from Oregon, priced under $40, that pairs well with fish or dessert any one of it.",
+    "url": "https://www.wineaccess.com/",
+    "mode": "browser"
+  },
+  {
+    "id": "stanford_graduate_chemistry_winter2023_schedule",
+    "instruction": "Go to https://www.stanford.edu/ and browse the class schedule to find graduate-level chemistry courses offered on Monday afternoons during the Winter 2023 quarter.",
+    "url": "https://www.stanford.edu/",
+    "mode": "browser"
+  }
+]

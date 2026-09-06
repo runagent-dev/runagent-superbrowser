@@ -1,0 +1,57 @@
+{
+  "ablation24": {
+    "benchmark": "online_mind2web_hard",
+    "n": 24,
+    "method": "stratified by site_type, proportional allocation, seed=20260906",
+    "note": "Pre-registered paired-ablation subset (E2-E8, E10). Chosen before any arm ran; never edit after results exist.",
+    "strata": {
+      "government_health": 6,
+      "housing_jobs": 2,
+      "info_media": 5,
+      "shopping": 6,
+      "travel_booking": 3,
+      "vehicles": 2
+    },
+    "task_ids": [
+      "0b838cd54f826c59c71f600c56b89a11",
+      "0e5536aaad9d3462b06cf725e6ed535a",
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "27fa3ac20745d3d35e89fae157f63069",
+      "33bd2cdcea4fcc42a09a8a1e4e5841c6",
+      "3443e9c3151fef19a3c3a45eb2c13640",
+      "442a450e696a96085257db6297891a4d",
+      "4464a8421f8bc8786524a499258dfad3",
+      "547f5729c59d5d12a457a3ebb74c31c6",
+      "5dec0e6620849459f29e6465982c597e",
+      "7680a920359cb1a508fbddb001b98167",
+      "8fdec8eeffd3491e6526cc78c028120b",
+      "b2f4fde2fce122a93c7b578086cb0585",
+      "b4aa7315e31dfcdc52baf7771be260c9",
+      "bb5d90e6f2fbc0ae146f7c1998c2b4a1",
+      "bfa2de159be6978acf2702be31a2eeeb",
+      "c39d6c245f8243993e707d54d2f4acec",
+      "c801d1c951f59297f526bab84fa86c6e",
+      "cf757a775fa1224acfc7998489e199a8",
+      "d1970c16271496cbbe166ecbecc0a1d8",
+      "f05e87c5b92d9869e08806103c1c15a1",
+      "f707d765bca668830745d20807d7bee6",
+      "fcf4952d2a1d80ea505c555c3c3b54e7",
+      "fe33894188d20d7469f37a9fd855e7ff"
+    ]
+  },
+  "smoke2": {
+    "benchmark": "online_mind2web_hard",
+    "n": 3,
+    "method": "explicit ids",
+    "note": "Two cheap tasks for end-to-end smoke tests",
+    "strata": {
+      "government_health": 2,
+      "info_media": 1
+    },
+    "task_ids": [
+      "0b2623e9fa5cea997f76490bcbc5220f",
+      "a5c87cc1c94a090c9a8dc2c8b6a125d0",
+      "f707d765bca668830745d20807d7bee6"
+    ]
+  }
+}

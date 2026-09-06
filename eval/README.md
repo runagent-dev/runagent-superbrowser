@@ -1,93 +1,97 @@
-# §7.4 Model-Family Evaluation
+# SuperBrowser research evaluation suite
 
-Empirically reproduces the paper's claim (sections/07_evaluation.tex, `\label{sec:modelfamilies}`):
-recent large Chinese models degrade on web-navigation in the Worker slot despite strong public
-reasoning benchmarks, via three failure modes — **tool-schema fidelity**, **`[Vn]` index
-discipline**, **procedural/declarative discipline**. Produces the figure + table for §7.4.
+Reproducible experiments behind the paper. Every experiment is a small package under
+`eval/experiments/` that drives the shared harness in `eval/core/`; every run leaves one machine-readable
+row (`results.jsonl`) plus a self-contained run directory, and every table/figure is regenerated from those
+rows. The protocol (task set, caps, pins, evaluators, metrics, statistics) is frozen in
+[`PROTOCOL.md`](PROTOCOL.md).
 
-The candidate model is whatever you set in `~/.nanobot/config.json` (`agents.defaults.model`). Swap it
-there, re-run, repeat. The harness auto-labels each run by the active model. Everything else
-(orchestrator/planner scaffolding, the Gemini vision tier, prompts, budgets) is held fixed.
-
-## How it works
-- A **gated tap** in `superbrowser_bridge/orchestrator_tools/delegation.py` dumps each delegated
-  Worker's full transcript (raw tool calls incl. rejected ones) + its live tool registry + telemetry
-  to `$SUPERBROWSER_EVAL_CAPTURE_DIR/<worker_task_id>.json`. No-op unless that env var is set.
-- `run_eval.py` runs the task suite through the full orchestrator (batch `test_superbrowser.py`),
-  setting the capture dir per run, harvesting transcripts + step ledgers, and scoring the final
-  answer with a fixed LLM judge.
-- `analyzer.py` classifies every Worker tool attempt into 9 mutually-exclusive outcome classes (using
-  the captured registry + the result-string tags the system already emits) and writes
-  `results/per_call.csv` + `results/per_model.csv`.
-- `figures/make_figure.py` emits the pgfplots figure + booktabs table (bare-tikzpicture `.tex`,
-  `\input` by the paper — house style, no matplotlib). `figures/make_appendix_traces.py` emits
-  representative failing traces.
-- `figures/make_heatmap.py` emits a model×failure-signal heatmap (`paper/figures/fig_modelsplit_heatmap.tex`,
-  Fig `fig:modelsplit-heatmap`) — the "which signals drive the gap" view. Reads `per_model.csv`
-  (+ `per_model_task.csv` for optional per-task panels, also written by `analyzer.py`).
-
-## Run it
-```bash
-cd /root/agentic-browser/runagent-superbrowser && source venv/bin/activate
-# 0. Start the TS SuperBrowser server in another shell:  cd .. && npm start
-# 1. EDIT eval/tasks.py  (your 5 tasks)  and  eval/models.py  (lab + cited benchmark numbers)
-# 2. For EACH candidate model: set agents.defaults.model in ~/.nanobot/config.json, then:
-python -m eval.run_eval --seeds 3            # auto-labels by the active model
-# 3. Rescue ablation (Chinese models): set a CN model in config.json, then:
-SUPERBROWSER_EVAL_SCHEMA_REMINDER=1 python -m eval.run_eval --seeds 3 --label <model>_rescue
-# 4. Aggregate + plot + traces:
-python -m eval.analyzer
-python -m eval.figures.make_figure          # add --verify to compile-check standalone
-python -m eval.figures.make_heatmap         # model×signal heatmap (--verify to compile-check)
-python -m eval.figures.make_appendix_traces
-# 5. Rebuild the paper:
-cd ../paper && latexmk -pdf main.tex
+```
+eval/
+  PROTOCOL.md               frozen protocol + pre-registered comparisons
+  benchmarks/               frozen task files, manifest, subsets, critical-state items, checks, exclusions
+  core/                     harness: protocol, tasks, arms, runner, run_one, harvest, records, judges,
+                            metrics, stats, loaders, pricing
+  experiments/<name>/       README.md (hypothesis, arms, metrics), run.py, analyze.py
+  artifacts/<name>/         tracked small outputs (csv / tex / png) the paper inputs
+  tests/                    offline tests (pytest; no browser, no network, no LLM)
+  runs/  results/  token_runs/   raw run data (git-ignored, regenerable)
 ```
 
-> Reduced run (low credits): pass `--seeds 2 --tasks "id1,id2"` for a 3-model × 2-task side-by-side;
-> the heatmap normalises per column, so the US-vs-CN contrast still reads with few models.
+## Quick start
 
-## Metrics (per model, mean ± s.d. over tasks × seeds)
-- **task_success** — fixed LLM judge vs the task rubric (heuristic fallback).
-- **schema_fidelity** = well-formed calls / all tool-emitting attempts (fails: bad tool name,
-  synonym/missing arg, prose-instead-of-call).
-- **index_discipline** = 1 − stale/out-of-range `[Vn]` clicks / vision-grounded clicks.
-- **procedural_share** = procedural clicks / (procedural + declarative clicks).
-- **dead_click_violation_rate** = dead-click-guard hits / click attempts.
-- **vision_calls_per_task** — from worker telemetry.
-
-## Single-component ablations (Table 1)
-Populates `paper/tables/tab1_ablations.tex` (`tab:ablation`): full system + six one-mechanism-removed
-configs, holding model/vision/budgets fixed. Set ONE capable model in `~/.nanobot/config.json` first
-(paper: "same LLM") so a success drop is attributable to the removed mechanism.
 ```bash
-# Python-side configs run against the standing default server; the 2 TS-side configs need a
-# rebuilt + restarted server (the runner prints the exact per-config sequence, or use --manage-server).
-python -m eval.run_ablations --tasks "petfinder_rabbits,bestbuy_qled_240hz_monitor" --seeds 2
-python -m eval.run_ablations --list           # configs + their toggle env vars
-python -m eval.figures.make_ablation_table    # fills tab1_ablations.tex (--annotate-n for interim note)
+source venv/bin/activate
+npm run build && npm start &                    # TypeScript browser server on :3100 (default state)
+python -m eval.core.tasks --list                # benchmarks + pre-registered subsets
+python -m eval.core.runner --experiment demo --arms ledger,fifo --tasks smoke2 --seeds 1 \
+    --model anthropic/claude-opus-4.8 --dry-run  # schedule + per-run env, launches nothing
+python -m eval.core.runner --experiment demo --arms ledger,fifo --tasks smoke2 --seeds 1 \
+    --model anthropic/claude-opus-4.8           # live: 3 tasks x 2 arms, judged, recorded
+python -m eval.core.judge --experiment demo     # (re)judge offline, refresh records
 ```
-- **Toggles** (default = full system; ablate only when set): `ABLATE_MEMORY_EVICTION`,
-  `ABLATE_STRUCTURED_LEDGER`, `WORKER_CHEVRON_FOCUS=0`+`BBOX_COMPOUND_ROW_SPLIT=0`,
-  `VISION_ASYNC_PREFETCH=0` (python-side, read in-process); `SUPERBROWSER_CLICK_TIERS=tier1`,
-  `MOTOR_HUMANIZATION=off` (TS-side — read by the server, so they need `npm run build` + a restart
-  with the env baked in; `--manage-server` automates that).
-- **Tokens/iter** is pooled from the harvested Worker `events.jsonl` `iteration` events; a provider
-  returning empty usage (>50% zero-token iters) leaves that cell `\todo` with a warning.
-- Un-run rows stay `\todo{value}`, so a partial table still compiles; rows are rebuilt each run, so
-  re-running with more data refreshes them. Keep the caption's "20-task/three-seed" framing honest
-  with `--annotate-n` for interim drafts.
 
-## You must fill in
-- `eval/tasks.py` — your five tasks (two examples + three `TODO` placeholders; placeholders are skipped).
-- `eval/models.py` — confirm a `match` resolves each model id; replace each `bench_composite` with a
-  **cited** number and set `confirmed=True`. Until then the figure + table render a red
-  "PLACEHOLDER" note so unfilled numbers can't silently ship.
-- `SUPERBROWSER_EVAL_JUDGE_MODEL` — pin a fixed strong judge (never a candidate model).
+Each experiment has the same interface (`python -m eval.experiments.<name>.run --help`) and fixes its own
+arms/subset; `--dry-run`, `--resume`, `--no-judge`, `--manage-server` (restart the TS server for TS-side
+arms) and `--model` are shared flags (`eval/core/runner.py`).
 
-## Tunables (env)
-`SUPERBROWSER_EVAL_CAPTURE_DIR` (set by the runner), `SUPERBROWSER_EVAL_SCHEMA_REMINDER` (rescue),
-`SUPERBROWSER_EVAL_JUDGE_MODEL` / `_JUDGE_API_KEY` / `_JUDGE_BASE_URL`, `SUPERBROWSER_WORKER_MAX_ITER`.
+## How a run works
 
-> Note: the figure/table `.tex` committed under `paper/figures` + `paper/tables` currently reflect
-> **synthetic placeholder data** (so the paper builds). Re-run steps 2-4 to populate real numbers.
+`runner.py` builds the schedule (`seed → task → arm`, arms interleaved per task, TS-side arms grouped) and
+launches **one subprocess per run** (`eval.core.run_one`) with the arm's env merged over the protocol pins
+and per-run paths. `run_one.py` writes a per-run nanobot config (pins + `--model`), runs the task through
+the orchestrator→worker pipeline (or the flat single-agent topology), and leaves:
+
+```
+eval/runs/<experiment>/<arm>/<task_id>/seed<k>/
+  spec.json  meta.json  result.txt  usage.json  config.redacted.json  run.log
+  workers/<wid>.json           full worker transcript + tool registry (delegation tap)
+  ledgers/<id>/                events.jsonl steps.jsonl ledger.json vision_calls.jsonl clicks.jsonl
+                               live_context.jsonl.gz task_summary.json step_history.json
+  screenshots/NNN-*.jpg        ordered trajectory screenshots (WebJudge input) + index.jsonl
+  judges/{deterministic,webjudge,answer_judge}.json
+  run_record.json              the RunRecord (also appended to ../../../results.jsonl)
+```
+
+`harvest.py` rebuilds a record from those files at any time (`python -m eval.core.harvest <run_dir>`);
+analyzers only read records + run directories.
+
+## Arms (env toggles; empty = full system)
+
+| Arm | Env | Side |
+|---|---|---|
+| `ledger` | — | python |
+| `full_history` / `fifo` / `summary` / `ledger_noevict` | `SUPERBROWSER_MEMORY_POLICY=…` (+ `_RECENT_K`, `_BUDGET_TOKENS`, `_KEEP_SCREENSHOTS`) | python |
+| `no_deadend` | `ABLATE_DEAD_END_MEMORY=1` | python |
+| `fresh_vision` | `ABLATE_VISION_REUSE=1` | python |
+| `snap_center` / `snap_dom_alt` (vs `snap_chevron`) | `SUPERBROWSER_SNAP_STRATEGY=…` | ts |
+| `no_ladder` | `ABLATE_CLICK_LADDER=1` (+`CLICK_LADDER_AUTO=0`, `SUPERBROWSER_CLICK_TIERS=tier1`) | both |
+| `flat` | `SUPERBROWSER_TOPOLOGY=flat` | python |
+| derived | `pressure_arm(base, tokens)` → `SUPERBROWSER_EVAL_DISTRACTOR_TOKENS`; `budget_arm(base, B, K)` | — |
+
+All toggles default to today's production behaviour; see `docs/CONFIG.md` for the semantics of each.
+
+## Experiments
+
+| Id | Package | Question | Status |
+|---|---|---|---|
+| E0 | `e0_headline_audit` | recompute the headline as k/N from records; report exclusions and the 66-vs-74 discrepancy | P4 |
+| E1 | `e1_main` | full system on the frozen hard split | P4 |
+| E2 | `e2_memory_policy` | matched memory policies (full / fifo / summary / ledger) — main experiment | P4 |
+| E3 | `e3_memory_pressure` | pressure ladder × memory policy | P4 |
+| E4 | `e4_deadend` | dead-end memory on/off → DRR | P4 |
+| E5 | `e5_perception_reuse` | perception reuse on/off → RPR, cost | P4 |
+| E6 | `e6_subelement` | snapper strategy on local fixtures (offline, no LLM) | P5 |
+| E7 | `e7_click_cascade` | click recovery ladder on/off | P4 |
+| E8 | `e8_topology` | orchestrator→worker vs flat single agent | P4 |
+| E9 | `e9_evaluator_validation` | human vs automatic evaluators (κ, FP/FN) | P4 |
+| E10 | `e10_robustness` | budgets, seeds, second host model | P4 |
+| E11 | `e11_cost` | cost per task / per success by role | P4 |
+| E12 | `e12_traces` | traces selected from aggregate effects | P4 |
+| — | `modelsplit` | legacy §7.4 tool-economy study (secondary) | kept |
+
+## Tests
+
+```bash
+python -m pytest eval/tests -q
+```

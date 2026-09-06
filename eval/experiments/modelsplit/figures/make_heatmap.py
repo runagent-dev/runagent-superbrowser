@@ -23,12 +23,12 @@ output is \\input directly by sections/07_evaluation.tex.
 Outputs:
     paper/figures/fig_modelsplit_heatmap.tex
 
-Usage:  python -m eval.figures.make_heatmap [--in ...] [--in-task ...] [--verify]
+Usage:  python -m eval.experiments.modelsplit.figures.make_heatmap [--in ...] [--in-task ...] [--verify]
 """
 from __future__ import annotations
 
-from .. import _bootstrap  # noqa: F401
-from .._bootstrap import REPO_ROOT
+from eval import _bootstrap  # noqa: F401
+from eval._bootstrap import REPO_ROOT
 from .make_figure import _f, _read, _is_rescue, _order, _tex_escape, _verify
 
 import argparse

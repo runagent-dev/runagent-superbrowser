@@ -1,3 +1,0 @@
-# Run artifacts and aggregated results are regenerable — don't commit them.
-runs/
-results/

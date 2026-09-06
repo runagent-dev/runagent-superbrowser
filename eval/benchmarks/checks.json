@@ -1,0 +1,6 @@
+{
+  "_doc": "Deterministic success checks per task_id (conjunction). Types: final_url_regex, answer_regex, answer_contains_all, visited_url_regex. Only add checks that PROVE a required state (a filter reflected in the URL, an exact value in the answer); leave tasks without a provable state to WebJudge. Fill before running; these are treated as ground truth in E9.",
+  "_examples": {
+    "<task_id>": {"checks": [{"type": "visited_url_regex", "pattern": "breed=English%20Spot", "flags": "i"}]}
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "benchmark": "online_mind2web",
+  "source": {
+    "path": "/root/agentic-browser/BrowserOS/packages/browseros-agent/apps/eval/data/mind2web.jsonl",
+    "description": "Online-Mind2Web task file as vendored by BrowserOS (packages/browseros-agent/apps/eval/data/mind2web.jsonl)",
+    "sha256": "5f543b11cd7fa3b9bb6d1bfd87acfbcea8772431caa4d449f140b7b15c64306f",
+    "n_rows": 300,
+    "upstream": "https://github.com/OSU-NLP-Group/Online-Mind2Web (CC BY 4.0; cite Mind2Web 2023 + Online-Mind2Web 2025)"
+  },
+  "frozen_at": "2026-09-06",
+  "counts_by_level": {
+    "easy": 83,
+    "hard": 74,
+    "medium": 143
+  },
+  "files": {
+    "online_mind2web_hard.jsonl": {
+      "n": 74,
+      "sha256": "1fe73083b27f56914c60c9b834b86afc799e6f3490fe4c87e2a1867cbd96f43e",
+      "role": "primary evaluation set (E1 and the ablation subset are drawn from here)"
+    },
+    "online_mind2web_all.jsonl": {
+      "n": 300,
+      "sha256": "718184a9f947f025f1893cbe3bbf072b77b31997aaaf375858b4a7b3bde7b547",
+      "role": "full 300-task file for reference / level-stratified analyses"
+    }
+  },
+  "notes": [
+    "The paper draft reported 'Mind2Web Hard (66 tasks)'. This frozen copy has 74 hard tasks and no per-task record of the 66-task run exists in the repository. Reconciling the two (which tasks, which exclusions) is a user-owned follow-up tracked in eval/benchmarks/exclusions.json; E0 reports the discrepancy explicitly.",
+    "Task ids are the upstream query_id (md5-like hex). Instructions are verbatim; start_url is the benchmark's starting page."
+  ]
+}

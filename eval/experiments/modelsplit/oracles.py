@@ -20,7 +20,7 @@ import os
 import re
 from pathlib import Path
 
-from ._bootstrap import DEFAULT_CONFIG_PATH
+from eval._bootstrap import DEFAULT_CONFIG_PATH
 
 _FAILURE_MARKERS = (
     "browser worker failed",
