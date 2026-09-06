@@ -95,3 +95,70 @@ All toggles default to today's production behaviour; see `docs/CONFIG.md` for th
 ```bash
 python -m pytest eval/tests -q
 ```
+
+## Cost & scale
+
+Every experiment is `arms × tasks × seeds` runs. `--dry-run` prints the exact count; the numbers below
+are the defaults (`ablation24` = 24 tasks, `--seeds 1`, except E2 which the paper runs at `--seeds 3`):
+
+| Experiment | Runs (default) | Runs at paper scale |
+|---|---|---|
+| E1 main | 74 (`--tasks all`) | 74 × seeds |
+| E2 memory policy | 96 (4 arms × 24) | 288 (4 × 24 × 3 seeds) |
+| E3 memory pressure | 216 (9 cells × 24) | 216 |
+| E4 / E5 / E7 / E8 | 48 each (2 × 24) | 48 each |
+| E10 robustness | 216 (budget sweep) | + window sweep + a 2nd model |
+| E6 sub-element | 0 API runs (offline fixtures) | committed |
+
+**Per-run cost** (one recorded 41-iteration run ≈ 2.2M input + ~40K output tokens, list price from
+`core/pricing.json`; prompt caching cuts the input term severalfold, so treat these as an upper bound and
+refresh from pilots with `python -m eval.experiments.e11_cost.analyze`):
+
+| Brain model | ≈ $/run (list) | Vision + WebJudge |
+|---|---|---|
+| anthropic/claude-opus-4.8 | ~$12 | +~$0.1 vision, +~$0.3 WebJudge (gpt-4o) |
+| openai/gpt-5.4 | ~$6 | same |
+| google/gemini-3.5-flash | ~$4 | same |
+
+So E1 on 74 tasks is roughly $300 (Flash) to $900 (Opus); the full ablation set (E2 at 3 seeds + E3 + E4 +
+E5 + E7 + E8) is ~700 runs, ~$3–8K on Opus and well under half that on Flash. Run a pilot first:
+`--tasks smoke2 --seeds 1` (3 tasks) end-to-end, then `--tasks ablation24 --seeds 1` before scaling.
+
+## Running the full study (user-launched; spends credits)
+
+```bash
+source venv/bin/activate
+npm run build && npm start &                       # default browser server on :3100
+python -m eval.rehearse                            # offline pre-flight: dry-runs + replay of recorded data
+export SUPERBROWSER_EVAL_WEBJUDGE_MODEL=gpt-4o SUPERBROWSER_EVAL_JUDGE_MODEL=gpt-5.5
+M=anthropic/claude-opus-4.8
+
+python -m eval.experiments.e1_main.run           --model $M --tasks all
+python -m eval.experiments.e2_memory_policy.run  --model $M --seeds 3 --with-noevict
+python -m eval.experiments.e3_memory_pressure.run --model $M
+python -m eval.experiments.e4_deadend.run        --model $M
+python -m eval.experiments.e5_perception_reuse.run --model $M
+python -m eval.experiments.e7_click_cascade.run  --model $M --manage-server   # TS-side arm
+python -m eval.experiments.e8_topology.run       --model $M
+python -m eval.experiments.e10_robustness.run    --model $M --sweep budget
+python -m eval.experiments.e6_subelement.run     --manage-server              # offline, no model
+
+for e in e1_main e2_memory_policy e3_memory_pressure e4_deadend e5_perception_reuse e7_click_cascade e8_topology e10_robustness e6_subelement; do
+  python -m eval.experiments.$e.analyze; done
+python -m eval.experiments.e0_headline_audit.analyze
+python -m eval.experiments.e11_cost.analyze
+python -m eval.experiments.e12_traces.analyze --experiment e2_memory_policy --arm-a ledger --arm-b fifo --metric csd_observed
+```
+
+TS-side arms (`e6`, and `e7`'s `no_ladder`) need `--manage-server`: the harness starts its **own** browser
+server on a free port with the arm's env baked in and never touches your `:3100` container.
+
+## User-owned follow-ups (left deliberately)
+
+- **Headline reconciliation** — `benchmarks/exclusions.json` `legacy_66_task_reconciliation` is open: which
+  task ids (or exclusion rule) turned the 74-task hard split into the draft's "66". E0 reports both.
+- **Brain model** — pass `--model`; `pricing.json` covers the three candidates. Set it once E1 is run.
+- **E9 human labels** — `make_sheet` builds the stratified sheet; two people fill `label_h1/label_h2`, then
+  `analyze` reports κ.
+- **checks.json / critical_state.json** — deterministic checks are a skeleton; critical-state items are
+  hand-reviewed for all 74 hard tasks and can be extended.

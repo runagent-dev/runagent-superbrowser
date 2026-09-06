@@ -40,6 +40,10 @@ eval/runs_*/
 eval/results/
 eval/token_runs/
 eval/excluded_runs/
+# Derived analysis artifacts are regenerated from runs; keep only the
+# offline, deterministic E6 fixture results under version control.
+eval/artifacts/*
+!eval/artifacts/e6_subelement/
 eval/**/__pycache__/
 # the global *.jsonl rule above must not hide the frozen benchmark task files
 !eval/benchmarks/*.jsonl
