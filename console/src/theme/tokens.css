@@ -1,0 +1,89 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Forge — white canvas, volcanic orange, industrial geometry. */
+:root {
+  --sb-orange: #ff4d00;
+  --sb-ember: linear-gradient(135deg, #ff4d00 0%, #ff8a00 100%);
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #ffffff;
+  color: #111110;
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 24px blueprint grid backdrop */
+.forge-grid {
+  background-image:
+    linear-gradient(#f1f0ee 1px, transparent 1px),
+    linear-gradient(90deg, #f1f0ee 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* corner tick brackets on cards */
+.forge-card {
+  position: relative;
+  background: #fafaf9;
+  border: 1.5px solid #e7e5e4;
+  border-radius: 2px;
+}
+.forge-card::before,
+.forge-card::after {
+  content: '';
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-color: var(--sb-orange);
+  border-style: solid;
+}
+.forge-card::before {
+  top: -1.5px;
+  left: -1.5px;
+  border-width: 1.5px 0 0 1.5px;
+}
+.forge-card::after {
+  bottom: -1.5px;
+  right: -1.5px;
+  border-width: 0 1.5px 1.5px 0;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* industrial focus ring */
+.forge-focus:focus-visible {
+  outline: 2px solid var(--sb-orange);
+  outline-offset: 2px;
+}
+
+/* machined section rule */
+.forge-rule {
+  height: 1.5px;
+  background: repeating-linear-gradient(90deg, #e7e5e4 0 6px, transparent 6px 10px);
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d6d3d1;
+  border-radius: 0;
+}

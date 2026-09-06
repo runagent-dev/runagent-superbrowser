@@ -57,12 +57,18 @@ puzzles = ["opencv-python>=4.8", "numpy>=1.24"]
 # RunAgentClient. 0.1.40+ has `runagent serve`, `config --register-agent`, and
 # RunAgentClient(local=True, host=, port=) — all needed by the all-in-one image.
 remote = ["runagent>=0.1.40"]
+# Chat gateway: WhatsApp (neonize) + Discord channel SDKs via nanobot's extras;
+# Telegram ships in nanobot-ai core. aiohttp (the gateway HTTP surface) is
+# already a base dependency.
+gateway = ["nanobot-ai[whatsapp,discord]>=0.2.2,<0.3"]
 dev = ["pytest>=8", "ruff>=0.5", "build", "twine"]
 
 [project.scripts]
 superbrowser-agent = "superbrowser_bridge.cli:main"
 superbrowser-doctor = "superbrowser_bridge.doctor:main"
 superbrowser-run = "runagent_superbrowser.__main__:main"
+superbrowser-config = "superbrowser_config.cli:main"
+superbrowser-gateway = "superbrowser_gateway.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/runagent-dev/runagent-superbrowser"
@@ -73,12 +79,28 @@ Issues = "https://github.com/runagent-dev/runagent-superbrowser/issues"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Builds console/ (Vite) into superbrowser_gateway/console_dist on `python -m
+# build`. No-op for editable installs / when the dist already exists / when
+# SUPERBROWSER_SKIP_CONSOLE_BUILD=1. See hatch_build.py.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build]
+# Ship the prebuilt console in wheels + sdists so pip-from-sdist needs no Node.
+artifacts = ["nanobot/superbrowser_gateway/console_dist/**/*"]
+
 [tool.hatch.build.targets.wheel]
 # Ship the top-level packages from under ./nanobot/ flattened to the wheel
 # root, so installed imports (`import vision_agent`, `import superbrowser_bridge`,
 # `import runagent_superbrowser`) match the in-tree layout. Internal tests,
 # caches and workspaces are excluded.
-packages = ["nanobot/superbrowser_bridge", "nanobot/vision_agent", "nanobot/runagent_superbrowser"]
+packages = [
+    "nanobot/superbrowser_bridge",
+    "nanobot/vision_agent",
+    "nanobot/runagent_superbrowser",
+    "nanobot/superbrowser_config",
+    "nanobot/superbrowser_gateway",
+]
 exclude = ["**/tests", "**/tests/**", "**/__pycache__", "**/*.pyc", "**/.pytest_cache"]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -99,6 +121,8 @@ include = [
     "nanobot/superbrowser_bridge",
     "nanobot/vision_agent",
     "nanobot/runagent_superbrowser",
+    "nanobot/superbrowser_config",
+    "nanobot/superbrowser_gateway",
     # SOUL prompts: kept in the sdist so building a wheel from it can
     # force-include them as package data (see the wheel target above).
     "nanobot/workspace_orchestrator/SOUL.md",
@@ -107,6 +131,10 @@ include = [
     "README.md",
     "LICENSE",
     "pyproject.toml",
+    "hatch_build.py",
+    # Prebuilt console (Node-free install from sdist); the source tree is not
+    # shipped — only the built dist.
+    "nanobot/superbrowser_gateway/console_dist",
 ]
 exclude = [
     "**/tests",
