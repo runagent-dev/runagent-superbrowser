@@ -28,7 +28,7 @@ there, re-run, repeat. The harness auto-labels each run by the active model. Eve
 
 ## Run it
 ```bash
-cd /root/agentic-browser/runagent-superbrowser && source venv/bin/activate
+cd /root/agentic-browser/runagent-superbrowser && cd runagent-superbrowser && source venv/bin/activate
 # 0. Start the TS SuperBrowser server in another shell:  cd .. && npm start
 # 1. EDIT eval/experiments/modelsplit/tasks.py  (your 5 tasks)  and  eval/experiments/modelsplit/models.py  (lab + cited benchmark numbers)
 # 2. For EACH candidate model: set agents.defaults.model in ~/.nanobot/config.json, then:

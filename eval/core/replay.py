@@ -2,14 +2,15 @@
 
 The model-split harness (``eval/experiments/modelsplit``) left runs under
 ``eval/runs/<model-label>/<task>/seed<k>/`` with the OLD ``meta.json`` schema
-and no ``spec.json``. This module writes a ``spec.json`` + a normalised
-``meta.json`` next to each such run so the current ``harvest``/metrics/analysis
-stack can ingest them, then builds RunRecords under a chosen experiment name.
+and no ``spec.json``. This module COPIES each such run into
+``eval/runs/<experiment>/<label>/<task>/seed<k>/`` and writes a ``spec.json`` +
+a normalised ``meta.json`` into the copy so the current ``harvest``/metrics/
+analysis stack can ingest it. The original run directories are never touched
+(the legacy analyzer in ``experiments/modelsplit`` keeps reading them).
 
 It is the P6 dress rehearsal: it exercises harvest + every process metric +
 the analyzers on REAL recorded transcripts/ledgers without a browser or an LLM
-(the recorded judge verdict is reused as a stubbed ``webjudge``). No live run
-data is modified beyond the added spec/normalised-meta files.
+(the recorded judge verdict is reused as a stubbed ``webjudge``).
 """
 from __future__ import annotations
 
@@ -26,14 +27,8 @@ _CUSTOM = {t.task_id: t for t in load_benchmark("custom_dev", annotate=False)} i
 
 
 def is_legacy_run(d: Path) -> bool:
-    """A §7.4 model-split run: either not yet adapted (old meta.json with a
-    'label', no spec.json) or already adapted by a prior replay (meta.orig.json
-    present). Re-running the replay is idempotent."""
-    if not (d / "workers").exists() or not (d / "meta.json").exists():
-        return False
-    if (d / "meta.orig.json").exists():
-        return True
-    if (d / "spec.json").exists():
+    """A §7.4 model-split run dir: old meta.json carrying a 'label', no spec.json."""
+    if not (d / "workers").exists() or not (d / "meta.json").exists() or (d / "spec.json").exists():
         return False
     try:
         return "label" in json.loads((d / "meta.json").read_text())
@@ -41,7 +36,19 @@ def is_legacy_run(d: Path) -> bool:
         return False
 
 
+def copy_run(src: Path, runs_root: Path, experiment: str) -> Path:
+    """Copy a legacy run into the experiment tree (idempotent: re-copied fresh)."""
+    meta = json.loads((src / "meta.json").read_text())
+    dest = Path(runs_root) / experiment / str(meta.get("label", "modelsplit")) / str(meta.get("task_id")) / f"seed{int(meta.get('seed') or 0)}"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    (dest / "source_run_dir").write_text(str(src.resolve()) + "\n")
+    return dest
+
+
 def adapt_run(d: Path, *, experiment: str) -> Path:
+    """Write spec.json + normalised meta.json INTO A COPY produced by copy_run."""
     src_meta = d / "meta.orig.json" if (d / "meta.orig.json").exists() else d / "meta.json"
     meta = json.loads(src_meta.read_text())
     task_id = meta.get("task_id")
@@ -88,21 +95,26 @@ def adapt_run(d: Path, *, experiment: str) -> Path:
 
 def replay_experiment(runs_root: Path, *, source_labels: list[str] | None = None,
                       experiment: str = "modelsplit_replay") -> int:
-    """Adapt every legacy run under runs_root into ``experiment`` and (re)build
-    its records + results.jsonl (deduplicated by run id)."""
+    """Copy every legacy run under runs_root into ``<runs_root>/<experiment>/``,
+    adapt the copies, and (re)build their records + results.jsonl. Originals
+    are read-only inputs; re-running rebuilds the copies from scratch."""
     n = 0
     results = results_path(runs_root, experiment)
     if results.exists():
         results.unlink()
+    legacy = []
     for meta_path in sorted(Path(runs_root).glob("*/*/seed*/meta.json")):
         d = meta_path.parent
         if d.parents[1].name == experiment or not is_legacy_run(d):
             continue
         if source_labels and json.loads(meta_path.read_text()).get("label") not in source_labels:
             continue
-        adapt_run(d, experiment=experiment)
-        rec = build_record(d)
-        rec.write(d)
+        legacy.append(d)
+    for src in legacy:
+        dest = copy_run(src, Path(runs_root), experiment)
+        adapt_run(dest, experiment=experiment)
+        rec = build_record(dest)
+        rec.write(dest)
         append_result(results, rec)
         n += 1
     (Path(runs_root) / experiment).mkdir(parents=True, exist_ok=True)

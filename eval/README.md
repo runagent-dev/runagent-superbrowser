@@ -97,6 +97,9 @@ python -m pytest eval/tests -q          # offline harness tests (also in CI)
 python -m eval.rehearse                 # dry-run every schedule + replay recorded runs
 ```
 
+The replay copies each legacy `eval/runs/<model>/<task>/seedN/` run into
+`eval/runs/modelsplit_replay/…` and adapts only the copy; the recorded originals are never modified.
+
 ## Cost & scale
 
 Every experiment is `arms × tasks × seeds` runs. `--dry-run` prints the exact count; the numbers below

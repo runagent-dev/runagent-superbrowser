@@ -35,8 +35,14 @@ def test_replay_adapts_and_is_idempotent(tmp_path):
     assert recs["claude"].outcome["success"] is True and recs["claude"].outcome["decided_by"] == "webjudge"
     assert recs["kimi"].outcome["success"] is False
     assert recs["claude"].counts["tool_calls_executed"] == 5  # from the synthetic transcript
-    # original meta preserved; re-running yields the same count (idempotent)
+    # the ORIGINAL run dir is untouched (legacy analyzer keeps working) ...
     d = tmp_path / "claude" / "petfinder_rabbits" / "seed0"
-    assert (d / "meta.orig.json").exists() and "label" in json.loads((d / "meta.orig.json").read_text())
+    assert sorted(p.name for p in d.iterdir()) == ["ledgers", "meta.json", "result.txt", "screenshots", "usage.json", "workers"]
+    assert "label" in json.loads((d / "meta.json").read_text())
+    # ... the adapted copy lives under the experiment tree and points back at its source
+    copy = tmp_path / "rep" / "claude" / "petfinder_rabbits" / "seed0"
+    assert (copy / "spec.json").exists() and (copy / "run_record.json").exists() and (copy / "judges" / "webjudge.json").exists()
+    assert (copy / "source_run_dir").read_text().strip() == str(d.resolve())
+    # re-running rebuilds the copies from scratch (idempotent)
     assert replay.replay_experiment(tmp_path, experiment="rep") == 2
     assert len(replay.load_replayed(tmp_path, "rep")) == 2

@@ -1,7 +1,7 @@
 {
   "benchmark": "online_mind2web",
   "source": {
-    "path": "/root/agentic-browser/BrowserOS/packages/browseros-agent/apps/eval/data/mind2web.jsonl",
+    "path": "../BrowserOS/packages/browseros-agent/apps/eval/data/mind2web.jsonl",
     "description": "Online-Mind2Web task file as vendored by BrowserOS (packages/browseros-agent/apps/eval/data/mind2web.jsonl)",
     "sha256": "5f543b11cd7fa3b9bb6d1bfd87acfbcea8772431caa4d449f140b7b15c64306f",
     "n_rows": 300,
