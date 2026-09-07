@@ -82,3 +82,29 @@ def test_answer_judge_with_fake_client(tmp_path):
     assert verdicts["answer_judge"].success is False
     assert primary_success(verdicts) == (False, "answer_judge")
     assert Verdict.from_dict(verdicts["answer_judge"].to_dict()).rationale == "no listing data"
+
+
+def test_webjudge_falls_back_when_model_rejects_max_tokens(tmp_path):
+    run_dir = make_run_dir(tmp_path, task_id="t11", screenshots=1)
+    task = Task.from_row(json.loads((run_dir / "spec.json").read_text())["task"])
+    calls = []
+
+    class Rejecting(FakeChatClient):
+        async def create(self, **kwargs):
+            calls.append(sorted(k for k in kwargs if k in ("temperature", "max_tokens", "max_completion_tokens")))
+            if "max_tokens" in kwargs:
+                raise RuntimeError("Unsupported parameter: 'max_tokens' is not supported with this model.")
+            return await super().create(**kwargs)
+
+    def responder(kwargs):
+        sys_prompt = kwargs["messages"][0]["content"]
+        if sys_prompt.startswith("You are an expert tasked with analyzing"):
+            return "**Key Points**:\n1. x"
+        if sys_prompt.startswith("You are an expert evaluator tasked"):
+            return "**Score**: 2"
+        return "Status: failure"
+
+    client = Rejecting(responder=responder)
+    verdicts = asyncio.run(judge_run_async(run_dir, task, which=["webjudge"], client=client))
+    assert verdicts["webjudge"].success is False
+    assert calls[0] == ["max_tokens", "temperature"] and calls[1] == ["max_completion_tokens"]

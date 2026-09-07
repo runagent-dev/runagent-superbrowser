@@ -154,9 +154,27 @@ class WebJudge:
         self.usage: dict[str, int] = {}
 
     async def _chat(self, messages: list[dict[str, Any]], *, max_tokens: int) -> str:
+        """Benchmark settings first (temperature 0, max_tokens); newer judge
+        models (o-series) reject those parameters, so fall back to
+        max_completion_tokens / no temperature rather than failing the verdict."""
+        attempts = (
+            {"temperature": 0, "max_tokens": max_tokens},
+            {"max_completion_tokens": max_tokens},
+            {},
+        )
+        last: Exception | None = None
         async with self._sem:
-            resp = await self.client.chat.completions.create(
-                model=self.model, temperature=0, messages=messages, max_tokens=max_tokens)
+            for kwargs in attempts:
+                try:
+                    resp = await self.client.chat.completions.create(model=self.model, messages=messages, **kwargs)
+                    break
+                except Exception as exc:  # noqa: BLE001 - parameter rejection -> next shape
+                    last = exc
+                    msg = str(exc).lower()
+                    if not any(k in msg for k in ("max_tokens", "temperature", "unsupported", "not supported", "invalid")):
+                        raise
+            else:
+                raise last if last else RuntimeError("judge call failed")
         self.usage = add_usage(self.usage, usage_of(resp))
         return (resp.choices[0].message.content or "") if resp.choices else ""
 
