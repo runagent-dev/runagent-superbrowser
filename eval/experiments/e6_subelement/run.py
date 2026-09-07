@@ -11,7 +11,7 @@ element (condition ``exact``).
 Strategies are TypeScript-side (``SUPERBROWSER_SNAP_STRATEGY``), so the runner
 restarts the server per strategy (``--manage-server``, default here) or runs
 the single strategy the current server was started with
-(``--strategy X --assume-server``).
+(``--strategies X --assume-server``).
 
     python -m eval.experiments.e6_subelement.run --manage-server
     python -m eval.experiments.e6_subelement.analyze
