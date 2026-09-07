@@ -1585,10 +1585,20 @@ class BrowserSessionState:
         print(f"  [activity log saved: {activity_path}]")
         return content
 
-    def save_screenshot(self, b64: str, label: str = "", *, source: str = "sync") -> str:
-        self.step_counter += 1
+    def save_screenshot(self, b64: str, label: str = "", *, source: str = "sync", bump: bool = True) -> str:
+        """Persist a screenshot. ``bump=True`` (every production caller) advances
+        ``step_counter`` — the step number the model sees in ``[SESSION_STATE …]``.
+        Trace-only saves (prefetch persistence under SUPERBROWSER_TRACE_SCREENSHOTS)
+        pass ``bump=False`` so instrumentation never changes what the model sees;
+        they get a ``NNNzKKK`` name that sorts right after the brain shot they follow."""
+        if bump:
+            self.step_counter += 1
+            ordinal = f"{self.step_counter:03d}"
+        else:
+            self._trace_shot_seq = getattr(self, "_trace_shot_seq", 0) + 1
+            ordinal = f"{self.step_counter:03d}z{self._trace_shot_seq:03d}"
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-        fn = f"{self.step_counter:03d}-{label}.jpg" if label else f"{self.step_counter:03d}.jpg"
+        fn = f"{ordinal}-{label}.jpg" if label else f"{ordinal}.jpg"
         path = os.path.join(SCREENSHOT_DIR, fn)
         with open(path, "wb") as f:
             f.write(base64.b64decode(b64))
@@ -1603,7 +1613,7 @@ class BrowserSessionState:
 
                 with open(os.path.join(SCREENSHOT_DIR, "index.jsonl"), "a", encoding="utf-8") as idx:
                     idx.write(_json.dumps({
-                        "idx": self.step_counter, "ts": _time.time(), "file": fn, "source": source,
+                        "idx": ordinal, "step": self.step_counter, "ts": _time.time(), "file": fn, "source": source,
                         "label": label, "url": self.current_url, "session_id": self.session_id,
                         "action_count": getattr(self, "action_count", None),
                         "vision_calls": self.vision_calls,

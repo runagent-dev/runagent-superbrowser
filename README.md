@@ -536,3 +536,11 @@ Full reference: [`.env.example`](.env.example) · unified `config.json` + machin
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Research evaluation
+
+The experiments behind the paper live in [`eval/`](eval/README.md): a frozen Online-Mind2Web hard split,
+a WebJudge port, matched memory-policy / dead-end / perception / snapper / topology ablations (all
+default-off env toggles, see [`docs/CONFIG.md`](docs/CONFIG.md) "Research switches"), process-level
+metrics and the pre-registered statistics in [`eval/PROTOCOL.md`](eval/PROTOCOL.md).
+`python -m eval.rehearse` checks the whole pipeline offline.

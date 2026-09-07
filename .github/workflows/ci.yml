@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[dev,eval]"
       - name: Install patchright Chromium
         run: |
           patchright install chromium
@@ -90,6 +90,7 @@ jobs:
           nanobot/superbrowser_config/tests
           nanobot/superbrowser_gateway/tests
           nanobot/runagent_superbrowser/tests
+          eval/tests
 
   parity-guards:
     name: parity guards (config envmap / presets)

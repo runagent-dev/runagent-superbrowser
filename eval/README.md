@@ -75,25 +75,26 @@ All toggles default to today's production behaviour; see `docs/CONFIG.md` for th
 
 | Id | Package | Question | Status |
 |---|---|---|---|
-| E0 | `e0_headline_audit` | recompute the headline as k/N from records; report exclusions and the 66-vs-74 discrepancy | P4 |
-| E1 | `e1_main` | full system on the frozen hard split | P4 |
-| E2 | `e2_memory_policy` | matched memory policies (full / fifo / summary / ledger) — main experiment | P4 |
-| E3 | `e3_memory_pressure` | pressure ladder × memory policy | P4 |
-| E4 | `e4_deadend` | dead-end memory on/off → DRR | P4 |
-| E5 | `e5_perception_reuse` | perception reuse on/off → RPR, cost | P4 |
-| E6 | `e6_subelement` | snapper strategy on local fixtures (offline, no LLM) | P5 |
-| E7 | `e7_click_cascade` | click recovery ladder on/off | P4 |
-| E8 | `e8_topology` | orchestrator→worker vs flat single agent | P4 |
-| E9 | `e9_evaluator_validation` | human vs automatic evaluators (κ, FP/FN) | P4 |
-| E10 | `e10_robustness` | budgets, seeds, second host model | P4 |
-| E11 | `e11_cost` | cost per task / per success by role | P4 |
-| E12 | `e12_traces` | traces selected from aggregate effects | P4 |
+| E0 | `e0_headline_audit` | recompute the headline as k/N from records; report exclusions and the 66-vs-74 discrepancy | ready (needs E1 records) |
+| E1 | `e1_main` | full system on the frozen hard split | ready to launch |
+| E2 | `e2_memory_policy` | matched memory policies (full / fifo / summary / ledger) — main experiment | ready to launch |
+| E3 | `e3_memory_pressure` | pressure ladder × memory policy | ready to launch |
+| E4 | `e4_deadend` | dead-end memory on/off → DRR | ready to launch |
+| E5 | `e5_perception_reuse` | perception reuse on/off → RPR, cost | ready to launch |
+| E6 | `e6_subelement` | snapper strategy on local fixtures (offline, no LLM) | **run; results in `artifacts/e6_subelement/`** |
+| E7 | `e7_click_cascade` | click recovery ladder on/off | ready (TS-side arm: `--manage-server`) |
+| E8 | `e8_topology` | orchestrator→worker vs flat single agent | ready to launch |
+| E9 | `e9_evaluator_validation` | human vs automatic evaluators (κ, FP/FN) | sheet builder + κ ready (needs runs + 2 annotators) |
+| E10 | `e10_robustness` | budgets, seeds, second host model | ready to launch |
+| E11 | `e11_cost` | cost per task / per success by role | ready (any experiment's records) |
+| E12 | `e12_traces` | traces selected from aggregate effects | ready (after an analyzer) |
 | — | `modelsplit` | legacy §7.4 tool-economy study (secondary) | kept |
 
 ## Tests
 
 ```bash
-python -m pytest eval/tests -q
+python -m pytest eval/tests -q          # offline harness tests (also in CI)
+python -m eval.rehearse                 # dry-run every schedule + replay recorded runs
 ```
 
 ## Cost & scale
@@ -107,7 +108,7 @@ are the defaults (`ablation24` = 24 tasks, `--seeds 1`, except E2 which the pape
 | E2 memory policy | 96 (4 arms × 24) | 288 (4 × 24 × 3 seeds) |
 | E3 memory pressure | 216 (9 cells × 24) | 216 |
 | E4 / E5 / E7 / E8 | 48 each (2 × 24) | 48 each |
-| E10 robustness | 216 (budget sweep) | + window sweep + a 2nd model |
+| E10 robustness | 144 (budget sweep: 2 policies × 3 budgets × 24) | + window sweep (216) + a 2nd model |
 | E6 sub-element | 0 API runs (offline fixtures) | committed |
 
 **Per-run cost** (one recorded 41-iteration run ≈ 2.2M input + ~40K output tokens, list price from

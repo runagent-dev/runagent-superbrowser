@@ -2,7 +2,7 @@
 
 **Question.** Does the memory result hold across history budgets, repeated seeds and a second host model, and where does bounded memory lose?
 
-**Arms.** `--sweep budget`: `{ledger,fifo,summary}__B{1024,2048,3072}` (history budget 0.5×/1×/1.5×); `--sweep window`: `__K{3,5,8}`; `--sweep seeds --seeds 3`: plain arms repeated; cross-model: rerun with `--model <second host>`.
+**Arms.** `--sweep budget`: `{ledger,summary}__B{1024,2048,3072}` (history budget 0.5×/1×/1.5×; FIFO holds no budgeted artefact); `--sweep window`: `{fifo,ledger,summary}__K{3,5,8}`; `--sweep seeds --seeds 3`: plain arms repeated; cross-model: rerun with `--model <second host>`.
 
 **Task set / seeds.** `ablation24` (see `eval/benchmarks/subsets.json`), 1 seed(s) by default.
 

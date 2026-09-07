@@ -142,9 +142,9 @@ def test_config_from_env_and_defaults():
         cfg = MemoryPolicyConfig.from_env()
         assert (cfg.name, cfg.recent_k, cfg.budget_tokens, cfg.dead_ends, cfg.cross_task) == ("fifo", 3, 1024, False, False)
         assert not cfg.inject_dead_ends and not cfg.inject_ledger
-    with _Env(SUPERBROWSER_MEMORY_POLICY="nope"):
-        with pytest.raises(ValueError):
-            MemoryPolicyConfig.from_env()
+    with _Env(SUPERBROWSER_MEMORY_POLICY="nope", SUPERBROWSER_MEMORY_RECENT_K="abc"):
+        cfg = MemoryPolicyConfig.from_env()   # fail-open: production keeps running on a typo
+        assert cfg.name == "ledger" and cfg.recent_k == 5 and cfg.is_default
     with _Env(SUPERBROWSER_MEMORY_KEEP_SCREENSHOTS="all"):
         assert MemoryPolicyConfig.from_env().keep_screenshots >= 10**5
 

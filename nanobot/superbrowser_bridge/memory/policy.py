@@ -51,13 +51,16 @@ _DEFAULT_BUDGET_TOKENS = 2048  # used by `summary` when the budget env is unset
 
 
 def _int_env(name: str, default: int | None) -> int | None:
+    """Integer env knob; a malformed value falls back to the default with a
+    warning (a typo in .env must never take the production agent down)."""
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
     try:
         return int(raw)
     except ValueError:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        logger.warning("{}={!r} is not an integer; using default {}", name, raw, default)
+        return default
 
 
 _TRUE = ("1", "true", "yes", "on")
@@ -76,7 +79,11 @@ class MemoryPolicyConfig:
     def from_env(cls) -> "MemoryPolicyConfig":
         name = (os.environ.get("SUPERBROWSER_MEMORY_POLICY") or "ledger").strip().lower()
         if name not in POLICY_NAMES:
-            raise ValueError(f"SUPERBROWSER_MEMORY_POLICY={name!r}; expected one of {POLICY_NAMES}")
+            # Fail OPEN: production must keep running on a typo. The eval harness
+            # validates arm names against its registry before a run starts, so an
+            # experiment can never silently land here.
+            logger.warning("SUPERBROWSER_MEMORY_POLICY={!r} is not one of {}; using 'ledger'", name, POLICY_NAMES)
+            name = "ledger"
         keep = os.environ.get("SUPERBROWSER_MEMORY_KEEP_SCREENSHOTS", "").strip().lower()
         keep_n = 10**6 if keep == "all" else (_int_env("SUPERBROWSER_MEMORY_KEEP_SCREENSHOTS", _DEFAULT_KEEP_SCREENSHOTS) or 0)
         return cls(

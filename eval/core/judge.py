@@ -59,10 +59,17 @@ def main(argv: list[str] | None = None) -> int:
     dirs = [Path(d) for d in args.run_dir]
     if args.experiment:
         dirs += list(iter_run_dirs(Path(args.out), args.experiment))
-        # also runs that never got a record (crashed before harvest)
+        # runs that never got a record (crashed before harvest)
         for spec in sorted((Path(args.out) / args.experiment).glob("*/*/seed*/spec.json")):
             if spec.parent not in dirs:
                 dirs.append(spec.parent)
+        # runs whose directories live elsewhere (e.g. replayed legacy runs): follow results.jsonl
+        from eval.core.records import read_results
+
+        for rec in read_results(results_path(Path(args.out), args.experiment)):
+            d = Path(rec.ids.get("run_dir", ""))
+            if d.exists() and d not in dirs:
+                dirs.append(d)
     if not dirs:
         print("nothing to judge (pass --experiment or --run-dir)")
         return 1

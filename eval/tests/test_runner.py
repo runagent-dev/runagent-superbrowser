@@ -45,3 +45,47 @@ def test_dry_run_launches_nothing(tmp_path, capsys):
     assert out == []
     assert "1 runs" in capsys.readouterr().out
     assert not (tmp_path / "e").exists()
+
+
+def test_execute_records_and_resumes_with_stubbed_launch(tmp_path, monkeypatch):
+    """Parent-side glue: launch (stubbed) -> harvest -> record -> results.jsonl; --resume skips."""
+    from eval.core import runner as R
+    from eval.core.records import read_results, results_path
+    from eval.tests.helpers import make_run_dir
+
+    calls = []
+
+    def fake_launch(spec, *, log_to):
+        calls.append(spec.run_id)
+        make_run_dir(tmp_path, experiment=spec.experiment, arm=spec.arm.name, task_id=spec.task.task_id,
+                     seed=spec.seed, judges={"webjudge": spec.arm.name == "ledger"})
+        return 0, "ok"
+
+    from eval.core import server as S
+    monkeypatch.setattr(R, "launch_run", fake_launch)
+    monkeypatch.setattr(S, "http_ok", lambda *a, **k: True)   # pretend the default server is up
+    specs = build_schedule(experiment="e", arms=arms.resolve("ledger,fifo"), tasks=_tasks(2), seeds=[0],
+                           protocol=DEFAULT_PROTOCOL, model="m", runs_root=tmp_path)
+    out = execute(specs, manage_server=False, assumed_server_env=None, resume=False, no_judge=True, judges=[],
+                  dry_run=False, log_dir=tmp_path / "logs")
+    assert len(out) == 4 and len(calls) == 4
+    rows = read_results(results_path(tmp_path, "e"))
+    assert len(rows) == 4 and sum(1 for r in rows if r.success) == 2
+    assert all(r.protocol.get("model") == "test/model" for r in rows)   # from the synthetic meta
+    # resume: nothing relaunched, summaries come from the stored records
+    calls.clear()
+    out2 = execute(specs, manage_server=False, assumed_server_env=None, resume=True, no_judge=True, judges=[],
+                   dry_run=False, log_dir=tmp_path / "logs")
+    assert calls == [] and all(o.status == "skipped" for o in out2)
+
+
+def test_execute_refuses_ts_arm_on_unmanaged_server_with_wrong_env(tmp_path, monkeypatch):
+    import pytest
+    from eval.core import server as S
+
+    monkeypatch.setattr(S, "http_ok", lambda *a, **k: True)
+    specs = build_schedule(experiment="e", arms=arms.resolve("snap_center"), tasks=_tasks(1), seeds=[0],
+                           protocol=DEFAULT_PROTOCOL, model="m", runs_root=tmp_path)
+    with pytest.raises(RuntimeError, match="needs the browser server started with"):
+        execute(specs, manage_server=False, assumed_server_env=None, resume=False, no_judge=True, judges=[],
+                dry_run=False, log_dir=tmp_path / "logs")

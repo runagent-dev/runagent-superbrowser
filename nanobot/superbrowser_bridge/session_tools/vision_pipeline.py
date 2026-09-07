@@ -1787,7 +1787,7 @@ def _schedule_vision_prefetch(
             # screenshot per action, so the eval harness turns this on.
             if os.environ.get("SUPERBROWSER_TRACE_SCREENSHOTS", "").lower() in ("1", "true", "yes", "on"):
                 try:
-                    state.save_screenshot(b64, "prefetch", source="prefetch")
+                    state.save_screenshot(b64, "prefetch", source="prefetch", bump=False)
                 except Exception:
                     pass
             try:  # research trace (no-op unless SUPERBROWSER_TRACE_VISION=1)
