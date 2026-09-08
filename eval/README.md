@@ -105,6 +105,13 @@ Note that WebJudge (primary) and the answer judge take separate credentials: giv
 `SUPERBROWSER_EVAL_WEBJUDGE_API_KEY` whenever the shared `SUPERBROWSER_EVAL_JUDGE_*` pair points at a
 different provider, or it will call its OpenAI-defined model against that provider's endpoint.
 
+Any vision-capable judge model works. `gpt-4o` is what Online-Mind2Web reports, so it is the default and
+the safest thing to cite; `gpt-5.4-mini` was verified to agree with it on the same trajectory at about a
+third of the input price. Reasoning models reject the benchmark's `temperature`/`max_tokens` pair — the
+judge learns the accepted shape on its first call and widens the cap if hidden reasoning swallows an
+answer, so no verdict is silently lost. Whichever you pick, record it: the model is stamped into every
+verdict, and judging is re-runnable offline with `python -m eval.core.judge --experiment <name> --force`.
+
 The replay copies each legacy `eval/runs/<model>/<task>/seedN/` run into
 `eval/runs/modelsplit_replay/…` and adapts only the copy; the recorded originals are never modified.
 
@@ -128,7 +135,7 @@ refresh from pilots with `python -m eval.experiments.e11_cost.analyze`):
 
 | Brain model | ≈ $/run (list) | Vision + WebJudge |
 |---|---|---|
-| anthropic/claude-opus-4.8 | ~$12 | +~$0.1 vision, +~$0.3 WebJudge (gpt-4o) |
+| anthropic/claude-opus-4.8 | ~$12 | +~$0.1 vision, +~$0.3 WebJudge (gpt-4o) or +~$0.1 (gpt-5.4-mini) |
 | openai/gpt-5.4 | ~$6 | same |
 | google/gemini-3.5-flash | ~$4 | same |
 

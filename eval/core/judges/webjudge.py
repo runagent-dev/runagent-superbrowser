@@ -152,31 +152,51 @@ class WebJudge:
         self.max_images = max_images
         self._sem = asyncio.Semaphore(concurrency)
         self.usage: dict[str, int] = {}
+        self._shape: str | None = None   # parameter shape this model accepts (learned on the first call)
+
+    def _shapes(self, max_tokens: int) -> tuple[dict[str, Any], ...]:
+        """Benchmark settings first (temperature 0, max_tokens); newer judge
+        models (o-series, gpt-5.x) reject those parameters, so fall back to
+        max_completion_tokens / no temperature rather than failing the verdict.
+        Once a shape works it is reused: on a reasoning model the first shape
+        fails every time, which would otherwise cost one dead round trip per
+        screenshot (~50 per run)."""
+        if self._shape == "max_tokens":
+            return ({"temperature": 0, "max_tokens": max_tokens},)
+        if self._shape == "max_completion_tokens":
+            return ({"max_completion_tokens": max_tokens},)
+        if self._shape == "bare":
+            return ({},)
+        return ({"temperature": 0, "max_tokens": max_tokens}, {"max_completion_tokens": max_tokens}, {})
 
     async def _chat(self, messages: list[dict[str, Any]], *, max_tokens: int) -> str:
-        """Benchmark settings first (temperature 0, max_tokens); newer judge
-        models (o-series) reject those parameters, so fall back to
-        max_completion_tokens / no temperature rather than failing the verdict."""
-        attempts = (
-            {"temperature": 0, "max_tokens": max_tokens},
-            {"max_completion_tokens": max_tokens},
-            {},
-        )
+        # A reasoning model spends max_completion_tokens on hidden reasoning first, so a
+        # capped call can return an empty answer. Retry once with a wider cap before
+        # letting an empty string reach the parsers (it would read as "no/false").
+        for cap in (max_tokens, max_tokens * 4):
+            resp, shape = await self._call(messages, cap)
+            self._shape = shape
+            self.usage = add_usage(self.usage, usage_of(resp))
+            choice = resp.choices[0] if resp.choices else None
+            text = (getattr(choice, "message", None) and choice.message.content) or ""
+            if text.strip() or getattr(choice, "finish_reason", None) != "length":
+                return text
+        return text
+
+    async def _call(self, messages: list[dict[str, Any]], max_tokens: int) -> tuple[Any, str]:
         last: Exception | None = None
         async with self._sem:
-            for kwargs in attempts:
+            for kwargs in self._shapes(max_tokens):
                 try:
                     resp = await self.client.chat.completions.create(model=self.model, messages=messages, **kwargs)
-                    break
+                    return resp, ("max_tokens" if "max_tokens" in kwargs
+                                  else "max_completion_tokens" if "max_completion_tokens" in kwargs else "bare")
                 except Exception as exc:  # noqa: BLE001 - parameter rejection -> next shape
                     last = exc
                     msg = str(exc).lower()
                     if not any(k in msg for k in ("max_tokens", "temperature", "unsupported", "not supported", "invalid")):
                         raise
-            else:
-                raise last if last else RuntimeError("judge call failed")
-        self.usage = add_usage(self.usage, usage_of(resp))
-        return (resp.choices[0].message.content or "") if resp.choices else ""
+        raise last if last else RuntimeError("judge call failed")
 
     async def identify_key_points(self, task: str) -> str:
         content = await self._chat([

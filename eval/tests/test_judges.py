@@ -174,3 +174,55 @@ def test_preflight_flags_model_endpoint_mismatch(monkeypatch, tmp_path):
     rep2 = preflight.Report()
     preflight.check_judges(rep2)
     assert not rep2.failed
+
+
+def test_webjudge_reuses_the_working_parameter_shape(tmp_path):
+    """A reasoning model rejects max_tokens on every call; the first rejection
+    must be learned, not repaid once per screenshot."""
+    import asyncio as _a
+    from eval.core.judges.webjudge import WebJudge
+
+    class Counting:
+        def __init__(self):
+            self.shapes = []
+            self.chat = self
+            self.completions = self
+
+        async def create(self, *, model, messages, **kwargs):
+            self.shapes.append(tuple(sorted(kwargs)))
+            if "max_tokens" in kwargs:
+                raise RuntimeError("Unsupported parameter: 'max_tokens' is not supported with this model")
+            return FakeChatClient.response("**Reasoning**: ok\n**Score**: 4")
+
+    c = Counting()
+    j = WebJudge(c, "gpt-5.4-mini")
+    for _ in range(3):
+        _a.run(j._chat([{"role": "user", "content": "x"}], max_tokens=512))
+    # first call probes max_tokens then succeeds; later calls go straight to the working shape
+    assert c.shapes[0] == ("max_tokens", "temperature")
+    assert c.shapes[1:] == [("max_completion_tokens",)] * 3
+
+
+def test_webjudge_retries_when_a_token_cap_swallows_the_answer(tmp_path):
+    """Empty content + finish_reason 'length' must not reach the parsers as a 'no'."""
+    import asyncio as _a
+    from eval.core.judges.webjudge import WebJudge
+
+    class Capped:
+        def __init__(self):
+            self.caps = []
+            self.chat = self
+            self.completions = self
+
+        async def create(self, *, model, messages, **kwargs):
+            cap = kwargs.get("max_completion_tokens") or kwargs.get("max_tokens")
+            self.caps.append(cap)
+            if cap and cap <= 512:      # all budget burned on hidden reasoning
+                return FakeChatClient.response("", finish_reason="length")
+            return FakeChatClient.response("**Reasoning**: fine\n**Score**: 4")
+
+    c = Capped()
+    j = WebJudge(c, "gpt-5.4-mini")
+    j._shape = "max_completion_tokens"
+    out = _a.run(j._chat([{"role": "user", "content": "x"}], max_tokens=512))
+    assert "Score" in out and c.caps == [512, 2048]

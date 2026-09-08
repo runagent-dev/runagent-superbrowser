@@ -166,14 +166,11 @@ class FakeChatClient:
         self.chat = self
         self.completions = self
 
-    async def create(self, **kwargs: Any):
-        self.calls.append(kwargs)
-        if self.responder is not None:
-            text = self.responder(kwargs)
-        elif self.replies:
-            text = self.replies.pop(0)
-        else:
-            text = ""
+    @staticmethod
+    def response(text: str, *, finish_reason: str | None = "stop", prompt_tokens: int = 100,
+                 completion_tokens: int = 20):
+        """An OpenAI-shaped chat completion, reusable by tests that need their
+        own client (e.g. to count parameter shapes or simulate a token cap)."""
 
         class _Msg:
             def __init__(self, c: str) -> None:
@@ -182,14 +179,27 @@ class FakeChatClient:
         class _Choice:
             def __init__(self, c: str) -> None:
                 self.message = _Msg(c)
+                self.finish_reason = finish_reason
 
         class _Usage:
-            prompt_tokens = 100
-            completion_tokens = 20
+            pass
+
+        u = _Usage()
+        u.prompt_tokens, u.completion_tokens = prompt_tokens, completion_tokens
 
         class _Resp:
             def __init__(self, c: str) -> None:
                 self.choices = [_Choice(c)]
-                self.usage = _Usage()
+                self.usage = u
 
         return _Resp(text)
+
+    async def create(self, **kwargs: Any):
+        self.calls.append(kwargs)
+        if self.responder is not None:
+            text = self.responder(kwargs)
+        elif self.replies:
+            text = self.replies.pop(0)
+        else:
+            text = ""
+        return self.response(text)

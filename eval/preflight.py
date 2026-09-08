@@ -129,16 +129,24 @@ def check_judges(rep: Report) -> list[tuple[str, Any, str]]:
 
 
 async def ping_llm(rep: Report, clients: list[tuple[str, Any, str]]) -> None:
+    """One tiny real completion per judge: proves model id + key + endpoint agree.
+
+    The cap is deliberately not 1 token: a reasoning model spends its output
+    budget on hidden reasoning first and errors out before writing anything,
+    which would look like a broken judge.
+    """
     for name, client, model in clients:
         try:
-            kwargs: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": "ping"}]}
+            kwargs: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": "Reply with: ok"}]}
             try:
-                await client.chat.completions.create(max_tokens=1, **kwargs)
+                resp = await client.chat.completions.create(max_tokens=64, **kwargs)
             except Exception as exc:  # reasoning models reject max_tokens
-                if "max_tokens" not in str(exc):
+                if "max_tokens" not in str(exc).lower():
                     raise
-                await client.chat.completions.create(max_completion_tokens=1, **kwargs)
-            rep.add(OK, f"{name} ping", f"{model} answered")
+                resp = await client.chat.completions.create(max_completion_tokens=64, **kwargs)
+            reply = ((resp.choices[0].message.content or "").strip() if resp.choices else "")
+            rep.add(OK, f"{name} ping", f"{model} answered {reply[:20]!r}" if reply
+                    else f"{model} reachable (empty reply; judge widens the cap at judge time)")
         except Exception as exc:
             rep.add(BAD, f"{name} ping", f"{model}: {type(exc).__name__}: {str(exc)[:160]}",
                     "fix the model id / key / base URL above before launching")

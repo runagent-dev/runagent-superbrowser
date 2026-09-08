@@ -46,6 +46,9 @@ Arms are interleaved per task (`seed → task → arm`) so paired conditions run
 1. **Deterministic checks** (`benchmarks/checks.json`, URL/answer regexes) — ground truth where defined.
 2. **WebJudge** (Online-Mind2Web's 3-step screenshot judge, prompts verbatim; model pinned by
    `SUPERBROWSER_EVAL_WEBJUDGE_MODEL`, default `gpt-4o`) — primary automatic evaluator.
+   The judge model must be vision-capable and is recorded in every verdict; it is pinned for a whole
+   study and never equals the candidate model. Re-judging a finished sweep with a different judge is
+   allowed only as a reported robustness check, never as a silent replacement of the headline number.
 3. **Answer judge** (text-only, `SUPERBROWSER_EVAL_JUDGE_MODEL`) — secondary.
 
 `outcome.success` = deterministic if it decided, else WebJudge, else answer judge (`outcome.decided_by`).
