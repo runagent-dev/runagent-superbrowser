@@ -95,7 +95,15 @@ All toggles default to today's production behaviour; see `docs/CONFIG.md` for th
 ```bash
 python -m pytest eval/tests -q          # offline harness tests (also in CI)
 python -m eval.rehearse                 # dry-run every schedule + replay recorded runs
+python -m eval.preflight                # live check before spending: keys, judges, server, session
 ```
+
+`preflight` is the one to run before any sweep. It resolves the brain model and its key, the vision
+provider, and BOTH judges, pings each distinct endpoint with a one-token request, opens and closes one
+browser session, and exits non-zero if anything is wrong. `--skip-llm --skip-session` makes it free.
+Note that WebJudge (primary) and the answer judge take separate credentials: give WebJudge
+`SUPERBROWSER_EVAL_WEBJUDGE_API_KEY` whenever the shared `SUPERBROWSER_EVAL_JUDGE_*` pair points at a
+different provider, or it will call its OpenAI-defined model against that provider's endpoint.
 
 The replay copies each legacy `eval/runs/<model>/<task>/seedN/` run into
 `eval/runs/modelsplit_replay/…` and adapts only the copy; the recorded originals are never modified.
@@ -130,12 +138,14 @@ E5 + E7 + E8) is ~700 runs, ~$3–8K on Opus and well under half that on Flash. 
 
 ## Running the full study (user-launched; spends credits)
 
+Terminal 1 keeps the browser server up (`npm run dev`, or `npm run build && npm start`). Everything
+below runs in a second terminal from the repo root; the harness loads `.env` itself, so no `source .env`.
+
 ```bash
 source venv/bin/activate
-npm run build && npm start &                       # default browser server on :3100
-python -m eval.rehearse                            # offline pre-flight: dry-runs + replay of recorded data
-export SUPERBROWSER_EVAL_WEBJUDGE_MODEL=gpt-4o SUPERBROWSER_EVAL_JUDGE_MODEL=gpt-5.5
-M=anthropic/claude-opus-4.8
+python -m eval.rehearse                            # offline pre-flight: dry-runs + replay, no network
+python -m eval.preflight --model <id>              # LIVE pre-flight: config, keys, judges, one session
+M=anthropic/claude-opus-4.8                        # whatever --model you pinned above
 
 python -m eval.experiments.e1_main.run           --model $M --tasks all
 python -m eval.experiments.e2_memory_policy.run  --model $M --seeds 3 --with-noevict

@@ -31,15 +31,33 @@ class Verdict:
 
 
 # ------------------------------------------------------------------ clients
-def resolve_client(*, model_env: str, default_model: str) -> tuple[Any, str]:
-    """(AsyncOpenAI | None, model). Key precedence: SUPERBROWSER_EVAL_JUDGE_API_KEY
-    > OPENAI_API_KEY > ~/.nanobot/config.json providers (openai, then openrouter).
-    A judge must never be the candidate model — pin it explicitly."""
+def resolve_client(*, model_env: str, default_model: str,
+                   prefix: str | None = None) -> tuple[Any, str]:
+    """(AsyncOpenAI | None, model).
+
+    ``prefix`` scopes the credentials to one judge, so the screenshot judge and
+    the answer judge can live on different providers (e.g. WebJudge on OpenAI,
+    the answer judge on a Gemini OpenAI-compatible endpoint). Key precedence:
+    ``<prefix>_API_KEY`` > ``SUPERBROWSER_EVAL_JUDGE_API_KEY`` > ``OPENAI_API_KEY``
+    > ``~/.nanobot/config.json`` providers (openai, then openrouter); the base URL
+    follows the key it belongs to, so a scoped key is never sent to the shared
+    endpoint and vice versa. A judge must never be the candidate model — pin it
+    explicitly."""
     from openai import AsyncOpenAI
 
     model = os.environ.get(model_env, default_model)
-    api_key = os.environ.get("SUPERBROWSER_EVAL_JUDGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("SUPERBROWSER_EVAL_JUDGE_BASE_URL")
+    api_key = base_url = None
+    if prefix:  # scoped pair wins, and stays a pair
+        api_key = os.environ.get(f"{prefix}_API_KEY") or None
+        if api_key:
+            base_url = os.environ.get(f"{prefix}_BASE_URL")
+    if not api_key:
+        api_key = os.environ.get("SUPERBROWSER_EVAL_JUDGE_API_KEY") or None
+        if api_key:
+            base_url = os.environ.get("SUPERBROWSER_EVAL_JUDGE_BASE_URL")
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY") or None
+        # a shared base URL is only meaningful for the shared key
     if not api_key:
         try:
             data = json.loads(Path(DEFAULT_CONFIG_PATH).read_text())

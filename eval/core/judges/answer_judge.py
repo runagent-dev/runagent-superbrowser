@@ -54,7 +54,8 @@ def _parse(txt: str) -> tuple[bool, str]:
 
 async def judge(task: Any, final_answer: str, *, client: Any = None, model: str | None = None) -> Verdict:
     if client is None:
-        client, resolved = resolve_client(model_env="SUPERBROWSER_EVAL_JUDGE_MODEL", default_model=DEFAULT_MODEL)
+        client, resolved = resolve_client(model_env="SUPERBROWSER_EVAL_JUDGE_MODEL", default_model=DEFAULT_MODEL,
+                                          prefix="SUPERBROWSER_EVAL_ANSWER_JUDGE")
         model = model or resolved
     if client is None:
         return Verdict("answer_judge", None, "no judge API key available", model)

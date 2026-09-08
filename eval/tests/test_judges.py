@@ -108,3 +108,69 @@ def test_webjudge_falls_back_when_model_rejects_max_tokens(tmp_path):
     verdicts = asyncio.run(judge_run_async(run_dir, task, which=["webjudge"], client=client))
     assert verdicts["webjudge"].success is False
     assert calls[0] == ["max_tokens", "temperature"] and calls[1] == ["max_completion_tokens"]
+
+
+def test_resolve_client_scopes_credentials_per_judge(monkeypatch, tmp_path):
+    """A judge with its own key must not inherit another judge's base URL.
+
+    Regression: the shared SUPERBROWSER_EVAL_JUDGE_* pair pointed at a Gemini
+    endpoint, so WebJudge (default model gpt-4o) was silently routed there and
+    would have failed on every run of a sweep.
+    """
+    from eval.core.judges.base import resolve_client
+
+    for k in ("SUPERBROWSER_EVAL_WEBJUDGE_API_KEY", "SUPERBROWSER_EVAL_WEBJUDGE_BASE_URL",
+              "SUPERBROWSER_EVAL_JUDGE_API_KEY", "SUPERBROWSER_EVAL_JUDGE_BASE_URL",
+              "SUPERBROWSER_EVAL_ANSWER_JUDGE_API_KEY", "SUPERBROWSER_EVAL_ANSWER_JUDGE_BASE_URL",
+              "OPENAI_API_KEY", "SUPERBROWSER_EVAL_WEBJUDGE_MODEL", "SUPERBROWSER_EVAL_JUDGE_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    # config fallback must not leak into this test
+    monkeypatch.setattr("eval.core.judges.base.DEFAULT_CONFIG_PATH", str(tmp_path / "none.json"))
+
+    # shared pair only -> both judges use it (back-compatible)
+    monkeypatch.setenv("SUPERBROWSER_EVAL_JUDGE_API_KEY", "shared-key")
+    monkeypatch.setenv("SUPERBROWSER_EVAL_JUDGE_BASE_URL", "https://gemini.example/v1")
+    web, _ = resolve_client(model_env="SUPERBROWSER_EVAL_WEBJUDGE_MODEL", default_model="gpt-4o",
+                            prefix="SUPERBROWSER_EVAL_WEBJUDGE")
+    assert "gemini.example" in str(web.base_url)
+
+    # scoped key for WebJudge -> its own endpoint (default OpenAI), shared pair untouched
+    monkeypatch.setenv("SUPERBROWSER_EVAL_WEBJUDGE_API_KEY", "web-key")
+    web, model = resolve_client(model_env="SUPERBROWSER_EVAL_WEBJUDGE_MODEL", default_model="gpt-4o",
+                                prefix="SUPERBROWSER_EVAL_WEBJUDGE")
+    assert model == "gpt-4o" and web.api_key == "web-key"
+    assert "gemini.example" not in str(web.base_url)
+    ans, _ = resolve_client(model_env="SUPERBROWSER_EVAL_JUDGE_MODEL", default_model="gpt-5.5",
+                            prefix="SUPERBROWSER_EVAL_ANSWER_JUDGE")
+    assert ans.api_key == "shared-key" and "gemini.example" in str(ans.base_url)
+
+    # a scoped base URL travels with the scoped key
+    monkeypatch.setenv("SUPERBROWSER_EVAL_WEBJUDGE_BASE_URL", "https://oai.example/v1")
+    web, _ = resolve_client(model_env="SUPERBROWSER_EVAL_WEBJUDGE_MODEL", default_model="gpt-4o",
+                            prefix="SUPERBROWSER_EVAL_WEBJUDGE")
+    assert "oai.example" in str(web.base_url)
+
+
+def test_preflight_flags_model_endpoint_mismatch(monkeypatch, tmp_path):
+    """The preflight must fail loudly on the exact misconfiguration above."""
+    from eval import preflight
+
+    for k in ("SUPERBROWSER_EVAL_WEBJUDGE_API_KEY", "SUPERBROWSER_EVAL_WEBJUDGE_BASE_URL",
+              "SUPERBROWSER_EVAL_ANSWER_JUDGE_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr("eval.core.judges.base.DEFAULT_CONFIG_PATH", str(tmp_path / "none.json"))
+    monkeypatch.setenv("SUPERBROWSER_EVAL_JUDGE_API_KEY", "k")
+    monkeypatch.setenv("SUPERBROWSER_EVAL_JUDGE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+    monkeypatch.setenv("SUPERBROWSER_EVAL_WEBJUDGE_MODEL", "gpt-4o")
+    monkeypatch.setenv("SUPERBROWSER_EVAL_JUDGE_MODEL", "gemini-3-flash-preview")
+
+    rep = preflight.Report()
+    preflight.check_judges(rep)
+    assert rep.failed
+    assert any("cannot be served by google endpoint" in r[2] for r in rep.rows if r[0] == preflight.BAD)
+
+    # matched pair -> no failure
+    monkeypatch.setenv("SUPERBROWSER_EVAL_WEBJUDGE_MODEL", "gemini-3-flash-preview")
+    rep2 = preflight.Report()
+    preflight.check_judges(rep2)
+    assert not rep2.failed
