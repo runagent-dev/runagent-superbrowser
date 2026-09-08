@@ -89,3 +89,68 @@ def test_derived_arms_keep_provenance():
     b = arms.budget_arm("ledger", budget_tokens=1024, recent_k=3)
     assert b.name == "ledger__B1024_K3" and b.env["SUPERBROWSER_MEMORY_BUDGET_TOKENS"] == "1024"
     assert arms.ts_signature(arms.get("snap_center")) == (("SUPERBROWSER_SNAP_STRATEGY", "center"),)
+
+
+def test_annotation_filter_selects_and_stays_deterministic():
+    """--tasks "level=hard,n=10" must give the same 10 tasks every time: a task
+    set has to be fixed before any arm runs, not re-drawn per launch."""
+    from collections import Counter
+
+    from eval.core.tasks import resolve_tasks
+
+    a = [t.task_id for t in resolve_tasks("level=hard,n=10", benchmark="online_mind2web_all")]
+    b = [t.task_id for t in resolve_tasks("level=hard,n=10", benchmark="online_mind2web_all")]
+    assert a == b and len(a) == 10
+    assert a != [t.task_id for t in resolve_tasks("level=hard,n=10,seed=99", benchmark="online_mind2web_all")]
+
+    multi = resolve_tasks("level=easy|medium,antibot=low,n=8", benchmark="online_mind2web_all")
+    assert len(multi) == 8
+    assert {t.level for t in multi} <= {"easy", "medium"}
+    assert {str(t.extra.get("antibot_risk")) for t in multi} == {"low"}
+
+    strat = resolve_tasks("n=12,stratify=level", benchmark="online_mind2web_all")
+    assert dict(Counter(t.level for t in strat)) == {"easy": 4, "medium": 4, "hard": 4}
+
+    # a filter is never mistaken for an id list or a subset name
+    assert [t.task_id for t in resolve_tasks("level=hard", benchmark="online_mind2web_all")] == \
+           sorted(t.task_id for t in resolve_tasks("all", benchmark="online_mind2web_hard"))
+
+
+def test_annotation_filter_errors_are_actionable():
+    import pytest
+
+    from eval.core.tasks import resolve_tasks
+
+    with pytest.raises(KeyError, match="online_mind2web_all"):
+        resolve_tasks("level=easy,n=5", benchmark="online_mind2web_hard")
+    with pytest.raises(KeyError, match="unknown filter field"):
+        resolve_tasks("difficulty=hard,n=5", benchmark="online_mind2web_all")
+    with pytest.raises(ValueError, match="expected key=value"):
+        resolve_tasks("level=hard,10", benchmark="online_mind2web_all")
+
+
+def test_catalog_annotations_reach_the_tasks():
+    """category / antibot_risk / attention_level must survive into Task.extra,
+    and the external third-party columns must NOT be in the benchmark rows."""
+    from eval.core.tasks import load_benchmark
+
+    tasks = load_benchmark("online_mind2web_all", annotate=False)
+    assert len(tasks) == 300
+    assert all(t.extra.get("category") for t in tasks)
+    assert {str(t.extra.get("antibot_risk")) for t in tasks} <= {"low", "medium", "high", "unknown"}
+    assert not any("external" in t.extra or "tinyfish" in str(t.extra).lower() for t in tasks)
+
+
+def test_subset_resolves_against_the_benchmark_it_was_frozen_from():
+    """A pilot drawn from the 300-task split must still resolve when the
+    experiment's default benchmark is the hard-only file."""
+    from eval.core.tasks import load_subsets, resolve_tasks
+
+    subsets = load_subsets()
+    pilot = next((k for k, v in subsets.items() if v.get("benchmark") == "online_mind2web_all"), None)
+    if pilot is None:
+        import pytest
+        pytest.skip("no cross-benchmark subset registered")
+    tasks = resolve_tasks(pilot, benchmark="online_mind2web_hard")
+    assert len(tasks) == subsets[pilot]["n"]
+    assert {t.level for t in tasks} - {"hard"}, "the pilot should span more than the hard split"

@@ -14,6 +14,7 @@ annotations that other files attach by ``task_id``:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from collections import defaultdict
@@ -127,10 +128,84 @@ def load_subsets() -> dict[str, dict[str, Any]]:
     return _read_json(BENCH_DIR / "subsets.json", {})
 
 
+FILTER_FIELDS = {
+    "level": lambda t: (t.level or "").lower(),
+    "category": lambda t: str(t.extra.get("category") or "").lower(),
+    "antibot": lambda t: str(t.extra.get("antibot_risk") or "").lower(),
+    "attention": lambda t: str(t.extra.get("attention_level") or "").lower(),
+    "website": lambda t: (t.domain or "").lower(),
+}
+
+
+def filter_tasks(tasks: list[Task], spec: str) -> list[Task]:
+    """Select tasks by annotation, e.g. ``level=hard,antibot=low,n=10``.
+
+    Every field accepts a ``|``-separated set (``level=easy|medium``). ``n``
+    caps the count and ``stratify`` spreads that cap evenly across the values of
+    a field (``stratify=level``). Selection is deterministic: tasks are ordered
+    by id and shuffled with ``seed`` (default: derived from the filter text), so
+    the same selector always yields the same task list on any machine. That
+    matters because a task set must be fixed BEFORE any arm runs.
+    """
+    terms: dict[str, str] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"bad filter term {part!r}; expected key=value (e.g. level=hard)")
+        k, v = part.split("=", 1)
+        terms[k.strip().lower()] = v.strip()
+
+    unknown = set(terms) - set(FILTER_FIELDS) - {"n", "seed", "stratify"}
+    if unknown:
+        raise KeyError(f"unknown filter field(s) {sorted(unknown)}; have "
+                       f"{sorted(FILTER_FIELDS)} plus n, seed, stratify")
+
+    out = list(tasks)
+    for key, getter in FILTER_FIELDS.items():
+        if key not in terms:
+            continue
+        wanted = {w.strip().lower() for w in terms[key].split("|") if w.strip()}
+        out = [t for t in out if getter(t) in wanted]
+
+    n = int(terms["n"]) if "n" in terms else None
+    if n is None:
+        return sorted(out, key=lambda t: t.task_id)
+
+    seed = int(terms["seed"]) if "seed" in terms else (
+        int(hashlib.sha256(spec.replace(" ", "").encode()).hexdigest()[:8], 16))
+    strat = terms.get("stratify")
+    if strat:
+        if strat not in FILTER_FIELDS:
+            raise KeyError(f"cannot stratify by {strat!r}; have {sorted(FILTER_FIELDS)}")
+        getter = FILTER_FIELDS[strat]
+        groups: dict[str, list[Task]] = defaultdict(list)
+        for t in sorted(out, key=lambda t: t.task_id):
+            groups[getter(t)].append(t)
+        for g in groups.values():
+            random.Random(seed).shuffle(g)
+        picked: list[Task] = []
+        # round-robin so a short group never starves a long one
+        for i in range(max((len(g) for g in groups.values()), default=0)):
+            for key in sorted(groups):
+                if i < len(groups[key]) and len(picked) < n:
+                    picked.append(groups[key][i])
+            if len(picked) >= n:
+                break
+        out = picked
+    else:
+        out = sorted(out, key=lambda t: t.task_id)
+        random.Random(seed).shuffle(out)
+        out = out[:n]
+    return sorted(out, key=lambda t: t.task_id)
+
+
 def resolve_tasks(spec: str, *, benchmark: str) -> list[Task]:
     """Turn a CLI task selector into Task objects.
 
-    ``spec`` is ``all``, a named subset from ``subsets.json``, or a
+    ``spec`` is ``all``, a named subset from ``subsets.json``, an annotation
+    filter (any ``key=value`` term, see :func:`filter_tasks`), or a
     comma-separated list of task ids. Order follows the benchmark file (stable
     across runs) so paired arms see the same sequence.
     """
@@ -138,12 +213,31 @@ def resolve_tasks(spec: str, *, benchmark: str) -> list[Task]:
     by_id = {t.task_id: t for t in tasks}
     if spec in ("", "all"):
         return tasks
+    if "=" in spec:                      # ids and subset names never contain '='
+        picked = filter_tasks(tasks, spec)
+        if not picked:
+            have = sorted({(t.level or "?") for t in tasks})
+            hint = ""
+            if "level=" in spec and len(have) == 1:
+                hint = (f" — {benchmark!r} contains only {have[0]!r} tasks; pass "
+                        f"--benchmark online_mind2web_all to select across levels")
+            raise KeyError(f"filter {spec!r} matched no task in benchmark {benchmark!r}{hint}")
+        keep = {t.task_id for t in picked}
+        return [t for t in tasks if t.task_id in keep]
     subsets = load_subsets()
     if spec in subsets:
-        ids = subsets[spec].get("task_ids", [])
+        entry = subsets[spec]
+        ids = entry.get("task_ids", [])
+        # a subset carries the benchmark it was frozen from: honour it, so a
+        # 10-task pilot drawn from the full split still resolves when the
+        # experiment's default benchmark is the hard-only file
+        source = entry.get("benchmark") or benchmark
+        if source != benchmark:
+            tasks = load_benchmark(source)
+            by_id = {t.task_id: t for t in tasks}
         missing = [i for i in ids if i not in by_id]
         if missing:
-            raise KeyError(f"subset {spec!r} references unknown task ids: {missing[:5]}")
+            raise KeyError(f"subset {spec!r} (benchmark {source!r}) references unknown task ids: {missing[:5]}")
         keep = set(ids)
         return [t for t in tasks if t.task_id in keep]
     wanted = [s.strip() for s in spec.split(",") if s.strip()]
@@ -227,6 +321,9 @@ def main(argv: list[str] | None = None) -> int:
 
         python -m eval.core.tasks --list
         python -m eval.core.tasks --show online_mind2web_hard
+        python -m eval.core.tasks --benchmark online_mind2web_all --select "level=hard,n=10"
+        python -m eval.core.tasks --benchmark online_mind2web_all \
+            --filter "level=hard|medium,antibot=low,n=10" --make-subset pilot10 --note "first sweep"
         python -m eval.core.tasks --make-subset ablation24 --n 24 [--seed 20260906]
     """
     import argparse
@@ -239,6 +336,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n", type=int, default=24)
     ap.add_argument("--seed", type=int, default=20260906)
     ap.add_argument("--ids", default=None, help="explicit comma-separated ids for --make-subset")
+    ap.add_argument("--select", metavar="FILTER", default=None,
+                    help='preview an annotation filter, e.g. "level=hard,antibot=low,n=10"')
+    ap.add_argument("--filter", metavar="FILTER", default=None,
+                    help="same syntax; use as the source of --make-subset instead of site-type stratification")
     ap.add_argument("--note", default="")
     args = ap.parse_args(argv)
     if args.list:
@@ -250,18 +351,35 @@ def main(argv: list[str] | None = None) -> int:
         for t in load_benchmark(args.show):
             print(f"{t.task_id}  [{t.level or '-':6s}] {site_type(t):17s} {t.domain:28s} {t.instruction[:70]}")
         return 0
+    if args.select:
+        chosen = resolve_tasks(args.select, benchmark=args.benchmark)
+        from collections import Counter
+        print(f"{len(chosen)} task(s) from {args.benchmark} matching {args.select!r}\n")
+        for t in chosen:
+            print(f"  {t.task_id}  [{(t.level or '-'):6s}] {str(t.extra.get('category') or '-'):22s} "
+                  f"antibot={str(t.extra.get('antibot_risk') or '-'):7s} {t.domain:26s} {t.instruction[:58]}")
+        for field in ("level", "category", "antibot_risk"):
+            vals = Counter(str(t.extra.get(field) if field != "level" else t.level) for t in chosen)
+            print(f"\n  {field}: {dict(sorted(vals.items()))}", end="")
+        print(f"\n\nSelection is deterministic. Freeze it before running arms:\n"
+              f"  python -m eval.core.tasks --benchmark {args.benchmark} "
+              f'--filter "{args.select}" --make-subset <name>')
+        return 0
     if args.make_subset:
         tasks = load_benchmark(args.benchmark)
         if args.ids:
             want = [s.strip() for s in args.ids.split(",") if s.strip()]
             chosen = [t for t in tasks if t.task_id in set(want)]
+        elif args.filter:
+            chosen = resolve_tasks(args.filter, benchmark=args.benchmark)
         else:
             chosen = stratified_subset(tasks, args.n, seed=args.seed)
         subsets = load_subsets()
         subsets[args.make_subset] = {
             "benchmark": args.benchmark,
             "n": len(chosen),
-            "method": ("explicit ids" if args.ids else f"stratified by site_type, proportional allocation, seed={args.seed}"),
+            "method": ("explicit ids" if args.ids else f"filter {args.filter!r}" if args.filter
+                       else f"stratified by site_type, proportional allocation, seed={args.seed}"),
             "note": args.note,
             "strata": dict(sorted(__import__("collections").Counter(site_type(t) for t in chosen).items())),
             "task_ids": [t.task_id for t in chosen],

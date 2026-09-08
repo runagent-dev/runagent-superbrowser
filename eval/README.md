@@ -174,6 +174,40 @@ python -m eval.experiments.e12_traces.analyze --experiment e2_memory_policy --ar
 TS-side arms (`e6`, and `e7`'s `no_ladder`) need `--manage-server`: the harness starts its **own** browser
 server on a free port with the arm's env baked in and never touches your `:3100` container.
 
+### Choosing which tasks to run
+
+`eval/benchmarks/online_mind2web_all.jsonl` holds all 300 Online-Mind2Web tasks (easy 83, medium 143,
+hard 74). Each carries three human annotations from the TinyFish workbook: an instruction `category`, an
+`antibot_risk` rating, and an `attention_level`. `task_catalog.json` holds the same annotations plus, under
+`external`, one third-party system's pass/fail per task and six annotators' human labels of *that* system's
+runs. Nothing under `external` is a SuperBrowser result and none of it reaches the benchmark rows.
+
+`--tasks` accepts an annotation filter wherever it accepts a subset name. Any term containing `=` switches
+it into filter mode:
+
+```bash
+python -m eval.core.tasks --benchmark online_mind2web_all --select "level=hard,n=10"
+python -m eval.core.tasks --benchmark online_mind2web_all --select "n=10,stratify=level,antibot=low|medium"
+```
+
+Fields are `level`, `category`, `antibot`, `attention`, `website`, each accepting a `|`-separated set, plus
+`n` to cap the count, `stratify=<field>` to spread that cap evenly, and `seed`. Selection is deterministic:
+the same filter yields the same tasks on any machine, so a run is reproducible from the string alone.
+
+**Freeze the selection before you run arms.** A task set must be fixed before results exist, otherwise
+dropping a task later is indistinguishable from dropping one that an arm failed:
+
+```bash
+python -m eval.core.tasks --benchmark online_mind2web_all \
+  --filter "n=10,stratify=level,antibot=low|medium" --make-subset pilot10 --note "first live sweep"
+python -m eval.experiments.e2_memory_policy.run --model <id> --tasks pilot10   # 10 tasks x 4 arms = 40 runs
+```
+
+A frozen subset records the benchmark it came from, so `--tasks pilot10` resolves even though the
+experiments default to the hard-only split. `pilot10` above is already registered: 10 tasks, 4 easy,
+3 medium, 3 hard, no high-anti-bot sites. Rebuild the catalog after editing the workbook with
+`python -m eval.benchmarks.build_catalog`.
+
 ### Running experiments one at a time
 
 Each experiment is independent: its own arms, its own `eval/runs/<experiment>/` tree, its own

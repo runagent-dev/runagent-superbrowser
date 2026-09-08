@@ -53,5 +53,29 @@
       "a5c87cc1c94a090c9a8dc2c8b6a125d0",
       "f707d765bca668830745d20807d7bee6"
     ]
+  },
+  "pilot10": {
+    "benchmark": "online_mind2web_all",
+    "n": 10,
+    "method": "filter 'n=10,stratify=level,antibot=low|medium'",
+    "note": "first live sweep: 10 tasks spread across levels, avoiding high anti-bot sites",
+    "strata": {
+      "government_health": 1,
+      "info_media": 7,
+      "shopping": 1,
+      "travel_booking": 1
+    },
+    "task_ids": [
+      "07bdc595306729a028ba06cc7451a80a",
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "16200f51d63f0a47a58fa17acd49e368",
+      "1fc28d91d25ccd1c6ba268101326a654",
+      "2fc51dd3febd447f0fdcdabca8d944ce",
+      "3084bc225219fcb73dc1cb0f97276c1c",
+      "75a1b5dcd2c28508a971d98d51fe5767",
+      "a6f0434ce6aff5f9b03681241b03ad82",
+      "b4aa7315e31dfcdc52baf7771be260c9",
+      "c03ee2be3d73556ab789c0ad1cbd3451"
+    ]
   }
 }
