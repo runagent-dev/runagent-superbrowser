@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -123,8 +124,35 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+def archive_failed_attempt(spec: RunSpec) -> Path | None:
+    """Move a previous, unfinished attempt out of the way before re-running.
+
+    A run killed by Ctrl-C or a timeout leaves screenshots, traces and ledgers
+    behind but no ``run_record.json``. Re-running into that directory only
+    overwrites the steps the retry reaches, so screenshots from the longer dead
+    attempt survive and WebJudge would score a trajectory that never happened.
+    The attempt is archived rather than deleted (these runs cost real money) and
+    lands outside the ``<arm>/<task>/seed*`` glob the analysis walks.
+    """
+    d = spec.run_dir
+    if not d.exists() or (d / "run_record.json").exists():
+        return None
+    if not any(c.name != "spec.json" for c in d.iterdir()):
+        return None                      # nothing but the spec we wrote last time
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(d.stat().st_mtime))
+    dest = d.parents[2] / "_failed_attempts" / f"{spec.arm.name}__{spec.task.task_id}__seed{spec.seed}__{stamp}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.move(str(d), str(dest))
+    return dest
+
+
 def launch_run(spec: RunSpec, *, log_to: Path) -> tuple[int | None, str]:
     """Run ``eval.core.run_one`` for ``spec``; returns (returncode|None, stop_note)."""
+    stale = archive_failed_attempt(spec)
+    if stale is not None:
+        print(f"    [archived unfinished attempt -> {stale.relative_to(stale.parents[2])}]", flush=True)
     spec.run_dir.mkdir(parents=True, exist_ok=True)
     (spec.run_dir / "spec.json").write_text(json.dumps(spec.to_json(), indent=2, ensure_ascii=False))
     env = {**os.environ, **spec.env()}

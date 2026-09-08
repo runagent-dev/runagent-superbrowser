@@ -89,3 +89,37 @@ def test_execute_refuses_ts_arm_on_unmanaged_server_with_wrong_env(tmp_path, mon
     with pytest.raises(RuntimeError, match="needs the browser server started with"):
         execute(specs, manage_server=False, assumed_server_env=None, resume=False, no_judge=True, judges=[],
                 dry_run=False, log_dir=tmp_path / "logs")
+
+
+def test_unfinished_attempt_is_archived_before_a_retry(tmp_path):
+    """Ctrl-C then --resume must not let a dead attempt's screenshots survive
+    into the retry, where the judge would score a trajectory that never ran."""
+    import json as _j
+    from eval.core import runner as R
+    from eval.core.arms import ARMS
+    from eval.core.protocol import DEFAULT_PROTOCOL
+    from eval.core.tasks import Task
+
+    task = Task(task_id="t1", benchmark="custom_dev", level="hard", website="e.com",
+                start_url="https://e.com", instruction="do it")
+    spec = R.RunSpec("e2_memory_policy", ARMS["ledger"], task, 0,
+                     R.run_dir_for(tmp_path, "e2_memory_policy", "ledger", "t1", 0),
+                     DEFAULT_PROTOCOL, "m", "orchestrator")
+
+    shots = spec.run_dir / "screenshots"
+    shots.mkdir(parents=True)
+    for i in range(6):
+        (shots / f"{i:03d}-shot.jpg").write_bytes(b"dead attempt")
+    (spec.run_dir / "meta.json").write_text(_j.dumps({"stop_reason": "killed"}))
+
+    archived = R.archive_failed_attempt(spec)
+    assert archived is not None and archived.exists()
+    assert not spec.run_dir.exists(), "the stale attempt must not remain in place"
+    assert len(list((archived / "screenshots").iterdir())) == 6, "the paid-for attempt is kept, not deleted"
+    # archives live outside the glob the analysis walks
+    assert not list((tmp_path / "e2_memory_policy").glob("*/*/seed*/screenshots"))
+
+    # a finished run is never touched
+    spec.run_dir.mkdir(parents=True)
+    (spec.run_dir / "run_record.json").write_text("{}")
+    assert R.archive_failed_attempt(spec) is None and spec.run_dir.exists()

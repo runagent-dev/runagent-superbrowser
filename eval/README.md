@@ -174,6 +174,24 @@ python -m eval.experiments.e12_traces.analyze --experiment e2_memory_policy --ar
 TS-side arms (`e6`, and `e7`'s `no_ladder`) need `--manage-server`: the harness starts its **own** browser
 server on a free port with the arm's env baked in and never touches your `:3100` container.
 
+### Running experiments one at a time
+
+Each experiment is independent: its own arms, its own `eval/runs/<experiment>/` tree, its own
+`results.jsonl`, its own analyzer. You can run one, analyse it, and come back weeks later for the next.
+Three things to know:
+
+- **Interrupting is safe.** Stop with Ctrl-C and re-launch the same command with `--resume`; finished runs
+  are skipped. An unfinished attempt is archived to `eval/runs/<experiment>/_failed_attempts/` before the
+  retry starts, so its screenshots can never be judged as part of the new run, and nothing you paid for is
+  deleted.
+- **Arms interleave per task, so drift is controlled inside an experiment but not between them.** The
+  schedule is seed → task → arm: every arm for one task runs back to back. That is why each experiment
+  re-runs its own baseline arm instead of reusing another experiment's, and why you should not compare a
+  TSR from E2 against a TSR from E4 run a month later.
+- **A partial sweep still analyses.** Pairing is per (task, seed); the analyzer reports how many runs were
+  unpaired. Judging is a separate offline pass (`python -m eval.core.judge --experiment <name>`), so you
+  can sweep now and judge later.
+
 ## User-owned follow-ups (left deliberately)
 
 - **Headline reconciliation** — `benchmarks/exclusions.json` `legacy_66_task_reconciliation` is open: which
