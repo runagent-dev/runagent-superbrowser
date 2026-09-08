@@ -194,6 +194,20 @@ Fields are `level`, `category`, `antibot`, `attention`, `website`, each acceptin
 `n` to cap the count, `stratify=<field>` to spread that cap evenly, and `seed`. Selection is deterministic:
 the same filter yields the same tasks on any machine, so a run is reproducible from the string alone.
 
+**Registered sets.** Three are already frozen (see `benchmarks/subsets.json` for the exact ids):
+
+| Subset | n | Levels | Anti-bot | Purpose |
+|---|---|---|---|---|
+| `pilot5` | 5 | 2 easy / 1 med / 2 hard | low only | smoke test, not a paper result |
+| `pilot10` | 10 | 4 / 3 / 3 | low + medium | cost calibration, not a paper result |
+| `paper24` | 24 | 8 / 8 / 8 | unfiltered (4 high) | the paper's evaluation set |
+
+`paper24` is an equal-allocation level-stratified random sample of the full 300-task split, seeded from its
+filter string and frozen before any arm ran. Anti-bot risk is deliberately **not** filtered there: dropping
+hard-to-reach sites would bias the headline upward, and blocked sites are handled by the impossible-task
+rule in `PROTOCOL.md` instead. The pilots do filter, because their job is to exercise the pipeline rather
+than to measure it — never report a pilot as a result.
+
 **Freeze the selection before you run arms.** A task set must be fixed before results exist, otherwise
 dropping a task later is indistinguishable from dropping one that an arm failed:
 

@@ -382,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
                        else f"stratified by site_type, proportional allocation, seed={args.seed}"),
             "note": args.note,
             "strata": dict(sorted(__import__("collections").Counter(site_type(t) for t in chosen).items())),
+            "level_counts": dict(sorted(__import__("collections").Counter(str(t.level) for t in chosen).items())),
+            "antibot_counts": dict(sorted(__import__("collections").Counter(
+                str(t.extra.get("antibot_risk") or "unknown") for t in chosen).items())),
             "task_ids": [t.task_id for t in chosen],
         }
         (BENCH_DIR / "subsets.json").write_text(json.dumps(subsets, indent=2) + "\n")

@@ -58,12 +58,21 @@
     "benchmark": "online_mind2web_all",
     "n": 10,
     "method": "filter 'n=10,stratify=level,antibot=low|medium'",
-    "note": "first live sweep: 10 tasks spread across levels, avoiding high anti-bot sites",
+    "note": "10-task pilot for cost calibration; low/medium anti-bot only. Not a paper result.",
     "strata": {
       "government_health": 1,
       "info_media": 7,
       "shopping": 1,
       "travel_booking": 1
+    },
+    "level_counts": {
+      "easy": 4,
+      "hard": 3,
+      "medium": 3
+    },
+    "antibot_counts": {
+      "low": 9,
+      "medium": 1
     },
     "task_ids": [
       "07bdc595306729a028ba06cc7451a80a",
@@ -76,6 +85,81 @@
       "a6f0434ce6aff5f9b03681241b03ad82",
       "b4aa7315e31dfcdc52baf7771be260c9",
       "c03ee2be3d73556ab789c0ad1cbd3451"
+    ]
+  },
+  "pilot5": {
+    "benchmark": "online_mind2web_all",
+    "n": 5,
+    "method": "filter 'n=5,stratify=level,antibot=low'",
+    "note": "5-task smoke set: equal level allocation, low anti-bot risk only. For checking the pipeline end to end, NOT a paper result.",
+    "strata": {
+      "government_health": 1,
+      "info_media": 3,
+      "shopping": 1
+    },
+    "level_counts": {
+      "easy": 2,
+      "hard": 2,
+      "medium": 1
+    },
+    "antibot_counts": {
+      "low": 5
+    },
+    "task_ids": [
+      "0e5536aaad9d3462b06cf725e6ed535a",
+      "29526b17a32485742b5ab63507e99417",
+      "3621b099326c7aebd2e2dac6be3b52d1",
+      "78baf9dbe7c3532f7d7ef4cc22a7f065",
+      "c8c1ff115879b3afd14280beb1559b13"
+    ]
+  },
+  "paper24": {
+    "benchmark": "online_mind2web_all",
+    "n": 24,
+    "method": "filter 'n=24,stratify=level'",
+    "note": "Main evaluation set for the paper. Level-stratified random sample of the full 300-task Online-Mind2Web split with EQUAL allocation (8 easy / 8 medium / 8 hard), seed derived from the filter string, frozen 2026-09-08 before any arm ran. Anti-bot risk deliberately NOT filtered: excluding hard-to-reach sites would bias the headline upward; blocked sites are handled by the pre-registered impossible-task rule in PROTOCOL.md.",
+    "strata": {
+      "government_health": 3,
+      "housing_jobs": 3,
+      "info_media": 13,
+      "shopping": 3,
+      "vehicles": 2
+    },
+    "level_counts": {
+      "easy": 8,
+      "hard": 8,
+      "medium": 8
+    },
+    "antibot_counts": {
+      "high": 4,
+      "low": 17,
+      "medium": 3
+    },
+    "task_ids": [
+      "0b2623e9fa5cea997f76490bcbc5220f",
+      "0b51b4fa0295ae80ccd176ebdad6fff6",
+      "207e933d1bba815bcb58664b5d82c085",
+      "23204728192da9f73197a613d9681c18",
+      "34ccd15a8ea8fd3895af83f5ccf62369",
+      "3621b099326c7aebd2e2dac6be3b52d1",
+      "367d843c640637745e8fafa741cca13b",
+      "3c1ffc3f494e423b3c434c79e35da8f3",
+      "47e314cc452c540524ffb7cf520285a3",
+      "5dec0e6620849459f29e6465982c597e",
+      "5e4e89c9b6fdaee7a41aca5601b82e04",
+      "6174e5ddd40cfbdc33ee1502f40bac39",
+      "7b182a5087347d494b48a29dbc0f1d3e",
+      "853afd530c72f4b00ffc32ae854efaf8",
+      "8fdec8eeffd3491e6526cc78c028120b",
+      "b320c68bffc1f3c7f2a8dc9d5478fb27",
+      "bb5d90e6f2fbc0ae146f7c1998c2b4a1",
+      "bd1e3770b7181f6fce9c35e18caa9785",
+      "c39d6c245f8243993e707d54d2f4acec",
+      "ce616721ce9aeda69890fbccb29677a6",
+      "d8e2a81fa621ce4737e5ea85671b630e",
+      "f00e7accfb4a5e09680bdb326e6274ad",
+      "f2097f92a10d42a842c14179f422311e",
+      "fd787623166785d84093565bf945fd24"
     ]
   }
 }
