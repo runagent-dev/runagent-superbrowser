@@ -161,5 +161,50 @@
       "f2097f92a10d42a842c14179f422311e",
       "fd787623166785d84093565bf945fd24"
     ]
+  },
+  "batch5a": {
+    "benchmark": "online_mind2web_all",
+    "n": 5,
+    "method": "deterministic level-balanced 5/5 split of pilot10",
+    "note": "Run batch5a then batch5b under ONE --experiment name so their records pool into one analysis.",
+    "strata": {},
+    "level_counts": {
+      "easy": 2,
+      "hard": 2,
+      "medium": 1
+    },
+    "antibot_counts": {
+      "low": 5
+    },
+    "task_ids": [
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "16200f51d63f0a47a58fa17acd49e368",
+      "2fc51dd3febd447f0fdcdabca8d944ce",
+      "75a1b5dcd2c28508a971d98d51fe5767",
+      "c03ee2be3d73556ab789c0ad1cbd3451"
+    ]
+  },
+  "batch5b": {
+    "benchmark": "online_mind2web_all",
+    "n": 5,
+    "method": "deterministic level-balanced 5/5 split of pilot10",
+    "note": "Run batch5a then batch5b under ONE --experiment name so their records pool into one analysis.",
+    "strata": {},
+    "level_counts": {
+      "easy": 2,
+      "hard": 1,
+      "medium": 2
+    },
+    "antibot_counts": {
+      "low": 4,
+      "medium": 1
+    },
+    "task_ids": [
+      "07bdc595306729a028ba06cc7451a80a",
+      "1fc28d91d25ccd1c6ba268101326a654",
+      "3084bc225219fcb73dc1cb0f97276c1c",
+      "a6f0434ce6aff5f9b03681241b03ad82",
+      "b4aa7315e31dfcdc52baf7771be260c9"
+    ]
   }
 }
