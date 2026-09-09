@@ -68,3 +68,33 @@ def test_headline_audit_from_records(tmp_path):
     assert len(a["missing_tasks"]) == 64
     assert a["paper_draft_claim"]["consistent_fraction"] is False
     assert sum(v["n"] for v in a["by_site_family"].values()) == 10
+
+
+def test_analyzer_can_read_a_combined_sweep(tmp_path, capsys):
+    """All ablations can be swept as ONE experiment so they share a baseline
+    arm; each experiment's analyzer must then pick out only its own arms."""
+    import importlib
+
+    from eval.core.harvest import build_record
+    from eval.core.records import append_result, results_path
+    from eval.tests.helpers import make_run_dir
+
+    runs = tmp_path / "runs"
+    combined = "combined10"
+    # one pool holding every ablation arm, 3 tasks each
+    all_arms = ["ledger", "fifo", "summary", "full_history", "no_deadend", "fresh_vision", "flat"]
+    for arm in all_arms:
+        for t in range(3):
+            d = make_run_dir(runs, experiment=combined, arm=arm, task_id=f"t{t}",
+                             judges={"webjudge": arm == "ledger"})
+            rec = build_record(d)
+            rec.write(d)
+            append_result(results_path(runs, combined), rec)
+
+    m = importlib.import_module("eval.experiments.e4_deadend.analyze")
+    assert m.main(["--runs", str(runs), "--experiment", combined]) == 0
+    out = capsys.readouterr().out
+    assert "reading 'combined10'" in out
+    # E4 compares ledger vs no_deadend only: 2 arms x 3 tasks out of the 21-record pool
+    assert "6/21 records" in out
+    assert "MISSING" not in out

@@ -222,6 +222,37 @@ experiments default to the hard-only split. `pilot10` above is already registere
 3 medium, 3 hard, no high-anti-bot sites. Rebuild the catalog after editing the workbook with
 `python -m eval.benchmarks.build_catalog`.
 
+### Running every ablation in one sweep (recommended on a small task set)
+
+The five paired ablations all use `ledger` as their baseline arm. Run them as separate experiments and you
+pay for that baseline five times. Run them as ONE experiment and you pay once:
+
+```bash
+python -m eval.core.runner --experiment combined10 \
+  --arms ledger,fifo,summary,full_history,no_deadend,fresh_vision,no_ladder,flat \
+  --model <id> --tasks pilot10 --manage-server
+```
+
+| | Separate experiments | One combined sweep |
+|---|---|---|
+| Runs on 10 tasks | 120 | **80** |
+| Baseline runs | 50 (40 redundant) | 10 |
+| Drift between comparisons | uncontrolled | all arms of a task run back to back |
+
+The second row is the cost saving; the third is the methodological gain. Interleaving every arm of a task
+in one window is the only way a cross-mechanism statement ("the Ledger helps more than dead-end memory
+does") is defensible at all.
+
+Then point each analyzer at the shared pool. It selects its own arms and says how many records matched:
+
+```bash
+for e in e2_memory_policy e4_deadend e5_perception_reuse e7_click_cascade e8_topology; do
+  python -m eval.experiments.$e.analyze --experiment combined10; done
+```
+
+Drop `no_ladder` from the arm list to avoid TypeScript-side server restarts (it is the only arm that needs
+them), and drop `--manage-server` with it.
+
 ### Running experiments one at a time
 
 Each experiment is independent: its own arms, its own `eval/runs/<experiment>/` tree, its own

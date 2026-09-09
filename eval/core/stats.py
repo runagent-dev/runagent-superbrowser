@@ -22,7 +22,11 @@ def wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, floa
     denom = 1 + z * z / n
     centre = (p + z * z / (2 * n)) / denom
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return (max(0.0, centre - half), min(1.0, centre + half))
+    lo, hi = max(0.0, centre - half), min(1.0, centre + half)
+    # k=0 and k=n are common on a small task set; the closed form leaves a ~1e-17
+    # residue there, which puts the point outside its own interval downstream.
+    eps = 1e-12
+    return (0.0 if lo < eps else lo, 1.0 if hi > 1 - eps else hi)
 
 
 def _binom_two_sided_p(k: int, n: int) -> float:

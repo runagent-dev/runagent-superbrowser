@@ -147,11 +147,27 @@ def analyze_main(spec: ExperimentSpec, extra: Callable[[argparse.Namespace, list
     def main(argv: list[str] | None = None) -> int:
         ap = argparse.ArgumentParser(description=f"analyze {spec.name}")
         ap.add_argument("--runs", default=str(DEFAULT_RUNS_ROOT))
+        ap.add_argument("--experiment", default=None,
+                        help="read runs from this experiment instead of %r — use it when several "
+                             "ablations were swept together as one combined experiment so they share "
+                             "one baseline arm; only this experiment's arms are analysed" % spec.name)
         ap.add_argument("--no-recompute", action="store_true", help="use stored metrics instead of recomputing from run dirs")
         if spec.extra_args:
             spec.extra_args(ap)
         args = ap.parse_args(argv)
-        recs = analysis.load(spec.name, runs_root=Path(args.runs), recompute=not args.no_recompute)
+        source = args.experiment or spec.name
+        recs = analysis.load(source, runs_root=Path(args.runs), recompute=not args.no_recompute)
+        if args.experiment:
+            try:                                   # the arms this run would have used
+                wanted = {a.name for a in spec.arms(args)}
+            except Exception:                      # fall back to the arms it compares
+                wanted = {n for pair in spec.pairs for n in pair}
+            kept = [r for r in recs if r.ids.get("arm") in wanted]
+            missing = wanted - {r.ids.get("arm") for r in kept}
+            print(f"[{spec.name}] reading {source!r}: {len(kept)}/{len(recs)} records match this "
+                  f"experiment's arms {sorted(wanted)}"
+                  + (f"; MISSING arm(s): {sorted(missing)}" if missing else ""))
+            recs = kept
         result = standard_analyze(spec, runs_root=Path(args.runs), records=recs)
         if extra is not None and recs:
             extra(args, recs, result)

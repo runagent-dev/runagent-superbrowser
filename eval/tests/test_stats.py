@@ -53,3 +53,18 @@ def test_kappa_and_confusion():
     assert abs(kappa - 0.4667) < 0.01
     assert cohen_kappa([True] * 5, [True] * 5)[1] == 1.0
     assert confusion(h1, h2) == {"tp": 4, "tn": 2, "fp": 1, "fn": 1}
+
+
+def test_wilson_bounds_are_exact_at_the_extremes():
+    """0/n and n/n happen often on a small task set; the closed form leaves a
+    ~1e-17 residue there, which put a point outside its own interval and made
+    matplotlib abort the analyzer over an error bar."""
+    from eval.core.stats import wilson_ci
+
+    lo, hi = wilson_ci(0, 10)
+    assert lo == 0.0 and 0.0 < hi < 1.0
+    lo, hi = wilson_ci(10, 10)
+    assert hi == 1.0 and 0.0 < lo < 1.0
+    for k in range(11):
+        lo, hi = wilson_ci(k, 10)
+        assert lo <= k / 10 <= hi, f"point {k}/10 must lie inside its own interval"

@@ -180,8 +180,10 @@ def scatter_png(path: Path, points: dict[str, tuple[float, float]], *, xlabel: s
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(4.8, 3.6), dpi=160)
     for name, (xv, yv) in points.items():
-        xe = [[xv - xerr[name][0]], [xerr[name][1] - xv]] if xerr and name in xerr else None
-        ye = [[yv - yerr[name][0]], [yerr[name][1] - yv]] if yerr and name in yerr else None
+        # matplotlib wants non-negative OFFSETS; never let a rounding residue in a
+        # confidence bound abort an analysis run over a plot
+        xe = [[max(0.0, xv - xerr[name][0])], [max(0.0, xerr[name][1] - xv)]] if xerr and name in xerr else None
+        ye = [[max(0.0, yv - yerr[name][0])], [max(0.0, yerr[name][1] - yv)]] if yerr and name in yerr else None
         ax.errorbar([xv], [yv], xerr=xe, yerr=ye, fmt="o", capsize=3)
         ax.annotate(name, (xv, yv), textcoords="offset points", xytext=(5, 5), fontsize=8)
     ax.set_xlabel(xlabel)
