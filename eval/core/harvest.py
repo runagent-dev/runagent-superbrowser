@@ -130,6 +130,10 @@ def classify_failure(*, success: bool | None, stop_reason: str | None, final_ans
     text = (final_answer or "") + " " + (error or "")
     if looks_like_api_error(final_answer) or (error and "quota" in error.lower()):
         return "api_error"
+    if stop_reason == "harness_error":
+        # the run produced nothing to grade (subprocess crash, harvest failure);
+        # judging an empty answer would manufacture a task failure
+        return "harness_error"
     if stop_reason == "timeout":
         return "timeout"
     low = text.lower()
@@ -152,7 +156,7 @@ def classify_failure(*, success: bool | None, stop_reason: str | None, final_ans
     return "other" if success is False else None
 
 
-EXCLUDABLE = ("site_unavailable", "geo_blocked", "captcha_unsolved", "api_error")
+EXCLUDABLE = ("site_unavailable", "geo_blocked", "captcha_unsolved", "api_error", "harness_error")
 
 
 def exclusion_label(failure_reason: str | None) -> str | None:

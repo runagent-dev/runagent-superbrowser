@@ -76,6 +76,26 @@ def check_config(rep: Report, model_override: str | None) -> dict[str, Any]:
             f"providers.{provider}.apiKey present" if key else f"providers.{provider}.apiKey is empty",
             f"set the {provider} key in ~/.nanobot/config.json")
     p = DEFAULT_PROTOCOL
+    # B4: the pin only moves nanobot's own snip threshold; the provider is never told.
+    # On a model with a smaller real window the prompt overflows and the provider 400s,
+    # which is then scored as an ordinary task failure.
+    if model:
+        try:
+            from eval.core.pricing import price_for
+
+            row = price_for(model) or {}
+            ctx = row.get("context_length")
+            if ctx and ctx < p.context_window_tokens:
+                rep.add(BAD, "context window",
+                        f"{model} accepts {ctx:,} tokens but the protocol pins contextWindowTokens="
+                        f"{p.context_window_tokens:,}",
+                        f"pass --context-window-tokens {ctx} to the run command, or pick a model with a "
+                        f"larger window; an overflow shows up as a task failure, not a config error")
+            elif ctx:
+                rep.add(OK, "context window", f"{model} accepts {ctx:,} tokens >= the pinned "
+                                              f"{p.context_window_tokens:,}")
+        except Exception:
+            pass
     rep.add(OK, "protocol pins",
             f"maxToolIterations={p.max_iterations} contextWindowTokens={p.context_window_tokens} "
             f"maxTokens={p.max_tokens} temperature={p.temperature} (patched per run, your config is not edited)")

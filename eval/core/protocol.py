@@ -44,7 +44,11 @@ def _default_env_pins() -> dict[str, str]:
         "SUPERBROWSER_TRACE_VISION": "1",        # memory/vision_calls.jsonl
         "SUPERBROWSER_TRACE_CLICKS": "1",        # memory/clicks.jsonl
         "SUPERBROWSER_TRACE_SCREENSHOTS": "1",   # per-run ordered screenshots (WebJudge)
-        "SUPERBROWSER_EVAL_CONTEXT_DUMP": "1",   # memory/live_context.jsonl.gz (CSD)
+        "SUPERBROWSER_EVAL_CONTEXT_DUMP": "1",
+        # nobody is watching a sweep: an armed handoff blocks ~180s per captcha
+        # waiting for a human, and only the orchestrator arm arms it, which would
+        # also make the E8 topology comparison unfair.
+        "SUPERBROWSER_MAX_HUMAN_HANDOFFS": "0",   # memory/live_context.jsonl.gz (CSD)
     }
 
 

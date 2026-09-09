@@ -72,7 +72,10 @@ def resolve_client(*, model_env: str, default_model: str,
             pass
     if not api_key:
         return None, model
-    kwargs: dict[str, Any] = {"api_key": api_key}
+    # A judge stall must not hold a sweep: WebJudge issues one vision call per
+    # screenshot, and the openai default is 600s x2 retries EACH.
+    kwargs: dict[str, Any] = {"api_key": api_key, "timeout": float(
+        os.environ.get("SUPERBROWSER_EVAL_JUDGE_TIMEOUT_S", "120")), "max_retries": 2}
     if base_url:
         kwargs["base_url"] = base_url
     return AsyncOpenAI(**kwargs), model

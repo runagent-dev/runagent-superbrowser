@@ -169,14 +169,22 @@ def launch_run(spec: RunSpec, *, log_to: Path) -> tuple[int | None, str]:
             return None, "killed: hard wall-clock exceeded"
 
 
-def _ensure_meta_after_kill(spec: RunSpec, note: str) -> None:
+def _ensure_meta_after_kill(spec: RunSpec, note: str, *, stop_reason: str = "timeout") -> None:
+    """Record WHY no meta.json exists.
+
+    A subprocess that died without writing one produced no trajectory at all, so
+    grading it as a task would invent a failure: the answer judge is handed an
+    empty answer and dutifully returns success=False, indistinguishable from an
+    agent that genuinely gave up. ``harness_error`` keeps such runs out of the
+    denominator (see harvest.EXCLUDABLE).
+    """
     meta_path = spec.run_dir / "meta.json"
     if meta_path.exists():
         return
     meta_path.write_text(json.dumps({
         "run_id": spec.run_id, "experiment": spec.experiment, "arm": spec.arm.name,
         "task_id": spec.task.task_id, "seed": spec.seed, "topology": spec.topology,
-        "stop_reason": "timeout", "error": note, "final_answer": "", "started_at": None,
+        "stop_reason": stop_reason, "error": note, "final_answer": "", "started_at": None,
         "ended_at": time.time(), "duration_s": None, "role_task_ids": [], "n_screenshots": 0,
     }, indent=2))
 
@@ -220,12 +228,26 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
             rc, note = launch_run(s, log_to=s.run_dir / "run.log")
             if rc is None:
                 _ensure_meta_after_kill(s, note)
-            rec = asyncio.run(finish_run(s, judges=judges, no_judge=no_judge))
+            elif rc != 0 and not (s.run_dir / "meta.json").exists():
+                # the subprocess crashed before producing anything to grade
+                _ensure_meta_after_kill(s, f"run_one exited {rc} without writing meta.json; see run.log",
+                                        stop_reason="harness_error")
+            try:
+                rec = asyncio.run(finish_run(s, judges=judges, no_judge=no_judge))
+            except Exception as exc:  # noqa: BLE001 - one bad run must not end the sweep
+                print(f"    !! harvest/judge failed: {type(exc).__name__}: {str(exc)[:200]}")
+                _ensure_meta_after_kill(s, f"{type(exc).__name__}: {exc}"[:300], stop_reason="harness_error")
+                try:
+                    rec = asyncio.run(finish_run(s, judges=[], no_judge=True))
+                except Exception as exc2:  # noqa: BLE001
+                    print(f"    !! could not record this run at all: {type(exc2).__name__}")
+                    out.append(RunResultSummary(s.run_id, "failed", None, round(time.time() - t0, 1), "unrecorded"))
+                    continue
             wall = round(time.time() - t0, 1)
             flag = ""
-            if rec.outcome.get("failure_reason") == "api_error":
+            if rec.outcome.get("failure_reason") in ("api_error", "harness_error"):
                 consecutive_api_errors += 1
-                flag = f"  [PROVIDER ERROR {consecutive_api_errors}/{max_api_errors} — excluded, not a task failure]"
+                flag = (f"  [{rec.outcome.get('failure_reason').upper()} {consecutive_api_errors}/{max_api_errors} — excluded, not a task failure]")
             else:
                 consecutive_api_errors = 0
             print(f"    -> success={rec.success} ({rec.outcome.get('decided_by')}) stop={rec.outcome.get('stop_reason')}"

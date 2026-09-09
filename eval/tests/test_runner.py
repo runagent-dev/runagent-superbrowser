@@ -123,3 +123,40 @@ def test_unfinished_attempt_is_archived_before_a_retry(tmp_path):
     spec.run_dir.mkdir(parents=True)
     (spec.run_dir / "run_record.json").write_text("{}")
     assert R.archive_failed_attempt(spec) is None and spec.run_dir.exists()
+
+
+def test_a_crashed_subprocess_is_a_harness_error_not_a_task_failure(tmp_path):
+    """run_one exiting non-zero produces no trajectory. Grading that as a task
+    hands the answer judge an empty answer, which returns success=False and is
+    indistinguishable from an agent giving up. Such runs must leave the
+    denominator."""
+    from eval.core import runner as R
+    from eval.core.arms import ARMS
+    from eval.core.harvest import classify_failure, exclusion_label
+    from eval.core.protocol import DEFAULT_PROTOCOL
+    from eval.core.tasks import Task
+
+    task = Task(task_id="t1", benchmark="custom_dev", level="hard", website="e.com",
+                start_url="https://e.com", instruction="do it")
+    spec = R.RunSpec("e_x", ARMS["ledger"], task, 0,
+                     R.run_dir_for(tmp_path, "e_x", "ledger", "t1", 0),
+                     DEFAULT_PROTOCOL, "m", "orchestrator")
+    spec.run_dir.mkdir(parents=True)
+    R._ensure_meta_after_kill(spec, "run_one exited 1 without writing meta.json",
+                              stop_reason="harness_error")
+    import json as _j
+    meta = _j.loads((spec.run_dir / "meta.json").read_text())
+    assert meta["stop_reason"] == "harness_error"
+
+    reason = classify_failure(success=False, stop_reason="harness_error", final_answer="",
+                              tags={}, error=meta["error"])
+    assert reason == "harness_error"
+    assert exclusion_label(reason) == "harness_error"
+
+
+def test_protocol_disarms_human_handoff():
+    """No human is watching a sweep; an armed handoff blocks ~180s per captcha,
+    and only the orchestrator arm arms it, which would also bias E8."""
+    from eval.core.protocol import DEFAULT_PROTOCOL
+
+    assert DEFAULT_PROTOCOL.env()["SUPERBROWSER_MAX_HUMAN_HANDOFFS"] == "0"

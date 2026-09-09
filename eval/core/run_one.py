@@ -272,6 +272,51 @@ def frame_task(task: dict[str, Any]) -> str:
     return task["instruction"]
 
 
+def _server_base() -> str:
+    return os.environ.get("SUPERBROWSER_URL") or "http://localhost:3100"
+
+
+def _list_sessions() -> set[str]:
+    try:
+        import httpx
+
+        tok = os.environ.get("TOKEN") or os.environ.get("SUPERBROWSER_TOKEN")
+        h = {"Authorization": f"Bearer {tok}"} if tok else {}
+        r = httpx.get(f"{_server_base()}/sessions", headers=h, timeout=10.0)
+        return set((r.json() or {}).get("sessions") or [])
+    except Exception:
+        return set()
+
+
+def close_new_sessions(before: set[str]) -> int:
+    """Close browser sessions this run opened, and only those.
+
+    Nothing in the bridge closes a session unless the model chooses to call
+    browser_close, and the server only reaps at 30 min idle / 2 h lifetime while
+    refusing new sessions past MAX_SESSIONS (20). A sweep of short runs therefore
+    walks into 429s that look like task failures. Diffing the session list around
+    the run closes ours without touching a session the operator already had open.
+    """
+    if os.environ.get("SUPERBROWSER_EVAL_CLOSE_SESSIONS", "1") == "0":
+        return 0
+    leaked = _list_sessions() - before
+    if not leaked:
+        return 0
+    import httpx
+
+    tok = os.environ.get("TOKEN") or os.environ.get("SUPERBROWSER_TOKEN")
+    h = {"Authorization": f"Bearer {tok}"} if tok else {}
+    n = 0
+    for sid in leaked:
+        try:
+            httpx.delete(f"{_server_base()}/session/{sid}", headers=h, timeout=20.0)
+            n += 1
+        except Exception:
+            pass
+    print(f"[run_one] closed {n} browser session(s) left open by this run")
+    return n
+
+
 async def _main(spec: dict[str, Any]) -> int:
     run_dir = Path(spec["run_dir"])
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -294,12 +339,17 @@ async def _main(spec: dict[str, Any]) -> int:
     timeout = spec.get("internal_timeout_s")
     topology = (spec.get("topology") or os.environ.get("SUPERBROWSER_TOPOLOGY") or "orchestrator").lower()
     started = time.time()
+    sessions_before = _list_sessions()
     try:
         if topology == "flat":
             out = await _run_flat(spec, framed, timeout)
         else:
             out = await _run_orchestrator(spec, framed, timeout)
     finally:
+        try:
+            close_new_sessions(sessions_before)
+        except Exception:
+            pass
         try:
             os.unlink(cfg_path)
         except OSError:
