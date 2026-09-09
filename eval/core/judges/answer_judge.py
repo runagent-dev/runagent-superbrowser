@@ -26,8 +26,20 @@ SYSTEM_PROMPT = (
 )
 
 FAILURE_MARKERS = ("browser worker failed", "captcha_unsolved", "network_blocked", "worker_no_tool_calls")
+# A provider refusal is NOT a task failure. If these are not detected, a sweep
+# whose key runs dry mid-way records every remaining run as a real failure and
+# the analysis reports a success rate built entirely on billing errors.
 API_ERROR_MARKERS = ("exceeded your current quota", "insufficient_quota", "check your plan and billing",
-                     "rate limit", "invalid_api_key", "incorrect api key", "authenticationerror")
+                     "rate limit", "invalid_api_key", "incorrect api key", "authenticationerror",
+                     # nanobot's own provider-rejection wording
+                     "the ai provider rejected the request", "out of quota", "account is in arrears",
+                     "billing status of your api key", "top up",
+                     # other providers
+                     "quota exceeded", "credit balance is too low", "insufficient credits",
+                     "requires more credits", "fewer max_tokens", "payment required",
+                     "error code: 402", "http 402", "you exceeded your current quota",
+                     "no endpoints found", "provider returned error")
+# NB: bare "402" is deliberately NOT a marker — a page result can contain that number.
 
 
 def looks_like_api_error(final_answer: str | None) -> bool:

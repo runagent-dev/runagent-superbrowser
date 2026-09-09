@@ -87,3 +87,34 @@ def test_harvest_uses_vision_and_click_traces_when_present(tmp_path):
     assert rec.counts["vision_cache_hits"] == 1 and rec.counts["clicks_logged"] == 2
     assert rec.artifacts["has_vision_trace"] and rec.artifacts["has_click_trace"]
     assert rec.tokens["context_est_after_peak"] == 42000
+
+
+def test_provider_refusal_is_excluded_not_counted_as_a_task_failure():
+    """A live smoke run hit an out-of-credit provider. The run finished in ~1s
+    with 0 iterations and was recorded as a genuine failure with reason
+    'premature_done'. A sweep whose key runs dry would then have produced a
+    success rate made entirely of billing errors."""
+    from eval.core.harvest import classify_failure, exclusion_label
+    from eval.core.judges.answer_judge import looks_like_api_error
+
+    verbatim = ("The AI provider rejected the request because the API key is out of quota or the "
+                "account is in arrears. Please top up / check the billing status of your API key "
+                "and try again.")
+    assert looks_like_api_error(verbatim)
+    reason = classify_failure(success=False, stop_reason="ok", final_answer=verbatim, tags={}, error=None)
+    assert reason == "api_error"
+    assert exclusion_label(reason) == "api_error", "must leave the denominator"
+
+    for other in ("This request requires more credits, or fewer max_tokens",
+                  "Error code: 402 - payment required",
+                  "Your credit balance is too low to access the API",
+                  "Rate limit exceeded, please try again later"):
+        assert looks_like_api_error(other), other
+
+    # a real task failure must NOT be swallowed by the broadened markers
+    for genuine in ("I could not find any matching flight under $200.",
+                    "The search returned no results for that zip code.",
+                    "I was unable to complete the booking because the seat map never loaded."):
+        assert not looks_like_api_error(genuine), genuine
+        assert classify_failure(success=False, stop_reason="ok", final_answer=genuine,
+                                tags={}, error=None) != "api_error"

@@ -84,6 +84,75 @@ def check_config(rep: Report, model_override: str | None) -> dict[str, Any]:
     return {"model": model, "provider": provider}
 
 
+async def check_credits(rep: Report, cfg: dict[str, Any]) -> None:
+    """Ask the provider what is left, when it can tell us."""
+    if cfg.get("provider") != "openrouter":
+        return
+    try:
+        import json as _json
+
+        import httpx
+
+        data = _json.loads(Path(DEFAULT_CONFIG_PATH).read_text())
+        key = ((data.get("providers", {}) or {}).get("openrouter", {}) or {}).get("apiKey")
+        if not key:
+            return
+        async with httpx.AsyncClient(timeout=20) as h:
+            r = await h.get("https://openrouter.ai/api/v1/credits",
+                            headers={"Authorization": f"Bearer {key}"})
+        d = (r.json() or {}).get("data") or {}
+        total, used = float(d.get("total_credits") or 0), float(d.get("total_usage") or 0)
+        left = total - used
+        status = OK if left > 20 else (WARN if left > 0 else BAD)
+        rep.add(status, "credits", f"OpenRouter balance ${left:.2f} (granted ${total:.2f}, used ${used:.2f})",
+                "top up before sweeping: with no balance every run fails instantly and is recorded as an "
+                "excluded api_error, so the sweep produces no usable data" if left <= 0 else
+                "a sweep costs several dollars per run; this will not finish" if status == WARN else "")
+    except Exception:
+        return
+
+
+async def ping_brain(rep: Report, cfg: dict[str, Any]) -> None:
+    """One tiny completion through the ACTUAL brain provider.
+
+    The judges having credit says nothing about the brain's key. A sweep whose
+    brain provider is out of quota finishes every run in about a second, and
+    those runs look like ordinary task failures unless something checks first.
+    """
+    model, provider = cfg.get("model"), cfg.get("provider")
+    if not model:
+        return
+    try:
+        import json as _json
+
+        from openai import AsyncOpenAI
+
+        data = _json.loads(Path(DEFAULT_CONFIG_PATH).read_text())
+        pc = (data.get("providers", {}) or {}).get(provider or "", {}) or {}
+        key = pc.get("apiKey")
+        base = pc.get("apiBase") or {"openrouter": "https://openrouter.ai/api/v1"}.get(provider)
+        if not key:
+            rep.add(BAD, "brain ping", f"no apiKey for provider {provider!r}")
+            return
+        client = AsyncOpenAI(api_key=key, **({"base_url": base} if base else {}))
+        # Ping with the protocol's REAL max_tokens. Providers reserve credit for the
+        # requested ceiling, so a tiny probe passes on an account whose balance
+        # cannot fund an actual run — the check would then bless a sweep that
+        # fails on every task.
+        cap = DEFAULT_PROTOCOL.max_tokens
+        resp = await client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": "Reply with: ok"}], max_tokens=cap)
+        reply = ((resp.choices[0].message.content or "").strip() if resp.choices else "")
+        rep.add(OK, "brain ping", f"{model} answered {reply[:20]!r} at the protocol's max_tokens={cap}")
+    except Exception as exc:
+        msg = str(exc)
+        money = any(w in msg.lower() for w in ("quota", "billing", "credit", "arrears", "402", "payment"))
+        rep.add(BAD, "brain ping", f"{model}: {type(exc).__name__}: {msg[:170]}",
+                "the brain provider is refusing requests — top up or switch --model BEFORE sweeping; "
+                "every run would otherwise finish in ~1s and be recorded as an excluded api_error"
+                if money else "fix the model id / key / provider above before launching")
+
+
 def check_vision(rep: Report) -> None:
     enabled = os.environ.get("VISION_ENABLED", "").strip() not in ("", "0", "false", "False")
     prov = os.environ.get("VISION_PROVIDER", "")
@@ -212,14 +281,17 @@ def check_disk(rep: Report) -> None:
 
 async def main_async(args: argparse.Namespace) -> int:
     rep = Report()
-    check_config(rep, args.model)
+    cfg = check_config(rep, args.model)
     check_vision(rep)
     clients = check_judges(rep)
     check_benchmark(rep)
     check_disk(rep)
     base = check_server(rep)
-    if not args.skip_llm and clients:
-        await ping_llm(rep, clients)
+    if not args.skip_llm:
+        await check_credits(rep, cfg)
+        await ping_brain(rep, cfg)
+        if clients:
+            await ping_llm(rep, clients)
     if base and not args.skip_session:
         await check_session(rep, base)
     print(rep.render())

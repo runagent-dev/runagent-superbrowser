@@ -206,6 +206,7 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
               f"pins: {specs[0].protocol.env() if specs else {}}")
         return out
     log_dir.mkdir(parents=True, exist_ok=True)
+    consecutive_api_errors, max_api_errors = 0, 3
     servers = ServerManager(manage=manage_server, log_dir=log_dir, assumed_env=assumed_server_env, port=server_port)
     try:
         for i, s in enumerate(specs, 1):
@@ -221,10 +222,26 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
                 _ensure_meta_after_kill(s, note)
             rec = asyncio.run(finish_run(s, judges=judges, no_judge=no_judge))
             wall = round(time.time() - t0, 1)
+            flag = ""
+            if rec.outcome.get("failure_reason") == "api_error":
+                consecutive_api_errors += 1
+                flag = f"  [PROVIDER ERROR {consecutive_api_errors}/{max_api_errors} — excluded, not a task failure]"
+            else:
+                consecutive_api_errors = 0
             print(f"    -> success={rec.success} ({rec.outcome.get('decided_by')}) stop={rec.outcome.get('stop_reason')}"
                   f" iters={rec.counts.get('worker_iterations')} tools={rec.counts.get('tool_calls_executed')}"
-                  f" vision={rec.counts.get('vision_calls')} {wall}s")
+                  f" vision={rec.counts.get('vision_calls')} {wall}s{flag}")
             out.append(RunResultSummary(s.run_id, "ok" if rc == 0 else "failed", rec.success, wall, note))
+            if consecutive_api_errors >= max_api_errors:
+                # Every further run would finish in a second and be recorded as a
+                # failure, so the sweep would spend its remaining budget writing
+                # a success rate made of billing errors. Stop and say so.
+                print(f"\n!! ABORTING after {consecutive_api_errors} consecutive provider errors "
+                      f"({len(out)}/{len(specs)} runs done).\n"
+                      f"   The model provider is refusing requests (quota, billing or auth) — this is not a\n"
+                      f"   property of the agent, and the runs above are marked api_error and excluded.\n"
+                      f"   Fix the key, then re-run the SAME command with --resume to continue where it stopped.")
+                break
     finally:
         servers.close()
     return out

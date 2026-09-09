@@ -152,8 +152,17 @@ def classify_failure(*, success: bool | None, stop_reason: str | None, final_ans
     return "other" if success is False else None
 
 
+EXCLUDABLE = ("site_unavailable", "geo_blocked", "captcha_unsolved", "api_error")
+
+
 def exclusion_label(failure_reason: str | None) -> str | None:
-    return failure_reason if failure_reason in ("site_unavailable", "geo_blocked", "captcha_unsolved") else None
+    """Reasons a run says nothing about the arm and must leave the denominator.
+
+    ``api_error`` is here because a provider refusal (out of quota, rate limit,
+    auth) is a fact about the account, not about the agent: counting it as a
+    failed task silently fabricates a success rate.
+    """
+    return failure_reason if failure_reason in EXCLUDABLE else None
 
 
 # ---------------------------------------------------------------------- build

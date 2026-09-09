@@ -98,9 +98,10 @@ python -m eval.rehearse                 # dry-run every schedule + replay record
 python -m eval.preflight                # live check before spending: keys, judges, server, session
 ```
 
-`preflight` is the one to run before any sweep. It resolves the brain model and its key, the vision
-provider, and BOTH judges, pings each distinct endpoint with a one-token request, opens and closes one
-browser session, and exits non-zero if anything is wrong. `--skip-llm --skip-session` makes it free.
+`preflight` is the one to run before any sweep. It pings the BRAIN provider at the protocol's real
+`max_tokens` (a 16-token probe passes on an account that cannot fund a single run), reports the provider's
+remaining balance where the API exposes it, and only then checks the judges, server and benchmark. It resolves the brain model and its key, the vision
+provider, and BOTH judges, opens and closes one browser session, and exits non-zero if anything is wrong. `--skip-llm --skip-session` makes it free.
 Note that WebJudge (primary) and the answer judge take separate credentials: give WebJudge
 `SUPERBROWSER_EVAL_WEBJUDGE_API_KEY` whenever the shared `SUPERBROWSER_EVAL_JUDGE_*` pair points at a
 different provider, or it will call its OpenAI-defined model against that provider's endpoint.
@@ -173,6 +174,15 @@ python -m eval.experiments.e12_traces.analyze --experiment e2_memory_policy --ar
 
 TS-side arms (`e6`, and `e7`'s `no_ladder`) need `--manage-server`: the harness starts its **own** browser
 server on a free port with the arm's env baked in and never touches your `:3100` container.
+
+### When the model provider refuses
+
+A provider refusal (out of credit, rate limit, bad key) is a fact about the account, not about the agent.
+Such a run finishes in about a second with zero iterations, so if it were scored as a task it would look
+like a agent giving up early. It is classified `api_error` and carries an exclusion label, so it leaves the
+denominator instead of inventing a failure. After three consecutive provider errors the sweep aborts and
+tells you to fix the key and re-run with `--resume`; without that a dead key part-way through a sweep would
+spend the remaining wall-clock writing a success rate made of billing errors.
 
 ### Choosing which tasks to run
 
