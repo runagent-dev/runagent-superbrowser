@@ -118,6 +118,24 @@ async function main(): Promise<void> {
     });
   }
 
+  // The server executes model-authored scripts (`/session/:id/script`). A script
+  // that forgets to `await` an async call leaves a rejected promise nobody
+  // handles, and Node treats that as fatal by default — one bad script written
+  // by the agent would take the whole server down, along with every other live
+  // session and every subsequent request. Observed in an evaluation sweep:
+  // `ReferenceError: document is not defined` thrown inside an un-awaited
+  // `solveQuiz()` killed the process mid-run. Log it and stay up; the failing
+  // request has already been answered with a structured error by the script
+  // runner's own catch.
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
+    console.error('[unhandledRejection] kept the server alive:', msg);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('[uncaughtException] kept the server alive:', err?.stack || err);
+  });
+
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log('\nShutting down...');
