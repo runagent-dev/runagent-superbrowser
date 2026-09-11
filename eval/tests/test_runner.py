@@ -55,7 +55,7 @@ def test_execute_records_and_resumes_with_stubbed_launch(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_launch(spec, *, log_to):
+    def fake_launch(spec, *, log_to, follow=False):
         calls.append(spec.run_id)
         make_run_dir(tmp_path, experiment=spec.experiment, arm=spec.arm.name, task_id=spec.task.task_id,
                      seed=spec.seed, judges={"webjudge": spec.arm.name == "ledger"})

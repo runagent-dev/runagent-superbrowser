@@ -148,8 +148,38 @@ def archive_failed_attempt(spec: RunSpec) -> Path | None:
     return dest
 
 
-def launch_run(spec: RunSpec, *, log_to: Path) -> tuple[int | None, str]:
-    """Run ``eval.core.run_one`` for ``spec``; returns (returncode|None, stop_note)."""
+# Lines worth surfacing when following a run in the terminal. The full log is
+# always written to the run's run.log either way; this only decides what is
+# echoed live, so a sweep does not look frozen for minutes at a time.
+_FOLLOW_PATTERNS = ("Tool call:", "[vision-agent]", "ERROR", "WARNING", "Traceback",
+                    "[run_one]", "browser_", "LLM returned error", "Starting agent loop iteration")
+
+
+def _echo_worthy(line: str) -> str | None:
+    """Condense a nanobot log line to something readable, or drop it."""
+    if not any(p in line for p in _FOLLOW_PATTERNS):
+        return None
+    if "Starting agent loop iteration" in line:
+        n = line.rsplit("iteration", 1)[-1].split("for")[0].strip()
+        return f"      iteration {n}"
+    if "Tool call:" in line:
+        call = line.split("Tool call:", 1)[1].strip()
+        return f"      -> {call[:110]}"
+    if "[vision-agent]" in line:
+        seg = line.split("[vision-agent]", 1)[1].strip()
+        return f"      vision {seg[:100]}"
+    if "ERROR" in line or "Traceback" in line or "LLM returned error" in line:
+        return f"      ! {line.strip()[:140]}"
+    return None
+
+
+def launch_run(spec: RunSpec, *, log_to: Path, follow: bool = False) -> tuple[int | None, str]:
+    """Run ``eval.core.run_one`` for ``spec``; returns (returncode|None, stop_note).
+
+    ``follow`` echoes a condensed live view to the terminal as well as writing
+    the full log; without it a 40-run sweep prints one line per run and looks
+    frozen for minutes at a time.
+    """
     stale = archive_failed_attempt(spec)
     if stale is not None:
         print(f"    [archived unfinished attempt -> {stale.relative_to(stale.parents[2])}]", flush=True)
@@ -158,15 +188,38 @@ def launch_run(spec: RunSpec, *, log_to: Path) -> tuple[int | None, str]:
     env = {**os.environ, **spec.env()}
     cmd = [sys.executable, "-m", "eval.core.run_one", "--spec", str(spec.run_dir / "spec.json")]
     hard_timeout = spec.protocol.wall_clock_s + 180
+    if not follow:
+        with log_to.open("ab") as log:
+            proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,  # noqa: S603
+                                    start_new_session=True)
+            try:
+                rc = proc.wait(timeout=hard_timeout)
+                return rc, "ok" if rc == 0 else f"exit {rc}"
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)
+                return None, "killed: hard wall-clock exceeded"
+
+    deadline = time.time() + hard_timeout
     with log_to.open("ab") as log:
-        proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,  # noqa: S603
-                                start_new_session=True)
+        proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE,  # noqa: S603
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        assert proc.stdout is not None
         try:
-            rc = proc.wait(timeout=hard_timeout)
-            return rc, "ok" if rc == 0 else f"exit {rc}"
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            return None, "killed: hard wall-clock exceeded"
+            for raw in proc.stdout:
+                log.write(raw)
+                if time.time() > deadline:
+                    _kill_tree(proc)
+                    return None, "killed: hard wall-clock exceeded"
+                shown = _echo_worthy(raw.decode("utf-8", "replace").rstrip())
+                if shown:
+                    print(shown, flush=True)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        rc = proc.wait()
+        return rc, "ok" if rc == 0 else f"exit {rc}"
 
 
 def _ensure_meta_after_kill(spec: RunSpec, note: str, *, stop_reason: str = "timeout") -> None:
@@ -201,7 +254,7 @@ async def finish_run(spec: RunSpec, *, judges: Sequence[str], no_judge: bool) ->
 def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: dict[str, str] | None,
             resume: bool, no_judge: bool, judges: Sequence[str], dry_run: bool,
             log_dir: Path, server_port: int | None = None,
-            viewer_port: int | None = None) -> list[RunResultSummary]:
+            viewer_port: int | None = None, follow: bool = False) -> list[RunResultSummary]:
     out: list[RunResultSummary] = []
     if dry_run:
         for i, s in enumerate(specs, 1):
@@ -239,7 +292,7 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
             s.server_url = servers.ensure(s.arm.ts_env)
             print(f"\n=== [{i}/{len(specs)}] {s.run_id} ===  server={s.server_url}")
             t0 = time.time()
-            rc, note = launch_run(s, log_to=s.run_dir / "run.log")
+            rc, note = launch_run(s, log_to=s.run_dir / "run.log", follow=follow)
             if rc is None:
                 _ensure_meta_after_kill(s, note)
             elif rc != 0 and not (s.run_dir / "meta.json").exists():
@@ -316,6 +369,9 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--viewer-port", type=int, default=8700,
                     help="live viewer port; it follows whichever run is writing frames (any browser tier)")
     ap.add_argument("--no-viewer", action="store_true", help="do not start the live viewer")
+    ap.add_argument("--follow", "-f", action="store_true",
+                    help="echo a condensed live log (iterations, tool calls, vision, errors) to the "
+                         "terminal; the full log always goes to each run's run.log regardless")
 
 
 def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[Arm]) -> list[RunResultSummary]:
@@ -339,7 +395,7 @@ def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[A
     results = execute(specs, manage_server=args.manage_server, assumed_server_env=assumed, resume=args.resume,
                       no_judge=args.no_judge, judges=judges, dry_run=args.dry_run,
                       log_dir=Path(args.out) / experiment / "_logs", server_port=args.server_port,
-                      viewer_port=None if args.no_viewer else args.viewer_port)
+                      viewer_port=None if args.no_viewer else args.viewer_port, follow=args.follow)
     if not args.dry_run:
         print("\n" + summarize(results))
         print(f"results: {results_path(Path(args.out), experiment)}")

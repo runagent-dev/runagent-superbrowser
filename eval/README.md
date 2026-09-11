@@ -272,7 +272,10 @@ Every sweep prints a clickable URL when it starts:
 ```
 
 It shows the newest frame from whichever run is currently writing, with the arm, the task, the page URL,
-the tier and the frame count, refreshing on its own. `--viewer-port N` moves it, `--no-viewer` turns it
+the tier and the frame count, refreshing on its own. Add `--follow` (or `-f`) to the run command to echo a
+condensed live log to the terminal as well -- iterations, tool calls, vision passes and errors. Without it
+a sweep prints one line per run and looks frozen for minutes at a time; the full log is written to each
+run's `run.log` either way, so `tail -f eval/runs/<exp>/*/*/seed0/run.log` works too. `--viewer-port N` moves it, `--no-viewer` turns it
 off; it is read-only, so starting and stopping it mid-sweep is safe. It also runs standalone against
 finished runs: `python -m eval.viewer --experiment ablate10`.
 
