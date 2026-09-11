@@ -177,6 +177,20 @@ export class ProxyPool {
       }
     }
 
+    // Nothing above selected a proxy, so this would have gone out on the host's
+    // own IP. PROXY_DEFAULT was only ever consulted from getEngineForRegion,
+    // i.e. when a region WAS asked for and missed — so a configured pool did
+    // nothing for an ordinary session, and a datacenter IP kept getting 403s
+    // from PerimeterX/Cloudflare-class sites with the proxy sitting unused.
+    // Documented intent (.env.example): a pool on tier 0 egresses every request
+    // through it from the first hit.
+    if (engine === this.defaultEngine) {
+      const fallback = this.defaultProxy || this.proxies.get('default')?.url;
+      if (fallback) {
+        engine = await this.getEngine(fallback);
+      }
+    }
+
     return engine.newPage();
   }
 
