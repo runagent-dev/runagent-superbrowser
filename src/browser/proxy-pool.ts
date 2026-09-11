@@ -69,11 +69,23 @@ export class ProxyPool {
     const poolStr = process.env.PROXY_POOL || '';
     if (!poolStr) return;
 
-    for (const entry of poolStr.split(',')) {
-      const [region, url] = entry.trim().split(':', 2);
-      if (region && url) {
-        // Rejoin in case the URL had a : in it (like socks5://host:port)
-        const fullUrl = entry.substring(region.length + 1).trim();
+    for (const raw of poolStr.split(',')) {
+      const entry = raw.trim();
+      if (!entry) continue;
+
+      // A bare URL is a documented form (`PROXY_POOL=http://user:pass@host:port`).
+      // Splitting on the first ':' treated the SCHEME as the region name and left
+      // `//user:pass@host:port` as the URL, which is not a usable proxy — so a
+      // single-endpoint pool silently produced a broken proxy for every Tier-1
+      // session. Match the Python parser: a scheme means the whole entry is a URL.
+      if (/^(https?|socks[45]):\/\//i.test(entry)) {
+        this.proxies.set('default', { region: 'default', url: entry });
+        continue;
+      }
+
+      const region = entry.split(':', 1)[0];
+      const fullUrl = entry.substring(region.length + 1).trim();
+      if (region && fullUrl) {
         this.proxies.set(region.toLowerCase(), {
           region: region.toLowerCase(),
           url: fullUrl,
