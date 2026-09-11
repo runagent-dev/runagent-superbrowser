@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import socketserver
 import threading
 import time
@@ -65,6 +66,29 @@ def _newest_frame(runs_root: Path, experiment: str | None) -> tuple[Path, dict[s
     return frame, meta
 
 
+def _rich_viewer_url(session_id: str, tier: str, run_dir: str | None) -> str | None:
+    """The real overlay viewer for this session: screencast, cursor, bboxes.
+
+    Tier-1 sessions live in the TypeScript server and are served from whichever
+    port that run used (recorded in the run's spec). Tier-3 sessions are served
+    by the Python viewer on its own port. Neither is reachable from a single
+    fixed address, which is why this page resolves it per run.
+    """
+    if not session_id:
+        return None
+    if tier == "t3":
+        port = os.environ.get("SUPERBROWSER_T3_VIEWER_PORT", "3101")
+        return f"http://127.0.0.1:{port}/t3/session/{session_id}/view"
+    base = None
+    if run_dir:
+        try:
+            base = json.loads((Path(run_dir) / "spec.json").read_text()).get("server_url")
+        except Exception:
+            base = None
+    base = base or os.environ.get("SUPERBROWSER_URL") or "http://localhost:3100"
+    return f"{base.rstrip('/')}/session/{session_id}/view"
+
+
 def _run_status(frame: Path) -> dict[str, Any]:
     """Describe the run that produced ``frame`` from its own spec/meta."""
     run_dir = frame.parent.parent
@@ -102,6 +126,8 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>SuperBrowser eval viewer</
  .stale{opacity:.45}
  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px}
  .dot.idle{background:#8b949e}
+ a#rich{color:#58a6ff;text-decoration:none;border:1px solid #1f6feb;border-radius:5px;padding:2px 8px}
+ a#rich:hover{background:#1f6feb22}
 </style>
 <header>
   <span><span class="dot" id="dot"></span><b id="arm">-</b></span>
@@ -110,6 +136,7 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>SuperBrowser eval viewer</
   <span><b id="age">-</b>s ago</span>
   <span>tier <b id="tier">-</b></span>
   <span id="url"></span>
+  <a id="rich" href="#" target="_blank" hidden>open full viewer (screencast + bboxes + cursor) &rarr;</a>
   <div class="task" id="task"></div>
 </header>
 <div class="wrap"><img id="shot" src="/frame.jpg" alt="latest frame"></div>
@@ -127,6 +154,8 @@ async function tick(){
     document.getElementById('tier').textContent  = s.tier || '-';
     document.getElementById('task').textContent  = s.instruction || '';
     document.getElementById('url').textContent   = s.url || '';
+    const rich = document.getElementById('rich');
+    if(s.rich){ rich.href = s.rich; rich.hidden = false; } else { rich.hidden = true; }
     const idle = (s.age_s ?? 99) > 30;
     document.getElementById('dot').className = 'dot' + (idle ? ' idle' : '');
     const img = document.getElementById('shot');
@@ -176,9 +205,10 @@ def make_handler(runs_root: Path, experiment: str | None):
                 frame, meta = found
                 st = _run_status(frame)
                 sid = str(meta.get("session_id") or "")
-                st.update(ok=True, url=meta.get("url"), session_id=sid,
-                          tier="t3" if sid.startswith("t3-") else ("t1" if sid else "-"),
-                          step=meta.get("step"), source=meta.get("source"))
+                tier = "t3" if sid.startswith("t3-") else ("t1" if sid else "-")
+                st.update(ok=True, url=meta.get("url"), session_id=sid, tier=tier,
+                          step=meta.get("step"), source=meta.get("source"),
+                          rich=_rich_viewer_url(sid, tier, st.get("run_dir")))
                 if st.get("instruction"):
                     st["instruction"] = html.unescape(str(st["instruction"]))[:160]
                 self._send(200, "application/json", json.dumps(st).encode())

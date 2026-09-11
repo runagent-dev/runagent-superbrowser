@@ -82,6 +82,9 @@ class RunSpec:
                     "family": self.arm.family, "description": self.arm.description},
             "task": self.task.to_dict(), "benchmark": self.task.benchmark,
             "run_dir": str(self.run_dir), "model": self.model, "topology": self.topology,
+            # which browser server this run used: the managed one gets a fresh
+            # free port each sweep, so the live viewer cannot guess it
+            "server_url": self.server_url,
             "protocol": {"hash": self.protocol.hash(), **self.protocol.to_dict()},
             "nanobot_overrides": self.protocol.nanobot_config_overrides(),
             "internal_timeout_s": max(60, self.protocol.wall_clock_s - 90),

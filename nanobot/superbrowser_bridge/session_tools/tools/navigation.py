@@ -525,17 +525,19 @@ class BrowserOpenTool(Tool):
         # bbox-vs-text-position drift breaks vision-driven clicks.
         self.s._needs_visual_settle = True
 
-        # If human handoff is enabled, print the view URL to stdout so the
-        # user can pre-open it in their browser. The view page polls the
-        # /human-input endpoint and will show a banner the instant the
-        # agent needs help, so having it open beforehand eliminates the
-        # race where the agent blocks for 5 min before the user notices.
+        # Print the live-view URL on every session open, not only when human
+        # handoff is armed. The page is how anyone watches a run — screencast,
+        # vision bounding boxes, cursor path — and an unattended run (an
+        # evaluation sweep, say) has handoff disabled precisely because nobody
+        # is expected to intervene, which is exactly when being able to look is
+        # most useful. The handoff banner text below stays conditional.
         #
         # For t3 sessions, the live viewer is served by the Python-side
         # aiohttp server (default :3101), NOT the TS server (:3100). The
         # browser_open call starts it on demand so the URL is live when
-        # the user clicks it.
-        if self.s.human_handoff_enabled and self.s.session_id:
+        # the user clicks it. Set SUPERBROWSER_PRINT_VIEW_URL=0 to silence it.
+        _print_view = os.environ.get("SUPERBROWSER_PRINT_VIEW_URL", "1") not in ("0", "false", "False")
+        if (self.s.human_handoff_enabled or _print_view) and self.s.session_id:
             if chosen_tier == "t3":
                 try:
                     from superbrowser_bridge.antibot import t3_viewer as _v
@@ -549,12 +551,14 @@ class BrowserOpenTool(Tool):
                     "SUPERBROWSER_PUBLIC_HOST", SUPERBROWSER_URL.rstrip("/"),
                 )
                 view_url = f"{public_host}/session/{self.s.session_id}/view"
-            if view_url:
+            if view_url and self.s.human_handoff_enabled:
                 print(
                     f"\n>> [HUMAN HANDOFF ENABLED] Open this URL in your browser "
                     f"and keep it open:\n>>   {view_url}\n>> "
                     f"If the agent needs help, you'll see a banner there."
                 )
+            elif view_url:
+                print(f"\n>> Watch this session live: {view_url}\n")
 
         caption = _format_state(data, self.s)
         caption = f"Session: {data['sessionId']}\n{caption}"

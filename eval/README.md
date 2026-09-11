@@ -279,7 +279,16 @@ run's `run.log` either way, so `tail -f eval/runs/<exp>/*/*/seed0/run.log` works
 off; it is read-only, so starting and stopping it mid-sweep is safe. It also runs standalone against
 finished runs: `python -m eval.viewer --experiment ablate10`.
 
-This deliberately does not use the browser server's `/session/:id/view` route. That route only knows
+The header carries an **open full viewer** link to the real overlay page for the live session --
+CDP screencast, vision bounding boxes, cursor path, keystrokes -- resolved per tier: the TypeScript
+server's `/session/:id/view` on that run's own port for Tier-1, and the Python viewer on
+`SUPERBROWSER_T3_VIEWER_PORT` (3101) for Tier-3. The Tier-3 viewer now starts automatically alongside the
+screencast; before, it only ever started on a human-assist request, so an unattended run streamed frames
+into a bus nobody served.
+
+The frame-following page above still exists as the entry point because neither overlay viewer is reachable
+from a fixed address: the managed server takes a fresh free port every sweep (now recorded in each run's
+`spec.json`), and a task that escalates to Tier-3 moves to a different server entirely. That route only knows
 Tier-1 sessions the TypeScript server holds itself, so a Tier-3 run is invisible through it, and the
 harness-managed server picks a new port every sweep. Both tiers write frames into the run directory, so
 serving those follows the sweep whichever tier a task ends up on.

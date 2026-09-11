@@ -763,6 +763,7 @@ class T3SessionManager:
         self._sessions: dict[str, _ManagedSession] = {}
         self._indexer_js: Optional[str] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._viewer_announced: set[str] = set()   # print the viewer URL once per session
 
     async def _ensure_browser(self) -> None:
         if self._browser is not None:
@@ -1193,6 +1194,20 @@ class T3SessionManager:
         """
         if os.environ.get("T3_DISABLE_SCREENCAST") == "1":
             return
+        # The screencast exists for the live viewer, but until now the viewer was
+        # only ever started by the human-assist path, so an unattended run
+        # streamed frames into a bus nobody served. Start it alongside the
+        # screencast and print the URL once per session.
+        if os.environ.get("SUPERBROWSER_T3_VIEWER_AUTOSTART", "1") not in ("0", "false", "False"):
+            try:
+                from . import t3_viewer as _viewer
+
+                await _viewer.ensure_started()
+                if sid not in self._viewer_announced:
+                    self._viewer_announced.add(sid)
+                    print(f"  [t3 viewer] {_viewer.view_url(sid)}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - a viewer must never break a run
+                logger.debug("t3 viewer autostart skipped: %s", exc)
         frame_counter = {"n": 0}
         try:
             cdp = await context.new_cdp_session(page)
