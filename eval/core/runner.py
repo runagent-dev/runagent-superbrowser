@@ -200,7 +200,8 @@ async def finish_run(spec: RunSpec, *, judges: Sequence[str], no_judge: bool) ->
 
 def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: dict[str, str] | None,
             resume: bool, no_judge: bool, judges: Sequence[str], dry_run: bool,
-            log_dir: Path, server_port: int | None = None) -> list[RunResultSummary]:
+            log_dir: Path, server_port: int | None = None,
+            viewer_port: int | None = None) -> list[RunResultSummary]:
     out: list[RunResultSummary] = []
     if dry_run:
         for i, s in enumerate(specs, 1):
@@ -214,6 +215,19 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
               f"pins: {specs[0].protocol.env() if specs else {}}")
         return out
     log_dir.mkdir(parents=True, exist_ok=True)
+    viewer = None
+    if viewer_port:
+        # Read-only, and deliberately not the TS server's /session/:id/view: that
+        # route only knows Tier-1 sessions it holds itself, so Tier-3 runs are
+        # invisible through it, and its port changes every sweep. Both tiers write
+        # frames into the run dir, so serving those follows the sweep either way.
+        try:
+            from eval.viewer import serve as _serve
+
+            viewer = _serve(viewer_port, Path(specs[0].run_dir).parents[3] if specs else DEFAULT_RUNS_ROOT, None)
+            print(f"\n  live viewer: http://127.0.0.1:{viewer_port}   (Tier-1 and Tier-3; follows the active run)\n")
+        except OSError as exc:
+            print(f"  [viewer not started on :{viewer_port} — {exc}; pass --viewer-port N or --no-viewer]")
     consecutive_api_errors, max_api_errors = 0, 3
     servers = ServerManager(manage=manage_server, log_dir=log_dir, assumed_env=assumed_server_env, port=server_port)
     try:
@@ -266,6 +280,8 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
                 break
     finally:
         servers.close()
+        if viewer is not None:
+            viewer.shutdown()
     return out
 
 
@@ -297,6 +313,9 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--assume-server-env", default="", help="k=v,k=v the running server was started with")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--viewer-port", type=int, default=8700,
+                    help="live viewer port; it follows whichever run is writing frames (any browser tier)")
+    ap.add_argument("--no-viewer", action="store_true", help="do not start the live viewer")
 
 
 def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[Arm]) -> list[RunResultSummary]:
@@ -319,7 +338,8 @@ def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[A
           f"model={model} out={args.out} protocol={protocol.hash()}")
     results = execute(specs, manage_server=args.manage_server, assumed_server_env=assumed, resume=args.resume,
                       no_judge=args.no_judge, judges=judges, dry_run=args.dry_run,
-                      log_dir=Path(args.out) / experiment / "_logs", server_port=args.server_port)
+                      log_dir=Path(args.out) / experiment / "_logs", server_port=args.server_port,
+                      viewer_port=None if args.no_viewer else args.viewer_port)
     if not args.dry_run:
         print("\n" + summarize(results))
         print(f"results: {results_path(Path(args.out), experiment)}")

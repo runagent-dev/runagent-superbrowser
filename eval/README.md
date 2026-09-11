@@ -263,6 +263,24 @@ for e in e2_memory_policy e4_deadend e5_perception_reuse e7_click_cascade e8_top
 Drop `no_ladder` from the arm list to avoid TypeScript-side server restarts (it is the only arm that needs
 them), and drop `--manage-server` with it.
 
+### Watching a sweep
+
+Every sweep prints a clickable URL when it starts:
+
+```
+  live viewer: http://127.0.0.1:8700   (Tier-1 and Tier-3; follows the active run)
+```
+
+It shows the newest frame from whichever run is currently writing, with the arm, the task, the page URL,
+the tier and the frame count, refreshing on its own. `--viewer-port N` moves it, `--no-viewer` turns it
+off; it is read-only, so starting and stopping it mid-sweep is safe. It also runs standalone against
+finished runs: `python -m eval.viewer --experiment ablate10`.
+
+This deliberately does not use the browser server's `/session/:id/view` route. That route only knows
+Tier-1 sessions the TypeScript server holds itself, so a Tier-3 run is invisible through it, and the
+harness-managed server picks a new port every sweep. Both tiers write frames into the run directory, so
+serving those follows the sweep whichever tier a task ends up on.
+
 ### Running experiments one at a time
 
 Each experiment is independent: its own arms, its own `eval/runs/<experiment>/` tree, its own
