@@ -103,3 +103,56 @@ def test_main_glue_with_stubbed_run(tmp_path, monkeypatch):
     assert json.loads((run_dir / "usage.json").read_text())["total_tokens"] == 12
     assert (run_dir / "ledgers" / "orch-x" / "events.jsonl").exists()
     assert (run_dir / "config.redacted.json").exists() and "environment" in meta
+
+
+def test_eval_topologies_strip_the_same_non_browser_tools():
+    """An orchestrator that can shell out stops being a browser agent.
+
+    Observed live: an orchestrator abandoned the browser and made 33 `exec`
+    calls, scraping a site with curl/grep/sed. That run measures nothing about
+    browser navigation, and since each arm would reach for the shell
+    differently it confounds the comparison outright. All three eval topologies
+    must face an identical toolset, or E8 compares toolsets rather than
+    topologies.
+    """
+    import eval.core.run_one as R
+
+    for name in ("exec", "run_cli_app", "spawn", "read_file", "write_file",
+                 "grep", "web_search", "web_fetch"):
+        assert name in R._NON_BROWSER_TOOLS, f"{name} must be stripped in eval runs"
+
+    class Tools:
+        def __init__(self):
+            self.registry = set(R._NON_BROWSER_TOOLS) | {"browser_open", "browser_click_at",
+                                                         "delegate_browser_task", "complete_goal"}
+
+        def unregister(self, name):
+            if name not in self.registry:
+                raise KeyError(name)
+            self.registry.discard(name)
+
+    class Loop:
+        def __init__(self):
+            self.tools = Tools()
+
+    class Bot:
+        def __init__(self):
+            self._loop = Loop()
+
+    bot = Bot()
+    removed = R.strip_non_browser_tools(bot)
+    assert set(removed) == set(R._NON_BROWSER_TOOLS)
+    assert bot._loop.tools.registry == {"browser_open", "browser_click_at",
+                                        "delegate_browser_task", "complete_goal"}, \
+        "browser and orchestration tools must survive"
+
+
+def test_host_tools_can_be_kept_deliberately(monkeypatch):
+    import eval.core.run_one as R
+
+    monkeypatch.setenv("SUPERBROWSER_EVAL_KEEP_HOST_TOOLS", "1")
+
+    class Bot:
+        _loop = type("L", (), {"tools": type("T", (), {"unregister": lambda self, n: None})()})()
+
+    assert R.strip_non_browser_tools(Bot()) == []

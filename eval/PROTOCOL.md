@@ -28,6 +28,17 @@ Everything below is encoded in `eval/core/protocol.py` (`Protocol`, hashed into 
 | Start URL policy | agent starts at `start_url`; direct navigation allowed within the pinned domain | recorded |
 | Brain model | chosen at launch (`--model`), recorded per run in `protocol.model`; vision model from `VISION_MODEL`; judge models recorded per verdict | run record |
 
+## Toolset (identical in every topology)
+
+The agent sees browser and orchestration tools only. nanobot's default host tools
+— `exec`, `run_cli_app`, `spawn`, `long_task`, filesystem read/write, `glob`/`grep`,
+`web_search`/`web_fetch` — are unregistered in all three eval topologies
+(orchestrator, delegated worker, flat). Two reasons: a run that shell-scrapes a
+site with curl measures nothing about browser navigation, and since each arm
+would reach for the shell differently it confounds the comparison. It also keeps
+an LLM from running arbitrary commands on the evaluation host.
+`SUPERBROWSER_EVAL_KEEP_HOST_TOOLS=1` opts out and must be reported if used.
+
 ## Confound controls (forced env for every run)
 
 `SUPERBROWSER_CROSS_TASK_MEMORY=0` (no site-model ingest/merge between runs), `LEARNING_READS_ENABLED=0`,

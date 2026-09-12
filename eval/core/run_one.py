@@ -87,6 +87,7 @@ async def _run_orchestrator(spec: dict[str, Any], framed_task: str, timeout: flo
     bot = Nanobot.from_config(workspace=str(workspace_for("orchestrator")))
     register_orchestrator_tools(bot)
     directive = apply_mode(bot, "browser")
+    strip_non_browser_tools(bot)
 
     short = uuid.uuid4().hex[:8]
     task_id, session_key = f"orch-{short}", f"orchestrator:{short}"
@@ -144,8 +145,10 @@ async def _run_flat(spec: dict[str, Any], framed_task: str, timeout: float | Non
     short = uuid.uuid4().hex[:8]
     task_id, session_key = short, f"worker:{short}"
     bot = Nanobot.from_config(workspace=BROWSER_WORKSPACE)
-    for name in ("web_search", "web_fetch", "read_file", "write_file", "edit_file", "list_dir", "glob",
-                 "grep", "exec", "spawn", "cron", "message"):
+    # Same list as the orchestrator and the delegated worker, so all three
+    # topologies face an identical toolset (this list was shorter than
+    # delegation.py's, which would have been a confound in the E8 comparison).
+    for name in _NON_BROWSER_TOOLS:
         try:
             bot._loop.tools.unregister(name)
         except Exception:
@@ -270,6 +273,42 @@ def frame_task(task: dict[str, Any]) -> str:
     if url and url not in task["instruction"]:
         return f"{task['instruction']}\n\nStart URL: {url}"
     return task["instruction"]
+
+
+# The delegated worker already has these removed (delegation.py), but the
+# ORCHESTRATOR keeps nanobot's full default toolset. Observed live: an
+# orchestrator gave up on the browser and made 33 `exec` calls, shell-scraping a
+# site with curl/grep/sed instead of browsing it. That run measures nothing about
+# a browser agent -- and every arm would reach for the shell differently, so the
+# comparison is confounded -- besides handing an LLM arbitrary shell on the host.
+# Eval-only: production keeps whatever tools the operator configured.
+_NON_BROWSER_TOOLS = (
+    "exec", "run_cli_app", "write_stdin", "list_exec_sessions",
+    "spawn", "long_task", "cron", "message",
+    "read_file", "write_file", "edit_file", "apply_patch",
+    "list_dir", "glob", "grep", "find_files",
+    "web_search", "web_fetch",
+)
+
+
+def strip_non_browser_tools(bot: Any) -> list[str]:
+    """Remove shell/filesystem/search tools from an eval orchestrator."""
+    removed = []
+    tools = getattr(getattr(bot, "_loop", None), "tools", None)
+    if tools is None:
+        return removed
+    keep = os.environ.get("SUPERBROWSER_EVAL_KEEP_HOST_TOOLS", "") not in ("", "0", "false")
+    if keep:
+        return removed
+    for name in _NON_BROWSER_TOOLS:
+        try:
+            tools.unregister(name)
+            removed.append(name)
+        except Exception:
+            pass
+    if removed:
+        print(f"[run_one] removed non-browser tools from the orchestrator: {', '.join(removed)}")
+    return removed
 
 
 def _server_base() -> str:
