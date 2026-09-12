@@ -2589,17 +2589,23 @@ class T3SessionManager:
         # arrow fns / `async () => {}` / bare `function` / IIFE `(() => ...)()`
         # / block `{ ... }` all stay as-is so their semantics are preserved.
         starts_function = body.startswith(
-            ("(", "async ", "async(", "function", "=>", "{")
+            ("(", "async ", "async(", "function", "=>")
         )
+        import re as _re
+        # `return` at a statement position, whatever follows it. The previous
+        # pattern demanded a space, "(" or ";" after the keyword, so
+        # `return[1,2]`, "return`x`", `return!!el`, `return/re/.test(s)` and
+        # `return{a:1}` were left unwrapped and reached page.evaluate as a bare
+        # statement -> "SyntaxError: Unexpected token 'return'".
+        has_top_return = _re.search(r"(?:^|[\s;{])return\b", body) is not None
         needs_wrap = False
         if body and not starts_function:
-            import re as _re
-            has_top_return = _re.search(
-                r"(?:^|[\s;{])return(?:$|[\s(;])", body,
-            ) is not None
             # Multi-statement: any ; that isn't just a trailing terminator.
             has_multi_stmt = ";" in body.rstrip(" \t\n;")
             needs_wrap = has_top_return or has_multi_stmt
+        elif body.startswith("{") and has_top_return:
+            # A block that returns is a statement body too, not an object literal.
+            needs_wrap = True
         if needs_wrap:
             # `async () => {}` lets callers use `await` at the top of
             # the body the same way run_script does.
