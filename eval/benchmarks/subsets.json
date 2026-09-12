@@ -211,12 +211,12 @@
     "benchmark": "online_mind2web_all",
     "n": 24,
     "method": "22 task ids supplied by the author, minus 2 whose sites return 403 through our residential proxy, plus the 1 task already completed under this experiment, plus 3 medium-level low-anti-bot fills chosen to restore level balance; every site was loaded in real Chrome through the proxy before freezing",
-    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task.",
+    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task. Swapped 157f4a79 (disney.com) out for 662ae0f2 (wanderlog.com) at the author's request; wanderlog verified reachable through the proxy. One completed run existed for the outgoing task and is orphaned, not counted.",
     "strata": {},
     "level_counts": {
-      "easy": 13,
+      "easy": 14,
       "hard": 5,
-      "medium": 6
+      "medium": 5
     },
     "antibot_counts": {
       "low": 19,
@@ -229,7 +229,6 @@
     },
     "task_ids": [
       "1223b07536a87e0170ff87cbbebd1d3c",
-      "157f4a79d55e8fa3fd55ba772ba40fbc",
       "16200f51d63f0a47a58fa17acd49e368",
       "1fc28d91d25ccd1c6ba268101326a654",
       "23204728192da9f73197a613d9681c18",
@@ -237,6 +236,7 @@
       "3443e9c3151fef19a3c3a45eb2c13640",
       "3ec0f6138d37fadcb989347a6088ec45",
       "4e801ba102dfaf22c7cf7a126b107609",
+      "662ae0f2d3ac851dbcdd245f908277e3",
       "733f1d8bf79d5bc2240c5357f928ffff",
       "85b284c18d7e78c9b5a9e074e7aa3b98",
       "871e7771cecb989972f138ecc373107b",
