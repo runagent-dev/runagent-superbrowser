@@ -223,8 +223,16 @@ class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def serve(port: int, runs_root: Path, experiment: str | None) -> _Server:
-    srv = _Server(("127.0.0.1", port), make_handler(runs_root, experiment))
+def serve(port: int, runs_root: Path, experiment: str | None, host: str = "127.0.0.1") -> _Server:
+    """Bind the viewer. Defaults to loopback: the page exposes screenshots of
+    whatever the agent is browsing, so on a public host it must not be open by
+    default. Reach it from a laptop with an SSH tunnel:
+
+        ssh -L 8700:127.0.0.1:8700 <user>@<host>
+
+    Pass host="0.0.0.0" only on a machine where that is acceptable.
+    """
+    srv = _Server((host, port), make_handler(runs_root, experiment))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -234,10 +242,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8700)
     ap.add_argument("--runs", default=str(RUNS_ROOT))
     ap.add_argument("--experiment", default=None, help="follow only this experiment")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address; loopback by default because the page shows the agent's "
+                         "screen. Use an SSH tunnel for remote access, or 0.0.0.0 deliberately.")
     args = ap.parse_args(argv)
-    srv = serve(args.port, Path(args.runs), args.experiment)
-    print(f"eval viewer: http://127.0.0.1:{args.port}    (Ctrl-C to stop)")
+    srv = serve(args.port, Path(args.runs), args.experiment, host=args.host)
+    print(f"eval viewer: http://{args.host}:{args.port}    (Ctrl-C to stop)")
     print("  follows whichever run is writing frames; works for Tier-1 and Tier-3 alike")
+    if args.host == "127.0.0.1":
+        print(f"  remote? tunnel it:  ssh -L {args.port}:127.0.0.1:{args.port} <user>@<this-host>")
+    else:
+        print(f"  WARNING: bound to {args.host} — anyone who can reach this port sees the agent's screen")
     try:
         while True:
             time.sleep(3600)

@@ -257,7 +257,8 @@ async def finish_run(spec: RunSpec, *, judges: Sequence[str], no_judge: bool) ->
 def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: dict[str, str] | None,
             resume: bool, no_judge: bool, judges: Sequence[str], dry_run: bool,
             log_dir: Path, server_port: int | None = None,
-            viewer_port: int | None = None, follow: bool = False) -> list[RunResultSummary]:
+            viewer_port: int | None = None, follow: bool = False,
+            viewer_host: str = "127.0.0.1") -> list[RunResultSummary]:
     out: list[RunResultSummary] = []
     if dry_run:
         for i, s in enumerate(specs, 1):
@@ -280,8 +281,12 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
         try:
             from eval.viewer import serve as _serve
 
-            viewer = _serve(viewer_port, Path(specs[0].run_dir).parents[3] if specs else DEFAULT_RUNS_ROOT, None)
-            print(f"\n  live viewer: http://127.0.0.1:{viewer_port}   (Tier-1 and Tier-3; follows the active run)\n")
+            viewer = _serve(viewer_port, Path(specs[0].run_dir).parents[3] if specs else DEFAULT_RUNS_ROOT,
+                            None, host=viewer_host)
+            print(f"\n  live viewer: http://{viewer_host}:{viewer_port}   (Tier-1 and Tier-3; follows the active run)")
+            if viewer_host == "127.0.0.1":
+                print(f"  on a remote box, tunnel it:  ssh -L {viewer_port}:127.0.0.1:{viewer_port} <user>@<host>")
+            print()
         except OSError as exc:
             print(f"  [viewer not started on :{viewer_port} — {exc}; pass --viewer-port N or --no-viewer]")
     consecutive_api_errors, max_api_errors = 0, 3
@@ -372,6 +377,8 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--viewer-port", type=int, default=8700,
                     help="live viewer port; it follows whichever run is writing frames (any browser tier)")
     ap.add_argument("--no-viewer", action="store_true", help="do not start the live viewer")
+    ap.add_argument("--viewer-host", default="127.0.0.1",
+                    help="viewer bind address (loopback by default; it shows the agent's screen)")
     ap.add_argument("--follow", "-f", action="store_true",
                     help="echo a condensed live log (iterations, tool calls, vision, errors) to the "
                          "terminal; the full log always goes to each run's run.log regardless")
@@ -398,7 +405,8 @@ def run_from_args(args: argparse.Namespace, *, experiment: str, arms: Sequence[A
     results = execute(specs, manage_server=args.manage_server, assumed_server_env=assumed, resume=args.resume,
                       no_judge=args.no_judge, judges=judges, dry_run=args.dry_run,
                       log_dir=Path(args.out) / experiment / "_logs", server_port=args.server_port,
-                      viewer_port=None if args.no_viewer else args.viewer_port, follow=args.follow)
+                      viewer_port=None if args.no_viewer else args.viewer_port, follow=args.follow,
+                      viewer_host=args.viewer_host)
     if not args.dry_run:
         print("\n" + summarize(results))
         print(f"results: {results_path(Path(args.out), experiment)}")

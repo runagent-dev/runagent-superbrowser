@@ -276,7 +276,18 @@ the tier and the frame count, refreshing on its own. Add `--follow` (or `-f`) to
 condensed live log to the terminal as well -- iterations, tool calls, vision passes and errors. Without it
 a sweep prints one line per run and looks frozen for minutes at a time; the full log is written to each
 run's `run.log` either way, so `tail -f eval/runs/<exp>/*/*/seed0/run.log` works too. `--viewer-port N` moves it, `--no-viewer` turns it
-off; it is read-only, so starting and stopping it mid-sweep is safe. It also runs standalone against
+off; it is read-only, so starting and stopping it mid-sweep is safe.
+
+**On a remote machine it binds to loopback on purpose** — the page shows whatever the agent is browsing,
+so it is not open to the network by default. Tunnel it from your laptop:
+
+```bash
+ssh -L 8700:127.0.0.1:8700 <user>@<host>      # then open http://127.0.0.1:8700 locally
+```
+
+`--viewer-host 0.0.0.0` overrides that where it is acceptable. Note the viewer lives inside the runner
+process, so it stops when the sweep stops; run `python -m eval.viewer` separately to keep a window open
+across sweeps. It also runs standalone against
 finished runs: `python -m eval.viewer --experiment ablate10`.
 
 The header carries an **open full viewer** link to the real overlay page for the live session --
