@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import re
 import time
 import uuid
@@ -712,6 +713,10 @@ class _ManagedSession:
     # before tearing down the context. `None` means no screencast (CDP
     # attach failed, or viewer infra not available).
     cdp: Optional[Any] = None
+    # The user_data_dir this session actually launched with. Normally the
+    # per-domain profile; a throwaway temp dir when that one was locked, in
+    # which case close() removes it.
+    user_data_dir: str = ""
     # Virtual cursor position tracked across tool calls so we can do
     # smooth bezier approaches to each target (instead of teleporting)
     # and feed those intermediate points into the viewer overlay.
@@ -764,6 +769,7 @@ class T3SessionManager:
         self._indexer_js: Optional[str] = None
         self._cleanup_task: Optional[asyncio.Task] = None
         self._viewer_announced: set[str] = set()   # print the viewer URL once per session
+        self._throwaway_profiles: set[str] = set()  # temp profiles made when the per-domain one was locked
 
     async def _ensure_browser(self) -> None:
         if self._browser is not None:
@@ -945,6 +951,7 @@ class T3SessionManager:
             # in a single call and returns a BrowserContext whose
             # owning Browser must be closed with it.
             profile_dir = _resolve_profile_dir(domain)
+            session_profile_dir = str(profile_dir)
             persist_args: list[str] = [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
@@ -981,10 +988,35 @@ class T3SessionManager:
                 persist_kwargs["executable_path"] = chrome_path
             if chrome_channel:
                 persist_kwargs["channel"] = chrome_channel
-            context = await self._pw.chromium.launch_persistent_context(**persist_kwargs)
+            try:
+                context = await self._pw.chromium.launch_persistent_context(**persist_kwargs)
+            except Exception as exc:  # noqa: BLE001 - profile already in use
+                # Chrome takes an EXCLUSIVE lock on user_data_dir. The profile is
+                # per-domain, so a second concurrent session on the same domain --
+                # which happens whenever the agent retries browser_open, or when
+                # two runs of a sweep overlap -- finds the directory locked. Chrome
+                # prints "Opening in existing browser session." and exits, and
+                # patchright surfaces that as TargetClosedError, which reads like a
+                # browser crash. Retry once on a private copy-free profile so the
+                # session still opens; the stealth benefit of profile continuity is
+                # lost for this session only.
+                msg = str(exc)
+                if "closed" not in msg.lower() and "in use" not in msg.lower():
+                    raise
+                alt = Path(tempfile.mkdtemp(prefix=f"t3-profile-{domain[:24]}-"))
+                logger.warning(
+                    "t3: profile %s is locked by another Chrome; using a throwaway "
+                    "profile %s for this session (%s)", profile_dir, alt, msg[:90],
+                )
+                persist_kwargs["user_data_dir"] = str(alt)
+                context = await self._pw.chromium.launch_persistent_context(**persist_kwargs)
+                self._throwaway_profiles.add(str(alt))
+                profile_dir = alt
+                session_profile_dir = str(alt)
             # Remember the browser handle so close() can tear it down.
             persistent_browser = getattr(context, "browser", None)
         else:
+            session_profile_dir = ""     # shared browser, no per-session profile
             context = await self._browser.new_context(
                 viewport={"width": viewport[0], "height": viewport[1]},
                 locale="en-US",
@@ -1093,6 +1125,7 @@ class T3SessionManager:
             ua=ua,
             task_id=task_id,
             persistent_browser=persistent_browser,
+            user_data_dir=session_profile_dir,
             cursor_x=float(_init_rng.randint(280, 620)),
             cursor_y=float(_init_rng.randint(220, 420)),
             light_mode=_initial_light,
@@ -2343,6 +2376,18 @@ class T3SessionManager:
                 await s.persistent_browser.close()
             except Exception as exc:
                 logger.debug("persistent browser close %s: %s", sid, exc)
+        # A throwaway profile exists only because the per-domain one was locked;
+        # nothing reads it again, and a sweep would otherwise leave one per
+        # collision behind on disk.
+        udd = getattr(s, "user_data_dir", None)
+        if udd and str(udd) in self._throwaway_profiles:
+            self._throwaway_profiles.discard(str(udd))
+            try:
+                import shutil as _shutil
+
+                _shutil.rmtree(udd, ignore_errors=True)
+            except Exception:
+                pass
         return {"success": True}
 
     # --- observation ---------------------------------------------------------
