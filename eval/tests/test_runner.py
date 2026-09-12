@@ -160,3 +160,43 @@ def test_protocol_disarms_human_handoff():
     from eval.core.protocol import DEFAULT_PROTOCOL
 
     assert DEFAULT_PROTOCOL.env()["SUPERBROWSER_MAX_HUMAN_HANDOFFS"] == "0"
+
+
+def test_children_are_reaped_not_orphaned(tmp_path, monkeypatch):
+    """Runs start in their own process group so a timeout can kill the whole
+    tree, which also means Ctrl-C never reaches them. Without explicit reaping
+    the parent dies and the run keeps going forever -- observed live as three
+    orphaned runs fighting over one Tier-3 Chrome profile."""
+    import subprocess
+
+    from eval.core import runner as R
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 4242
+            self._alive = True
+            self.killed = False
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def wait(self, timeout=None):
+            self._alive = False
+            return 0
+
+    proc = FakeProc()
+    killed: list[int] = []
+    monkeypatch.setattr(R.os, "killpg", lambda pid, sig: killed.append(pid))
+
+    R._LIVE_CHILDREN.clear()
+    R._LIVE_CHILDREN.add(proc)
+    assert R.reap_children("test") == 1
+    assert killed == [4242], "the child's process GROUP must be signalled, not just the pid"
+    assert not R._LIVE_CHILDREN, "a reaped child must be forgotten"
+
+    # already-finished children are not signalled, and reaping twice is safe
+    done = FakeProc(); done._alive = False
+    R._LIVE_CHILDREN.add(done)
+    killed.clear()
+    assert R.reap_children() == 0 and killed == []
+    assert R.reap_children() == 0

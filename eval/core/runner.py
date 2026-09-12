@@ -19,6 +19,7 @@ Experiments wrap this with their own ``run.py`` that fixes arms/subset.
 from __future__ import annotations
 
 import argparse
+import atexit
 import asyncio
 import json
 import os
@@ -116,6 +117,15 @@ def build_schedule(*, experiment: str, arms: Sequence[Arm], tasks: Sequence[Task
     return specs
 
 
+# Every run is started in its own process group so a timeout can kill the whole
+# tree (Chrome included). The side effect is that Ctrl-C on the sweep never
+# reaches the running child, so the parent would die and the run keep going as an
+# orphan -- observed live: three orphaned runs fighting over one Tier-3 Chrome
+# profile, producing TargetClosedError and burning credit on work no parent would
+# ever harvest. These hooks make the parent reap its child on any exit path.
+_LIVE_CHILDREN: set[subprocess.Popen] = set()
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -125,6 +135,38 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:
             pass
+    finally:
+        _LIVE_CHILDREN.discard(proc)
+
+
+def reap_children(note: str = "") -> int:
+    """Kill any run subprocess this sweep still owns. Safe to call twice."""
+    n = 0
+    for proc in list(_LIVE_CHILDREN):
+        if proc.poll() is None:
+            _kill_tree(proc)
+            n += 1
+        else:
+            _LIVE_CHILDREN.discard(proc)
+    if n:
+        print(f"\n  [stopped {n} in-flight run(s){' — ' + note if note else ''}; "
+              f"their work is not harvested, so --resume will redo them]", flush=True)
+    return n
+
+
+def _install_signal_handlers() -> None:
+    """Reap the child, then die of the same signal (so the exit code is honest)."""
+    def handler(signum, _frame):
+        reap_children(f"signal {signal.Signals(signum).name}")
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):   # not the main thread, or unsupported
+            pass
+    atexit.register(reap_children, "process exit")
 
 
 def archive_failed_attempt(spec: RunSpec) -> Path | None:
@@ -195,17 +237,21 @@ def launch_run(spec: RunSpec, *, log_to: Path, follow: bool = False) -> tuple[in
         with log_to.open("ab") as log:
             proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,  # noqa: S603
                                     start_new_session=True)
+            _LIVE_CHILDREN.add(proc)
             try:
                 rc = proc.wait(timeout=hard_timeout)
                 return rc, "ok" if rc == 0 else f"exit {rc}"
             except subprocess.TimeoutExpired:
                 _kill_tree(proc)
                 return None, "killed: hard wall-clock exceeded"
+            finally:
+                _LIVE_CHILDREN.discard(proc)
 
     deadline = time.time() + hard_timeout
     with log_to.open("ab") as log:
         proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE,  # noqa: S603
                                 stderr=subprocess.STDOUT, start_new_session=True)
+        _LIVE_CHILDREN.add(proc)
         assert proc.stdout is not None
         try:
             for raw in proc.stdout:
@@ -222,6 +268,7 @@ def launch_run(spec: RunSpec, *, log_to: Path, follow: bool = False) -> tuple[in
             except Exception:
                 pass
         rc = proc.wait()
+        _LIVE_CHILDREN.discard(proc)
         return rc, "ok" if rc == 0 else f"exit {rc}"
 
 
@@ -272,6 +319,7 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
               f"pins: {specs[0].protocol.env() if specs else {}}")
         return out
     log_dir.mkdir(parents=True, exist_ok=True)
+    _install_signal_handlers()
     viewer = None
     if viewer_port:
         # Read-only, and deliberately not the TS server's /session/:id/view: that
@@ -340,6 +388,7 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
                       f"   Fix the key, then re-run the SAME command with --resume to continue where it stopped.")
                 break
     finally:
+        reap_children("sweep finished")
         servers.close()
         if viewer is not None:
             viewer.shutdown()

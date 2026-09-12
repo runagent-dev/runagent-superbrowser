@@ -311,7 +311,12 @@ Each experiment is independent: its own arms, its own `eval/runs/<experiment>/` 
 Three things to know:
 
 - **Interrupting is safe.** Stop with Ctrl-C and re-launch the same command with `--resume`; finished runs
-  are skipped. An unfinished attempt is archived to `eval/runs/<experiment>/_failed_attempts/` before the
+  are skipped. The runner kills the run in flight and says so — runs live in their own process group so a
+  timeout can kill Chrome too, which means Ctrl-C does not reach them on its own. Without that reaping the
+  parent died and the run continued as an orphan, and two orphans on the same site then fought over the
+  per-domain Tier-3 Chrome profile (`TargetClosedError`) while spending credit on work nothing harvests.
+  If a sweep was killed some other way, check with `ps -eo pid,cmd | grep '[r]un_one --spec'` before
+  relaunching. An unfinished attempt is archived to `eval/runs/<experiment>/_failed_attempts/` before the
   retry starts, so its screenshots can never be judged as part of the new run, and nothing you paid for is
   deleted.
 - **Arms interleave per task, so drift is controlled inside an experiment but not between them.** The
