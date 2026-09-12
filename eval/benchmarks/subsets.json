@@ -211,11 +211,11 @@
     "benchmark": "online_mind2web_all",
     "n": 24,
     "method": "22 task ids supplied by the author, minus 2 whose sites return 403 through our residential proxy, plus the 1 task already completed under this experiment, plus 3 medium-level low-anti-bot fills chosen to restore level balance; every site was loaded in real Chrome through the proxy before freezing",
-    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected.",
+    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task.",
     "strata": {},
     "level_counts": {
-      "easy": 12,
-      "hard": 6,
+      "easy": 13,
+      "hard": 5,
       "medium": 6
     },
     "antibot_counts": {
@@ -228,7 +228,6 @@
       "method": "real Chrome, fresh context per site"
     },
     "task_ids": [
-      "0b2623e9fa5cea997f76490bcbc5220f",
       "1223b07536a87e0170ff87cbbebd1d3c",
       "157f4a79d55e8fa3fd55ba772ba40fbc",
       "16200f51d63f0a47a58fa17acd49e368",
@@ -242,6 +241,7 @@
       "85b284c18d7e78c9b5a9e074e7aa3b98",
       "871e7771cecb989972f138ecc373107b",
       "9bb63ad0e38d5691a618932a8b31c05a",
+      "a11ecdff735b51372d536c866011af6f",
       "a69d2934fe54fef165490a5a2d95bf38",
       "bb314cb80f0f8489135cbf59074d11e2",
       "bb518416a786fdb9b9bbf0c78515595e",
