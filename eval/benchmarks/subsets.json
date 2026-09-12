@@ -210,42 +210,48 @@
   "ablate24": {
     "benchmark": "online_mind2web_all",
     "n": 24,
-    "method": "level-stratified to 8/8/8, seeded 'ablate24-2026-09-12', restricted to low/medium anti-bot risk, and constructed as a superset of batch5a so runs already completed are preserved",
-    "note": "Single 24-task ablation set. Frozen 2026-09-12 before the arms it adds had run. High anti-bot tasks are excluded on cost grounds (no arm can complete them, so they contribute no paired signal); state this exclusion when reporting.",
+    "method": "22 task ids supplied by the author, minus 2 whose sites return 403 through our residential proxy, plus the 1 task already completed under this experiment, plus 3 medium-level low-anti-bot fills chosen to restore level balance; every site was loaded in real Chrome through the proxy before freezing",
+    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected.",
     "strata": {},
     "level_counts": {
-      "easy": 8,
-      "hard": 8,
-      "medium": 8
+      "easy": 12,
+      "hard": 6,
+      "medium": 6
     },
     "antibot_counts": {
-      "low": 24
+      "low": 19,
+      "medium": 5
+    },
+    "screened": {
+      "proxy": "residential",
+      "date": "2026-09-12",
+      "method": "real Chrome, fresh context per site"
     },
     "task_ids": [
       "0b2623e9fa5cea997f76490bcbc5220f",
       "1223b07536a87e0170ff87cbbebd1d3c",
       "157f4a79d55e8fa3fd55ba772ba40fbc",
       "16200f51d63f0a47a58fa17acd49e368",
-      "2fc51dd3febd447f0fdcdabca8d944ce",
+      "1fc28d91d25ccd1c6ba268101326a654",
+      "23204728192da9f73197a613d9681c18",
+      "26810ed9c123a62992e3eed31db3c5ee",
       "3443e9c3151fef19a3c3a45eb2c13640",
-      "3c1ffc3f494e423b3c434c79e35da8f3",
-      "561693d6eec7bbfba3fefe9e4b26decb",
-      "59912927c1fddee6ded8a49986896bc2",
-      "6ca20f1da01edeb49a7a42c816d8c6fe",
-      "75a1b5dcd2c28508a971d98d51fe5767",
-      "783ce6a3499fa7cf25bc12f8f0ecbbbb",
-      "7e6993f2c5cd72c44809024f0bc85dc1",
-      "828c2d98616a9478d5864d847d5a1b28",
-      "8f80e64e44e1fada018997b2fe869683",
-      "b69eb4de621e9e265676daac44938f3f",
-      "c03ee2be3d73556ab789c0ad1cbd3451",
-      "c2153fc053112e89c2f103869c4d6890",
-      "c3a333968fc3c43d7f2688f425a0d633",
-      "c7c07ec10c668625a21ba64165d719bb",
-      "d71be72aa25c3eab8eea47a0e60382e2",
-      "e7301bb694871429bf2eb36c3a72186c",
-      "ec78d3a635e417bc2a80d03ca93d7165",
-      "f2be37a9a60fbc25b6b11cf622d17352"
+      "3ec0f6138d37fadcb989347a6088ec45",
+      "4e801ba102dfaf22c7cf7a126b107609",
+      "733f1d8bf79d5bc2240c5357f928ffff",
+      "85b284c18d7e78c9b5a9e074e7aa3b98",
+      "871e7771cecb989972f138ecc373107b",
+      "9bb63ad0e38d5691a618932a8b31c05a",
+      "a69d2934fe54fef165490a5a2d95bf38",
+      "bb314cb80f0f8489135cbf59074d11e2",
+      "bb518416a786fdb9b9bbf0c78515595e",
+      "bbbc243b4f18a7a897f0bc84e11d293f",
+      "c521933dad9c0ef9f1dfa2f38b8e4405",
+      "c801d1c951f59297f526bab84fa86c6e",
+      "c8c1ff115879b3afd14280beb1559b13",
+      "c94551d2b18f9ad0ab31b0bd98ca42e3",
+      "cf757a775fa1224acfc7998489e199a8",
+      "d71be72aa25c3eab8eea47a0e60382e2"
     ]
   }
 }
