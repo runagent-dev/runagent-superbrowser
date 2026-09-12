@@ -329,11 +329,19 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
         try:
             from eval.viewer import serve as _serve
 
+            tok = None
+            if viewer_host not in ("127.0.0.1", "localhost"):
+                import secrets
+
+                tok = secrets.token_urlsafe(12)
             viewer = _serve(viewer_port, Path(specs[0].run_dir).parents[3] if specs else DEFAULT_RUNS_ROOT,
-                            None, host=viewer_host)
-            print(f"\n  live viewer: http://{viewer_host}:{viewer_port}   (Tier-1 and Tier-3; follows the active run)")
+                            None, host=viewer_host, token=tok)
+            url = f"http://{viewer_host}:{viewer_port}" + (f"/?t={tok}" if tok else "")
+            print(f"\n  live viewer: {url}   (Tier-1 and Tier-3; follows the active run)")
             if viewer_host == "127.0.0.1":
-                print(f"  on a remote box, tunnel it:  ssh -L {viewer_port}:127.0.0.1:{viewer_port} <user>@<host>")
+                print("  loopback only. From a laptop, run this ON THE LAPTOP (not on the server):")
+                print(f"      ssh -L {viewer_port}:127.0.0.1:{viewer_port} <user>@<host>")
+                print(f"  or bind it directly with:  --viewer-host 0.0.0.0   (adds a token to the URL)")
             print()
         except OSError as exc:
             print(f"  [viewer not started on :{viewer_port} — {exc}; pass --viewer-port N or --no-viewer]")

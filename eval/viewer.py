@@ -139,12 +139,14 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>SuperBrowser eval viewer</
   <a id="rich" href="#" target="_blank" hidden>open full viewer (screencast + bboxes + cursor) &rarr;</a>
   <div class="task" id="task"></div>
 </header>
-<div class="wrap"><img id="shot" src="/frame.jpg" alt="latest frame"></div>
+<div class="wrap"><img id="shot" alt="latest frame"></div>
 <script>
 let last = "";
 async function tick(){
   try{
-    const s = await (await fetch('/status.json?_=' + Date.now())).json();
+    const T = new URLSearchParams(location.search).get('t');
+    const q = (u) => u + (u.includes('?') ? '&' : '?') + '_=' + Date.now() + (T ? '&t=' + T : '');
+    const s = await (await fetch(q('/status.json'))).json();
     if(!s.ok){ document.getElementById('arm').textContent = 'waiting for a run…'; return; }
     document.getElementById('arm').textContent   = s.arm || '-';
     document.getElementById('done').textContent  = s.runs_finished ?? '-';
@@ -160,7 +162,7 @@ async function tick(){
     document.getElementById('dot').className = 'dot' + (idle ? ' idle' : '');
     const img = document.getElementById('shot');
     img.classList.toggle('stale', idle);
-    if(s.frame !== last){ last = s.frame; img.src = '/frame.jpg?_=' + Date.now(); }
+    if(s.frame !== last){ last = s.frame; img.src = q('/frame.jpg'); }
   }catch(e){}
 }
 tick(); setInterval(tick, 1500);
@@ -168,8 +170,24 @@ tick(); setInterval(tick, 1500);
 """
 
 
-def make_handler(runs_root: Path, experiment: str | None):
+def make_handler(runs_root: Path, experiment: str | None, token: str | None = None):
     class Handler(BaseHTTPRequestHandler):
+        def _authorised(self) -> bool:
+            """Gate every path behind ?t=<token> when a token is set.
+
+            The page shows whatever the agent is browsing, so binding it to a
+            public interface without this would put that on the open internet.
+            """
+            if not token:
+                return True
+            from urllib.parse import parse_qs, urlparse
+
+            q = parse_qs(urlparse(self.path).query)
+            if (q.get("t") or [""])[0] == token:
+                return True
+            hdr = self.headers.get("Authorization", "")
+            return hdr.replace("Bearer ", "").strip() == token
+
         def log_message(self, *a):  # quiet
             pass
 
@@ -182,6 +200,9 @@ def make_handler(runs_root: Path, experiment: str | None):
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._authorised():
+                self._send(401, "text/plain", b"add ?t=<token> (printed when the viewer started)")
+                return
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
                 self._send(200, "text/html; charset=utf-8", PAGE.encode())
@@ -223,7 +244,8 @@ class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def serve(port: int, runs_root: Path, experiment: str | None, host: str = "127.0.0.1") -> _Server:
+def serve(port: int, runs_root: Path, experiment: str | None, host: str = "127.0.0.1",
+          token: str | None = None) -> _Server:
     """Bind the viewer. Defaults to loopback: the page exposes screenshots of
     whatever the agent is browsing, so on a public host it must not be open by
     default. Reach it from a laptop with an SSH tunnel:
@@ -232,7 +254,7 @@ def serve(port: int, runs_root: Path, experiment: str | None, host: str = "127.0
 
     Pass host="0.0.0.0" only on a machine where that is acceptable.
     """
-    srv = _Server((host, port), make_handler(runs_root, experiment))
+    srv = _Server((host, port), make_handler(runs_root, experiment, token))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -245,14 +267,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address; loopback by default because the page shows the agent's "
                          "screen. Use an SSH tunnel for remote access, or 0.0.0.0 deliberately.")
+    ap.add_argument("--token", default=None,
+                    help="require ?t=<token>; auto-generated when --host is not loopback")
     args = ap.parse_args(argv)
-    srv = serve(args.port, Path(args.runs), args.experiment, host=args.host)
-    print(f"eval viewer: http://{args.host}:{args.port}    (Ctrl-C to stop)")
+    token = args.token
+    if token is None and args.host not in ("127.0.0.1", "localhost"):
+        import secrets
+
+        token = secrets.token_urlsafe(12)
+    srv = serve(args.port, Path(args.runs), args.experiment, host=args.host, token=token)
+    shown = f"http://{args.host}:{args.port}" + (f"/?t={token}" if token else "")
+    print(f"eval viewer: {shown}    (Ctrl-C to stop)")
     print("  follows whichever run is writing frames; works for Tier-1 and Tier-3 alike")
     if args.host == "127.0.0.1":
         print(f"  remote? tunnel it:  ssh -L {args.port}:127.0.0.1:{args.port} <user>@<this-host>")
     else:
-        print(f"  WARNING: bound to {args.host} — anyone who can reach this port sees the agent's screen")
+        print(f"  bound to {args.host}; the URL above carries a token — anyone with it sees the agent's screen")
     try:
         while True:
             time.sleep(3600)
