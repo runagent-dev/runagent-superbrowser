@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Verdict, add_usage, parse_json_verdict, resolve_client, usage_of
+from .base import Verdict, aclose_client, add_usage, parse_json_verdict, resolve_client, usage_of
 
 DEFAULT_MODEL = "gpt-5.5"
 
@@ -65,6 +65,7 @@ def _parse(txt: str) -> tuple[bool, str]:
 
 
 async def judge(task: Any, final_answer: str, *, client: Any = None, model: str | None = None) -> Verdict:
+    owned = client is None      # only close a client we built ourselves
     if client is None:
         client, resolved = resolve_client(model_env="SUPERBROWSER_EVAL_JUDGE_MODEL", default_model=DEFAULT_MODEL,
                                           prefix="SUPERBROWSER_EVAL_ANSWER_JUDGE")
@@ -72,6 +73,8 @@ async def judge(task: Any, final_answer: str, *, client: Any = None, model: str 
     if client is None:
         return Verdict("answer_judge", None, "no judge API key available", model)
     if looks_like_api_error(final_answer):
+        if owned:
+            await aclose_client(client)
         return Verdict("answer_judge", False, "provider/billing error in place of an answer", model,
                        details={"api_error": True})
     rubric = getattr(task, "reference", None) or "(no explicit rubric — use the task's implied success criteria)"
@@ -84,9 +87,13 @@ async def judge(task: Any, final_answer: str, *, client: Any = None, model: str 
             resp = await client.chat.completions.create(model=model, messages=messages, **kwargs)
             txt = (resp.choices[0].message.content or "").strip()
             ok, rationale = _parse(txt)
+            if owned:
+                await aclose_client(client)
             return Verdict("answer_judge", ok, rationale, model,
                            details={"heuristic_success": heuristic_success(final_answer)},
                            usage=add_usage({}, usage_of(resp)))
         except Exception as exc:  # noqa: BLE001 - retry without temperature, then give up
             last = exc
+    if owned:
+        await aclose_client(client)
     return Verdict("answer_judge", None, f"judge error: {last}", model)

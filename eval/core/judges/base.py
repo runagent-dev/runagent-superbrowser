@@ -81,6 +81,28 @@ def resolve_client(*, model_env: str, default_model: str,
     return AsyncOpenAI(**kwargs), model
 
 
+async def aclose_client(client: Any) -> None:
+    """Close a judge client we constructed ourselves.
+
+    resolve_client builds an AsyncOpenAI, which owns an httpx connection pool.
+    Left open, that pool is finalised by the garbage collector AFTER
+    asyncio.run() has closed the loop, and the teardown raises
+    "RuntimeError: Event loop is closed" as a bare traceback next to the run's
+    result line — alarming, and noisy enough to hide a real error.
+    """
+    for attr in ("aclose", "close"):
+        fn = getattr(client, attr, None)
+        if fn is None:
+            continue
+        try:
+            r = fn()
+            if hasattr(r, "__await__"):
+                await r
+            return
+        except Exception:
+            return
+
+
 def usage_of(resp: Any) -> dict[str, int]:
     u = getattr(resp, "usage", None)
     if u is None:

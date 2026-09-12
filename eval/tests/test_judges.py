@@ -226,3 +226,50 @@ def test_webjudge_retries_when_a_token_cap_swallows_the_answer(tmp_path):
     j._shape = "max_completion_tokens"
     out = _a.run(j._chat([{"role": "user", "content": "x"}], max_tokens=512))
     assert "Score" in out and c.caps == [512, 2048]
+
+
+def test_judges_close_clients_they_created(tmp_path):
+    """An unclosed AsyncOpenAI owns an httpx pool that the GC finalises after
+    asyncio.run() closes the loop, printing a bare
+    "RuntimeError: Event loop is closed" traceback beside the run's result."""
+    import asyncio as _a
+
+    from eval.core.judges import answer_judge, webjudge
+    from eval.core.tasks import Task
+
+    class TrackingClient(FakeChatClient):
+        def __init__(self, replies=None):
+            super().__init__(replies)
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+
+    task = Task(task_id="t", benchmark="b", instruction="do it", reference="rubric")
+
+    # injected clients are the caller's to close, so they must be left open
+    inj = TrackingClient(['{"success": true, "rationale": "ok"}'])
+    _a.run(answer_judge.judge(task, "the answer", client=inj))
+    assert inj.closed == 0, "an injected client must not be closed by the judge"
+
+    # a client the judge builds itself must be closed
+    made: list = []
+
+    def fake_resolve(**kw):
+        c = TrackingClient(['{"success": true, "rationale": "ok"}'])
+        made.append(c)
+        return c, "m"
+
+    import eval.core.judges.answer_judge as AJ
+    import eval.core.judges.webjudge as WJ
+    orig_aj, orig_wj = AJ.resolve_client, WJ.resolve_client
+    try:
+        AJ.resolve_client = fake_resolve
+        _a.run(AJ.judge(task, "the answer"))
+        WJ.resolve_client = fake_resolve
+        _a.run(WJ.judge(task, tmp_path, transcripts=[]))
+    finally:
+        AJ.resolve_client, WJ.resolve_client = orig_aj, orig_wj
+
+    assert made and all(c.closed == 1 for c in made), \
+        f"each self-built client must be closed exactly once, got {[c.closed for c in made]}"

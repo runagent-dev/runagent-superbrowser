@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .base import Verdict, action_history, add_usage, resolve_client, usage_of
+from .base import Verdict, aclose_client, action_history, add_usage, resolve_client, usage_of
 
 DEFAULT_MODEL = "gpt-4o"
 SCORE_THRESHOLD = 3
@@ -265,6 +265,7 @@ class WebJudge:
 
 async def judge(task: Any, run_dir: Path, *, transcripts: list[dict[str, Any]], client: Any = None,
                 model: str | None = None) -> Verdict:
+    owned = client is None      # only close a client we built ourselves
     if client is None:
         client, resolved = resolve_client(model_env="SUPERBROWSER_EVAL_WEBJUDGE_MODEL", default_model=DEFAULT_MODEL,
                                           prefix="SUPERBROWSER_EVAL_WEBJUDGE")
@@ -272,12 +273,16 @@ async def judge(task: Any, run_dir: Path, *, transcripts: list[dict[str, Any]], 
     model = model or DEFAULT_MODEL
     if client is None:
         return Verdict("webjudge", None, "no judge API key available", model)
-    shots = list_screenshots(run_dir)
-    actions = action_history(transcripts)
-    if not shots and not actions:
-        return Verdict("webjudge", None, "no screenshots and no actions recorded for this run", model,
-                       details={"screenshots_evaluated": 0, "n_actions": 0})
     try:
-        return await WebJudge(client, model).evaluate(task.instruction, shots, actions)
-    except Exception as exc:  # noqa: BLE001 - never crash a harvest on a judge error
-        return Verdict("webjudge", None, f"judge error: {exc}", model)
+        shots = list_screenshots(run_dir)
+        actions = action_history(transcripts)
+        if not shots and not actions:
+            return Verdict("webjudge", None, "no screenshots and no actions recorded for this run", model,
+                           details={"screenshots_evaluated": 0, "n_actions": 0})
+        try:
+            return await WebJudge(client, model).evaluate(task.instruction, shots, actions)
+        except Exception as exc:  # noqa: BLE001 - never crash a harvest on a judge error
+            return Verdict("webjudge", None, f"judge error: {exc}", model)
+    finally:
+        if owned:
+            await aclose_client(client)
