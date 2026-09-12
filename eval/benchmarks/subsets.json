@@ -211,12 +211,12 @@
     "benchmark": "online_mind2web_all",
     "n": 24,
     "method": "22 task ids supplied by the author, minus 2 whose sites return 403 through our residential proxy, plus the 1 task already completed under this experiment, plus 3 medium-level low-anti-bot fills chosen to restore level balance; every site was loaded in real Chrome through the proxy before freezing",
-    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task. Swapped 157f4a79 (disney.com) out for 662ae0f2 (wanderlog.com) at the author's request; wanderlog verified reachable through the proxy. One completed run existed for the outgoing task and is orphaned, not counted. Swapped 3443e9c3 (webmd.com, hard) out for 95cad96f (rottentomatoes.com, easy) at the author's request; rottentomatoes verified reachable through the proxy.",
+    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task. Swapped 157f4a79 (disney.com) out for 662ae0f2 (wanderlog.com) at the author's request; wanderlog verified reachable through the proxy. One completed run existed for the outgoing task and is orphaned, not counted. Swapped 3443e9c3 (webmd.com, hard) out for 95cad96f (rottentomatoes.com, easy) at the author's request; rottentomatoes verified reachable through the proxy. Swapped 4e801ba1 (thumbtack.com, medium) out for dd44c665 (spothero.com, hard) at the author's request on cost grounds; spothero verified reachable through the proxy. Seven completed thumbtack runs (4 successes) are archived, not counted.",
     "strata": {},
     "level_counts": {
       "easy": 15,
-      "hard": 4,
-      "medium": 5
+      "hard": 5,
+      "medium": 4
     },
     "antibot_counts": {
       "low": 19,
@@ -234,7 +234,6 @@
       "23204728192da9f73197a613d9681c18",
       "26810ed9c123a62992e3eed31db3c5ee",
       "3ec0f6138d37fadcb989347a6088ec45",
-      "4e801ba102dfaf22c7cf7a126b107609",
       "662ae0f2d3ac851dbcdd245f908277e3",
       "733f1d8bf79d5bc2240c5357f928ffff",
       "85b284c18d7e78c9b5a9e074e7aa3b98",
@@ -251,7 +250,8 @@
       "c8c1ff115879b3afd14280beb1559b13",
       "c94551d2b18f9ad0ab31b0bd98ca42e3",
       "cf757a775fa1224acfc7998489e199a8",
-      "d71be72aa25c3eab8eea47a0e60382e2"
+      "d71be72aa25c3eab8eea47a0e60382e2",
+      "dd44c665cec1e9c929a4c5f074e7844a"
     ]
   }
 }
