@@ -206,5 +206,46 @@
       "a6f0434ce6aff5f9b03681241b03ad82",
       "b4aa7315e31dfcdc52baf7771be260c9"
     ]
+  },
+  "ablate24": {
+    "benchmark": "online_mind2web_all",
+    "n": 24,
+    "method": "level-stratified to 8/8/8, seeded 'ablate24-2026-09-12', restricted to low/medium anti-bot risk, and constructed as a superset of batch5a so runs already completed are preserved",
+    "note": "Single 24-task ablation set. Frozen 2026-09-12 before the arms it adds had run. High anti-bot tasks are excluded on cost grounds (no arm can complete them, so they contribute no paired signal); state this exclusion when reporting.",
+    "strata": {},
+    "level_counts": {
+      "easy": 8,
+      "hard": 8,
+      "medium": 8
+    },
+    "antibot_counts": {
+      "low": 24
+    },
+    "task_ids": [
+      "0b2623e9fa5cea997f76490bcbc5220f",
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "157f4a79d55e8fa3fd55ba772ba40fbc",
+      "16200f51d63f0a47a58fa17acd49e368",
+      "2fc51dd3febd447f0fdcdabca8d944ce",
+      "3443e9c3151fef19a3c3a45eb2c13640",
+      "3c1ffc3f494e423b3c434c79e35da8f3",
+      "561693d6eec7bbfba3fefe9e4b26decb",
+      "59912927c1fddee6ded8a49986896bc2",
+      "6ca20f1da01edeb49a7a42c816d8c6fe",
+      "75a1b5dcd2c28508a971d98d51fe5767",
+      "783ce6a3499fa7cf25bc12f8f0ecbbbb",
+      "7e6993f2c5cd72c44809024f0bc85dc1",
+      "828c2d98616a9478d5864d847d5a1b28",
+      "8f80e64e44e1fada018997b2fe869683",
+      "b69eb4de621e9e265676daac44938f3f",
+      "c03ee2be3d73556ab789c0ad1cbd3451",
+      "c2153fc053112e89c2f103869c4d6890",
+      "c3a333968fc3c43d7f2688f425a0d633",
+      "c7c07ec10c668625a21ba64165d719bb",
+      "d71be72aa25c3eab8eea47a0e60382e2",
+      "e7301bb694871429bf2eb36c3a72186c",
+      "ec78d3a635e417bc2a80d03ca93d7165",
+      "f2be37a9a60fbc25b6b11cf622d17352"
+    ]
   }
 }
