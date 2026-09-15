@@ -38,8 +38,14 @@ def click_trace_enabled() -> bool:
 
 
 def _memory_dir(state: Any) -> Path | None:
+    # BrowserSessionState keeps its Memory on ``_memory`` (no public property),
+    # so reading ``state.memory`` raised AttributeError, the except below
+    # swallowed it, and every trace record was silently dropped: an entire
+    # 192-run sweep produced zero vision_calls.jsonl / clicks.jsonl files, which
+    # cost the redundant-perception and click-recovery metrics outright.
+    mem = getattr(state, "_memory", None) or getattr(state, "memory", None)
     try:
-        return Path(state.memory.events.path).parent
+        return Path(mem.events.path).parent
     except Exception:
         return None
 
