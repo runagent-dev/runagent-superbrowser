@@ -1,0 +1,35 @@
+[
+  {
+    "arm_a": "ledger",
+    "arm_b": "no_deadend",
+    "n": 24,
+    "k_a": 11,
+    "k_b": 13,
+    "tsr_a": 0.4583333333333333,
+    "tsr_b": 0.5416666666666666,
+    "wilson_a": [
+      0.2789133373121099,
+      0.6492513464108051
+    ],
+    "wilson_b": [
+      0.3507486535891948,
+      0.72108666268789
+    ],
+    "n_excluded": 0,
+    "excluded": {},
+    "unpaired": {
+      "ledger": 0,
+      "no_deadend": 0
+    },
+    "n_pairs": 24,
+    "both_success": 8,
+    "a_only": 3,
+    "b_only": 5,
+    "both_fail": 8,
+    "p_value": 0.7265625,
+    "diff": -0.08333333333333333,
+    "diff_ci_low": -0.3333333333333333,
+    "diff_ci_high": 0.16666666666666666,
+    "confirmatory": true
+  }
+]

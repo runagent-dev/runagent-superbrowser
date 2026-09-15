@@ -44,6 +44,7 @@ eval/excluded_runs/
 # offline, deterministic E6 fixture results under version control.
 eval/artifacts/*
 !eval/artifacts/e6_subelement/
+!eval/artifacts/ablate10_paper/
 eval/**/__pycache__/
 # the global *.jsonl rule above must not hide the frozen benchmark task files
 !eval/benchmarks/*.jsonl

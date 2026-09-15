@@ -1,0 +1,5 @@
+arm,n,k,tsr,wilson_low,wilson_high,n_excluded,iterations,tool_calls,vision_calls,prompt_mean,prompt_peak,input_tokens,wall_s,usd,usd_cached,usd_per_success,csd_observed,drr,repeated_actions,rpr,first_path_success,recovery_success,failure_reasons
+fifo,24,15,0.625,0.4271,0.788406,0,41.9167,22.4583,16.5833,36802.9,43417.6,1.79256e+06,523.369,0.362483,0.20803,0.579973,0.962588,0.03125,0.791667,,0.982474,,"{""premature_done"": 8, ""bot_block"": 1}"
+full_history,24,17,0.708333,0.508323,0.850854,0,34.3333,17.7083,14.0417,41827,56228.8,1.6923e+06,349.847,0.332307,0.161417,0.46914,0.983193,0,1,,0.687446,,"{""premature_done"": 5, ""bot_block"": 1, ""grounding"": 1}"
+ledger,24,11,0.458333,0.278913,0.649251,1,41.125,18.625,14.7917,37155.8,43350,1.6482e+06,495.131,0.334627,0.218527,0.730095,0.997391,0,0.708333,,0.878932,,"{""premature_done"": 11, ""captcha_unsolved"": 1, ""timeout"": 1}"
+summary,24,13,0.541667,0.350749,0.721087,0,37.7083,20.4167,16.625,37564.3,43040.8,1.67449e+06,524.345,0.353936,0.213789,0.653421,0.952673,0,0.666667,,0.993464,,"{""premature_done"": 10, ""bot_block"": 1}"

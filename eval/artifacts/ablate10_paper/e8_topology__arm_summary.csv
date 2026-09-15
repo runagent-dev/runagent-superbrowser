@@ -1,0 +1,3 @@
+arm,n,k,tsr,wilson_low,wilson_high,n_excluded,iterations,tool_calls,vision_calls,prompt_mean,prompt_peak,input_tokens,wall_s,usd,usd_cached,usd_per_success,csd_observed,drr,repeated_actions,rpr,first_path_success,recovery_success,failure_reasons
+flat,24,10,0.416667,0.244676,0.611653,2,27.9167,13.75,10.5417,30612.3,36574,931551,251.928,0.20665,0.140151,0.49596,0.967836,0,0.625,,0.967172,,"{""premature_done"": 7, ""bot_block"": 5, ""site_unavailable"": 2}"
+ledger,24,11,0.458333,0.278913,0.649251,1,41.125,18.625,14.7917,37155.8,43350,1.6482e+06,495.131,0.334627,0.218527,0.730095,0.997391,0,0.708333,,0.878932,,"{""premature_done"": 11, ""captcha_unsolved"": 1, ""timeout"": 1}"
