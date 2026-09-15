@@ -26,6 +26,7 @@ TRACKED_MODELS = (
     "google/gemini-3-flash-preview",
     "openai/gpt-4o",
     "openai/gpt-5.4-mini",
+    "z-ai/glm-5.3-flash",
     "openai/o4-mini",
     "openai/gpt-5.5",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
