@@ -25,7 +25,15 @@ from .telemetry import _extract_recent_failures
 
 
 RESUMPTION_PATH = "/tmp/superbrowser/resumption.json"
+# Warm window: the Puppeteer session is expected to still be alive, so the
+# next worker can attach to the live page and carry on mid-flow.
 RESUMPTION_TTL_SEC = 300
+# Cold window: the session is gone (the worker closed it, or it expired),
+# but knowing WHERE the last worker got to is still worth far more than
+# starting from a blank page. A worker that spent 47 iterations reaching a
+# filtered result page should not have to rediscover that URL. Beyond this
+# the page state is too likely to have moved on to be a useful hint.
+RESUMPTION_COLD_TTL_SEC = 1800
 
 
 def save_resumption_artifact(
@@ -33,6 +41,7 @@ def save_resumption_artifact(
     domain: str,
     help_reason: str = "",
     help_failed_tactics: str = "",
+    progress_note: str = "",
 ) -> bool:
     """Write a resumption hint so the next delegation can pick up where we left off.
 
@@ -50,6 +59,9 @@ def save_resumption_artifact(
             "recent_failures": _extract_recent_failures(state.step_history),
             "help_reason": help_reason or "",
             "help_failed_tactics": help_failed_tactics or "",
+            # What the previous worker actually established. Without it the
+            # successor repeats the reasoning as well as the navigation.
+            "progress_note": (progress_note or "")[:1200],
             "written_at": time.time(),
         }
         os.makedirs(os.path.dirname(RESUMPTION_PATH), exist_ok=True)
@@ -63,11 +75,22 @@ def save_resumption_artifact(
 
 
 async def load_resumption_artifact(domain: str) -> dict | None:
-    """Read and validate a resumption artifact for the given domain.
+    """Read and validate a resumption artifact for ``domain``.
 
-    Returns None if the artifact is missing, expired, from a different
-    domain, or the referenced Puppeteer session is no longer alive
-    on the TS server.
+    Returns the payload with a ``warm`` flag, or None when there is
+    nothing usable:
+
+      warm=True   the referenced Puppeteer session answered a liveness
+                  probe, so the successor can attach to the live page.
+      warm=False  the session is gone or the warm window has passed, but
+                  the artifact is still inside the cold window. The URL,
+                  the best checkpoint and the list of failed tactics
+                  remain useful: the successor navigates back and
+                  continues instead of rediscovering all of it.
+
+    Previously any dead session threw the whole artifact away, which is
+    what made a worker that ran out of iterations hand its successor a
+    blank page.
     """
     if not os.path.exists(RESUMPTION_PATH):
         return None
@@ -78,7 +101,7 @@ async def load_resumption_artifact(domain: str) -> dict | None:
         return None
 
     age = time.time() - float(payload.get("written_at", 0) or 0)
-    if age > RESUMPTION_TTL_SEC:
+    if age > RESUMPTION_COLD_TTL_SEC:
         try:
             os.remove(RESUMPTION_PATH)
         except OSError:
@@ -86,28 +109,26 @@ async def load_resumption_artifact(domain: str) -> dict | None:
         return None
     if payload.get("domain") != domain:
         return None
+    if not payload.get("current_url"):
+        return None            # nothing to navigate back to
 
     sid = payload.get("session_id")
-    if not sid:
-        return None
+    warm = False
+    if sid and age <= RESUMPTION_TTL_SEC:
+        # Cheap liveness probe — hit whichever backend owns this session.
+        try:
+            r = await _request_with_backoff(
+                "GET",
+                f"{SUPERBROWSER_URL}/session/{sid}/state",
+                params={"vision": "false"},
+                timeout=5.0,
+            )
+            warm = r.status_code == 200
+        except Exception:
+            warm = False
 
-    # Cheap liveness probe — hit whichever backend owns this session.
-    try:
-        r = await _request_with_backoff(
-            "GET",
-            f"{SUPERBROWSER_URL}/session/{sid}/state",
-            params={"vision": "false"},
-            timeout=5.0,
-        )
-        if r.status_code != 200:
-            try:
-                os.remove(RESUMPTION_PATH)
-            except OSError:
-                pass
-            return None
-    except Exception:
-        return None
-
+    payload["warm"] = warm
+    payload["age_s"] = int(age)
     return payload
 
 

@@ -20,7 +20,11 @@ def _extract_recent_failures(step_history: list[dict], limit: int = 5) -> list[d
     markers = ("FAILED", "failed (", "error:", "Script error", "ERROR:", "NOT solved")
     for step in reversed(step_history):
         result = str(step.get("result") or "")
-        if any(m in result for m in markers):
+        # Text markers cover most failures, but a tool that recorded
+        # success=False with a plainly-worded result ("no effect", "no
+        # movement") is still a tactic the next worker should not repeat.
+        explicit_failure = step.get("success") is False
+        if explicit_failure or any(m in result for m in markers):
             out.append({
                 "tool": step.get("tool", ""),
                 "args": str(step.get("args", ""))[:160],

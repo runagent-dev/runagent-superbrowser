@@ -1028,29 +1028,61 @@ class DelegateBrowserTaskTool(Tool):
         if domain:
             resumption = await load_resumption_artifact(domain)
         if resumption:
-            worker_state.session_id = resumption["session_id"]
-            worker_state.current_url = resumption.get("current_url", "")
-            worker_state.best_checkpoint_url = resumption.get("best_checkpoint_url", "") or ""
             failed_lines = [
                 f"- {f['tool']}({f['args']}) → {f['result_excerpt']}"
                 for f in resumption.get("recent_failures", [])
             ]
             failed_block = "\n".join(failed_lines) if failed_lines else "(none recorded)"
             help_reason = resumption.get("help_reason") or ""
-            parts.append(
-                f"\n## RESUMPTION — continue on existing browser session\n"
-                f"A previous worker got stuck and handed off to you.\n\n"
-                f"**Existing session_id**: `{resumption['session_id']}`  "
-                f"(Puppeteer page is LIVE at {resumption.get('current_url', '?')})\n\n"
-                f"**DO NOT call browser_open.** The session already exists. "
-                f"Use the session_id above for every tool call. Start with:\n"
-                f"  1. browser_get_markdown(session_id='{resumption['session_id']}') — see current state\n"
-                f"  2. Pick a DIFFERENT tactic than what failed below\n\n"
-                f"**Tactics that already failed — do NOT repeat them**:\n{failed_block}\n"
-                + (f"\n**Previous worker's explanation**: {help_reason}\n" if help_reason else "")
-                + "\nIf you also get stuck, call browser_request_help with a concrete "
-                "new-tactic suggestion and call done(success=False)."
-            )
+            progress_note = (resumption.get("progress_note") or "").strip()
+            prev_url = resumption.get("current_url", "") or ""
+            checkpoint_url = resumption.get("best_checkpoint_url", "") or ""
+            if resumption.get("warm", True):
+                # The page is still open: attach to it and carry on mid-flow.
+                worker_state.session_id = resumption["session_id"]
+                worker_state.current_url = prev_url
+                worker_state.best_checkpoint_url = checkpoint_url
+                parts.append(
+                    f"\n## RESUMPTION — continue on existing browser session\n"
+                    f"A previous worker got stuck and handed off to you.\n\n"
+                    f"**Existing session_id**: `{resumption['session_id']}`  "
+                    f"(Puppeteer page is LIVE at {prev_url or '?'})\n\n"
+                    f"**DO NOT call browser_open.** The session already exists. "
+                    f"Use the session_id above for every tool call. Start with:\n"
+                    f"  1. browser_get_markdown(session_id='{resumption['session_id']}') — see current state\n"
+                    f"  2. Pick a DIFFERENT tactic than what failed below\n\n"
+                    + (f"**What the previous worker established**:\n{progress_note}\n\n"
+                       if progress_note else "")
+                    + f"**Tactics that already failed — do NOT repeat them**:\n{failed_block}\n"
+                    + (f"\n**Previous worker's explanation**: {help_reason}\n" if help_reason else "")
+                    + "\nIf you also get stuck, call browser_request_help with a concrete "
+                    "new-tactic suggestion and call done(success=False)."
+                )
+            else:
+                # The session is gone, but where it got to is not. A worker
+                # that spent its whole budget reaching a filtered result page
+                # should not have to rediscover that URL from the homepage.
+                # It opens its own session and navigates straight back.
+                worker_state.best_checkpoint_url = checkpoint_url
+                resume_url = checkpoint_url or prev_url
+                parts.append(
+                    f"\n## RESUMPTION — a previous worker already got this far\n"
+                    f"A previous worker ran out of its step budget "
+                    f"{int(resumption.get('age_s') or 0)}s ago. Its browser session has "
+                    f"since closed, so you open your own — but do NOT start from the "
+                    f"site's home page.\n\n"
+                    f"**Resume here**: {resume_url}\n"
+                    + (f"(last page it was on: {prev_url})\n" if prev_url and prev_url != resume_url else "")
+                    + f"\nStart with:\n"
+                    f"  1. browser_open(url='{resume_url}') — go straight back to that state\n"
+                    f"  2. browser_get_markdown(session_id) — confirm the page is as expected\n"
+                    f"  3. Continue from there; only re-do earlier steps if the page "
+                    f"shows they did not stick (filters reset, logged out, cart empty)\n\n"
+                    + (f"**What the previous worker established**:\n{progress_note}\n\n"
+                       if progress_note else "")
+                    + f"**Tactics that already failed — do NOT repeat them**:\n{failed_block}\n"
+                    + (f"\n**Previous worker's explanation**: {help_reason}\n" if help_reason else "")
+                )
 
         # Enforce workflow IN the prompt itself (not just SOUL.md)
         if is_research:
@@ -1455,7 +1487,12 @@ CRITICAL RULES:
                     for s in (worker_state.step_history or [])
                 )
                 if not already_requested_help and domain:
-                    save_resumption_artifact(worker_state, domain)
+                    # Carry the worker's own account of what it established.
+                    # The URL says where it got to; this says what it learned
+                    # getting there, which is the expensive half.
+                    save_resumption_artifact(
+                        worker_state, domain, progress_note=(content or "")[:1200],
+                    )
 
             # --- Network-layer block fallback (pre-captcha) ----------------
             # NETWORK_BLOCKED means the site refused at the TLS/edge layer
