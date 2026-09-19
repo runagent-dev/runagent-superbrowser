@@ -48,7 +48,14 @@ class BrowserScreenshotTool(Tool):
         peek_hash = ""
         try:
             peek_elements = await _fetch_elements(session_id, self.s)
-            peek_hash = BrowserSessionState.hash_page_content(peek_elements)
+            # A pane scroll leaves the element listing identical, so the
+            # dedup key must also carry where each pane is scrolled to —
+            # otherwise the screenshot that would show what the scroll
+            # revealed is refused as a duplicate.
+            peek_hash = BrowserSessionState.hash_page_content(
+                peek_elements,
+                scroll_sig=getattr(self.s, "_last_scroll_signature", "") or "",
+            )
         except Exception:
             pass
 
@@ -72,9 +79,16 @@ class BrowserScreenshotTool(Tool):
 
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
+            # Same key on the way in as on the way out, or the next peek
+            # never matches and dedup stops working entirely.
+            scroll_sig = data.get("scrollSignature", "") or ""
+            try:
+                self.s._last_scroll_signature = scroll_sig
+            except Exception:
+                pass
             self.s.mark_screenshot_taken(
                 actual_url,
-                self.s.hash_page_content(data.get("elements", "")),
+                self.s.hash_page_content(data.get("elements", ""), scroll_sig=scroll_sig),
             )
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
         self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")

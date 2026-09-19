@@ -3915,6 +3915,88 @@ export class PageWrapper {
     };
   }
 
+  /**
+   * Scroll one named surface, verified.
+   *
+   * `window.scrollBy` moves the document and succeeds on almost every
+   * page, so the page-scroll path can never reach a sidebar that has
+   * its own `overflow-y`. This takes an explicit element and moves
+   * *that*, reporting how far it actually went so a no-op is visible to
+   * the caller rather than reported as a successful scroll.
+   */
+  async scrollSurfaceBy(
+    selector: string,
+    direction: 'up' | 'down',
+    pixels: number,
+  ): Promise<{ ok: boolean; before: number; after: number; scrolledPx: number; reason: string }> {
+    const px = Math.max(1, Math.round(Math.abs(pixels)));
+    const delta = direction === 'down' ? px : -px;
+    const out = await this.page.evaluate(
+      (sel: string, d: number) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (!el) return { ok: false, before: 0, after: 0, reason: 'container_not_found' };
+        const cs = window.getComputedStyle(el);
+        const scrollable =
+          (cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+          && el.scrollHeight > el.clientHeight + 4;
+        if (!scrollable) {
+          return { ok: false, before: el.scrollTop, after: el.scrollTop, reason: 'container_not_scrollable' };
+        }
+        // Same smooth-scroll override the page path uses: with
+        // `scroll-behavior: smooth` the read-back below would race the
+        // animation and report a false no-op.
+        const saved = el.style.scrollBehavior;
+        el.style.scrollBehavior = 'auto';
+        const before = el.scrollTop;
+        el.scrollTop = before + d;
+        const after = el.scrollTop;
+        el.style.scrollBehavior = saved;
+        if (after === before) {
+          const atEnd = d > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+          const atStart = d < 0 && el.scrollTop <= 1;
+          return { ok: false, before, after, reason: atEnd ? 'at_end' : atStart ? 'at_start' : 'no_movement' };
+        }
+        return { ok: true, before, after, reason: 'scrolled' };
+      },
+      selector,
+      delta,
+    );
+    // Give lazily-rendered rows a moment to paint before the caller
+    // screenshots or re-reads the DOM.
+    if (out.ok) await new Promise((r) => setTimeout(r, 350));
+    return { ...out, scrolledPx: out.after - out.before };
+  }
+
+  /** Absolute position within one pane, 0..100. Mirrors
+   * `scrollToPercent` but for a named surface. */
+  async scrollSurfaceToPercent(
+    selector: string,
+    percent: number,
+  ): Promise<{ ok: boolean; before: number; after: number; scrolledPx: number; reason: string }> {
+    const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+    const out = await this.page.evaluate(
+      (sel: string, p: number) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (!el) return { ok: false, before: 0, after: 0, reason: 'container_not_found' };
+        const range = el.scrollHeight - el.clientHeight;
+        if (range <= 4) {
+          return { ok: false, before: el.scrollTop, after: el.scrollTop, reason: 'container_not_scrollable' };
+        }
+        const saved = el.style.scrollBehavior;
+        el.style.scrollBehavior = 'auto';
+        const before = el.scrollTop;
+        el.scrollTop = Math.round((range * p) / 100);
+        const after = el.scrollTop;
+        el.style.scrollBehavior = saved;
+        return { ok: after !== before, before, after, reason: after !== before ? 'scrolled' : 'already_there' };
+      },
+      selector,
+      pct,
+    );
+    if (out.ok) await new Promise((r) => setTimeout(r, 350));
+    return { ...out, scrolledPx: out.after - out.before };
+  }
+
   async getScrollInfo(): Promise<[number, number, number]> {
     // Prefer the tagged document-scroll host (set by
     // `_windowScrollByWithFallback` when window.scrollBy turned out to

@@ -953,7 +953,32 @@ class BrowserNavigateTool(Tool):
                 "whenever you're scrolling toward a NAMED control: the "
                 "probe is your ground truth. If `in_viewport=false`, "
                 "scroll again or call `browser_get_markdown` — do NOT "
-                "emit a V_n claiming to be this label on the next turn."
+                "emit a V_n claiming to be this label on the next turn. "
+                "It ALSO steers the scroll: if the label lives inside a "
+                "sidebar or panel, that panel is scrolled instead of the "
+                "page."
+            ),
+            nullable=True,
+        ),
+        region=StringSchema(
+            description=(
+                "Which scrollable surface to move: 'left', 'right', "
+                "'main', 'modal' or 'page'. Use this when the page has "
+                "its own scrollbar AND a rail/panel that scrolls "
+                "separately — plain scrolling always moves the page, so "
+                "a filter list or results rail will sit still unless you "
+                "name it. Every scroll response lists the available "
+                "surfaces under `[SURFACES …]`; pick a region from "
+                "there. Omit to scroll the page."
+            ),
+            nullable=True,
+        ),
+        container_selector=StringSchema(
+            description=(
+                "CSS selector of an exact scroll container, as an "
+                "override when `region` is ambiguous. Take the selector "
+                "verbatim from the `[SURFACES …]` line of a previous "
+                "scroll response; do not invent one."
             ),
             nullable=True,
         ),
@@ -963,7 +988,11 @@ class BrowserNavigateTool(Tool):
 class BrowserScrollTool(Tool):
     name = "browser_scroll"
     description = (
-        "Scroll the page. Three modes: (a) `direction='up'|'down'` — "
+        "Scroll a page or one of its inner panels. NOTE: a page and its "
+        "sidebars scroll independently; without `region` or "
+        "`target_text` this moves the PAGE, so a left/right rail will "
+        "not move. The response lists every scrollable surface. "
+        "Three modes: (a) `direction='up'|'down'` — "
         "small viewport step (~40% of viewport, ~440px on default "
         "viewport); use this for 'show me a bit more'; "
         "(b) `pixels=N` (with `direction`) — explicit incremental, "
@@ -994,6 +1023,8 @@ class BrowserScrollTool(Tool):
         percent: float | None = None,
         pixels: int | None = None,
         target_text: str | None = None,
+        region: str | None = None,
+        container_selector: str | None = None,
         **kw: Any,
     ) -> Any:
         if pixels is not None:
@@ -1004,6 +1035,10 @@ class BrowserScrollTool(Tool):
             label = direction or "down"
         if target_text and target_text.strip():
             label += f" probe={target_text.strip()!r}"
+        if region and region.strip():
+            label += f" region={region.strip().lower()}"
+        if container_selector and container_selector.strip():
+            label += f" container={container_selector.strip()!r}"
         print(f"\n>> browser_scroll({label})")
         gate = await _feedback_gate("browser_scroll")
         if gate:
@@ -1021,6 +1056,10 @@ class BrowserScrollTool(Tool):
             payload["direction"] = direction or "down"
         if target_text and target_text.strip():
             payload["targetText"] = target_text.strip()
+        if region and region.strip():
+            payload["region"] = region.strip().lower()
+        if container_selector and container_selector.strip():
+            payload["containerSelector"] = container_selector.strip()
         r = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/scroll",
@@ -1055,20 +1094,46 @@ class BrowserScrollTool(Tool):
         else:
             base = f"Scrolled {direction or 'down'} requested"
 
+        # Which surface actually moved. When an inner pane was scrolled the
+        # document's scrollY does not change, so the page-geometry delta
+        # below would read as "did not move" and send the model into a
+        # retry loop. Report the pane's own movement instead.
+        moved = data.get("scrolled_surface") if isinstance(data.get("scrolled_surface"), dict) else None
+        if moved:
+            px = int(moved.get("scrolledPx") or 0)
+            where = f"{moved.get('region') or '?'} ({moved.get('label') or moved.get('selector')})"
+            if px:
+                base += f" → scrolled {where} by {px:+d}px"
+            else:
+                reason = str(moved.get("reason") or "no_movement")
+                base += f" → {where} did NOT move ({reason})"
+                if reason == "at_end":
+                    base += "; that panel is already at its end — scroll a different region."
+                elif reason == "container_not_found":
+                    base += "; the selector matched nothing — take one from [SCROLL SURFACES]."
+            if moved.get("fell_back_to_page"):
+                base += " [fell back to the page scroll]"
         if pre_y is not None:
             actual = post_y - pre_y
-            base += f" → moved {actual:+d}px (Y {pre_y}→{post_y})"
+            if moved and int(moved.get("scrolledPx") or 0):
+                base += f" (page Y unchanged at {post_y})" if actual == 0 else f" (page Y {pre_y}→{post_y})"
+            else:
+                base += f" → moved {actual:+d}px (Y {pre_y}→{post_y})"
             # Flag silent no-op scrolls. Without this caption the LLM
             # often retries the same scroll, looping forever on locked-
             # body SPAs. With Bug-1 fix in place this should be rare,
             # but the diagnostic is essential for the cases it misses.
-            if (pixels is not None and pixels > 0) or (percent is None and direction):
+            if ((pixels is not None and pixels > 0) or (percent is None and direction)) and not (
+                moved and int(moved.get("scrolledPx") or 0)
+            ):
                 if abs(actual) < 5:
                     base += (
                         ". WARNING: page did not move. The real scroll "
-                        "container may be a non-document element. Try "
-                        "`browser_scroll_within` if a popup/modal is "
-                        "open, or `browser_get_markdown` to inspect."
+                        "surface is probably a panel, not the document — "
+                        "see [SCROLL SURFACES] below and re-scroll with "
+                        "region='left'|'right'|'main'. Use "
+                        "`browser_scroll_within` only for an OPEN "
+                        "popup/menu/modal."
                     )
         # PROBE caption — anti-hallucination signal for pixel-scroll.
         # When `target_text` is set the TS server returns a `probe` dict
@@ -1077,6 +1142,11 @@ class BrowserScrollTool(Tool):
         # scroll_until's per-step trace, but for a single pixel step —
         # the brain reads it instead of guessing from the post-scroll
         # vision pass.
+        from ..formatting import _format_scroll_surfaces
+        surfaces_caption = _format_scroll_surfaces(data.get("scroll_surfaces"))
+        if surfaces_caption:
+            base += "\n" + surfaces_caption
+
         probe = data.get("probe") if isinstance(data.get("probe"), dict) else None
         newly_visible_raw = data.get("newly_visible") or []
         newly_visible: list[str] = [str(x) for x in newly_visible_raw if x]

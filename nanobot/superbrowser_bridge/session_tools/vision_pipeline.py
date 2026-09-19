@@ -1655,8 +1655,11 @@ def _schedule_vision_prefetch(
             # Empty signature falls through to legacy behaviour for
             # non-iframe pages.
             iframe_sig = data.get("iframeSignature", "") or ""
+            # Pane offsets belong in the cache key for the same reason
+            # the iframe signature does: neither shows up in `elements`.
+            scroll_sig = data.get("scrollSignature", "") or ""
             dh = (
-                dom_hash_of(elements, iframe_sig)
+                dom_hash_of(elements, iframe_sig, scroll_sig)
                 if dom_hash_of else ""
             )
             # Phase 1.2: viewport-aware secondary cache-key signal so

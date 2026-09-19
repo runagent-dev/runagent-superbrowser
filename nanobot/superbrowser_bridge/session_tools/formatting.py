@@ -75,6 +75,13 @@ async def _fetch_elements(session_id: str, state: "BrowserSessionState | None" =
         r.raise_for_status()
         data = r.json()
         if state is not None:
+            # Where the panes sit right now. The screenshot dedup peek
+            # reads this back so a sidebar scroll is not mistaken for an
+            # unchanged page.
+            try:
+                state._last_scroll_signature = data.get("scrollSignature", "") or ""
+            except Exception:
+                pass
             fps = data.get("fingerprints") or {}
             if isinstance(fps, dict):
                 # JSON keys come back as strings; coerce to int for direct index lookup.
@@ -212,6 +219,53 @@ def _format_tab_notices(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_scroll_surfaces(surfaces: Any) -> str:
+    """One line naming every pane that scrolls on its own.
+
+    A page and its rails scroll independently, and a plain scroll always
+    moves the page. Unless the model is told a rail exists, and where it
+    is on screen, it cannot know that the filter list it can see is not
+    the thing its scroll just moved. Printing this next to the
+    screenshot is what lets it pass `region=` on the first try instead
+    of scrolling the main column three times and hallucinating progress.
+    """
+    if not isinstance(surfaces, list) or not surfaces:
+        return ""
+    inner = [s for s in surfaces if isinstance(s, dict) and s.get("selector")]
+    if not inner:
+        return ""            # page-only: nothing to disambiguate, stay quiet
+    # Two panes can share a region (two right-hand rails, say), and then
+    # `region=` alone cannot pick between them — so every inner pane
+    # carries its selector, which `container_selector` takes verbatim.
+    bits: list[str] = []
+    for s in surfaces[:5]:
+        if not isinstance(s, dict):
+            continue
+        region = str(s.get("region") or "?")
+        down = int(s.get("remaining_down") or 0)
+        up = int(s.get("remaining_up") or 0)
+        rect = s.get("rect") if isinstance(s.get("rect"), dict) else {}
+        if region == "page":
+            bits.append(f"page(down {down}px, up {up}px)")
+        else:
+            x = int(rect.get("x") or 0)
+            w = int(rect.get("w") or 0)
+            sel = str(s.get("selector") or "")
+            sel_part = f" sel={sel}" if sel else ""
+            bits.append(
+                f"{region}(x{x}-{x + w}, down {down}px, up {up}px{sel_part})"
+            )
+    if not bits:
+        return ""
+    return (
+        "[SCROLL SURFACES] " + " | ".join(bits)
+        + " — these scroll SEPARATELY. browser_scroll moves the page unless "
+        "you pass region='left'|'right'|'main'|'modal' (or "
+        "container_selector=<sel> when two panes share a region), or "
+        "target_text that lives in a panel."
+    )
+
+
 def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str:
     """Canonical per-iteration state caption.
 
@@ -253,6 +307,9 @@ def _format_state(data: dict, state: "BrowserSessionState | None" = None) -> str
             f"Scroll: {si.get('scrollY', 0)}/{si.get('scrollHeight', 0)} "
             f"(viewport: {si.get('viewportHeight', 0)})"
         )
+    surfaces_line = _format_scroll_surfaces(data.get("scroll_surfaces"))
+    if surfaces_line:
+        parts.append(surfaces_line)
     tabs_summary = data.get("tabs")
     if isinstance(tabs_summary, dict) and int(tabs_summary.get("count") or 1) > 1:
         parts.append(

@@ -39,7 +39,11 @@ def _log(msg: str) -> None:
     sys.stderr.write(f"[vision-agent] {msg}\n")
 
 
-def dom_hash_of(dom_elements: str | None, iframe_signature: str = "") -> str:
+def dom_hash_of(
+    dom_elements: str | None,
+    iframe_signature: str = "",
+    scroll_signature: str = "",
+) -> str:
     """SHA-256 of the DOM element listing, used as cache key.
 
     Uses the full 64-char hex to avoid cache-key collisions on pages
@@ -48,6 +52,10 @@ def dom_hash_of(dom_elements: str | None, iframe_signature: str = "") -> str:
     A collision causes stale bboxes to be served, which manifests as
     the vision agent "hallucinating" targets that aren't really on the
     current screen.
+
+    `scroll_signature` (optional): where each independently scrollable
+    pane is scrolled to. A sidebar scroll changes no element in the
+    listing, so without it the cache serves pre-scroll bboxes.
 
     Phase I — `iframe_signature` (optional): a per-iframe content
     summary emitted by the TS /state handler. Outer `dom_elements`
@@ -60,10 +68,15 @@ def dom_hash_of(dom_elements: str | None, iframe_signature: str = "") -> str:
     """
     if not dom_elements:
         return ""
-    payload = (
-        f"{dom_elements}\n[IFRAME_SIG]\n{iframe_signature}"
-        if iframe_signature else dom_elements
-    )
+    payload = dom_elements
+    if iframe_signature:
+        payload = f"{payload}\n[IFRAME_SIG]\n{iframe_signature}"
+    # A pane scroll moves what is on screen without changing a single
+    # element in the listing, so without this the cache would hand back
+    # bboxes measured before the pane moved — the same failure mode
+    # `iframe_signature` was added to close.
+    if scroll_signature:
+        payload = f"{payload}\n[SCROLL_SIG]\n{scroll_signature}"
     return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
 

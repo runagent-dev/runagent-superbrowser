@@ -294,6 +294,10 @@ class BrowserSessionState:
         # same underlying intent.
         self._last_intent: str = ""
         self._last_dom_hash: str = ""
+        # Where every independently scrollable pane is scrolled to, as of
+        # the last /state read. Part of observation identity: see
+        # hash_page_content.
+        self._last_scroll_signature: str = ""
         self._last_vision_summary: str = ""
         # Task context stamped by set_task_context() when the orchestrator
         # spawns a browser worker — piped into the vision prompt so
@@ -969,7 +973,11 @@ class BrowserSessionState:
             self.popup_scroll_at = 0.0
 
     @staticmethod
-    def hash_page_content(text: str, scroll_y: int | None = None) -> str:
+    def hash_page_content(
+        text: str,
+        scroll_y: int | None = None,
+        scroll_sig: str = "",
+    ) -> str:
         """Structural fingerprint of a page for screenshot dedup.
 
         Replaces the old "SHA1 of first 500 chars" scheme, which was both
@@ -985,6 +993,11 @@ class BrowserSessionState:
           - tag-name histogram (button/input/a/…)
           - top-N aria-label / placeholder / name values, normalized
           - scroll-Y bucketed to 100px when supplied
+          - `scroll_sig`: where every independently scrollable pane
+            sits. A sidebar scroll changes no element in the listing,
+            so without this the screenshot dedup reads it as "nothing
+            changed" and refuses the very screenshot the agent needs
+            to see what the scroll revealed.
 
         All inputs are concatenated into a deterministic canonical string,
         then SHA1-hashed and truncated. Bucketing scroll keeps tiny scroll
@@ -1026,6 +1039,8 @@ class BrowserSessionState:
             scroll_bucket = f"s{int(scroll_y) // 100}"
 
         canonical = f"n={count}|h={hist}|a={attrs}|{scroll_bucket}"
+        if scroll_sig:
+            canonical += f"|s={scroll_sig}"
         return hashlib.sha1(canonical.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
     def record_step(self, tool_name: str, args_summary: str, result_summary: str) -> None:

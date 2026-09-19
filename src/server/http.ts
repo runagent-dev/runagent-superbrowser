@@ -22,6 +22,7 @@ import { verifyCaptchaSolve, captureJpegB64 } from '../agent/judge.js';
 import { tokenAuth, validateUrl, isValidSessionId, RateLimiter, isLoopbackRequest } from './auth.js';
 import { runPuppeteerScript } from '../browser/script-runner.js';
 import { runScrollProbe, capturePreScrollBboxes } from '../browser/scroll-probe.js';
+import { surveyScrollSurfaces, chooseSurface, scrollSignatureOf } from '../browser/scroll-surfaces.js';
 import { selectOptionByLabel, selectOptionByVisionBbox, selectOptionInIframe } from '../browser/elements.js';
 import { ProxyPool } from '../browser/proxy-pool.js';
 import { HumanInputManager, type HumanInputType } from '../agent/human-input.js';
@@ -981,11 +982,26 @@ export function createHttpServer(
         iframeSignature = '';
       }
 
+      // Which panes scroll independently, measured now so the model sees
+      // them alongside the screenshot it is about to reason over. Without
+      // this the decision "scroll the rail or the page?" is made blind and
+      // always resolves to the page.
+      const scrollSurfaces = await surveyScrollSurfaces(page.getRawPage());
+
       res.json(withTabInfo(req.params.id, {
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
         elements: state.elementTree.clickableElementsToString(),
+        scroll_surfaces: scrollSurfaces.map((s2) => ({
+          selector: s2.selector, region: s2.region, label: s2.label,
+          rect: s2.rect,
+          remaining_down: s2.remainingDown, remaining_up: s2.remainingUp,
+        })),
+        // Where every pane is scrolled to. Folded into the observation
+        // identity so a pane scroll can never be mistaken for "nothing
+        // changed" — same role iframeSignature plays for in-frame edits.
+        scrollSignature: scrollSignatureOf(scrollSurfaces),
         // Phase I: same-origin iframe content summary. Python mixes
         // this into dom_hash so iframe-internal mutations bust the
         // vision cache. Empty string when the page has no iframes
@@ -1789,9 +1805,20 @@ export function createHttpServer(
     if (!page) { res.status(404).json({ error: 'Session not found or expired' }); return; }
 
     try {
-      const { direction, percent, pixels, targetText } = req.body;
+      const { direction, percent, pixels, targetText, region, containerSelector } = req.body;
       const trimmedTarget = typeof targetText === 'string' ? targetText.trim() : '';
       const [preY] = await page.getScrollInfo();
+      // Survey what can actually scroll BEFORE moving anything. A page
+      // nearly always scrolls, so without this the document wins every
+      // time and a sidebar can never be reached.
+      const surfaces = await surveyScrollSurfaces(page.getRawPage(), {
+        targetText: trimmedTarget || undefined,
+      });
+      const picked = chooseSurface(surfaces, {
+        containerSelector: typeof containerSelector === 'string' ? containerSelector : undefined,
+        region: typeof region === 'string' ? region : undefined,
+        hasTargetText: !!trimmedTarget,
+      });
       // Pre-scroll bbox capture for sticky-candidate detection — only
       // when caller supplied a target. Costs one extra page.evaluate
       // (~20-40ms) but suppresses false-positive in_viewport=true on
@@ -1803,12 +1830,44 @@ export function createHttpServer(
       // `pixels` (when set) wins — explicit incremental motion that
       // sidesteps the percent-vs-viewport ambiguity. Falls through to
       // legacy direction/percent paths otherwise.
-      if (typeof pixels === 'number' && pixels > 0) {
-        await page.scrollByPixels(direction === 'up' ? 'up' : 'down', pixels);
+      const dir: 'up' | 'down' = direction === 'up' ? 'up' : 'down';
+      let scrolledSurface: Record<string, unknown> | null = null;
+      if (picked && picked.selector) {
+        // An inner pane was named, or owns the text we are hunting for.
+        // `percent` is an absolute position, so honour it against the
+        // pane's own range rather than silently turning it into a step.
+        let r: { ok: boolean; before: number; after: number; scrolledPx: number; reason: string };
+        if (percent !== undefined && !(typeof pixels === 'number' && pixels > 0)) {
+          r = await page.scrollSurfaceToPercent(picked.selector, Number(percent));
+        } else {
+          const step = typeof pixels === 'number' && pixels > 0
+            ? pixels
+            : Math.max(120, Math.round(picked.clientHeight * 0.8) || 400);
+          r = await page.scrollSurfaceBy(picked.selector, dir, step);
+        }
+        scrolledSurface = {
+          selector: picked.selector, region: picked.region, label: picked.label,
+          scrolledPx: r.scrolledPx, reason: r.reason,
+        };
+        // A named container that cannot move is a dead end, not a
+        // reason to silently scroll the page instead: saying so lets
+        // the caller retarget rather than repeat.
+        if (!r.ok && !containerSelector && !region) {
+          if (typeof pixels === 'number' && pixels > 0) {
+            await page.scrollByPixels(dir, pixels);
+          } else if (percent !== undefined) {
+            await page.scrollToPercent(percent);
+          } else {
+            await page.scrollPage(dir);
+          }
+          scrolledSurface = { ...scrolledSurface, fell_back_to_page: true };
+        }
+      } else if (typeof pixels === 'number' && pixels > 0) {
+        await page.scrollByPixels(dir, pixels);
       } else if (percent !== undefined) {
         await page.scrollToPercent(percent);
       } else {
-        await page.scrollPage(direction || 'down');
+        await page.scrollPage(dir);
       }
 
       const newState = await page.getState({ useVision: false });
@@ -1830,6 +1889,18 @@ export function createHttpServer(
         scrollInfo: { scrollY: newState.scrollY, scrollHeight: newState.scrollHeight, viewportHeight: newState.viewportHeight },
         probe,
         newly_visible,
+        // What moved, and what else could have. Without this the agent
+        // cannot tell a sidebar scroll from a page scroll and repeats
+        // the wrong one.
+        scrolled_surface: scrolledSurface,
+        scroll_surfaces: surfaces.map((s2) => ({
+          selector: s2.selector, region: s2.region, label: s2.label,
+          remaining_down: s2.remainingDown, remaining_up: s2.remainingUp,
+          contains_target: !!s2.containsTarget,
+        })),
+        scrollSignature: scrollSignatureOf(
+          await surveyScrollSurfaces(page.getRawPage()),
+        ),
       }));
     } catch (err) {
       handleError(res, err);
@@ -1864,6 +1935,23 @@ export function createHttpServer(
       const cad = (cadence === 'fine' || cadence === 'medium' || cadence === 'coarse')
         ? cadence
         : undefined;
+      // Auto-resolve the scroll container from the target when the caller
+      // did not name one. scrollUntil already knows how to walk inside a
+      // container; what it could not do is *find* the right one, so a
+      // target sitting in a sidebar was hunted by scrolling the main
+      // column until max_iterations — the exact loop this closes.
+      let resolvedContainer = typeof containerSelector === 'string' && containerSelector.trim()
+        ? containerSelector.trim()
+        : '';
+      let autoResolvedFrom = '';
+      if (!resolvedContainer && typeof targetText === 'string' && targetText.trim()) {
+        const surfaces = await surveyScrollSurfaces(page.getRawPage(), { targetText: targetText.trim() });
+        const owner = chooseSurface(surfaces, { hasTargetText: true });
+        if (owner?.selector) {
+          resolvedContainer = owner.selector;
+          autoResolvedFrom = owner.region;
+        }
+      }
       const outcome = await page.scrollUntil({
         targetText: typeof targetText === 'string' ? targetText : undefined,
         targetRole: typeof targetRole === 'string' ? targetRole : undefined,
@@ -1875,8 +1963,8 @@ export function createHttpServer(
         ...(typeof stepRatio === 'number' ? { stepRatio } : {}),
         cadence: cad,
         autoReverse: typeof autoReverse === 'boolean' ? autoReverse : true,
-        containerSelector: typeof containerSelector === 'string' && containerSelector.trim()
-          ? containerSelector
+        containerSelector: resolvedContainer
+          ? resolvedContainer
           : undefined,
         emitTrace: typeof emitTrace === 'boolean' ? emitTrace : true,
       });
@@ -1892,6 +1980,12 @@ export function createHttpServer(
           scrollHeight: newState.scrollHeight,
           viewportHeight: newState.viewportHeight,
         },
+        // Say when the pane was inferred rather than asked for, so the
+        // caller can tell "searched the rail" from "searched the page".
+        auto_resolved_container: autoResolvedFrom
+          ? { selector: resolvedContainer, region: autoResolvedFrom }
+          : null,
+        scrollSignature: scrollSignatureOf(await surveyScrollSurfaces(page.getRawPage())),
       });
     } catch (err) {
       handleError(res, err);
