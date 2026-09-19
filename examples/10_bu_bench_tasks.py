@@ -302,7 +302,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--benchmark", default=BENCHMARK, choices=sorted(BENCHMARKS),
                     help="task set to run: " + "; ".join(f"{k} = {v['what']}" for k, v in BENCHMARKS.items()))
-    ap.add_argument("--model", default=os.environ.get("MODEL", "z-ai/glm-5.3-flash"))
+    ap.add_argument("--model", default=None,
+                    help="brain model id. Default: whatever agents.defaults.model says in "
+                         "~/.nanobot/config.json, so changing the model there changes the runs. "
+                         "The resolved id is passed to eval.core.runner explicitly and recorded "
+                         "per run.")
     ap.add_argument("--timeout", type=int, default=1800, help="per-task wall clock (s); BU Bench uses 1800")
     ap.add_argument("--mode", choices=("auto", "browser", "fetch"), default=None,
                     help="auto: orchestrator picks the browser worker or the search worker per task, like the "
@@ -326,6 +330,21 @@ def main(argv: list[str] | None = None) -> int:
     BENCHMARK = args.benchmark
     EXPERIMENT = BENCHMARK
     SUBSET = BENCHMARKS[BENCHMARK]["subset"]
+    # The model used to be hardcoded here, so editing ~/.nanobot/config.json
+    # had no effect on a run and the id in the banner was a constant rather
+    # than a fact. Resolve it from the same place the runner would.
+    model_source = "--model"
+    if not args.model:
+        args.model = os.environ.get("MODEL") or ""
+        model_source = "$MODEL"
+    if not args.model:
+        from eval._bootstrap import read_active_model
+        args.model = read_active_model().get("model") or ""
+        model_source = "~/.nanobot/config.json (agents.defaults.model)"
+    if not args.model or args.model == "unknown":
+        print("no model: pass --model, set $MODEL, or set agents.defaults.model "
+              "in ~/.nanobot/config.json")
+        return 2
     # Resolve the engine pinning only once the benchmark is known, so the
     # default tracks the task set rather than a single hardcoded value.
     if args.mode is None:
@@ -345,6 +364,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"benchmark={BENCHMARK} ({BENCHMARKS[BENCHMARK]['what']})")
     print(f"experiment={EXPERIMENT} arm={ARM} model={args.model} mode={args.mode} "
           f"timeout={args.timeout}s tasks={len(queue)} runs_root={RUNS_ROOT}")
+    print(f"  model from {model_source}")
+    # A benchmark compares harnesses under ONE pinned model. Silently mixing
+    # two across a task set makes the column meaningless, and the mix is
+    # invisible once the runs are collected, so say it now.
+    others = sorted({m for m in (classify(t["task_id"]).get("model") for t in tasks)
+                     if m and m != args.model})
+    if others:
+        print(f"  WARNING: finished runs in {EXPERIMENT} already used {', '.join(others)}. "
+              f"Mixing models across one task set invalidates the comparison — "
+              f"re-run the others with --model {args.model}, or switch back.")
     if args.mode == "auto":
         print("  mode=auto: the orchestrator may answer a task WITHOUT opening a browser. "
               "Use --mode browser to require the engine.")
