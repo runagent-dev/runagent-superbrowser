@@ -253,5 +253,137 @@
       "d71be72aa25c3eab8eea47a0e60382e2",
       "dd44c665cec1e9c929a4c5f074e7844a"
     ]
+  },
+  "bu25": {
+    "benchmark": "bu_bench_v1",
+    "task_ids": [
+      "2c93f863-f1e8-47c5-a731-6449d37150ee",
+      "b0bf1829-1145-4008-b7de-46244d8d50c2",
+      "bb85cb1e-679f-455d-95e5-edd421ea8205",
+      "f924e084-8cd6-4ef2-8fb6-68277ffe68ea",
+      "20c680da-1972-4ab7-8970-7ed089f21fd0",
+      "a527109f-4b9c-4ba6-9458-009ad0bdd3f7",
+      "8c13e8a8-343d-417d-acac-fac86de1cd22",
+      "45789896-66b8-4b38-810d-6fc839df03da",
+      "5eca85e0-4b4d-418e-ad1a-390dc68910d1",
+      "1bab296c-8836-453f-9008-5e5cae260cea",
+      "0be6ba06-8e22-4f62-be27-691dc882a68a",
+      "d7eea2b1-7d31-425e-977c-b803ffd28250",
+      "33f4cc19-2380-42bc-95fa-338e83d5ddaf",
+      "f2366e2e-ab84-4739-a493-3e81c091e00c",
+      "6aa71dee-b9a8-4897-83b9-42facca4c541",
+      "71906b5a-577d-48c4-a253-c756790afa64",
+      "90be6fd6-9f82-49df-88b9-4e119ef5b654",
+      "cecf0cdc-87eb-44ec-9c8e-17c8335afa5f",
+      "34cbe431-fbeb-4d0b-b3e7-a80d3de302bc",
+      "c9f78efb-bdae-40fb-b4b4-78a859e506d7",
+      "c1640562-f622-431a-bed5-da18dea68606",
+      "631f887e-60d3-41b5-b2a3-97571d72d30f",
+      "b79e09f2-0cb3-4c14-bfb5-aa834d64f858",
+      "62ef9538-b0b2-474e-8844-b34fd484cb24",
+      "d919dc4d-dc69-431c-8af3-e52d849b9810"
+    ],
+    "note": "harness-bench subset; author-edited selection (2026-09-18), starting from a stratified draw of 5 per category with random.Random(0) over sorted task ids; the final list is NOT that draw",
+    "frozen_from": "harness-bench/tasks/subsets.json"
+  },
+  "si12": {
+    "benchmark": "scroll_iframe",
+    "task_ids": [
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "442a450e696a96085257db6297891a4d",
+      "a48e2f1ee8d87eaeea56fe5e730427e6",
+      "3443e9c3151fef19a3c3a45eb2c13640",
+      "39c388cdc468688c8139cc2bb5157c13",
+      "ce616721ce9aeda69890fbccb29677a6",
+      "9ef1a8972f375db59c0e6329e11b7939",
+      "79f0bd7df6e685f30f20025cc6755c0a",
+      "84ef883a37af638c3bcf7561f28ce80a",
+      "123e8c2fc453f55fadd1d0b9aaf94df4",
+      "b1ce968a361e1088ce8d2ade6c2c9af0",
+      "0a0fa834ce41b5297c6474293383759d"
+    ],
+    "note": "harness-bench subset; hand-picked budget subset: six iframe + six scroll, favouring low anti-bot risk so the run measures frame handling and scrolling rather than bot-blocking",
+    "frozen_from": "harness-bench/tasks/subsets_scroll_iframe.json"
+  },
+  "si_all": {
+    "benchmark": "scroll_iframe",
+    "task_ids": [
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "442a450e696a96085257db6297891a4d",
+      "a48e2f1ee8d87eaeea56fe5e730427e6",
+      "3443e9c3151fef19a3c3a45eb2c13640",
+      "39c388cdc468688c8139cc2bb5157c13",
+      "50d91eabde542906937ab4c5b6f8f23a",
+      "ce616721ce9aeda69890fbccb29677a6",
+      "9ed3827266b3b804f485859c3d00401e",
+      "dcd26e662a616d373ddd339747c6ce5b",
+      "853afd530c72f4b00ffc32ae854efaf8",
+      "82eb3bfedd78456a0230b389f4e7a938",
+      "1fc28d91d25ccd1c6ba268101326a654",
+      "9ef1a8972f375db59c0e6329e11b7939",
+      "79f0bd7df6e685f30f20025cc6755c0a",
+      "84ef883a37af638c3bcf7561f28ce80a",
+      "f27c0a7b8b0bb33d37698dff227fc8d7",
+      "fcf4952d2a1d80ea505c555c3c3b54e7",
+      "123e8c2fc453f55fadd1d0b9aaf94df4",
+      "0a0fa834ce41b5297c6474293383759d",
+      "64345c365f544375357c7b67917f08a0",
+      "b1ce968a361e1088ce8d2ade6c2c9af0",
+      "c073ac1bcf40f84c599affc97edbc396",
+      "255bf27c43fd3f9254d6b81a5f36d3a9",
+      "d02d236836924919f35f2438d9ed2374"
+    ],
+    "note": "harness-bench subset; every curated task (12 iframe + 12 scroll)",
+    "frozen_from": "harness-bench/tasks/subsets_scroll_iframe.json"
+  },
+  "si_iframe": {
+    "benchmark": "scroll_iframe",
+    "task_ids": [
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "442a450e696a96085257db6297891a4d",
+      "a48e2f1ee8d87eaeea56fe5e730427e6",
+      "3443e9c3151fef19a3c3a45eb2c13640",
+      "39c388cdc468688c8139cc2bb5157c13",
+      "50d91eabde542906937ab4c5b6f8f23a",
+      "ce616721ce9aeda69890fbccb29677a6",
+      "9ed3827266b3b804f485859c3d00401e",
+      "dcd26e662a616d373ddd339747c6ce5b",
+      "853afd530c72f4b00ffc32ae854efaf8",
+      "82eb3bfedd78456a0230b389f4e7a938",
+      "1fc28d91d25ccd1c6ba268101326a654"
+    ],
+    "note": "harness-bench subset; iframe/widget group only",
+    "frozen_from": "harness-bench/tasks/subsets_scroll_iframe.json"
+  },
+  "si_scroll": {
+    "benchmark": "scroll_iframe",
+    "task_ids": [
+      "9ef1a8972f375db59c0e6329e11b7939",
+      "79f0bd7df6e685f30f20025cc6755c0a",
+      "84ef883a37af638c3bcf7561f28ce80a",
+      "f27c0a7b8b0bb33d37698dff227fc8d7",
+      "fcf4952d2a1d80ea505c555c3c3b54e7",
+      "123e8c2fc453f55fadd1d0b9aaf94df4",
+      "0a0fa834ce41b5297c6474293383759d",
+      "64345c365f544375357c7b67917f08a0",
+      "b1ce968a361e1088ce8d2ade6c2c9af0",
+      "c073ac1bcf40f84c599affc97edbc396",
+      "255bf27c43fd3f9254d6b81a5f36d3a9",
+      "d02d236836924919f35f2438d9ed2374"
+    ],
+    "note": "harness-bench subset; scroll/long-list group only",
+    "frozen_from": "harness-bench/tasks/subsets_scroll_iframe.json"
+  },
+  "hi5": {
+    "benchmark": "hard5",
+    "task_ids": [
+      "1223b07536a87e0170ff87cbbebd1d3c",
+      "c577a14301a725e09ccd269a3e0b271e",
+      "442a450e696a96085257db6297891a4d",
+      "a48e2f1ee8d87eaeea56fe5e730427e6",
+      "b2f4fde2fce122a93c7b578086cb0585"
+    ],
+    "note": "harness-bench subset; the five author-supplied hard-interaction tasks; each a distinct obstacle (embedded document, multi-facet filtering, slider, drag-and-drop, anti-bot)",
+    "frozen_from": "harness-bench/tasks/subsets_hard5.json"
   }
 }
