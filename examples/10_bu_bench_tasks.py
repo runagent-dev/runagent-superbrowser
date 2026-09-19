@@ -56,10 +56,21 @@ from eval.core.tasks import load_benchmark  # noqa: E402
 
 # Task sets this script can drive. The experiment name equals the benchmark
 # name, so each set gets its own run tree under eval/runs/<benchmark>/.
+# `mode` is the DEFAULT engine pinning for each benchmark, overridable with
+# --mode. It is not cosmetic. Under "auto" the orchestrator keeps the search
+# worker and may answer a task without opening a browser at all — which is
+# reasonable for BU Bench, a third of whose tasks are research questions, and
+# useless for a benchmark whose whole point is interacting with a widget.
+# Observed: the 401(k) slider task returned an annuity calculation from the
+# model's own head in 28s with iters=0 tools=0 vision=0, having announced
+# "I can answer directly without needing to browse Chase's calculator."
 BENCHMARKS = {
-    "bu_bench_v1":   {"subset": "bu25", "what": "browser-use BU Bench V1"},
-    "scroll_iframe": {"subset": "si12", "what": "iframe/widget + long-list scrolling (from Online-Mind2Web)"},
-    "hard5":         {"subset": "hi5",  "what": "five author-supplied hard-interaction tasks, one obstacle each"},
+    "bu_bench_v1":   {"subset": "bu25", "mode": "auto",
+                      "what": "browser-use BU Bench V1"},
+    "scroll_iframe": {"subset": "si12", "mode": "browser",
+                      "what": "iframe/widget + long-list scrolling (from Online-Mind2Web)"},
+    "hard5":         {"subset": "hi5",  "mode": "browser",
+                      "what": "five author-supplied hard-interaction tasks, one obstacle each"},
 }
 BENCHMARK = os.environ.get("HB_BENCHMARK", "bu_bench_v1")
 EXPERIMENT = BENCHMARK
@@ -230,10 +241,17 @@ def run_one(task: dict[str, Any], *, model: str, timeout: int, viewer_port: int 
 
 def collect_one(task_id: str, model: str) -> str:
     """Import one finished run into harness-bench (unified record + screenshots)
-    so all four harnesses sit side by side for judging. Never re-runs anything."""
+    so all four harnesses sit side by side for judging. Never re-runs anything.
+
+    --benchmark is required, not optional: harness_bench resolves task ids
+    against one benchmark at a time and defaults to bu_bench_v1, so omitting
+    it made every hard5 / scroll_iframe collect die with
+    `KeyError: unknown task id(s)` after the run had already succeeded.
+    """
     if not HARNESS_BENCH.exists():
         return "harness-bench not found; skipped"
     r = subprocess.run([sys.executable, "-m", "harness_bench.run", "--harness", "superbrowser",
+                        "--benchmark", BENCHMARK,
                         "--model", model, "--tasks", task_id, "--collect-only", "--no-judge"],
                        cwd=str(HARNESS_BENCH), capture_output=True, text=True)
     dest = HARNESS_BENCH / "runs" / "superbrowser" / model.replace("/", "-") / task_id
@@ -286,10 +304,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="task set to run: " + "; ".join(f"{k} = {v['what']}" for k, v in BENCHMARKS.items()))
     ap.add_argument("--model", default=os.environ.get("MODEL", "z-ai/glm-5.3-flash"))
     ap.add_argument("--timeout", type=int, default=1800, help="per-task wall clock (s); BU Bench uses 1800")
-    ap.add_argument("--mode", choices=("auto", "browser", "fetch"), default="auto",
-                    help="auto (default): orchestrator picks the browser worker or the search worker per task, "
-                         "like the other harnesses which also have fetch/search tools. browser: pin the engine "
-                         "(what the paper's ablation uses). Recorded in each run's env snapshot.")
+    ap.add_argument("--mode", choices=("auto", "browser", "fetch"), default=None,
+                    help="auto: orchestrator picks the browser worker or the search worker per task, like the "
+                         "other harnesses which also have fetch/search tools. browser: pin the engine (what the "
+                         "paper's ablation uses) — the orchestrator cannot answer from its own knowledge. "
+                         "Default is per benchmark: "
+                         + ", ".join(f"{k}={v['mode']}" for k, v in sorted(BENCHMARKS.items()))
+                         + ". Recorded in each run's env snapshot.")
     ap.add_argument("--tasks", default=None, help="comma-separated task ids (default: the whole subset)")
     ap.add_argument("--redo", default=None, help="comma-separated task ids to re-run; the old attempt is archived")
     ap.add_argument("--from-index", type=int, default=1, help="start at the Nth task of the subset")
@@ -305,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
     BENCHMARK = args.benchmark
     EXPERIMENT = BENCHMARK
     SUBSET = BENCHMARKS[BENCHMARK]["subset"]
+    # Resolve the engine pinning only once the benchmark is known, so the
+    # default tracks the task set rather than a single hardcoded value.
+    if args.mode is None:
+        args.mode = BENCHMARKS[BENCHMARK]["mode"]
 
     selected = [s.strip() for s in (args.redo or args.tasks or "").split(",") if s.strip()] or None
     tasks = load_tasks(selected)
@@ -320,6 +345,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"benchmark={BENCHMARK} ({BENCHMARKS[BENCHMARK]['what']})")
     print(f"experiment={EXPERIMENT} arm={ARM} model={args.model} mode={args.mode} "
           f"timeout={args.timeout}s tasks={len(queue)} runs_root={RUNS_ROOT}")
+    if args.mode == "auto":
+        print("  mode=auto: the orchestrator may answer a task WITHOUT opening a browser. "
+              "Use --mode browser to require the engine.")
     print(f"judging is NOT run here; score all four harnesses later with harness_bench.judge_all\n")
 
     if args.dry_run:
@@ -385,10 +413,17 @@ def main(argv: list[str] | None = None) -> int:
     save_status(tasks)
     if not args.no_collect and HARNESS_BENCH.exists():
         print("\nre-syncing every finished run into harness-bench ...")
-        subprocess.run([sys.executable, "-m", "harness_bench.run", "--harness", "superbrowser",
-                        "--model", args.model, "--tasks", SUBSET, "--collect-only", "--no-judge"],
-                       cwd=str(HARNESS_BENCH), check=False, capture_output=True)
-        print(f"  -> {HARNESS_BENCH / 'runs' / 'superbrowser' / args.model.replace('/', '-')}")
+        rs = subprocess.run([sys.executable, "-m", "harness_bench.run", "--harness", "superbrowser",
+                             "--benchmark", BENCHMARK,
+                             "--model", args.model, "--tasks", SUBSET, "--collect-only", "--no-judge"],
+                            cwd=str(HARNESS_BENCH), check=False, capture_output=True, text=True)
+        if rs.returncode == 0:
+            print(f"  -> {HARNESS_BENCH / 'runs' / 'superbrowser' / args.model.replace('/', '-')}")
+        else:
+            # Printing the destination unconditionally hid real failures —
+            # the path is where the runs WOULD go, not proof any arrived.
+            tail = (rs.stdout + rs.stderr).strip().splitlines()[-1:] or ["no output"]
+            print(f"  -> re-sync FAILED: {tail[0][:200]}")
     pending = counts.get("pending", 0) + sum(counts.get(k, 0) for k in NEEDS_FIX)
     if pending:
         print(f"\n{pending} task(s) still need attention; re-run this script to continue.")
