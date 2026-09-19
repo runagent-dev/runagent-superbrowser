@@ -1,0 +1,10 @@
+metric,arm_a,arm_b,n,mean_a,mean_b,mean_diff,ci_low,ci_high,wilcoxon_p,median_diff
+vision_calls,ledger,fresh_vision,23,14.3478,5.52174,8.82609,3.47826,15.4348,0.00451478,5
+tool_calls,ledger,fresh_vision,23,18,15.8696,2.13043,-6.08696,11.1304,0.580781,2
+worker_iterations,ledger,fresh_vision,23,40.7391,32,8.73913,-7.17391,25,0.269571,6
+wall_s,ledger,fresh_vision,23,442.308,361.45,80.8574,-86.8587,249.782,0.286143,37.11
+usd,ledger,fresh_vision,23,0.316165,0.227241,0.088924,-0.0239007,0.210307,0.169523,0.029316
+csd_observed,ledger,fresh_vision,14,0.996645,0.947619,0.049026,-0.00238095,0.124242,0.5,0
+drr,ledger,fresh_vision,23,0,0,0,0,0,,0
+repeated_actions,ledger,fresh_vision,23,0.695652,0.782609,-0.0869565,-0.652174,0.391304,0.90625,0
+first_path_success,ledger,fresh_vision,13,0.832368,0.994505,-0.162138,-0.324476,-0.024975,0.0625,0

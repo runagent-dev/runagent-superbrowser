@@ -1,0 +1,9 @@
+metric,arm_a,arm_b,n,mean_a,mean_b,mean_diff,ci_low,ci_high,wilcoxon_p,median_diff
+tool_calls,ledger,no_ladder,23,18,24.5652,-6.56522,-13.2609,0.130435,0.0713459,-4
+worker_iterations,ledger,no_ladder,23,40.7391,41.6522,-0.913043,-14.0435,12.6522,0.726479,-2
+wall_s,ledger,no_ladder,23,442.308,469.844,-27.5365,-181.632,129.999,0.753985,-7.56
+usd,ledger,no_ladder,23,0.316165,0.357479,-0.0413147,-0.150046,0.0708261,0.427418,-0.022275
+csd_observed,ledger,no_ladder,14,0.996645,0.971583,0.0250624,-0.00107086,0.0570437,0.21875,0
+drr,ledger,no_ladder,23,0,0.141304,-0.141304,-0.380435,0,,0
+repeated_actions,ledger,no_ladder,23,0.695652,1.52174,-0.826087,-1.95652,0,0.15625,0
+first_path_success,ledger,no_ladder,16,0.863799,0.986806,-0.123007,-0.275153,-0.00883838,0.078125,0

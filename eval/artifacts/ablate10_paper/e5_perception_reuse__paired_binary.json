@@ -2,18 +2,18 @@
   {
     "arm_a": "ledger",
     "arm_b": "fresh_vision",
-    "n": 24,
+    "n": 23,
     "k_a": 11,
     "k_b": 12,
-    "tsr_a": 0.4583333333333333,
-    "tsr_b": 0.5,
+    "tsr_a": 0.4782608695652174,
+    "tsr_b": 0.5217391304347826,
     "wilson_a": [
-      0.2789133373121099,
-      0.6492513464108051
+      0.29237157416646653,
+      0.6703726266357259
     ],
     "wilson_b": [
-      0.3142742581957335,
-      0.6857257418042665
+      0.32962737336427406,
+      0.7076284258335335
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -21,15 +21,17 @@
       "ledger": 0,
       "fresh_vision": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 9,
     "a_only": 2,
     "b_only": 3,
-    "both_fail": 10,
+    "both_fail": 9,
     "p_value": 1.0,
-    "diff": -0.041666666666666664,
-    "diff_ci_low": -0.20833333333333334,
-    "diff_ci_high": 0.125,
-    "confirmatory": true
+    "diff": -0.043478260869565216,
+    "diff_ci_low": -0.21739130434782608,
+    "diff_ci_high": 0.13043478260869565,
+    "confirmatory": false,
+    "p_holm": 1.0,
+    "holm_family": "e5_perception_reuse:secondary"
   }
 ]

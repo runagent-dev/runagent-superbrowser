@@ -2,18 +2,18 @@
   {
     "arm_a": "ledger",
     "arm_b": "fifo",
-    "n": 24,
+    "n": 23,
     "k_a": 11,
     "k_b": 15,
-    "tsr_a": 0.4583333333333333,
-    "tsr_b": 0.625,
+    "tsr_a": 0.4782608695652174,
+    "tsr_b": 0.6521739130434783,
     "wilson_a": [
-      0.2789133373121099,
-      0.6492513464108051
+      0.29237157416646653,
+      0.6703726266357259
     ],
     "wilson_b": [
-      0.42709962442674276,
-      0.7884063244045122
+      0.44890335377263,
+      0.8118872406120227
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -21,32 +21,34 @@
       "ledger": 0,
       "fifo": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 10,
     "a_only": 1,
     "b_only": 5,
-    "both_fail": 8,
+    "both_fail": 7,
     "p_value": 0.21875,
-    "diff": -0.16666666666666666,
-    "diff_ci_low": -0.375,
+    "diff": -0.17391304347826086,
+    "diff_ci_low": -0.34782608695652173,
     "diff_ci_high": 0.0,
-    "confirmatory": true
+    "confirmatory": true,
+    "p_holm": null,
+    "holm_family": null
   },
   {
     "arm_a": "ledger",
     "arm_b": "full_history",
-    "n": 24,
+    "n": 23,
     "k_a": 11,
     "k_b": 17,
-    "tsr_a": 0.4583333333333333,
-    "tsr_b": 0.7083333333333334,
+    "tsr_a": 0.4782608695652174,
+    "tsr_b": 0.7391304347826086,
     "wilson_a": [
-      0.2789133373121099,
-      0.6492513464108051
+      0.29237157416646653,
+      0.6703726266357259
     ],
     "wilson_b": [
-      0.5083230633550337,
-      0.8508535180303913
+      0.5352999516257462,
+      0.8745138395501366
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -54,32 +56,34 @@
       "ledger": 0,
       "full_history": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 8,
     "a_only": 3,
     "b_only": 9,
-    "both_fail": 4,
+    "both_fail": 3,
     "p_value": 0.14599609375,
-    "diff": -0.25,
-    "diff_ci_low": -0.5,
-    "diff_ci_high": 0.041666666666666664,
-    "confirmatory": true
+    "diff": -0.2608695652173913,
+    "diff_ci_low": -0.5217391304347826,
+    "diff_ci_high": 0.0,
+    "confirmatory": true,
+    "p_holm": null,
+    "holm_family": null
   },
   {
     "arm_a": "ledger",
     "arm_b": "summary",
-    "n": 24,
+    "n": 23,
     "k_a": 11,
     "k_b": 13,
-    "tsr_a": 0.4583333333333333,
-    "tsr_b": 0.5416666666666666,
+    "tsr_a": 0.4782608695652174,
+    "tsr_b": 0.5652173913043478,
     "wilson_a": [
-      0.2789133373121099,
-      0.6492513464108051
+      0.29237157416646653,
+      0.6703726266357259
     ],
     "wilson_b": [
-      0.3507486535891948,
-      0.72108666268789
+      0.3681137508501646,
+      0.743653646743258
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -87,32 +91,34 @@
       "ledger": 0,
       "summary": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 7,
     "a_only": 4,
     "b_only": 6,
-    "both_fail": 7,
+    "both_fail": 6,
     "p_value": 0.75390625,
-    "diff": -0.08333333333333333,
-    "diff_ci_low": -0.3333333333333333,
-    "diff_ci_high": 0.16666666666666666,
-    "confirmatory": false
+    "diff": -0.08695652173913043,
+    "diff_ci_low": -0.34782608695652173,
+    "diff_ci_high": 0.17391304347826086,
+    "confirmatory": false,
+    "p_holm": 1.0,
+    "holm_family": "e2_memory_policy:secondary"
   },
   {
     "arm_a": "summary",
     "arm_b": "fifo",
-    "n": 24,
+    "n": 23,
     "k_a": 13,
     "k_b": 15,
-    "tsr_a": 0.5416666666666666,
-    "tsr_b": 0.625,
+    "tsr_a": 0.5652173913043478,
+    "tsr_b": 0.6521739130434783,
     "wilson_a": [
-      0.3507486535891948,
-      0.72108666268789
+      0.3681137508501646,
+      0.743653646743258
     ],
     "wilson_b": [
-      0.42709962442674276,
-      0.7884063244045122
+      0.44890335377263,
+      0.8118872406120227
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -120,15 +126,17 @@
       "summary": 0,
       "fifo": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 7,
     "a_only": 6,
     "b_only": 8,
-    "both_fail": 3,
+    "both_fail": 2,
     "p_value": 0.79052734375,
-    "diff": -0.08333333333333333,
-    "diff_ci_low": -0.375,
-    "diff_ci_high": 0.20833333333333334,
-    "confirmatory": false
+    "diff": -0.08695652173913043,
+    "diff_ci_low": -0.391304347826087,
+    "diff_ci_high": 0.21739130434782608,
+    "confirmatory": false,
+    "p_holm": 1.0,
+    "holm_family": "e2_memory_policy:secondary"
   }
 ]

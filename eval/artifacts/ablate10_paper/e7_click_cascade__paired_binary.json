@@ -2,18 +2,18 @@
   {
     "arm_a": "ledger",
     "arm_b": "no_ladder",
-    "n": 24,
+    "n": 23,
     "k_a": 11,
     "k_b": 17,
-    "tsr_a": 0.4583333333333333,
-    "tsr_b": 0.7083333333333334,
+    "tsr_a": 0.4782608695652174,
+    "tsr_b": 0.7391304347826086,
     "wilson_a": [
-      0.2789133373121099,
-      0.6492513464108051
+      0.29237157416646653,
+      0.6703726266357259
     ],
     "wilson_b": [
-      0.5083230633550337,
-      0.8508535180303913
+      0.5352999516257462,
+      0.8745138395501366
     ],
     "n_excluded": 0,
     "excluded": {},
@@ -21,15 +21,17 @@
       "ledger": 0,
       "no_ladder": 0
     },
-    "n_pairs": 24,
+    "n_pairs": 23,
     "both_success": 11,
     "a_only": 0,
     "b_only": 6,
-    "both_fail": 7,
+    "both_fail": 6,
     "p_value": 0.03125,
-    "diff": -0.25,
-    "diff_ci_low": -0.4166666666666667,
-    "diff_ci_high": -0.08333333333333333,
-    "confirmatory": true
+    "diff": -0.2608695652173913,
+    "diff_ci_low": -0.43478260869565216,
+    "diff_ci_high": -0.08695652173913043,
+    "confirmatory": false,
+    "p_holm": 0.03125,
+    "holm_family": "e7_click_cascade:secondary"
   }
 ]

@@ -1,0 +1,479 @@
+{
+  "experiment": "ablate10",
+  "shape": {
+    "records": 192,
+    "tasks": 24,
+    "arms": [
+      "fifo",
+      "flat",
+      "fresh_vision",
+      "full_history",
+      "ledger",
+      "no_deadend",
+      "no_ladder",
+      "summary"
+    ],
+    "records_per_task": {
+      "8": 24
+    },
+    "duplicate_run_ids": [],
+    "seeds": [
+      0
+    ]
+  },
+  "protocol": {
+    "hashes": {
+      "aef972e8b2217cf5": 192
+    },
+    "version": [
+      "iclr2027-v1"
+    ],
+    "max_iterations": [
+      50
+    ],
+    "wall_clock_s": [
+      1800
+    ],
+    "context_window_tokens": [
+      200000
+    ],
+    "benchmark": [
+      "online_mind2web_all"
+    ],
+    "judge_models": {
+      "webjudge": {
+        "gpt-5.4-mini": 192
+      },
+      "answer_judge": {
+        "gemini-3-flash-preview": 192
+      },
+      "deterministic": {
+        "None": 192
+      }
+    },
+    "decided_by": {
+      "webjudge": 191,
+      "answer_judge": 1
+    },
+    "vision_model": {
+      "gemini-3-flash-preview": 192
+    }
+  },
+  "host_model": {
+    "models": {
+      "z-ai/glm-5.3-flash": 188,
+      "minimax/minimax-m3": 4
+    },
+    "mixed_model_tasks": {
+      "dd44c665cec1e9c929a4c5f074e7844a": {
+        "fifo": "z-ai/glm-5.3-flash",
+        "flat": "minimax/minimax-m3",
+        "fresh_vision": "minimax/minimax-m3",
+        "full_history": "z-ai/glm-5.3-flash",
+        "ledger": "z-ai/glm-5.3-flash",
+        "no_deadend": "minimax/minimax-m3",
+        "no_ladder": "minimax/minimax-m3",
+        "summary": "z-ai/glm-5.3-flash"
+      }
+    },
+    "mixed_model_tasks_excluded": {
+      "dd44c665cec1e9c929a4c5f074e7844a": true
+    },
+    "excluded_tasks": {
+      "dd44c665cec1e9c929a4c5f074e7844a": "host_model_mismatch"
+    }
+  },
+  "code_drift": {
+    "shas": [
+      "00df212",
+      "33c67a3",
+      "3508dbf",
+      "475dca5",
+      "8fb8ce9",
+      "a3bbab1",
+      "a87c2d0",
+      "b6f7c37"
+    ],
+    "shas_chronological": [
+      "8fb8ce9",
+      "00df212",
+      "3508dbf",
+      "475dca5",
+      "a3bbab1",
+      "33c67a3",
+      "b6f7c37",
+      "a87c2d0"
+    ],
+    "n_shas": 8,
+    "dirty_records": 176,
+    "sha_histogram_by_arm": {
+      "fifo": {
+        "00df212": 3,
+        "33c67a3": 1,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a3bbab1": 1,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "flat": {
+        "00df212": 3,
+        "33c67a3": 2,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "fresh_vision": {
+        "00df212": 3,
+        "33c67a3": 2,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "full_history": {
+        "00df212": 3,
+        "33c67a3": 2,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "ledger": {
+        "00df212": 3,
+        "33c67a3": 1,
+        "3508dbf": 1,
+        "475dca5": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "no_deadend": {
+        "00df212": 3,
+        "33c67a3": 2,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "no_ladder": {
+        "00df212": 3,
+        "33c67a3": 2,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      },
+      "summary": {
+        "00df212": 3,
+        "33c67a3": 1,
+        "3508dbf": 1,
+        "8fb8ce9": 2,
+        "a3bbab1": 1,
+        "a87c2d0": 4,
+        "b6f7c37": 12
+      }
+    },
+    "balanced_across_arms": false,
+    "balanced_across_arms_excluding_multi_sha_tasks": true,
+    "tasks_spanning_several_shas": {
+      "662ae0f2d3ac851dbcdd245f908277e3": [
+        "33c67a3",
+        "475dca5",
+        "a3bbab1"
+      ]
+    },
+    "records_on_multi_sha_tasks": 8
+  },
+  "toolset": {
+    "non_browser_executed": {},
+    "non_browser_executed_total": 0,
+    "non_browser_attempted": {
+      "list_exec_sessions": 47,
+      "find_files": 20,
+      "write_stdin": 26,
+      "exec": 3,
+      "long_task": 2
+    },
+    "runs_attempting_non_browser": 54,
+    "host_tool_strip_sha": "536706c",
+    "records_before_host_tool_strip": 64
+  },
+  "instructions": {
+    "checked": 24,
+    "mismatches": {
+      "85b284c18d7e78c9b5a9e074e7aa3b98": {
+        "as_run": "View the cheapest apartment available for students at the University of Texas Austin under 2500 dollars",
+        "frozen": "View the cheapest apartment available for students at the University of Leeds with bills that include WIFI and cleaning services.",
+        "declared": true
+      }
+    },
+    "undeclared_mismatches": [],
+    "declared_without_mismatch": [],
+    "benchmark_missing": [],
+    "declared_deviations": {
+      "85b284c18d7e78c9b5a9e074e7aa3b98": {
+        "reason": "REASON PENDING FROM AUTHOR — the instruction was rewritten by the authors before the arms ran; the Online-Mind2Web wording was never run under this experiment.",
+        "handling": "kept in the primary analysis and disclosed; the frozen benchmark file is unchanged (sha256 in manifest.json)"
+      }
+    }
+  },
+  "traces": {
+    "has_vision_trace": 0,
+    "has_click_trace": 0,
+    "has_context_dump": 192,
+    "grounding_source": {
+      "tags": 192
+    },
+    "rpr_source": {
+      "transcript_headers": 192
+    },
+    "rpr_available": 0,
+    "recovery_available": 0,
+    "first_path_available": 143,
+    "csd_observed_available": 142
+  },
+  "context": {
+    "by_arm": {
+      "fifo": {
+        "prompt_peak_mean": 43417.583333333336,
+        "prompt_peak_max": 71084,
+        "ctx_est_peak_max": 71908,
+        "runs_over_snip_threshold": 0
+      },
+      "flat": {
+        "prompt_peak_mean": 36573.958333333336,
+        "prompt_peak_max": 49952,
+        "ctx_est_peak_max": 51239,
+        "runs_over_snip_threshold": 0
+      },
+      "fresh_vision": {
+        "prompt_peak_mean": 43305.916666666664,
+        "prompt_peak_max": 64318,
+        "ctx_est_peak_max": 65252,
+        "runs_over_snip_threshold": 0
+      },
+      "full_history": {
+        "prompt_peak_mean": 56228.833333333336,
+        "prompt_peak_max": 90882,
+        "ctx_est_peak_max": 92303,
+        "runs_over_snip_threshold": 0
+      },
+      "ledger": {
+        "prompt_peak_mean": 43350.041666666664,
+        "prompt_peak_max": 57838,
+        "ctx_est_peak_max": 59500,
+        "runs_over_snip_threshold": 0
+      },
+      "no_deadend": {
+        "prompt_peak_mean": 45347.666666666664,
+        "prompt_peak_max": 62848,
+        "ctx_est_peak_max": 110293,
+        "runs_over_snip_threshold": 0
+      },
+      "no_ladder": {
+        "prompt_peak_mean": 46058.958333333336,
+        "prompt_peak_max": 67690,
+        "ctx_est_peak_max": 69799,
+        "runs_over_snip_threshold": 0
+      },
+      "summary": {
+        "prompt_peak_mean": 43040.791666666664,
+        "prompt_peak_max": 65304,
+        "ctx_est_peak_max": 66444,
+        "runs_over_snip_threshold": 0
+      }
+    },
+    "snip_threshold": [
+      182592
+    ],
+    "prompt_peak_max_overall": 90882,
+    "runs_over_snip_threshold": 0
+  },
+  "judge_input": {
+    "fifo": {
+      "mean_screenshots_evaluated": 14.208333333333334,
+      "n": 24
+    },
+    "flat": {
+      "mean_screenshots_evaluated": 10.458333333333334,
+      "n": 24
+    },
+    "fresh_vision": {
+      "mean_screenshots_evaluated": 4.375,
+      "n": 24
+    },
+    "full_history": {
+      "mean_screenshots_evaluated": 13.0,
+      "n": 24
+    },
+    "ledger": {
+      "mean_screenshots_evaluated": 13.458333333333334,
+      "n": 24
+    },
+    "no_deadend": {
+      "mean_screenshots_evaluated": 11.5,
+      "n": 24
+    },
+    "no_ladder": {
+      "mean_screenshots_evaluated": 15.458333333333334,
+      "n": 24
+    },
+    "summary": {
+      "mean_screenshots_evaluated": 14.5,
+      "n": 24
+    }
+  },
+  "infra_errors": {
+    "markers": "ERR_NO_SUPPORTED_PROXIES|ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY_CONNECTION_FAILED|proxy error|session backend lost|session (?:is )?(?:dead|expired)",
+    "dominant_min": 3,
+    "count_histogram": {
+      "1": 2,
+      "2": 2,
+      "3": 2,
+      "6": 1,
+      "11": 2
+    },
+    "by_arm": {
+      "fifo": {
+        "runs_with_any_marker": 1,
+        "runs_dominant": 1
+      },
+      "flat": {
+        "runs_with_any_marker": 4,
+        "runs_dominant": 0
+      },
+      "fresh_vision": {
+        "runs_with_any_marker": 1,
+        "runs_dominant": 1
+      },
+      "full_history": {
+        "runs_with_any_marker": 1,
+        "runs_dominant": 1
+      },
+      "ledger": {
+        "runs_with_any_marker": 1,
+        "runs_dominant": 1
+      },
+      "no_deadend": {
+        "runs_with_any_marker": 0,
+        "runs_dominant": 0
+      },
+      "no_ladder": {
+        "runs_with_any_marker": 1,
+        "runs_dominant": 1
+      },
+      "summary": {
+        "runs_with_any_marker": 0,
+        "runs_dominant": 0
+      }
+    },
+    "runs": {
+      "fifo": {
+        "cf757a775fa1224acfc7998489e199a8": 6
+      },
+      "flat": {
+        "95cad96f2e43f3c0d8efad1331c77c8c": 1,
+        "9bb63ad0e38d5691a618932a8b31c05a": 1,
+        "b6d10e9bd19b4009a02dea0e98f4e1ae": 2,
+        "cf757a775fa1224acfc7998489e199a8": 2
+      },
+      "fresh_vision": {
+        "bb518416a786fdb9b9bbf0c78515595e": 3
+      },
+      "full_history": {
+        "733f1d8bf79d5bc2240c5357f928ffff": 11
+      },
+      "ledger": {
+        "bb314cb80f0f8489135cbf59074d11e2": 11
+      },
+      "no_ladder": {
+        "bb518416a786fdb9b9bbf0c78515595e": 3
+      }
+    }
+  },
+  "archives": {
+    "_discarded_petfinder": {
+      "entries": 5,
+      "size_mb": 33.6
+    },
+    "_discarded_student_com": {
+      "entries": 6,
+      "size_mb": 18.9
+    },
+    "_failed_attempts": {
+      "entries": 19,
+      "size_mb": 15.8
+    },
+    "_logs": {
+      "entries": 78,
+      "size_mb": 0.1
+    },
+    "_orphaned_by_task_swaps": {
+      "entries": 15,
+      "size_mb": 61.0
+    },
+    "_preproxy_discarded": {
+      "entries": 1,
+      "size_mb": 3.7
+    }
+  },
+  "subset": {
+    "name": "ablate24",
+    "method": "22 task ids supplied by the author, minus 2 whose sites return 403 through our residential proxy, plus the 1 task already completed under this experiment, plus 3 medium-level low-anti-bot fills chosen to restore level balance; every site was loaded in real Chrome through the proxy before freezing",
+    "note": "Frozen 2026-09-12 before any of the added arms ran. Excluded for unreachability: b7a9a6b5 (uniqlo.com 403 via residential proxy); 180ed2ec (umich.edu 403 via residential proxy). Fills: 157f4a79, 4e801ba1, 85b284c1. Site reachability was screened, which biases the absolute success rate upward and must be stated when reporting; paired arm comparisons are unaffected. Swapped 0b2623e9 (petfinder.com, hard) out for a11ecdff (coursera.org, easy) at the author's request; coursera verified reachable through the proxy. No completed runs existed for the outgoing task. Swapped 157f4a79 (disney.com) out for 662ae0f2 (wanderlog.com) at the author's request; wanderlog verified reachable through the proxy. One completed run existed for the outgoing task and is orphaned, not counted. Swapped 3443e9c3 (webmd.com, hard) out for 95cad96f (rottentomatoes.com, easy) at the author's request; rottentomatoes verified reachable through the proxy. Swapped 4e801ba1 (thumbtack.com, medium) out for dd44c665 (spothero.com, hard) at the author's request on cost grounds; spothero verified reachable through the proxy. Seven completed thumbtack runs (4 successes) are archived, not counted. Swapped c94551d2 (petfinder.com, 3-filter search) out for b6d10e9b (foxsports.com) on cost grounds: all 4 arms run failed it at 17-29 min each, so it produced no discordant pairs. foxsports verified reachable through the proxy.",
+    "level_counts": {
+      "easy": 16,
+      "hard": 5,
+      "medium": 3
+    },
+    "screened": {
+      "proxy": "residential",
+      "date": "2026-09-12",
+      "method": "real Chrome, fresh context per site"
+    }
+  },
+  "cost": {
+    "usd_agent": 59.47,
+    "usd_judge": 8.16,
+    "usd_total": 67.63,
+    "unpriced_records": 0,
+    "summed_run_time_h": 21.99,
+    "elapsed_h_first_start_to_last_end": 73.2,
+    "price_table_as_of": [
+      "2026-09-15"
+    ]
+  },
+  "outcome": {
+    "failure_reasons": {
+      "premature_done": 63,
+      "bot_block": 15,
+      "site_unavailable": 3,
+      "grounding": 1,
+      "captcha_unsolved": 1,
+      "timeout": 1
+    },
+    "exclusion_labels": {
+      "site_unavailable": 3,
+      "captcha_unsolved": 1
+    },
+    "level_counts_per_arm": {
+      "hard": 5,
+      "easy": 16,
+      "medium": 3
+    },
+    "primary_task_count": 23
+  },
+  "checks": {
+    "one_record_per_task_arm": true,
+    "single_protocol_hash": true,
+    "single_webjudge_model": true,
+    "mixed_model_tasks_all_excluded": true,
+    "no_non_browser_tool_executed": true,
+    "all_instruction_mismatches_declared": true,
+    "code_drift_balanced_across_arms_excluding_multi_sha_tasks": true,
+    "no_run_over_snip_threshold": true,
+    "all_records_priced": true
+  }
+}

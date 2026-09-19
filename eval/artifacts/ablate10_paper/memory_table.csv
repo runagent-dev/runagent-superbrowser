@@ -1,0 +1,5 @@
+arm,tsr,csd_observed,csd_task_given,drr,repeated_actions,prompt_peak,compressor_calls
+fifo,0.652174,0.960387,0.8875,0.0326087,0.826087,43026.6,0
+full_history,0.73913,0.982143,0.95,0,1.04348,55512.3,0
+ledger,0.478261,0.997237,1,0,0.695652,43064.6,0
+summary,0.565217,0.949889,0.9375,0,0.608696,42778.6,7.08333
