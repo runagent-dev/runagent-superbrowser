@@ -15,6 +15,38 @@ const puppeteer = puppeteerExtra as any;
 import { getStealthScript, getPlatformOverrideScript } from './stealth.js';
 import { PageWrapper } from './page.js';
 
+/**
+ * Chrome's `--proxy-server` flag accepts `scheme://host:port` only. A proxy
+ * URL that carries credentials (`http://user:pass@host:port`, the documented
+ * PROXY_POOL form) makes every navigation fail with
+ * `net::ERR_NO_SUPPORTED_PROXIES`, which surfaced as HTTP 500 on
+ * /session/create for every Tier-1 session behind an authenticated proxy.
+ * Split the credentials out here and answer the proxy's 407 challenge per
+ * page with `page.authenticate()` instead.
+ */
+export interface ProxyLaunchConfig {
+  server: string;
+  auth?: { username: string; password: string };
+}
+
+export function splitProxyCredentials(proxyUrl: string): ProxyLaunchConfig {
+  const trimmed = proxyUrl.trim();
+  // `new URL('host:port')` would misparse the host as the scheme; only a value
+  // with an explicit scheme is a URL we can split.
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return { server: trimmed };
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { server: trimmed };
+  }
+  const username = decodeURIComponent(parsed.username || '');
+  const password = decodeURIComponent(parsed.password || '');
+  const server = `${parsed.protocol}//${parsed.host}`;
+  if (!username && !password) return { server };
+  return { server, auth: { username, password } };
+}
+
 puppeteer.use(StealthPlugin() as any);
 
 export interface BrowserConfig {
@@ -198,6 +230,8 @@ export class BrowserEngine extends EventEmitter {
    */
   private pendingSelfPages = 0;
   private selfCreatedTargets = new WeakSet<Target>();
+  /** Proxy credentials split out of `config.proxy`; answered per page via `page.authenticate`. */
+  private proxyAuth: { username: string; password: string } | undefined;
 
   constructor(config: Partial<BrowserConfig> = {}) {
     super();
@@ -214,7 +248,11 @@ export class BrowserEngine extends EventEmitter {
     ];
 
     if (this.config.proxy) {
-      args.push(`--proxy-server=${this.config.proxy}`);
+      const { server, auth } = splitProxyCredentials(this.config.proxy);
+      args.push(`--proxy-server=${server}`);
+      this.proxyAuth = auth;
+    } else {
+      this.proxyAuth = undefined;
     }
 
     // Opt-in GPU-disable for environments where Chromium can't use a GPU.
@@ -364,12 +402,23 @@ export class BrowserEngine extends EventEmitter {
       this.pendingSelfPages--;
     }
 
+    await this.applyProxyAuth(page);
     await this.instrumentPage(page);
 
     const wrapper = new PageWrapper(page, this.config);
     wrapper.ownerEngine = this;
     this.emit('newPage', wrapper);
     return wrapper;
+  }
+
+  /** Answer the authenticated proxy's 407 challenge for this page (no-op without credentials). */
+  private async applyProxyAuth(page: Page): Promise<void> {
+    if (!this.proxyAuth) return;
+    try {
+      await page.authenticate(this.proxyAuth);
+    } catch (err) {
+      console.warn(`[engine] page.authenticate for the proxy failed: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -380,6 +429,7 @@ export class BrowserEngine extends EventEmitter {
    * (both are idempotent installs). Never throws.
    */
   async adoptPage(page: Page): Promise<PageWrapper> {
+    await this.applyProxyAuth(page);
     await this.instrumentPage(page, true);
     try { await page.evaluate(NAME_SHIM_SRC); } catch { /* best-effort */ }
     try { await page.evaluate(MUTATION_COUNTER_SRC); } catch { /* best-effort */ }
