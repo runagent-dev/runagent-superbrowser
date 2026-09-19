@@ -84,6 +84,7 @@ class BrowserSessionState:
         self.action_count = 0
         self.actions_since_screenshot = 0
         self._last_suggestion_signature: str = ""
+        self._autocomplete_attempts: dict[str, int] = {}
 
         # Navigation mechanics - intra-session URL accounting used by
         # regression detection. The semantic side (current URL surfaced
@@ -945,6 +946,35 @@ class BrowserSessionState:
         if norm and key in self.screenshotted_keys:
             return False, "[Screenshot already exists for this URL + content. Use browser_get_markdown or browser_eval to read page state instead.]"
         return True, ""
+
+    # Consecutive types into one field that produced no usable suggestion
+    # list. Two is enough to conclude the dropdown is not coming: the probe
+    # already waits for the list to settle, so a second empty settle is not
+    # bad luck. Past this the tooling must stop asking for a dropdown and
+    # say so, or the worker spends its whole budget summoning one.
+    AUTOCOMPLETE_GIVE_UP_AFTER = 2
+
+    def note_autocomplete_attempt(self, field_key: str, usable: bool) -> int:
+        """Count consecutive unusable autocomplete outcomes for one field.
+
+        Returns the running count (0 once a usable list appears). Read by
+        the caption builder so the advice can change from "try again" to
+        "stop trying", which is the difference between a worker that
+        recovers and one that loops.
+        """
+        try:
+            counts = getattr(self, "_autocomplete_attempts", None)
+            if counts is None:
+                counts = {}
+                self._autocomplete_attempts = counts
+            key = field_key or "_"
+            if usable:
+                counts.pop(key, None)
+                return 0
+            counts[key] = counts.get(key, 0) + 1
+            return counts[key]
+        except Exception:
+            return 0
 
     def record_suggestion_signature(self, signature: str) -> None:
         """Remember the autocomplete list as of the last probe.

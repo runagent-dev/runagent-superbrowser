@@ -87,6 +87,11 @@ class FieldState:
     kind: FieldKind = FieldKind.TEXT
     depends_on: Optional[str] = None
     resolved_value: Optional[str] = None  # what the picker actually selected
+    # Set when the field was declared autocomplete=true but no usable
+    # suggestion list ever appeared, so it was filled from the typed text
+    # instead of a picked suggestion. Surfaced on the checklist so the
+    # brain knows the value was never confirmed against a suggestion.
+    autocomplete_unavailable: bool = False
 
 
 @dataclass
@@ -252,6 +257,34 @@ class FormFillSession:
             return None
         if observed_value:
             fs.last_observed_value = observed_value
+        fs.status = FieldStatus.FILLED
+        return fs
+
+    def mark_autocomplete_unavailable(
+        self, label: str = "", observed_value: str = ""
+    ) -> Optional[FieldState]:
+        """Release a field whose suggestion list never came.
+
+        AWAIT_AUTOCOMPLETE used to be exit-only via
+        `mark_autocomplete_picked`, so a field on a widget that never
+        opened its list stayed pending for the rest of the run. The
+        worker hook re-injects the checklist every iteration and
+        `browser_form_commit` refuses to submit while anything is
+        pending, so that one field could consume the entire step budget
+        with nothing left to try. The typed value is still on the page;
+        treat it as filled and let verification judge it like any other.
+        """
+        key = (label or self.autocomplete_pending_for or "").lower()
+        if not key:
+            return None
+        fs = self.fields.get(key)
+        if fs is None:
+            return None
+        if self.autocomplete_pending_for == key:
+            self.autocomplete_pending_for = None
+        if observed_value:
+            fs.last_observed_value = observed_value
+        fs.autocomplete_unavailable = True
         fs.status = FieldStatus.FILLED
         return fs
 

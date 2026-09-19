@@ -122,3 +122,88 @@ class TestOpen:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestGiveUp:
+    """The loop this breaks: a worker spending 20+ iterations summoning a
+    dropdown that was never going to appear.
+
+    Observed on an Expedia package search — type, screenshot, eval,
+    list_elements, get_rect, image_region, retype, fix_text_at,
+    edit_text_at, wait_for, type again, screenshot again. Nothing in the
+    system told it to stop: the caption kept explaining how to get a
+    list, the form checklist was re-injected every iteration, and
+    browser_form_commit refuses to submit while a field is pending.
+    """
+
+    def test_first_failure_still_suggests_recovery(self):
+        cap = _autocomplete_caption(_scan("empty"), "New York", attempts=1)
+        assert "AUTOCOMPLETE_GIVE_UP" not in cap
+
+    def test_second_failure_releases_the_worker(self):
+        cap = _autocomplete_caption(_scan("empty"), "New York", attempts=2)
+        assert "AUTOCOMPLETE_GIVE_UP" in cap
+        assert "STOP retyping" in cap
+
+    def test_give_up_names_the_dead_ends_that_were_actually_tried(self):
+        cap = _autocomplete_caption(_scan("unrelated", ["Paris"]), "New York", attempts=3)
+        assert "eval/markdown/region crops" in cap
+
+    def test_give_up_offers_a_concrete_way_forward(self):
+        cap = _autocomplete_caption(_scan("empty"), "New York", attempts=2)
+        assert "direct URL" in cap
+        assert "as typed" in cap
+
+    def test_give_up_pre_empts_the_form_checklist_nag(self):
+        # The checklist is re-injected every iteration and would otherwise
+        # contradict the release.
+        cap = _autocomplete_caption(_scan("empty"), "New York", attempts=2)
+        assert "checklist" in cap and "proceed anyway" in cap
+
+    def test_an_open_list_never_gives_up(self):
+        cap = _autocomplete_caption(_scan("open", ["New York"]), "New York", attempts=5)
+        assert "AUTOCOMPLETE_GIVE_UP" not in cap
+        assert "dropdown is open" in cap
+
+    def test_pending_also_releases_once_it_is_hopeless(self):
+        cap = _autocomplete_caption(_scan("pending"), "New York", attempts=2)
+        assert "AUTOCOMPLETE_GIVE_UP" in cap
+
+
+def _session():
+    from superbrowser_bridge.form_session import FormFillSession
+    return FormFillSession.begin(
+        intent="search packages",
+        started_at_turn=0,
+        fields=[{"label": "Going to", "value": "San Francisco", "autocomplete": True}],
+    )
+
+
+class TestFormFieldRelease:
+    def test_await_autocomplete_is_no_longer_a_dead_end(self):
+        from superbrowser_bridge.form_session import FieldStatus
+        sess = _session()
+        sess.mark_typed(label_or_index="Going to", value_typed="San Francisco", turn=1)
+        assert sess.fields["going to"].status is FieldStatus.AWAIT_AUTOCOMPLETE
+
+        released = sess.mark_autocomplete_unavailable("Going to", observed_value="San Francisco")
+        assert released is not None
+        assert sess.fields["going to"].status is FieldStatus.FILLED
+        assert sess.fields["going to"].autocomplete_unavailable is True
+        assert sess.autocomplete_pending_for is None
+
+    def test_a_released_field_leaves_the_pending_checklist(self):
+        # The checklist is re-injected by the worker hook every iteration,
+        # so a field that can never leave it is a permanent instruction to
+        # keep working on it.
+        from superbrowser_bridge.form_session import FieldStatus
+        sess = _session()
+        sess.mark_typed(label_or_index="Going to", value_typed="San Francisco", turn=1)
+        # "[?]" is the await-autocomplete marker: an open demand.
+        assert "[?]" in sess.remaining_checklist()
+        assert "pending=" in sess.commit_summary()
+
+        sess.mark_autocomplete_unavailable("Going to")
+        assert "[?]" not in sess.remaining_checklist()
+        assert "pending=" not in sess.commit_summary()
+        assert sess.fields["going to"].status is FieldStatus.FILLED

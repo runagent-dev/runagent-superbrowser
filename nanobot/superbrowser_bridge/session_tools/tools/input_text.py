@@ -439,7 +439,39 @@ async def _scan_autocomplete_suggestions(
     return empty
 
 
-def _autocomplete_caption(scan: dict, typed_text: str) -> str:
+def _release_stuck_autocomplete_field(
+    state: "BrowserSessionState",
+    label: str | None,
+    index: int | None,
+    attempts: int,
+    typed_text: str,
+) -> None:
+    """Let a form field out of AWAIT_AUTOCOMPLETE when no list ever came.
+
+    Without this the release in the caption is advice the worker cannot
+    act on: `browser_form_commit` refuses to submit while any field is
+    pending, and the worker hook re-injects the checklist every single
+    iteration. Telling the brain to move on while the form machinery
+    keeps saying the field is unfinished is how a worker burns its whole
+    budget on one input.
+    """
+    if attempts < getattr(state, "AUTOCOMPLETE_GIVE_UP_AFTER", 2):
+        return
+    sess = getattr(state, "form_session", None)
+    if sess is None:
+        return
+    try:
+        key = label or ""
+        if not key and index is not None:
+            fs = sess._match_field(index)
+            key = fs.label if fs is not None else ""
+        if key:
+            sess.mark_autocomplete_unavailable(key, observed_value=typed_text)
+    except Exception:
+        pass
+
+
+def _autocomplete_caption(scan: dict, typed_text: str, attempts: int = 0) -> str:
     """Model-facing text for an autocomplete probe.
 
     The rule this enforces: never assert that a dropdown is open unless
@@ -457,6 +489,29 @@ def _autocomplete_caption(scan: dict, typed_text: str) -> str:
     waited = scan.get("elapsed_ms") or 0
     quoted = f'"{typed_text}"' if typed_text else "the text"
 
+    # Past the give-up point the advice has to invert. Every other branch
+    # below tells the worker how to get a suggestion list; repeated
+    # unchanged, that is what a 20-iteration retype/eval/screenshot loop
+    # is made of. The worker also has a form checklist re-injected every
+    # iteration and a commit gate that blocks on pending fields, so
+    # nothing else in the system will tell it to stop.
+    give_up = attempts >= 2 and state != "open"
+
+    def _release(msg: str) -> str:
+        if not give_up:
+            return msg
+        return msg + (
+            f" \n[AUTOCOMPLETE_GIVE_UP] You have now typed into this field "
+            f"{attempts} times without a usable suggestion list, and the probe "
+            "waits for the list to settle before reporting — so it is not "
+            "arriving. STOP retyping this field and stop hunting for the "
+            "dropdown with eval/markdown/region crops. The typed value is on "
+            "the page. Move on: submit or press the site's search control with "
+            "the value as typed, or reach the result another way (a direct URL "
+            "with query parameters). If a form checklist still lists this "
+            "field, that is expected — proceed anyway."
+        )
+
     if state == "open":
         return (
             f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(items)}] A suggestion "
@@ -467,7 +522,7 @@ def _autocomplete_caption(scan: dict, typed_text: str) -> str:
         )
 
     if state == "unrelated":
-        return (
+        return _release(
             f"\n\n[AUTOCOMPLETE_UNRELATED suggestions={len(items)}] A dropdown is "
             f"on screen, but none of its items match {quoted}"
             + ("" if scan.get("changed") else " and it did not change when you typed")
@@ -484,7 +539,7 @@ def _autocomplete_caption(scan: dict, typed_text: str) -> str:
         )
 
     if state == "pending":
-        return (
+        return _release(
             f"\n\n[AUTOCOMPLETE_PENDING] The suggestion list was still loading "
             f"{waited}ms after {quoted} was entered, so nothing is settled "
             "yet. Do NOT describe or click suggestions from this turn. Use "
@@ -509,7 +564,7 @@ def _autocomplete_caption(scan: dict, typed_text: str) -> str:
         "(browser_get_markdown or browser_screenshot), correct it if wrong, "
         "or proceed without the dropdown."
     )
-    return note
+    return _release(note)
 
 
 @tool_parameters(
@@ -775,9 +830,18 @@ class BrowserTypeAtTool(Tool):
             )
             self.s.record_suggestion_signature(scan.get("signature") or "")
         suggestions: list[dict] = scan.get("suggestions") or []
-        if scan.get("state") in ("open", "unrelated", "pending") or suggestions:
-            caption += _autocomplete_caption(scan, text)
+        ac_state = str(scan.get("state") or "empty")
+        field_key = (
+            f"v{vision_index}" if vision_index is not None
+            else f"{int(target_x)},{int(target_y)}"
+        )
+        attempts = self.s.note_autocomplete_attempt(
+            field_key, usable=(ac_state == "open"),
+        )
+        if ac_state in ("open", "unrelated", "pending") or suggestions:
+            caption += _autocomplete_caption(scan, text, attempts=attempts)
             self.s.last_type_at = time.time()
+        _release_stuck_autocomplete_field(self.s, label, vision_index, attempts, text)
 
         # Phase 2.1: notify the active form_session that this field was
         # typed into. Promotes its FieldStatus to FILLED (or
@@ -1323,8 +1387,12 @@ class BrowserTypeTool(Tool):
             )
         else:
             caption = f'Typed "{text}" into [{index}]'
+        attempts = self.s.note_autocomplete_attempt(
+            f"i{index}", usable=(state == "open"),
+        )
         if state in ("open", "unrelated", "pending") or suggestions:
-            caption += _autocomplete_caption(scan, text)
+            caption += _autocomplete_caption(scan, text, attempts=attempts)
+        _release_stuck_autocomplete_field(self.s, None, index, attempts, text)
 
         # Post-type semantic verification (index-addressed variant).
         # Skip when the tool no-op'd (field already matched).
