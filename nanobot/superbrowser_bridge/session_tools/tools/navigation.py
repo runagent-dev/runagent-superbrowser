@@ -887,6 +887,20 @@ class BrowserNavigateTool(Tool):
                 return caption
 
         self.s.record_step("browser_navigate", url, f"title={data.get('title', '?')}")
+        # A navigation that returned a real page IS progress, and until now
+        # only browser_open and a successful run_script recorded one. That
+        # left `best_checkpoint_url` pinned to the landing page, so
+        # browser_rewind_to_checkpoint sent a stuck worker back to the front
+        # door and a resumption hand-off pointed its successor there too —
+        # discarding every step in between. Going backward is not progress,
+        # so a regression does not checkpoint.
+        if actual_url and not regression:
+            try:
+                self.s.record_checkpoint(
+                    actual_url, data.get("title", "") or "", f"browser_navigate({url})",
+                )
+            except Exception:
+                pass
         # Prefetch vision so the LLM's next browser_screenshot finds the
         # bboxes already cached.
         _schedule_vision_prefetch(self.s, session_id)

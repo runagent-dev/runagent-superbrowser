@@ -1064,7 +1064,12 @@ class DelegateBrowserTaskTool(Tool):
                 # should not have to rediscover that URL from the homepage.
                 # It opens its own session and navigates straight back.
                 worker_state.best_checkpoint_url = checkpoint_url
-                resume_url = checkpoint_url or prev_url
+                # Resume at the furthest point reached, not the last
+                # checkpoint: the checkpoint is the last page known to have
+                # loaded cleanly, which is at best equal to and often behind
+                # where the worker actually got to. The checkpoint stays
+                # available below as the fallback if that page is gone.
+                resume_url = prev_url or checkpoint_url
                 parts.append(
                     f"\n## RESUMPTION — a previous worker already got this far\n"
                     f"A previous worker ran out of its step budget "
@@ -1072,7 +1077,8 @@ class DelegateBrowserTaskTool(Tool):
                     f"since closed, so you open your own — but do NOT start from the "
                     f"site's home page.\n\n"
                     f"**Resume here**: {resume_url}\n"
-                    + (f"(last page it was on: {prev_url})\n" if prev_url and prev_url != resume_url else "")
+                    + (f"(fallback if that page no longer loads: {checkpoint_url})\n"
+                       if checkpoint_url and checkpoint_url != resume_url else "")
                     + f"\nStart with:\n"
                     f"  1. browser_open(url='{resume_url}') — go straight back to that state\n"
                     f"  2. browser_get_markdown(session_id) — confirm the page is as expected\n"
@@ -1119,13 +1125,28 @@ CRITICAL RULES:
             # live page and spawn a new throwaway browser (root cause of the
             # inner-loop regression). Remove it from the tool list entirely
             # so the LLM never sees it as an option.
-            if resumption:
+            if resumption and resumption.get("warm", True):
                 browser_open_line = (
                     "- browser_open — NOT AVAILABLE for this task. A browser session is\n"
                     f"  already active (session_id={resumption['session_id']}). Use that\n"
                     "  session_id on every tool call. If you call browser_open it will\n"
                     "  refuse with [SESSION_ALREADY_OPEN …] — that is the signal to\n"
                     "  switch to browser_screenshot or browser_navigate instead."
+                )
+            elif resumption:
+                # Cold resume: the previous session is gone, so the worker DOES
+                # open its own — but at the URL the last one reached, not the
+                # site's front door. Saying "not available" here would strand it.
+                _resume_url = (
+                    resumption.get("current_url")
+                    or resumption.get("best_checkpoint_url")
+                    or ""
+                )
+                browser_open_line = (
+                    f"- browser_open(url='{_resume_url}') — open HERE, not at the site's\n"
+                    "  home page: a previous worker already reached this state and its\n"
+                    "  session has since closed. CALL AT MOST ONCE PER TASK; afterwards\n"
+                    "  use browser_navigate to move between pages."
                 )
             else:
                 browser_open_line = (
