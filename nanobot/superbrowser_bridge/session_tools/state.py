@@ -83,6 +83,7 @@ class BrowserSessionState:
         self.step_counter = 0
         self.action_count = 0
         self.actions_since_screenshot = 0
+        self._last_suggestion_signature: str = ""
 
         # Navigation mechanics - intra-session URL accounting used by
         # regression detection. The semantic side (current URL surfaced
@@ -944,6 +945,18 @@ class BrowserSessionState:
         if norm and key in self.screenshotted_keys:
             return False, "[Screenshot already exists for this URL + content. Use browser_get_markdown or browser_eval to read page state instead.]"
         return True, ""
+
+    def record_suggestion_signature(self, signature: str) -> None:
+        """Remember the autocomplete list as of the last probe.
+
+        Read by the next type's staleness test when a pre-type scan is
+        unavailable. Kept on the session because the question it answers
+        — "did this list respond to my keystroke?" — spans two tool calls.
+        """
+        try:
+            self._last_suggestion_signature = signature or ""
+        except Exception:
+            pass
 
     def mark_screenshot_taken(self, url: str, content_hash: str = "") -> None:
         """Record that a screenshot was taken for (url, content_hash).

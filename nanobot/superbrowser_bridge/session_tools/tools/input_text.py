@@ -125,23 +125,16 @@ async def _insert_text_escalation(
     return None
 
 
-_AUTOCOMPLETE_SCAN_JS = """
-(async () => {
-  // Debounce wait — many autocomplete widgets fetch suggestions on a
-  // 100-300ms debounce, so an immediate scan misses them.
-  await new Promise(r => requestAnimationFrame(() => r()));
-  await new Promise(r => setTimeout(r, 300));
-
-  const seen = new Set();
-  const out = [];
-  const selectors = [
-    // Standard ARIA listbox / option
+# Selector families for visible suggestion items. Kept in one place so the
+# pre-type signature and the post-type poll harvest the same set — the
+# staleness test compares them, so any divergence would be a false signal.
+_SUGGESTION_SELECTORS_JS = r"""
+  const SELECTORS = [
     '[role="listbox"] [role="option"]',
     '[role="combobox"] + * li',
     '[role="combobox"] + * [role="option"]',
     '[role="option"]:not([aria-hidden="true"])',
     '[aria-selected]:not([aria-hidden="true"])',
-    // Generic class-name patterns
     '.autocomplete-suggestions li, .autocomplete li',
     'ul.suggestions li, .suggestions li',
     '.MuiAutocomplete-listbox li',
@@ -150,146 +143,373 @@ _AUTOCOMPLETE_SCAN_JS = """
     '.ui-autocomplete li',
     '[class*="autocomplete"][class*="option"]',
     '[class*="suggestion"] li, [class*="suggestions"] li',
-    // Algolia InstantSearch / Autocomplete
     '.ais-Hits-list .ais-Hits-item',
     '[class*="ais-Hits-item"]',
     '[class*="aa-Item"]',
     '[class*="aa-Suggestion"]',
-    // Downshift
     '[id^="downshift"] [role="option"]',
     '[id^="downshift"] li',
-    // React Select / similar
     '[class*="select__option"]',
     '[id*="-option-"]',
-    // Reach UI
     '[data-reach-combobox-option]',
-    // Headless UI
     '[id^="headlessui-listbox-option-"]',
     '[id^="headlessui-combobox-option-"]',
   ];
-  for (const sel of selectors) {
-    let nodes;
-    try { nodes = document.querySelectorAll(sel); } catch { continue; }
-    nodes.forEach(el => {
-      const r = el.getBoundingClientRect();
-      if (r.width < 30 || r.height < 10) return;
-      if (r.top > window.innerHeight * 1.5) return;
-      const cs = window.getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return;
-      const txt = (el.innerText || el.textContent || '').trim();
-      if (!txt || txt.length > 120 || seen.has(txt)) return;
-      seen.add(txt);
-      out.push({
-        text: txt,
-        x: Math.round(r.left + r.width / 2),
-        y: Math.round(r.top + r.height / 2),
-        w: Math.round(r.width),
-        h: Math.round(r.height),
+  function harvestSuggestions() {
+    const seen = new Set();
+    const out = [];
+    for (const sel of SELECTORS) {
+      let nodes;
+      try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
+      nodes.forEach(function (el) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 30 || r.height < 10) return;
+        if (r.top > window.innerHeight * 1.5) return;
+        const cs = window.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return;
+        const txt = (el.innerText || el.textContent || '').trim();
+        if (!txt || txt.length > 120 || seen.has(txt)) return;
+        seen.add(txt);
+        out.push({
+          text: txt,
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        });
       });
+    }
+    return out;
+  }
+  function signatureOf(items) {
+    return items.map(function (i) { return i.text; }).join('␟');
+  }
+"""
+
+# Signature of what is on screen BEFORE a keystroke lands. The post-type
+# poll needs it to answer the only question that matters: did this list
+# respond to what I just typed, or is it left over from a previous query?
+_AUTOCOMPLETE_PRESCAN_JS = "(() => {" + _SUGGESTION_SELECTORS_JS + """
+  return signatureOf(harvestSuggestions());
+})()
+"""
+
+# Post-type poll. Replaces a flat 300ms sleep, which was shorter than a
+# network round trip and so routinely sampled the gap before results
+# arrived — reporting "no suggestions" on a widget that was still
+# fetching, or the PREVIOUS query's results on one that had not cleared.
+_AUTOCOMPLETE_SCAN_TEMPLATE = "(async () => {" + _SUGGESTION_SELECTORS_JS + r"""
+  const PREV = __PREV_SIG__;
+  const TYPED = (__TYPED__ || '').trim().toLowerCase();
+  const BUDGET = __BUDGET__;
+  // The list must hold still this long before it is judged.
+  const QUIET_MS = 500;
+
+  const active = document.activeElement;
+  const isTextEntry = !!active && (
+    active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable
+  );
+
+  function attr(el, n) { return ((el && el.getAttribute(n)) || '').toLowerCase(); }
+
+  // Does the widget advertise itself as an autocomplete? This describes
+  // what the field IS, never whether a list is currently open, and must
+  // not be allowed to stand in for the latter.
+  let isAutocompleteInput = false;
+  let popupId = null;
+  if (isTextEntry) {
+    const role = attr(active, 'role');
+    const ac = attr(active, 'aria-autocomplete');
+    const hp = attr(active, 'aria-haspopup');
+    popupId = active.getAttribute('aria-controls') || null;
+    isAutocompleteInput = (
+      role === 'combobox' || role === 'searchbox' ||
+      ac === 'list' || ac === 'both' || ac === 'inline' ||
+      hp === 'listbox' || hp === 'menu' || hp === 'grid' ||
+      hp === 'tree' || hp === 'dialog' ||
+      attr(active, 'aria-expanded') === 'true' || !!popupId
+    );
+  }
+
+  function popupEl() { return popupId ? document.getElementById(popupId) : null; }
+
+  function popupVisibleNow() {
+    const p = popupEl();
+    if (!p) return false;
+    const r = p.getBoundingClientRect();
+    const cs = window.getComputedStyle(p);
+    return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  }
+
+  // Is the widget still fetching? Without this the poll cannot tell "no
+  // matches exist" from "the request has not come back yet", and those
+  // two need opposite advice.
+  function busyNow() {
+    const scopes = [active, popupEl()].filter(Boolean);
+    for (const el of scopes) {
+      if (attr(el, 'aria-busy') === 'true') return true;
+    }
+    for (const el of scopes) {
+      try {
+        if (el.querySelector('[role="progressbar"], [aria-busy="true"], [class*="spinner"], [class*="loading"], [class*="Spinner"], [class*="Loading"]')) return true;
+      } catch (e) { /* ignore */ }
+    }
+    if (document.documentElement.getAttribute('aria-busy') === 'true') return true;
+    return false;
+  }
+
+  // Does any item plausibly answer what was typed? Soft evidence only:
+  // a query like "JFK" legitimately returns "John F. Kennedy Airport".
+  // Used to rescue the case where the same text is typed twice and the
+  // list correctly does not change.
+  function correspondsTo(items) {
+    if (!TYPED) return false;
+    const head = TYPED.split(/\s+/)[0];
+    return items.some(function (i) {
+      const t = (i.text || '').toLowerCase();
+      return t.indexOf(TYPED) !== -1 || (head.length >= 3 && t.indexOf(head) !== -1);
     });
   }
 
-  // ARIA-based detection on the focused/typed-into input. Catches
-  // widgets whose listbox DOM doesn't match any of our selectors —
-  // we still know an autocomplete is wired up, even if we can't
-  // enumerate the items.
-  const el = document.activeElement;
-  let isAutocompleteInput = false;
-  let popupId = null;
-  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
-    const role = (el.getAttribute('role') || '').toLowerCase();
-    const ariaAutocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
-    const ariaHaspopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
-    const ariaExpanded = (el.getAttribute('aria-expanded') || '').toLowerCase();
-    const ariaControls = el.getAttribute('aria-controls') || '';
-    isAutocompleteInput = (
-      role === 'combobox' || role === 'searchbox' ||
-      ariaAutocomplete === 'list' || ariaAutocomplete === 'both' ||
-      ariaAutocomplete === 'inline' ||
-      ariaHaspopup === 'listbox' || ariaHaspopup === 'menu' ||
-      ariaHaspopup === 'grid' || ariaHaspopup === 'tree' ||
-      ariaHaspopup === 'dialog' ||
-      ariaExpanded === 'true' ||
-      !!ariaControls
-    );
-    popupId = ariaControls || null;
+  // Wait for the list to STOP changing rather than exiting on the first
+  // non-empty read. Measured on booking.com: focusing the field paints a
+  // "popular destinations" list within a few ms, and the real query
+  // results replace it a few hundred ms later. An early exit therefore
+  // reported the popular list as the answer to the query — and since one
+  // of its entries happened to be "New York", even a correspondence check
+  // was satisfied by it. Only a settled list can be judged.
+  const start = Date.now();
+  let items = [], sig = '', busy = false, timedOut = false;
+  let lastSig = null, quietSince = 0;
+
+  for (;;) {
+    items = harvestSuggestions();
+    sig = signatureOf(items);
+    busy = busyNow();
+    const elapsed = Date.now() - start;
+
+    if (sig !== lastSig) { lastSig = sig; quietSince = elapsed; }
+    if (!busy && (elapsed - quietSince) >= QUIET_MS) break;
+    if (elapsed >= BUDGET) { timedOut = true; break; }
+    await new Promise(function (r) { setTimeout(r, 100); });
   }
 
-  // Popup-via-aria-controls visibility check. If the input points at
-  // an explicit popup id, see if that popup is on-screen with content.
-  let popupVisible = false;
-  if (popupId) {
-    const popup = document.getElementById(popupId);
-    if (popup) {
-      const r = popup.getBoundingClientRect();
-      const cs = window.getComputedStyle(popup);
-      popupVisible = (
-        r.width > 0 && r.height > 0 &&
-        cs.display !== 'none' && cs.visibility !== 'hidden'
-      );
-    }
+  const changed = sig !== PREV;
+  const corresponds = correspondsTo(items);
+  let state;
+  if (items.length > 0) {
+    // Correspondence is the only signal that survives a site which
+    // leaves a previous query's results on screen — "changed" does not,
+    // change. Two real shapes land in 'unrelated': booking.com leaving
+    // the previous query's cities on screen, and booking.com answering
+    // nonsense with a fuzzy fallback ("zzqqxxwwvv" -> "Mzuzu (ZZU)").
+    // Neither is a match for what was typed. A legitimate match sharing
+    // no substring (JFK -> "John F. Kennedy Airport") lands here too,
+    // and its advice is to verify before clicking rather than assume —
+    // the safe direction: it never asserts a match nobody checked.
+    state = corresponds ? 'open' : 'unrelated';
+  } else if (busy || timedOut) {
+    state = 'pending';
+  } else {
+    state = 'empty';
   }
 
-  const detected = out.length > 0 || isAutocompleteInput || popupVisible;
   return {
-    suggestions: out.slice(0, 8),
-    detected,
+    suggestions: items.slice(0, 8),
+    state: state,
+    signature: sig,
+    changed: changed,
+    corresponds: corresponds,
+    busy: busy,
+    timed_out: timedOut,
+    elapsed_ms: Date.now() - start,
     is_autocomplete_input: isAutocompleteInput,
-    popup_visible: popupVisible,
+    popup_visible: popupVisibleNow(),
   };
-})();
+})()
 """
 
 
-async def _scan_autocomplete_suggestions(session_id: str) -> dict:
-    """Probe the page for autocomplete state. Returns:
-        {
-          'suggestions': list[dict] (visible options with center coords),
-          'detected': bool (True if suggestions found OR ARIA says combobox),
-          'is_autocomplete_input': bool,
-          'popup_visible': bool,
-        }
-    Best-effort — returns an empty dict on probe error.
+async def _prescan_suggestion_signature(session_id: str) -> str:
+    """Signature of the suggestion list as it stands BEFORE a keystroke.
+
+    Cheap (one evaluate, no waiting) and load-bearing: without it the
+    post-type poll cannot distinguish a list that answered this keystroke
+    from one left over from the previous query.
+    """
+    try:
+        r = await _request_with_backoff(
+            "POST",
+            f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
+            json={"script": _AUTOCOMPLETE_PRESCAN_JS},
+            timeout=5.0,
+        )
+        if r.status_code != 200:
+            return ""
+        got = r.json().get("result")
+        return got if isinstance(got, str) else ""
+    except Exception:
+        # No signature just means the staleness test abstains.
+        return ""
+
+
+_AUTOCOMPLETE_BUDGET_MS = 3000
+
+
+async def _scan_autocomplete_suggestions(
+    session_id: str,
+    *,
+    prev_signature: str = "",
+    typed_text: str = "",
+    budget_ms: int = _AUTOCOMPLETE_BUDGET_MS,
+) -> dict:
+    """Probe autocomplete state after typing.
+
+    Returns a `state` that the caller must respect:
+
+      open    — a list is on screen AND it answered this keystroke.
+      unrelated — a list is on screen but nothing in it matches what was
+                typed: the previous query's results left rendered, or a
+                fuzzy fallback for a query with no real match.
+      empty   — no list, and the widget is not fetching. There genuinely
+                are no suggestions.
+      pending — still fetching when the budget ran out. Nothing is
+                settled; the caller must not describe the page yet.
+
+    `detected` is retained for back-compat and now means exactly
+    "state == 'open'". It used to be true whenever the focused field
+    merely LOOKED like a combobox, which made the caller announce an open
+    dropdown over a closed one.
     """
     empty: dict = {
-        "suggestions": [],
-        "detected": False,
-        "is_autocomplete_input": False,
-        "popup_visible": False,
+        "suggestions": [], "state": "empty", "detected": False,
+        "signature": "", "changed": False, "corresponds": False,
+        "busy": False, "timed_out": False, "elapsed_ms": 0,
+        "is_autocomplete_input": False, "popup_visible": False,
     }
+    script = (
+        _AUTOCOMPLETE_SCAN_TEMPLATE
+        .replace("__PREV_SIG__", _json_top.dumps(prev_signature or ""))
+        .replace("__TYPED__", _json_top.dumps(typed_text or ""))
+        .replace("__BUDGET__", str(int(budget_ms)))
+    )
     try:
         sr = await _request_with_backoff(
             "POST",
             f"{SUPERBROWSER_URL}/session/{session_id}/evaluate",
-            json={"script": _AUTOCOMPLETE_SCAN_JS},
-            timeout=5.0,
+            json={"script": script},
+            # The probe polls for up to budget_ms inside the page, so the
+            # HTTP timeout has to clear it with room to spare.
+            timeout=(budget_ms / 1000.0) + 6.0,
         )
         if sr.status_code != 200:
             return empty
-        body = sr.json()
-        got = body.get("result") if isinstance(body, dict) else None
+        got = sr.json().get("result")
         if not isinstance(got, dict):
             return empty
-        suggestions = got.get("suggestions") or []
-        if not isinstance(suggestions, list):
-            suggestions = []
-        suggestions = [s for s in suggestions if isinstance(s, dict) and s.get("text")]
+        suggestions = [
+            x for x in (got.get("suggestions") or [])
+            if isinstance(x, dict) and x.get("text")
+        ]
+        state = str(got.get("state") or "empty")
+        if state not in ("open", "unrelated", "empty", "pending"):
+            state = "empty"
         out = {
             "suggestions": suggestions,
-            "detected": bool(got.get("detected")),
+            "state": state,
+            "detected": state == "open",
+            "signature": str(got.get("signature") or ""),
+            "changed": bool(got.get("changed")),
+            "corresponds": bool(got.get("corresponds")),
+            "busy": bool(got.get("busy")),
+            "timed_out": bool(got.get("timed_out")),
+            "elapsed_ms": int(got.get("elapsed_ms") or 0),
             "is_autocomplete_input": bool(got.get("is_autocomplete_input")),
             "popup_visible": bool(got.get("popup_visible")),
         }
         print(
-            f"  [autocomplete scan: suggestions={len(suggestions)} "
-            f"aria_input={out['is_autocomplete_input']} "
-            f"popup_visible={out['popup_visible']} "
-            f"detected={out['detected']}]"
+            f"  [autocomplete scan: state={out['state']} "
+            f"suggestions={len(suggestions)} changed={out['changed']} "
+            f"corresponds={out['corresponds']} busy={out['busy']} "
+            f"waited={out['elapsed_ms']}ms]"
         )
         return out
     except Exception as exc:
         print(f"  [autocomplete scan failed: {exc}]")
     return empty
+
+
+def _autocomplete_caption(scan: dict, typed_text: str) -> str:
+    """Model-facing text for an autocomplete probe.
+
+    The rule this enforces: never assert that a dropdown is open unless
+    items were actually seen on screen, and never present items as
+    matches for `typed_text` unless they answered it. The previous
+    version said "A suggestion dropdown is open" whenever the focused
+    field looked like a combobox — including with the listbox display:none
+    and zero options — and then told the model to click "the matching
+    V_n". Being ordered to pick from a list that does not exist is what
+    the confabulated selections were.
+    """
+    state = scan.get("state") or "empty"
+    items: list[dict] = scan.get("suggestions") or []
+    sample = "; ".join((s.get("text") or "")[:80] for s in items[:5])
+    waited = scan.get("elapsed_ms") or 0
+    quoted = f'"{typed_text}"' if typed_text else "the text"
+
+    if state == "open":
+        return (
+            f"\n\n[AUTOCOMPLETE_OPEN suggestions={len(items)}] A suggestion "
+            f"dropdown is open"
+            + (f". Visible items: {sample}." if sample else ".")
+            + " Call browser_screenshot, then "
+            "browser_click_at(vision_index=V_n) on the matching V_n."
+        )
+
+    if state == "unrelated":
+        return (
+            f"\n\n[AUTOCOMPLETE_UNRELATED suggestions={len(items)}] A dropdown is "
+            f"on screen, but none of its items match {quoted}"
+            + ("" if scan.get("changed") else " and it did not change when you typed")
+            + (f". It shows: {sample}." if sample else ".")
+            + " Three things cause this: the list is left over from an "
+            "earlier query, the site answered with a fuzzy fallback because "
+            "nothing really matched, or its results for your query are still "
+            "on their way and what you see is what was there before. In none "
+            f"of those cases are these confirmed matches for {quoted}, so do "
+            "NOT click one on the assumption that it is. Confirm the field "
+            "really contains what you meant, give the list another moment "
+            "with browser_wait_for on the item you expect, and only click an "
+            "item that genuinely corresponds."
+        )
+
+    if state == "pending":
+        return (
+            f"\n\n[AUTOCOMPLETE_PENDING] The suggestion list was still loading "
+            f"{waited}ms after {quoted} was entered, so nothing is settled "
+            "yet. Do NOT describe or click suggestions from this turn. Use "
+            "browser_wait_for for the item you expect, or take a fresh "
+            "browser_screenshot before deciding."
+        )
+
+    # empty
+    note = (
+        f"\n\n[AUTOCOMPLETE_EMPTY] No suggestion list appeared for {quoted} "
+        f"(waited {waited}ms and the field is not still loading)."
+    )
+    if scan.get("is_autocomplete_input"):
+        note += (
+            " The field IS an autocomplete, so the usual cause is that the "
+            "query matched nothing — a typo, or text that landed differently "
+            "than intended."
+        )
+    note += (
+        " There is nothing on screen to pick. Do NOT invent a suggestion or "
+        "click where one would have been. Confirm the field's real value "
+        "(browser_get_markdown or browser_screenshot), correct it if wrong, "
+        "or proceed without the dropdown."
+    )
+    return note
 
 
 @tool_parameters(
@@ -420,6 +640,10 @@ class BrowserTypeAtTool(Tool):
         #                           opted in). The final value is computed from
         #                           the live `before` inside the same JS tick.
         _mode = "replace" if clear else "append"
+        # What is on screen BEFORE the keystroke. The post-type probe
+        # compares against this to tell a list that answered this input
+        # from one left over from a previous query.
+        pre_sig = await _prescan_suggestion_signature(session_id)
         atomic_js = render_atomic_text_js(
             target_x, target_y, text, mode=_mode,
         )
@@ -542,23 +766,17 @@ class BrowserTypeAtTool(Tool):
         # Post-type autocomplete scan. Surfaces any visible suggestion
         # list inline + sets last_type_at so the dead-type guard can
         # catch a re-type into the same field. Skipped on a pure clear.
-        scan: dict = {"suggestions": [], "detected": False}
+        scan: dict = {"suggestions": [], "state": "empty", "detected": False}
         if changed and not is_clear:
-            scan = await _scan_autocomplete_suggestions(session_id)
+            scan = await _scan_autocomplete_suggestions(
+                session_id,
+                prev_signature=pre_sig,
+                typed_text=text,
+            )
+            self.s.record_suggestion_signature(scan.get("signature") or "")
         suggestions: list[dict] = scan.get("suggestions") or []
-        detected: bool = bool(scan.get("detected"))
-        if suggestions or detected:
-            count_str = str(len(suggestions)) if suggestions else "?"
-            sample = "; ".join(
-                ((s.get("text") or "")[:80]) for s in suggestions[:5]
-            )
-            caption += (
-                f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is open"
-                + (f". Visible items: {sample}." if sample else ".")
-                + " Call browser_screenshot, then "
-                f"browser_click_at(vision_index=V_n) on the matching V_n."
-            )
+        if scan.get("state") in ("open", "unrelated", "pending") or suggestions:
+            caption += _autocomplete_caption(scan, text)
             self.s.last_type_at = time.time()
 
         # Phase 2.1: notify the active form_session that this field was
@@ -1026,6 +1244,8 @@ class BrowserTypeTool(Tool):
                 )
 
         self.s.consecutive_click_calls += 1  # type is also step-by-step
+        # Pre-keystroke suggestion signature — see browser_type_at.
+        pre_sig = await _prescan_suggestion_signature(session_id)
         payload: dict[str, Any] = {"index": index, "text": text, "clear": clear}
         cached_fp = self.s.element_fingerprints.get(index)
         if cached_fp:
@@ -1071,14 +1291,17 @@ class BrowserTypeTool(Tool):
         # Probe the page for newly-appeared autocomplete suggestions. If
         # we find any, surface them inline so the LLM picks one instead
         # of re-typing the full phrase.
-        scan: dict = await _scan_autocomplete_suggestions(session_id)
+        scan: dict = await _scan_autocomplete_suggestions(
+            session_id, prev_signature=pre_sig, typed_text=text,
+        )
+        self.s.record_suggestion_signature(scan.get("signature") or "")
         suggestions: list[dict] = scan.get("suggestions") or []
-        detected: bool = bool(scan.get("detected"))
+        state: str = str(scan.get("state") or "empty")
 
         self.s.record_step(
             "browser_type",
             f'index={index}, text="{text[:30]}"',
-            f"ok ({len(suggestions)} suggestions, detected={detected})" if (suggestions or detected) else "ok",
+            f"ok (autocomplete {state}, {len(suggestions)} suggestions)",
         )
 
         # Surface pre-type inspection info so the LLM knows whether we
@@ -1100,18 +1323,8 @@ class BrowserTypeTool(Tool):
             )
         else:
             caption = f'Typed "{text}" into [{index}]'
-        if suggestions or detected:
-            count_str = str(len(suggestions)) if suggestions else "?"
-            sample = "; ".join(
-                ((s.get("text") or "")[:80]) for s in suggestions[:5]
-            )
-            caption += (
-                f"\n\n[AUTOCOMPLETE_OPEN suggestions={count_str}] A "
-                f"suggestion dropdown is open"
-                + (f". Visible items: {sample}." if sample else ".")
-                + " Call browser_screenshot, then "
-                f"browser_click_at(vision_index=V_n) on the matching V_n."
-            )
+        if state in ("open", "unrelated", "pending") or suggestions:
+            caption += _autocomplete_caption(scan, text)
 
         # Post-type semantic verification (index-addressed variant).
         # Skip when the tool no-op'd (field already matched).
