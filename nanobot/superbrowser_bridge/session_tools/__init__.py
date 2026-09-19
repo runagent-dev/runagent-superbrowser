@@ -50,6 +50,7 @@ from .resumption import (
     RESUMPTION_TTL_SEC,
     clear_resumption_artifact,
     load_resumption_artifact,
+    demote_resumption_artifact,
     save_resumption_artifact,
 )
 from .telemetry import (

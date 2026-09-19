@@ -34,6 +34,12 @@ RESUMPTION_TTL_SEC = 300
 # filtered result page should not have to rediscover that URL. Beyond this
 # the page state is too likely to have moved on to be a useful hint.
 RESUMPTION_COLD_TTL_SEC = 1800
+# How many workers may inherit one lineage of progress before the artifact
+# is dropped. Each hop drops the live session and keeps only the URL and
+# the accumulated dead ends, so it cannot re-seed a stuck session; the cap
+# exists because a task that has defeated this many workers is not going
+# to be solved by a fourth reading the same notes.
+RESUMPTION_MAX_HOPS = 3
 
 
 def save_resumption_artifact(
@@ -130,6 +136,115 @@ async def load_resumption_artifact(domain: str) -> dict | None:
     payload["warm"] = warm
     payload["age_s"] = int(age)
     return payload
+
+
+def _merge_failures(old: list, new: list, cap: int = 8) -> list:
+    """Union of two failed-tactic lists, newest last, de-duplicated.
+
+    The point of carrying these across a handoff is that each worker adds
+    what IT discovered does not work. Replacing rather than merging would
+    make every successor re-learn its predecessor's dead ends.
+    """
+    seen: set = set()
+    out: list = []
+    for item in list(old or []) + list(new or []):
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("tool", "")),
+            str(item.get("args", ""))[:80],
+            str(item.get("result_excerpt", ""))[:80],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out[-cap:]
+
+
+def demote_resumption_artifact(
+    state: "BrowserSessionState",
+    domain: str,
+    progress_note: str = "",
+) -> bool:
+    """Carry progress forward after a worker resumed and still failed.
+
+    This replaces an outright `clear_resumption_artifact()`. Clearing was
+    aimed at a real failure — re-seeding the next worker with a LIVE
+    session that walks its LLM straight back into the same loop — but it
+    also discarded the furthest URL reached and every dead end both
+    workers had paid for. With a 50-step worker cap, a task needing three
+    workers got knowledge transfer on the first handoff and nothing
+    afterwards.
+
+    Demoting keeps what is safe and drops what poisons:
+
+      - the live `session_id` is dropped, so the successor opens its own
+        page and cannot be walked back into the stuck one;
+      - the furthest URL survives, preferring whichever worker got deeper
+        (a successor that regressed does not overwrite a better URL);
+      - failed tactics from both workers are merged, so each successor
+        starts knowing strictly more than its predecessor did;
+      - `hops` increments, and past RESUMPTION_MAX_HOPS the artifact is
+        dropped entirely.
+
+    Returns True when an artifact survives for the next worker.
+    """
+    try:
+        if not os.path.exists(RESUMPTION_PATH):
+            return False
+        with open(RESUMPTION_PATH) as f:
+            prev = json.load(f)
+    except (ValueError, OSError):
+        return False
+
+    if prev.get("domain") != domain:
+        # A different site's artifact is not ours to demote or destroy.
+        return False
+
+    hops = int(prev.get("hops", 0) or 0) + 1
+    if hops > RESUMPTION_MAX_HOPS:
+        clear_resumption_artifact()
+        print(f"  [resumption artifact dropped after {hops - 1} hops]")
+        return False
+
+    new_url = getattr(state, "current_url", "") or ""
+    new_cp = getattr(state, "best_checkpoint_url", "") or ""
+    payload = dict(prev)
+    payload.pop("session_id", None)       # never hand on a live session
+    payload["hops"] = hops
+    # Keep the deeper of the two URLs. A worker that bounced back to the
+    # home page must not erase the filtered result page its predecessor
+    # spent its whole budget reaching.
+    if new_url and len(new_url) >= len(str(prev.get("current_url") or "")):
+        payload["current_url"] = new_url
+    if new_cp:
+        payload["best_checkpoint_url"] = new_cp
+    payload["recent_failures"] = _merge_failures(
+        prev.get("recent_failures"),
+        _extract_recent_failures(getattr(state, "step_history", []) or []),
+    )
+    if progress_note:
+        earlier = str(prev.get("progress_note") or "")
+        payload["progress_note"] = (
+            (earlier + "\n---\n" + progress_note)[-1200:] if earlier
+            else progress_note[:1200]
+        )
+    payload["written_at"] = time.time()
+
+    try:
+        os.makedirs(os.path.dirname(RESUMPTION_PATH), exist_ok=True)
+        with open(RESUMPTION_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except OSError as exc:
+        print(f"  [resumption demote failed: {exc}]")
+        return False
+    print(
+        f"  [resumption artifact demoted to hop {hops}/{RESUMPTION_MAX_HOPS}: "
+        f"session dropped, url={payload.get('current_url')} "
+        f"failures={len(payload.get('recent_failures') or [])}]"
+    )
+    return True
 
 
 def clear_resumption_artifact() -> None:

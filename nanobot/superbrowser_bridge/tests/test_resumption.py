@@ -126,3 +126,99 @@ class ExtractFailuresTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DemoteTests(unittest.TestCase):
+    """Progress must survive more than one handoff.
+
+    The bug: when a worker resumed from an artifact and ALSO failed, the
+    orchestrator called `clear_resumption_artifact()`. The intent was
+    sound — re-seeding the next worker with a LIVE session walks its LLM
+    straight back into the stuck page — but the remedy threw away the
+    furthest URL reached and both workers' dead ends along with it. With
+    a 50-step worker cap, a task needing three workers got knowledge
+    transfer across the first handoff and none afterwards, so worker 3
+    started at the home page rediscovering what workers 1 and 2 had each
+    spent a full budget learning.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._saved_path = R.RESUMPTION_PATH
+        R.RESUMPTION_PATH = os.path.join(self._dir, "resumption.json")
+
+    def tearDown(self):
+        R.RESUMPTION_PATH = self._saved_path
+
+    def _payload(self):
+        with open(R.RESUMPTION_PATH) as f:
+            return json.load(f)
+
+    def test_the_live_session_is_dropped(self):
+        # This is the actual poison: a session_id the successor attaches
+        # to, landing it back on the page that already defeated someone.
+        R.save_resumption_artifact(_State(), "shop.example")
+        self.assertTrue(R.demote_resumption_artifact(_State(), "shop.example"))
+        self.assertNotIn("session_id", self._payload())
+
+    def test_the_furthest_url_survives(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        R.demote_resumption_artifact(_State(), "shop.example")
+        self.assertEqual(
+            self._payload()["current_url"],
+            "https://shop.example/search?q=x&page=4",
+        )
+
+    def test_a_worker_that_regressed_does_not_erase_a_better_url(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        R.demote_resumption_artifact(_State(current_url="https://shop.example/"), "shop.example")
+        self.assertEqual(
+            self._payload()["current_url"],
+            "https://shop.example/search?q=x&page=4",
+            "bouncing to the home page must not overwrite the deep URL",
+        )
+
+    def test_dead_ends_accumulate_across_workers(self):
+        first = [{"tool": "browser_click_at", "args": "{}", "result": "no effect", "success": False}]
+        R.save_resumption_artifact(_State(step_history=first), "shop.example")
+        second = [{"tool": "browser_scroll", "args": "{}", "result": "no movement", "success": False}]
+        R.demote_resumption_artifact(_State(step_history=second), "shop.example")
+        tools = [f["tool"] for f in self._payload()["recent_failures"]]
+        self.assertIn("browser_click_at", tools, "worker 1's dead end was lost")
+        self.assertIn("browser_scroll", tools, "worker 2's dead end was not added")
+
+    def test_hops_increment_and_are_visible(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        R.demote_resumption_artifact(_State(), "shop.example")
+        self.assertEqual(self._payload()["hops"], 1)
+        R.demote_resumption_artifact(_State(), "shop.example")
+        self.assertEqual(self._payload()["hops"], 2)
+
+    def test_the_lineage_ends_rather_than_carrying_forever(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        for _ in range(R.RESUMPTION_MAX_HOPS):
+            R.demote_resumption_artifact(_State(), "shop.example")
+        self.assertFalse(R.demote_resumption_artifact(_State(), "shop.example"))
+        self.assertFalse(os.path.exists(R.RESUMPTION_PATH))
+
+    def test_another_domain_is_not_ours_to_touch(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        self.assertFalse(R.demote_resumption_artifact(_State(), "other.example"))
+        self.assertTrue(os.path.exists(R.RESUMPTION_PATH))
+
+    def test_a_demoted_artifact_loads_cold_and_still_carries_progress(self):
+        R.save_resumption_artifact(_State(), "shop.example")
+        R.demote_resumption_artifact(_State(), "shop.example")
+
+        async def _fake(*a, **kw):
+            raise AssertionError("no session_id, so liveness must not be probed")
+
+        with mock.patch.object(R, "_request_with_backoff", _fake):
+            got = asyncio.run(R.load_resumption_artifact("shop.example"))
+        self.assertIsNotNone(got)
+        self.assertFalse(got["warm"], "a demoted artifact can never be warm")
+        self.assertEqual(got["current_url"], "https://shop.example/search?q=x&page=4")
+        self.assertEqual(got["hops"], 1)
+
+    def test_demoting_nothing_is_a_no_op(self):
+        self.assertFalse(R.demote_resumption_artifact(_State(), "shop.example"))

@@ -370,6 +370,7 @@ class DelegateBrowserTaskTool(Tool):
             clear_resumption_artifact,
             load_resumption_artifact,
             register_session_tools,
+            demote_resumption_artifact,
             save_resumption_artifact,
         )
         from superbrowser_bridge.memory import Memory
@@ -1072,7 +1073,18 @@ class DelegateBrowserTaskTool(Tool):
                 resume_url = prev_url or checkpoint_url
                 parts.append(
                     f"\n## RESUMPTION — a previous worker already got this far\n"
-                    f"A previous worker ran out of its step budget "
+                    + (
+                        # Say how many have already tried. A worker that
+                        # believes it is the first will re-run the obvious
+                        # approach; one that knows it is the third reads the
+                        # dead-end list as binding rather than advisory.
+                        f"**You are worker {int(resumption.get('hops', 0)) + 1} on this task.** "
+                        f"{int(resumption.get('hops', 0))} previous worker"
+                        f"{'' if int(resumption.get('hops', 0)) == 1 else 's'} failed; the "
+                        f"tactics below are their combined dead ends, not one worker's.\n"
+                        if int(resumption.get("hops", 0) or 0) > 0 else ""
+                    )
+                    + f"A previous worker ran out of its step budget "
                     f"{int(resumption.get('age_s') or 0)}s ago. Its browser session has "
                     f"since closed, so you open your own — but do NOT start from the "
                     f"site's home page.\n\n"
@@ -1494,14 +1506,22 @@ CRITICAL RULES:
             elif net_blocked_early:
                 clear_resumption_artifact()
             elif resumption is not None:
-                # We resumed and still failed. That means the resumption
-                # artifact is the carrier of the bug, not a solution.
+                # We resumed and still failed. The thing that poisons the
+                # next worker is the LIVE session — it walks the new LLM
+                # straight back into the stuck page — not the knowledge of
+                # where we got to or what we already tried. Clearing threw
+                # all three away together, so with a 50-step worker cap a
+                # task needing three workers carried knowledge over the
+                # first handoff and none after it. Demote instead: drop the
+                # session, keep the furthest URL, merge both workers' dead
+                # ends, and stop entirely after RESUMPTION_MAX_HOPS.
                 print(
-                    "\n>> resumption artifact consumed but task still failed "
-                    "— clearing artifact instead of re-saving to stop the "
-                    "self-poisoning loop"
+                    "\n>> resumption consumed but task still failed "
+                    "— demoting artifact (session dropped, progress kept)"
                 )
-                clear_resumption_artifact()
+                demote_resumption_artifact(
+                    worker_state, domain, progress_note=(content or "")[:1200],
+                )
             else:
                 already_requested_help = any(
                     s.get("tool") == "browser_request_help"
