@@ -36,6 +36,30 @@ describe('shouldBlockRequest', () => {
     expect(shouldBlockRequest('https://www.chase.com/assets/adservice-banner.js', PAGE)).toBe(false);
   });
 
+  it('does not block a first-party bundle DIRECTORY named for analytics', () => {
+    // Measured on nike.com, where the old patterns would have aborted 15
+    // first-party requests: the whole code-split bundle lives under
+    // /static/analytics-client/, so every numbered chunk matched. A
+    // file-name match was not the only shape of this bug.
+    const nike = 'https://www.nike.com/';
+    for (const u of [
+      'https://www.nike.com/static/analytics-client/public/analytics-client.min.js',
+      'https://www.nike.com/static/analytics-client/public/9970.chunk.5cf733.js',
+      'https://www.nike.com/static/analytics-client/public/6168.chunk.e56ac6.js',
+    ]) {
+      expect(shouldBlockRequest(u, nike), u).toBe(false);
+    }
+  });
+
+  it('does not block first-party telemetry on the site\'s own subdomain', () => {
+    // capitalone.com routes Snowplow through its own host. Blocking a
+    // site's own subdomain is how a "tracker" rule reaches page code.
+    expect(shouldBlockRequest(
+      'https://potomac-clickstream.capitalone.com/com.snowplowanalytics.snowplow/tp2',
+      'https://www.capitalone.com/',
+    )).toBe(false);
+  });
+
   it('still blocks third-party ad and tracker hosts', () => {
     for (const u of [
       'https://googleads.g.doubleclick.net/pagead/viewthroughconversion/1036322744/',
