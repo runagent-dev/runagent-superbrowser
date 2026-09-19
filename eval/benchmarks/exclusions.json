@@ -1,5 +1,5 @@
 {
-  "_doc": "Pre-registered exclusion rules and hand exclusions for the frozen hard split. Fill BEFORE running an arm comparison; never after seeing one arm's outcome. Every entry needs a reason. E0 reports results with and without these.",
+  "_doc": "Pre-registered exclusion rules and hand exclusions for the frozen hard split. Fill BEFORE running an arm comparison; never after seeing one arm's outcome. Every entry needs a reason. E0 reports results with and without these. task_exclusions entries need a rule id from `rules`. instruction_deviations records every task whose as-run instruction differs from the frozen benchmark wording; such a task is never silently re-labelled as a benchmark task.",
   "rules": [
     {
       "id": "site_unavailable",
@@ -15,12 +15,41 @@
       "id": "captcha_unsolved",
       "description": "Captcha challenge not cleared by solver in every paired arm",
       "adjudication": "deterministic marker in all arms"
+    },
+    {
+      "id": "host_model_mismatch",
+      "description": "The arms of a task were not all run on the study's pinned host model (protocol.model differs across the task's records). The same-model pin of the protocol is violated, so the task leaves every primary table; it is reported in the n=24 sensitivity line.",
+      "adjudication": "deterministic: protocol.model not identical across the task's arm records; never outcome-based"
     }
   ],
-  "task_exclusions": [],
+  "task_exclusions": [
+    {
+      "task_id": "dd44c665cec1e9c929a4c5f074e7844a",
+      "rule": "host_model_mismatch",
+      "experiment": "ablate10",
+      "reason": "spothero.com: 4 of 8 arms (no_deadend, fresh_vision, flat, no_ladder) ran on minimax/minimax-m3 after an operator config change; the other 4 on z-ai/glm-5.3-flash. Same-model pin violated. Not outcome-based: all 8 arms failed the task, so no numerator changes; denominators become 23.",
+      "recorded": "2026-09-16"
+    }
+  ],
   "legacy_66_task_reconciliation": {
     "status": "open",
     "owner": "user",
     "note": "List here the task_ids that made up the paper's 66-task run (or the rule that removed 8 tasks from the 74-task hard split) once known."
-  }
+  },
+  "instruction_deviations": [
+    {
+      "task_id": "85b284c18d7e78c9b5a9e074e7aa3b98",
+      "experiment": "ablate10",
+      "upstream_instruction": "View the cheapest apartment available for students at the University of Leeds with bills that include WIFI and cleaning services.",
+      "as_run_instruction": "View the cheapest apartment available for students at the University of Texas Austin under 2500 dollars",
+      "arms_affected": "all 8 (identical text in every arm; paired comparisons unaffected)",
+      "discarded_variant": {
+        "instruction": "View the cheapest apartment available for students at the University of Texas Austin with bills that include WIFI and cleaning services.",
+        "archived_under": "eval/runs/ablate10/_discarded_student_com/"
+      },
+      "reason": "REASON PENDING FROM AUTHOR \u2014 the instruction was rewritten by the authors before the arms ran; the Online-Mind2Web wording was never run under this experiment.",
+      "handling": "kept in the primary analysis and disclosed; the frozen benchmark file is unchanged (sha256 in manifest.json)",
+      "recorded": "2026-09-16"
+    }
+  ]
 }

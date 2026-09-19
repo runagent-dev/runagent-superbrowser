@@ -140,9 +140,13 @@ def iter_run_dirs(runs_root: Path, experiment: str) -> Iterator[Path]:
         yield p.parent
 
 
-def rebuild_results(runs_root: Path, experiment: str) -> Path:
-    """Regenerate results.jsonl from the per-run records (source of truth)."""
-    out = results_path(runs_root, experiment)
+def rebuild_results(runs_root: Path, experiment: str, out: Path | None = None) -> Path:
+    """Regenerate results.jsonl from the per-run records (source of truth).
+
+    ``out`` writes the rebuilt file elsewhere (e.g. a frozen copy under
+    ``eval/artifacts/``) and leaves the experiment's own results.jsonl alone.
+    """
+    out = Path(out) if out is not None else results_path(runs_root, experiment)
     tmp = out.with_suffix(".jsonl.tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     with tmp.open("w", encoding="utf-8") as f:

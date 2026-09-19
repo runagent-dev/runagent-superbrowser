@@ -98,3 +98,24 @@ def test_analyzer_can_read_a_combined_sweep(tmp_path, capsys):
     # E4 compares ledger vs no_deadend only: 2 arms x 3 tasks out of the 21-record pool
     assert "6/21 records" in out
     assert "MISSING" not in out
+
+
+def test_provider_errors_are_never_scored_as_task_failures(tmp_path):
+    """An api_error on one side of a pair drops the pair (there is no task
+    outcome to compare), and the run leaves its arm's denominator."""
+    from eval.core.harvest import build_record
+
+    recs = []
+    for task, (ok_a, ok_b) in {"t1": (True, False), "t2": (True, True), "t3": (False, True)}.items():
+        for arm, ok in (("ledger", ok_a), ("fifo", ok_b)):
+            final = "Found it" if ok else "no result"
+            if task == "t3" and arm == "ledger":
+                final = "The AI provider rejected the request because the API key is out of quota"
+            d = make_run_dir(tmp_path, experiment="x", arm=arm, task_id=task, judges={"webjudge": ok}, final=final)
+            recs.append(build_record(d))
+    arms = analysis.by_arm(recs)
+    pb = analysis.paired_binary(arms, "ledger", "fifo")
+    assert pb["n"] == 2 and pb["n_excluded"] == 1 and "api_error" in pb["excluded"]["t3:s0"]
+    summ = analysis.arm_summary(recs)
+    assert summ["ledger"]["n"] == 2 and summ["ledger"]["n_provider_errors"] == 1
+    assert summ["fifo"]["n"] == 3 and summ["fifo"]["n_provider_errors"] == 0

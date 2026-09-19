@@ -71,7 +71,8 @@ def main(argv=None) -> int:
     out = report.out_dir(NAME)
     md = [f"# Traces: {args.experiment} — {args.arm_a} vs {args.arm_b}", "",
           f"{len(cases)} discordant pairs (one arm succeeded, the other failed) of {len(pairing.keys)} paired runs; "
-          f"ranked by |Δ {args.metric}|. Selected AFTER the aggregate comparison in `eval/artifacts/{args.experiment}/`.", ""]
+          f"ranked by |Δ {args.metric}|. Selected AFTER the aggregate comparison (the paired tables the analyzers wrote under "
+          f"`eval/artifacts/`; for a combined sweep such as `{args.experiment}` those are the per-experiment analyzer dirs).", ""]
     for gap, ra, rb in cases[: args.top]:
         md += [f"## {ra.ids['task_id']} (seed {ra.ids['seed']}) — |Δ {args.metric}| = {gap:.3f}", "",
                f"Task: {json.loads((Path(ra.ids['run_dir']) / 'spec.json').read_text())['task']['instruction'] if (Path(ra.ids['run_dir']) / 'spec.json').exists() else ''}", "",

@@ -42,6 +42,19 @@ def test_frozen_hard_split_matches_manifest():
     assert all(t.critical_state for t in tasks)
 
 
+def test_as_run_ablation_subset_is_documented():
+    """`ablate24` is the subset the reported sweep ran. Its composition history
+    (author-supplied list, reachability screen, five swaps) must stay in the
+    subset note, and the excluded/deviating tasks must be members."""
+    subsets = load_subsets()
+    sub = subsets["ablate24"]
+    assert sub["n"] == 24 and len(sub["task_ids"]) == 24
+    assert "Swapped" in sub["note"] and "screened" in sub["note"].lower()
+    assert set(excluded_task_ids()) <= set(sub["task_ids"])
+    tasks = resolve_tasks("ablate24", benchmark="online_mind2web_hard")
+    assert len(tasks) == 24
+
+
 def test_subsets_resolve_and_are_pre_registered():
     subsets = load_subsets()
     assert "ablation24" in subsets and subsets["ablation24"]["n"] == 24
@@ -63,8 +76,33 @@ def test_stratified_subset_is_deterministic_and_covers_strata():
     assert len({site_type(t) for t in a}) == len({site_type(t) for t in tasks})
 
 
-def test_exclusions_hook_is_empty_until_user_fills_it():
-    assert excluded_task_ids() == {}
+def test_frozen_benchmark_files_match_manifest_digests():
+    """Every frozen benchmark file must hash to the digest recorded in
+    manifest.json. A local edit to a task instruction (which happened once,
+    in the working tree) silently turns a benchmark task into a custom one."""
+    import hashlib
+
+    manifest = json.loads((BENCH_DIR / "manifest.json").read_text())
+    for name, entry in manifest["files"].items():
+        digest = hashlib.sha256((BENCH_DIR / name).read_bytes()).hexdigest()
+        assert digest == entry["sha256"], f"{name} differs from the frozen digest in manifest.json"
+
+
+def test_exclusions_are_pre_registered_with_rule_and_reason():
+    """Hand exclusions must cite a rule id, a reason and a date; the rule must
+    exist. Instruction deviations must carry both wordings so the supplement
+    can print them side by side."""
+    from eval.core.tasks import load_exclusions
+
+    ex = load_exclusions()
+    rules = {r["id"] for r in ex.get("rules", [])}
+    for e in ex.get("task_exclusions", []):
+        assert e["task_id"] and e["rule"] in rules and e["reason"] and e["recorded"], e
+        assert "outcome" not in e["rule"], "exclusions must never be outcome-based"
+    for d in ex.get("instruction_deviations", []):
+        assert d["task_id"] and d["upstream_instruction"] and d["as_run_instruction"], d
+        assert d["upstream_instruction"] != d["as_run_instruction"]
+    assert set(excluded_task_ids()) == {e["task_id"] for e in ex.get("task_exclusions", [])}
 
 
 def test_arm_registry_integrity():

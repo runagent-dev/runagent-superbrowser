@@ -54,7 +54,21 @@ eval/runs/<experiment>/<arm>/<task_id>/seed<k>/
 ```
 
 `harvest.py` rebuilds a record from those files at any time (`python -m eval.core.harvest <run_dir>`);
-analyzers only read records + run directories.
+analyzers only read records + run directories. `python -m eval.core.record --experiment <name>` records
+every run directory that has no `run_record.json` yet (SDK audit-trail runs, crashed runs with `--rescue`)
+and `--rebuild-results --to <path>` freezes a `results.jsonl` that carries the analyzers' metrics.
+
+### Sweep audit, paper tables, supplement
+
+```bash
+python -m eval.core.audit_sweep --experiment ablate10         # provenance checks -> eval/artifacts/ablate10_audit/
+python -m eval.experiments.paper_tables --freeze              # copy analyzer + audit outputs into eval/artifacts/ablate10_paper/
+python -m eval.experiments.paper_tables                       # regenerate ../paper/tables/*.tex + numbers.tex (prose macros)
+python -m eval.experiments.paper_tables --check               # golden: fail if the paper's tables differ from the records
+python -m eval.supplement.build --experiment ablate10 --tier light   # ICLR supplementary bundle (<100 MB); --tier full for the archive
+```
+
+`PROTOCOL.md` ends with an "As-run deviations" section for the reported sweep; the audit checks each item.
 
 ## Arms (env toggles; empty = full system)
 
@@ -210,12 +224,14 @@ the same filter yields the same tasks on any machine, so a run is reproducible f
 |---|---|---|---|---|
 | `pilot5` | 5 | 2 easy / 1 med / 2 hard | low only | smoke test, not a paper result |
 | `pilot10` | 10 | 4 / 3 / 3 | low + medium | cost calibration, not a paper result |
-| `paper24` | 24 | 8 / 8 / 8 | unfiltered (4 high) | the paper's evaluation set |
+| `paper24` | 24 | 8 / 8 / 8 | unfiltered (4 high) | registered, never run |
+| `ablate24` | 24 | 16 / 3 / 5 | screened (low + medium) | **the set the reported sweep (`ablate10`) ran** — see `PROTOCOL.md` "As-run deviations" for its composition history |
 
 `paper24` is an equal-allocation level-stratified random sample of the full 300-task split, seeded from its
-filter string and frozen before any arm ran. Anti-bot risk is deliberately **not** filtered there: dropping
-hard-to-reach sites would bias the headline upward, and blocked sites are handled by the impossible-task
-rule in `PROTOCOL.md` instead. The pilots do filter, because their job is to exercise the pipeline rather
+filter string; it was registered but the reported sweep did not use it. Anti-bot risk is deliberately **not**
+filtered there: dropping hard-to-reach sites would bias the headline upward, and blocked sites are handled by
+the impossible-task rule in `PROTOCOL.md` instead. `ablate24` — the set that ran — *was* screened for
+reachability, which is why the paper states the upward bias explicitly. The pilots do filter, because their job is to exercise the pipeline rather
 than to measure it — never report a pilot as a result.
 
 **Freeze the selection before you run arms.** A task set must be fixed before results exist, otherwise

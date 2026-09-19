@@ -7,7 +7,11 @@ SPEC = ExperimentSpec(
     title="Perception reuse on/off",
     question="How much redundant perception (vision calls, cost, latency) does reuse of grounded perception save, and does the saving shrink on pages that change more?",
     arms=lambda args: [_arms.get("ledger"), _arms.get("fresh_vision")],
-    confirmatory=(("ledger", "fresh_vision"),),
+    default_tasks="ablate24",
+    # PROTOCOL.md pre-registers only C1/C2 (E2). This study's pair is SECONDARY:
+    # reported as diagnostic and Holm-adjusted with the other secondary tests.
+    confirmatory=(),
+    secondary=(("ledger", "fresh_vision"),),
     metrics=("vision_calls", "tool_calls", "worker_iterations", "wall_s", "usd"),
     notes=["Page-churn strata are measured from the vision fingerprints (fraction of consecutive vision passes with a changed DOM hash) on the ledger arm."],
 )

@@ -147,6 +147,29 @@ def mean_ci(xs: Sequence[float], *, seed: int = 0, n_boot: int = 5000) -> tuple[
     return (_mean(xs), means[int(0.025 * n_boot)], means[min(n_boot - 1, int(0.975 * n_boot))])
 
 
+# ------------------------------------------------------- multiplicity
+def holm(pvalues: Sequence[float]) -> list[float]:
+    """Holm step-down adjusted p-values (family-wise error control).
+
+    Returned in the input order. Used across the secondary paired comparisons
+    of a sweep: the pre-registered confirmatory pair(s) are reported unadjusted
+    and everything else is adjusted as one family, so a single significant
+    secondary result cannot be read as if it had been the only test run.
+    """
+    ps = [float(p) for p in pvalues]
+    m = len(ps)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: ps[i])
+    adj = [0.0] * m
+    running = 0.0
+    for rank, i in enumerate(order):
+        val = min(1.0, (m - rank) * ps[i])
+        running = max(running, val)
+        adj[i] = running
+    return adj
+
+
 # ---------------------------------------------------------------- trends
 def spearman_trend(levels: Sequence[float], values: Sequence[float]) -> tuple[float, float | None]:
     """Spearman rho (and p if scipy is available) between an ordered level and a metric."""

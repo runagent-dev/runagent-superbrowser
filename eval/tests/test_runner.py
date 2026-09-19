@@ -200,3 +200,26 @@ def test_children_are_reaped_not_orphaned(tmp_path, monkeypatch):
     killed.clear()
     assert R.reap_children() == 0 and killed == []
     assert R.reap_children() == 0
+
+
+def test_resume_redoes_provider_error_runs(tmp_path):
+    """A run recorded as api_error / harness_error is not a task outcome; a
+    --resume must archive it and run it again instead of skipping it forever."""
+    import json as _j
+    from eval.core import runner as R
+    from eval.core.arms import ARMS
+    from eval.core.protocol import DEFAULT_PROTOCOL
+    from eval.core.records import RunRecord
+    from eval.core.tasks import Task
+
+    task = Task(task_id="t1", benchmark="custom_dev", level="hard", website="e.com",
+                start_url="https://e.com", instruction="do it")
+    spec = R.RunSpec("exp", ARMS["ledger"], task, 0, R.run_dir_for(tmp_path, "exp", "ledger", "t1", 0),
+                     DEFAULT_PROTOCOL, "m", "orchestrator")
+    spec.run_dir.mkdir(parents=True)
+    RunRecord(ids={"run_id": spec.run_id}, protocol={}, outcome={"failure_reason": "api_error", "exclusion_label": "api_error"}).write(spec.run_dir)
+    (spec.run_dir / "run.log").write_text("LLM returned error: out of quota")
+    dest = R.archive_excluded_attempt(spec, "api_error")
+    assert dest is not None and dest.name.endswith("__api_error") and (dest / "run.log").exists()
+    assert not spec.run_dir.exists(), "the errored attempt is moved aside so the retry starts clean"
+    assert "api_error" in R.REDO_ON_RESUME and "harness_error" in R.REDO_ON_RESUME

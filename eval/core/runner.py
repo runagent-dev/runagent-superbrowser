@@ -169,6 +169,24 @@ def _install_signal_handlers() -> None:
     atexit.register(reap_children, "process exit")
 
 
+REDO_ON_RESUME = ("api_error", "harness_error")
+
+
+def archive_excluded_attempt(spec: RunSpec, reason: str | None) -> Path | None:
+    """Move a RECORDED run whose record is a provider/harness error out of the
+    way so ``--resume`` re-runs it. Kept, not deleted, like every attempt."""
+    d = spec.run_dir
+    if not d.exists():
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(d.stat().st_mtime))
+    dest = d.parents[2] / "_failed_attempts" / f"{spec.arm.name}__{spec.task.task_id}__seed{spec.seed}__{stamp}__{reason or 'excluded'}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.move(str(d), str(dest))
+    return dest
+
+
 def archive_failed_attempt(spec: RunSpec) -> Path | None:
     """Move a previous, unfinished attempt out of the way before re-running.
 
@@ -309,7 +327,10 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
     out: list[RunResultSummary] = []
     if dry_run:
         for i, s in enumerate(specs, 1):
-            flag = " (skip: done)" if resume and (s.run_dir / "run_record.json").exists() else ""
+            flag = ""
+            if resume and (s.run_dir / "run_record.json").exists():
+                prev = RunRecord.read(s.run_dir).outcome.get("failure_reason")
+                flag = f" (resume: redo, was {prev})" if prev in REDO_ON_RESUME else " (skip: done)"
             print(f"{i:4d}. seed{s.seed}  {s.task.task_id[:12]}  {s.arm.name:18s} side={s.arm.side:6s}"
                   f" topo={s.topology}{flag}")
             extra = {k: v for k, v in s.arm.env.items()}
@@ -351,8 +372,16 @@ def execute(specs: list[RunSpec], *, manage_server: bool, assumed_server_env: di
         for i, s in enumerate(specs, 1):
             if resume and (s.run_dir / "run_record.json").exists():
                 rec = RunRecord.read(s.run_dir)
-                out.append(RunResultSummary(s.run_id, "skipped", rec.success, rec.timing.get("wall_s"), "resume"))
-                continue
+                if rec.outcome.get("failure_reason") in REDO_ON_RESUME:
+                    # A provider refusal or harness crash says nothing about the
+                    # agent; leaving it in place would make --resume skip the run
+                    # for good and shrink every comparison it belongs to.
+                    dest = archive_excluded_attempt(s, rec.outcome.get("failure_reason"))
+                    print(f"  [resume] {s.run_id}: previous attempt was {rec.outcome.get('failure_reason')} -> archived "
+                          f"({dest.name if dest else '-'}); re-running")
+                else:
+                    out.append(RunResultSummary(s.run_id, "skipped", rec.success, rec.timing.get("wall_s"), "resume"))
+                    continue
             s.server_url = servers.ensure(s.arm.ts_env)
             print(f"\n=== [{i}/{len(specs)}] {s.run_id} ===  server={s.server_url}")
             t0 = time.time()

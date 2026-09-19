@@ -68,3 +68,20 @@ def test_wilson_bounds_are_exact_at_the_extremes():
     for k in range(11):
         lo, hi = wilson_ci(k, 10)
         assert lo <= k / 10 <= hi, f"point {k}/10 must lie inside its own interval"
+
+
+def test_holm_step_down():
+    from eval.core.stats import holm
+
+    # the seven paired tests of the reported sweep, in table order
+    ps = [0.219, 0.146, 0.754, 0.727, 1.0, 0.031, 1.0]
+    adj = holm(ps)
+    assert len(adj) == 7 and all(a >= p for a, p in zip(adj, ps))
+    assert abs(adj[5] - 0.217) < 1e-9          # 0.031 * 7
+    assert abs(adj[1] - 0.876) < 1e-9          # 0.146 * 6
+    assert adj[2] == adj[3] == adj[4] == adj[6] == 1.0
+    assert holm([]) == []
+    assert holm([0.01]) == [0.01]
+    # monotone: adjusted values never decrease along the sorted order
+    order = sorted(range(7), key=lambda i: ps[i])
+    assert all(adj[order[i]] <= adj[order[i + 1]] for i in range(6))

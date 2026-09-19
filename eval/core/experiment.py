@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from eval.core import analysis, report
+from eval.core import analysis, report, stats
 from eval.core.arms import Arm
 from eval.core.loaders import DEFAULT_RUNS_ROOT, records_frame
 from eval.core.records import RunRecord
@@ -27,7 +27,7 @@ class ExperimentSpec:
     title: str
     question: str
     arms: Callable[[argparse.Namespace], Sequence[Arm]]
-    default_tasks: str = "ablation24"
+    default_tasks: str = "ablate24"
     default_seeds: int = 1
     confirmatory: Sequence[tuple[str, str]] = ()      # (arm_a, arm_b) pairs tested first
     secondary: Sequence[tuple[str, str]] = ()
@@ -60,34 +60,63 @@ def per_run_rows(records: Sequence[RunRecord]) -> list[dict[str, Any]]:
     return df.to_dict(orient="records") if len(df) else []
 
 
+_SUMMARY_COLUMNS = ("n", "k", "tsr", "n_excluded", "n_provider_errors", "n_pre_excluded", "iterations", "tool_calls", "vision_calls",
+                    "prompt_mean", "prompt_peak", "prompt_peak_max", "ctx_peak", "ctx_peak_max", "n_over_snip_threshold",
+                    "input_tokens", "wall_s", "usd", "usd_cached", "usd_judge", "usd_per_success",
+                    "csd_observed", "csd_observed_pooled", "csd_events", "csd_lost", "csd_n_runs",
+                    "csd_task_given", "csd_task_given_pooled", "csd_task_given_events", "csd_task_given_lost", "csd_task_given_n_runs",
+                    "drr", "drr_n_runs", "repeated_actions", "rpr", "rpr_n_runs",
+                    "first_path_success", "first_path_n_runs", "first_path_source",
+                    "recovery_success", "recovery_n_runs", "failure_reasons")
+
+
+def _summary_rows(summary: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for arm, s in summary.items():
+        row = {"arm": arm}
+        for c in _SUMMARY_COLUMNS:
+            if c == "tsr":
+                row["tsr"] = s["tsr"]
+                row["wilson_low"], row["wilson_high"] = s["wilson"]
+            else:
+                row[c] = s.get(c)
+        rows.append(row)
+    return rows
+
+
 def standard_analyze(spec: ExperimentSpec, *, runs_root: Path = DEFAULT_RUNS_ROOT, recompute: bool = True,
                      records: Sequence[RunRecord] | None = None) -> dict[str, Any]:
-    recs = list(records) if records is not None else analysis.load(spec.name, runs_root=runs_root, recompute=recompute)
+    all_recs = list(records) if records is not None else analysis.load(spec.name, runs_root=runs_root, recompute=recompute)
     out = report.out_dir(spec.name)
-    result: dict[str, Any] = {"experiment": spec.name, "n_records": len(recs)}
-    if not recs:
+    result: dict[str, Any] = {"experiment": spec.name, "n_records": len(all_recs)}
+    if not all_recs:
         print(f"[{spec.name}] no records under {runs_root / spec.name}")
         return result
     # persist recomputed metrics back into the run dirs so results.jsonl stays the source of truth
-    for r in recs:
+    for r in all_recs:
         try:
             r.write(Path(r.ids["run_dir"]))
         except Exception:
             pass
-    report.write_csv(out / "per_run.csv", per_run_rows(recs))
+    # pre-registered hand exclusions leave EVERY primary table (per-arm rows
+    # included), so denominators agree with the paired n; the all-task summary
+    # is kept as a sensitivity artifact
+    recs, dropped = analysis.split_pre_registered(all_recs)
+    result["n_records_primary"] = len(recs)
+    result["pre_registered_exclusions"] = dropped
+    if dropped:
+        print(f"[{spec.name}] pre-registered exclusions applied: " + "; ".join(f"{t}: {why}" for t, why in dropped.items()))
+    report.write_csv(out / "per_run.csv", per_run_rows(all_recs))
     arms = analysis.by_arm(recs)
-    summary = analysis.arm_summary(recs)
+    summary = analysis.arm_summary(recs, apply_exclusions=False)
     result["arms"] = summary
     report.write_json(out / "arm_summary.json", summary)
-    rows = []
-    for arm, s in summary.items():
-        rows.append({"arm": arm, "n": s["n"], "k": s["k"], "tsr": s["tsr"], "wilson_low": s["wilson"][0], "wilson_high": s["wilson"][1],
-                     "n_excluded": s["n_excluded"], "iterations": s["iterations"], "tool_calls": s["tool_calls"],
-                     "vision_calls": s["vision_calls"], "prompt_mean": s["prompt_mean"], "prompt_peak": s["prompt_peak"],
-                     "input_tokens": s["input_tokens"], "wall_s": s["wall_s"], "usd": s["usd"], "usd_cached": s["usd_cached"],
-                     "usd_per_success": s["usd_per_success"], "csd_observed": s["csd_observed"], "drr": s["drr"],
-                     "repeated_actions": s["repeated_actions"], "rpr": s["rpr"], "first_path_success": s["first_path_success"],
-                     "recovery_success": s["recovery_success"], "failure_reasons": s["failure_reasons"]})
+    if dropped:
+        summary_all = analysis.arm_summary(all_recs, apply_exclusions=False)
+        result["arms_all_tasks"] = summary_all
+        report.write_json(out / "arm_summary_all_tasks.json", summary_all)
+        report.write_csv(out / "arm_summary_all_tasks.csv", _summary_rows(summary_all))
+    rows = _summary_rows(summary)
     report.write_csv(out / "arm_summary.csv", rows)
     tex_rows = [[report.tex_escape(r["arm"]), f"{r['k']}/{r['n']}", report.fmt(r["tsr"], "pct"),
                  report.fmt(r["iterations"]), report.fmt(r["tool_calls"]), report.fmt(r["vision_calls"]),
@@ -110,18 +139,27 @@ def standard_analyze(spec: ExperimentSpec, *, runs_root: Path = DEFAULT_RUNS_ROO
                 pm = analysis.paired_metric(arms, a, b, getter, name=m)
                 if pm["n"]:
                     paired_met.append(pm)
+    # Holm step-down over this experiment's SECONDARY comparisons (the
+    # confirmatory pairs were pre-registered and are reported unadjusted)
+    secondary = [pb for pb in paired_bin if not pb["confirmatory"]]
+    for pb, adj in zip(secondary, stats.holm([pb["p_value"] for pb in secondary])):
+        pb["p_holm"] = adj
+    for pb in paired_bin:
+        pb.setdefault("p_holm", None)
+        pb["holm_family"] = f"{spec.name}:secondary" if not pb["confirmatory"] else None
     result["paired_binary"] = paired_bin
     result["paired_metrics"] = paired_met
     if paired_bin:
         report.write_json(out / "paired_binary.json", paired_bin)
         report.write_csv(out / "paired_binary.csv", [{k: v for k, v in pb.items() if k not in ("excluded", "unpaired")} for pb in paired_bin])
         report.write_tex_table(out / "paired_binary.tex",
-                               ["Comparison", "n", "TSR A", "TSR B", "$\\Delta$ (pp)", "95\\% CI", "discordant", "McNemar p"],
+                               ["Comparison", "n", "TSR A", "TSR B", "$\\Delta$ (pp)", "95\\% CI", "discordant", "McNemar p", "Holm p"],
                                [[f"{report.tex_escape(pb['arm_a'])} vs {report.tex_escape(pb['arm_b'])}" + (" $^\\dagger$" if pb["confirmatory"] else ""),
                                  str(pb["n"]), f"{pb['k_a']}/{pb['n']}", f"{pb['k_b']}/{pb['n']}",
                                  report.fmt(100 * pb["diff"]), f"[{report.fmt(100 * pb['diff_ci_low'])}, {report.fmt(100 * pb['diff_ci_high'])}]",
-                                 f"{pb['a_only']}/{pb['b_only']}", report.fmt(pb["p_value"], "auto")] for pb in paired_bin],
-                               note="dagger = pre-registered confirmatory comparison; discordant = A-only/B-only successes")
+                                 f"{pb['a_only']}/{pb['b_only']}", report.fmt(pb["p_value"], "auto"),
+                                 report.fmt(pb["p_holm"], "auto") if pb["p_holm"] is not None else "--"] for pb in paired_bin],
+                               note="dagger = pre-registered confirmatory comparison (unadjusted); Holm p = step-down adjustment over the secondary comparisons of this experiment; discordant = A-only/B-only successes")
     if paired_met:
         report.write_csv(out / "paired_metrics.csv", paired_met)
     # figures
