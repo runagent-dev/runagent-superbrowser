@@ -45,6 +45,8 @@ eval/excluded_runs/
 eval/artifacts/*
 !eval/artifacts/e6_subelement/
 !eval/artifacts/ablate10_paper/
+!eval/artifacts/ablate10_paper/*.jsonl
+!eval/artifacts/ablate10_paper/tables/
 eval/**/__pycache__/
 # the global *.jsonl rule above must not hide the frozen benchmark task files
 !eval/benchmarks/*.jsonl
@@ -54,3 +56,11 @@ console/node_modules/
 console/dist/
 console/tsconfig.tsbuildinfo
 nanobot/superbrowser_gateway/console_dist/
+
+# BU Bench V1 plaintext tasks (decrypted locally by harness-bench; never commit)
+eval/benchmarks/bu_bench_v1.jsonl
+eval/benchmarks/bu_smoke.jsonl
+
+# Agent run scratch inside the bundled workspaces (screenshots, upload fixtures)
+nanobot/workspace_*/crops/
+nanobot/workspace_*/*upload*.txt
