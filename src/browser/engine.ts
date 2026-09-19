@@ -13,6 +13,7 @@ import type { Browser, Page, Target } from 'puppeteer-core';
 
 const puppeteer = puppeteerExtra as any;
 import { getStealthScript, getPlatformOverrideScript } from './stealth.js';
+import { shouldBlockRequest } from './request-blocking.js';
 import { PageWrapper } from './page.js';
 
 /**
@@ -360,18 +361,13 @@ export class BrowserEngine extends EventEmitter {
       await run(async () => {
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-          const url = req.url();
-
-          const blockedPatterns = [
-            /doubleclick\.net/,
-            /google-analytics\.com/,
-            /googletagmanager\.com/,
-            /facebook\.net.*\/tr/,
-            /analytics/,
-            /adservice/,
-          ];
-
-          if (blockedPatterns.some((p) => p.test(url))) {
+          // Host-anchored, and never same-site with the page. The old
+          // list tested substrings against the whole URL, so the bare
+          // pattern /analytics/ aborted first-party bundle chunks —
+          // chase.com's `analytics-OctagonAnalyticsLite.<hash>.chunk.js`
+          // among them — and left the page an empty document. See
+          // request-blocking.ts.
+          if (shouldBlockRequest(req.url(), page.url())) {
             req.abort().catch(() => {});
             return;
           }
