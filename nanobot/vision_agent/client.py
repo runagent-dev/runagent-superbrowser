@@ -184,6 +184,7 @@ class VisionAgent:
         task_instruction: str | None = None,
         cursor_trail: list[tuple[int, int]] | None = None,
         current_subgoal: Any | None = None,
+        cacheable: bool = True,
     ) -> VisionResponse:
         start = time.monotonic()
         # Subgoal id participates in the cache key — same screenshot
@@ -558,7 +559,7 @@ class VisionAgent:
 
             # Only remember bboxes when the screenshot was fresh. A stale
             # or partial pass would poison the next SoM overlay.
-            if parsed.screenshot_freshness == "fresh":
+            if cacheable and parsed.screenshot_freshness == "fresh":
                 self._last_response_bboxes[sid_key] = list(parsed.bboxes)
                 self._last_response_ts[sid_key] = time.monotonic()
                 self._last_response_url[sid_key] = url or ""
@@ -577,7 +578,24 @@ class VisionAgent:
             # non-fresh — caching a stale/uncertain pass would re-serve
             # those bboxes on the next call, which is exactly the
             # hallucination we're guarding against.
-            if parsed.screenshot_freshness == "fresh":
+            #
+            # `cacheable=False` is the caller's way of saying the pixels
+            # were untrustworthy — in practice a capture that came back
+            # blank. That case cannot be caught by the freshness check
+            # below, because freshness is the model's own opinion of the
+            # image and a model handed an empty page will cheerfully call
+            # it fresh. It matters more than it looks: the cache key is
+            # built from the DOM (`dom_hash` / `dom_text_hash`) and never
+            # from the image, so a frame captured during a re-render —
+            # DOM already committed, pixels not yet painted — keys to the
+            # exact entry the settled page will produce. Cache it and the
+            # empty-bbox answer outlives the race that produced it.
+            if not cacheable:
+                _log(
+                    f"cache PUT skipped (uncacheable capture)  "
+                    f"url={(url or '')[:60]}"
+                )
+            elif parsed.screenshot_freshness == "fresh":
                 await self._cache.put(key, parsed)
             else:
                 _log(

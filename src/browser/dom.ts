@@ -207,6 +207,16 @@ export interface PageState extends DOMState {
   url: string;
   title: string;
   screenshot?: string;
+  /** True when the capture carried no meaningful content — a mid-teardown
+   *  or pre-paint frame. Callers must not cache anything derived from it.
+   *  Only set when `useVision` requested a screenshot. */
+  screenshotBlank?: boolean;
+  /** Fraction of sampled pixels that differ from the modal tone (0..1).
+   *  Diagnostic companion to `screenshotBlank`. */
+  screenshotInk?: number;
+  /** How many captures it took to get a painted frame. >1 means the first
+   *  attempt came back blank and the page was given time to commit. */
+  screenshotAttempts?: number;
   scrollY: number;
   scrollHeight: number;
   viewportHeight: number;

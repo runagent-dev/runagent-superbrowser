@@ -1650,6 +1650,7 @@ class BrowserSessionState:
         selector_entries: list[dict] | None = None,
         iframe_signature: str = "",
         scroll_info: dict | None = None,
+        screenshot_blank: bool = False,
     ) -> list[dict] | str:
         """Async dispatch between the vision-preprocessor path and the
         legacy image-blocks path.
@@ -1723,6 +1724,11 @@ class BrowserSessionState:
                     image_width=img_w,
                     image_height=img_h,
                     task_instruction=self.task_instruction or None,
+                    # A frame that never painted must not seed the cache:
+                    # the key is built from the DOM, so empty bboxes would
+                    # be re-served once the page settles under the very
+                    # same key.
+                    cacheable=not screenshot_blank,
                 )
                 # analyze() sets image dims but NOT dpr (it takes no dpr arg),
                 # so the sync-screenshot epoch would otherwise carry dpr=1.0 and

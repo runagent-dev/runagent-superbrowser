@@ -16,6 +16,7 @@
  */
 
 import type { Page } from 'puppeteer-core';
+import { waitForFramesPainted } from './frame-paint.js';
 
 export type ErrorPageKind =
   | 'chrome-error'
@@ -87,21 +88,37 @@ export async function waitForPageReady(
  *   3. Layout-shift idle — `PerformanceObserver({ type: 'layout-shift' })`
  *      collects shifts (filtering `hadRecentInput`); resolves when no
  *      shifts have occurred for `quietMs`.
+ *   4. Cross-origin frame paint — every check above runs inside the top
+ *      document, where a cross-origin iframe is an opaque box: its
+ *      fonts, images and hydration raise no layout shift and touch no
+ *      `document.fonts` the parent can see. Steps 1-3 therefore report
+ *      'stable' over a page that is still a blank rectangle whenever
+ *      the content lives in such a frame. Step 4 probes the child
+ *      frames directly. It has its OWN budget rather than sharing
+ *      `maxMs`, because a third-party widget booting off a CDN does not
+ *      fit in the 1500ms that suffices for fonts and images, and
+ *      lengthening `maxMs` would slow down every ordinary page to pay
+ *      for it. Pages without content-sized child frames skip it for the
+ *      cost of one `page.frames()` read.
  *
- * Returns 'stable' when all three completed before `maxMs`, 'timeout'
- * when the hard cap fired. Either return value is safe — the caller
+ * Returns 'stable' when all four completed before their budgets,
+ * 'timeout' when a hard cap fired. Either return value is safe — the caller
  * proceeds in both cases. Wrapped in try/catch so a broken page
  * (e.g., closed mid-call) never throws.
  *
  * Configurable via env:
- *   VISUAL_STABLE_MAX_MS  (default 1500)  — hard cap
+ *   VISUAL_STABLE_MAX_MS  (default 1500)  — hard cap for steps 1-3
  *   VISUAL_STABLE_QUIET_MS (default 200)  — layout-shift idle window
- *   VISUAL_STABLE_DISABLE=1                — bypass entirely (legacy)
+ *   VISUAL_STABLE_FRAME_MS (default 4000) — hard cap for step 4;
+ *                                           `frameMsArg` overrides it
+ *   VISUAL_STABLE_DISABLE=1                — bypass steps 1-3 (legacy)
+ *   VISUAL_STABLE_FRAME_DISABLE=1          — bypass step 4
  */
 export async function waitForVisualStable(
   page: Page,
   maxMsArg?: number,
   quietMsArg?: number,
+  frameMsArg?: number,
 ): Promise<'stable' | 'timeout'> {
   if (process.env.VISUAL_STABLE_DISABLE === '1') return 'stable';
   const envMax = parseInt(process.env.VISUAL_STABLE_MAX_MS || '', 10);
@@ -114,8 +131,9 @@ export async function waitForVisualStable(
     50,
     Math.min(1000, quietMsArg ?? (Number.isFinite(envQuiet) ? envQuiet : 200)),
   );
+  let inner: 'stable' | 'timeout' = 'timeout';
   try {
-    return (await page.evaluate(async (args: { maxMs: number; quietMs: number }) => {
+    inner = (await page.evaluate(async (args: { maxMs: number; quietMs: number }) => {
       const start = performance.now();
       const remaining = () => Math.max(0, args.maxMs - (performance.now() - start));
 
@@ -211,8 +229,20 @@ export async function waitForVisualStable(
   } catch {
     // Page closed / navigated mid-evaluate — treat as not-stable but
     // don't fail the caller; the next screenshot path can handle it.
-    return 'timeout';
+    inner = 'timeout';
   }
+
+  // (4) Cross-origin frame paint. Runs even when the in-page steps
+  // timed out: the frame is the part of the page the agent is usually
+  // being asked to look at, so it is worth the wait regardless of what
+  // the parent document did.
+  let frames: 'painted' | 'timeout' | 'none' = 'none';
+  try {
+    frames = await waitForFramesPainted(page, frameMsArg);
+  } catch {
+    /* best-effort — a frame probe must never fail the caller */
+  }
+  return inner === 'stable' && frames !== 'timeout' ? 'stable' : 'timeout';
 }
 
 /**

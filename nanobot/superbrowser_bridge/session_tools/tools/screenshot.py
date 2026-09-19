@@ -65,17 +65,37 @@ class BrowserScreenshotTool(Tool):
             return reason
 
         self.s.screenshots_taken += 1
+        # bounds=true returns selectorEntries (with x/y/width/height) +
+        # devicePixelRatio so we can draw bbox overlays before the
+        # screenshot goes to the vision LLM.
+        params = {"vision": "true", "bounds": "true"}
+        # Honour the post-navigation settle flag. This path used to ignore
+        # it entirely, so the one frame the brain actually reasons over was
+        # the only frame that never waited for fonts, images, layout-shift
+        # idle or a cross-origin widget to paint.
+        wanted_settle = bool(getattr(self.s, "_needs_visual_settle", False))
+        if wanted_settle:
+            params["settle"] = "true"
         r = await _request_with_backoff(
             "GET",
             f"{SUPERBROWSER_URL}/session/{session_id}/state",
-            # bounds=true returns selectorEntries (with x/y/width/height) +
-            # devicePixelRatio so we can draw bbox overlays before the
-            # screenshot goes to the vision LLM.
-            params={"vision": "true", "bounds": "true"},
-            timeout=15.0,
+            params=params,
+            # A settle can spend its own budget plus the cross-origin frame
+            # budget before /state returns, so give it more room than the
+            # unsettled path.
+            timeout=25.0 if wanted_settle else 15.0,
         )
         r.raise_for_status()
         data = r.json()
+
+        screenshot_blank = bool(data.get("screenshotBlank"))
+        if wanted_settle and not screenshot_blank:
+            # Disarm only on a capture that painted — a blank one leaves
+            # the flag set so the next attempt settles too.
+            try:
+                self.s._needs_visual_settle = False
+            except Exception:
+                pass
 
         actual_url = data.get("url", self.s.current_url)
         if actual_url:
@@ -86,13 +106,31 @@ class BrowserScreenshotTool(Tool):
                 self.s._last_scroll_signature = scroll_sig
             except Exception:
                 pass
-            self.s.mark_screenshot_taken(
-                actual_url,
-                self.s.hash_page_content(data.get("elements", ""), scroll_sig=scroll_sig),
-            )
+            if not screenshot_blank:
+                # Marking a blank capture would be self-defeating: the
+                # dedup key is (url, DOM content hash), and a frame caught
+                # before paint has the SAME DOM as the settled page. The
+                # re-screenshot that would finally show the content gets
+                # refused as a duplicate, and the agent is stuck looking
+                # at a white page it is no longer allowed to re-take.
+                self.s.mark_screenshot_taken(
+                    actual_url,
+                    self.s.hash_page_content(data.get("elements", ""), scroll_sig=scroll_sig),
+                )
         self.s.log_activity(f"screenshot({actual_url[:50] if actual_url else '?'})")
         self.s.record_step("browser_screenshot", "", f"url={actual_url[:60] if actual_url else '?'}")
         caption = _format_state(data, self.s)
+        if screenshot_blank:
+            # Say so plainly. Without this the model reads an empty page as
+            # fact and concludes the content does not exist, when what it
+            # is looking at is a frame captured before the page painted.
+            caption += (
+                "\n[PAINT] This capture came back BLANK — the page had not "
+                "rendered yet (a cross-origin widget or a component still "
+                "mounting). Do NOT conclude the content is missing. Wait "
+                "briefly with browser_wait_for, or re-screenshot, before "
+                "judging what is on the page."
+            )
         caption += f"\n[Screenshots taken: {self.s.screenshots_taken} (unlimited)]"
         if data.get("screenshot"):
             entries = data.get("selectorEntries") or []
@@ -129,6 +167,10 @@ class BrowserScreenshotTool(Tool):
                 # epoch's scroll anchor so a later click_at/type_at can
                 # detect a scroll-since-screenshot and refuse stale coords.
                 scroll_info=data.get("scrollInfo"),
+                # Never let bboxes derived from an unpainted frame persist
+                # in the vision cache — the key is DOM-derived, so they
+                # would be served back for the settled page too.
+                screenshot_blank=screenshot_blank,
             )
         return caption
 

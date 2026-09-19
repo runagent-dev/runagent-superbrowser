@@ -1624,12 +1624,15 @@ def _schedule_vision_prefetch(
             params: dict[str, str] = {
                 "vision": "true", "bounds": "true", "pageref": "keep",
             }
-            if getattr(state, "_needs_visual_settle", False):
+            wanted_settle = bool(getattr(state, "_needs_visual_settle", False))
+            if wanted_settle:
                 params["settle"] = "true"
-                try:
-                    state._needs_visual_settle = False
-                except Exception:
-                    pass
+                # NB: the flag is NOT cleared here. It used to be, which
+                # meant a background prefetch consumed the one settle a
+                # navigation buys and the brain's own screenshot — which
+                # never asks for settle on its own — got the unsettled
+                # frame. Clear it below, and only once a capture actually
+                # came back painted.
             # Bump prefetch timeout when settle is active — the TS
             # waitForVisualStable can spend up to VISUAL_STABLE_MAX_MS
             # (default 1500ms) before /state returns.
@@ -1646,6 +1649,27 @@ def _schedule_vision_prefetch(
             b64 = data.get("screenshot")
             if not b64:
                 return None
+            # A blank capture is worth nothing to the prefetch and is
+            # actively harmful if analysed: the vision cache is keyed on
+            # the DOM, so a frame caught mid-re-render (DOM committed,
+            # pixels not yet painted) would store empty bboxes under the
+            # key the settled page is about to ask for. The TS side has
+            # already retried; if it is still blank, drop the prefetch and
+            # leave the cache untouched. The synchronous screenshot path
+            # will capture again later, and the settle flag stays armed
+            # for it.
+            if data.get("screenshotBlank"):
+                print(
+                    f"  [vision prefetch skipped: blank frame "
+                    f"(ink={data.get('screenshotInk')}, "
+                    f"attempts={data.get('screenshotAttempts')})]"
+                )
+                return None
+            if wanted_settle:
+                try:
+                    state._needs_visual_settle = False
+                except Exception:
+                    pass
             agent = get_vision_agent()
             img_w, img_h = _read_image_dims(b64)
             elements = data.get("elements", "")

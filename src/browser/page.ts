@@ -22,6 +22,7 @@ import { DownloadMonitor } from './download-monitor.js';
 import { validateUrl } from '../server/auth.js';
 import type { FailureReason } from '../agent/types.js';
 import { sanitizeImageBuffer } from './image-safety.js';
+import { measurePaint, waitForFramesPainted } from './frame-paint.js';
 import {
   waitForPageReady,
   waitForVisualStable,
@@ -239,7 +240,15 @@ export class PageWrapper {
     // space ABOVE where text actually lives by click time. Hard cap at
     // 1500ms means worst-case adds ~1500ms to a cold first navigation.
     // VISUAL_STABLE_DISABLE=1 to bypass.
-    await waitForVisualStable(this.page).catch(() => {});
+    //
+    // The cross-origin frame step gets a deliberately small budget HERE.
+    // Navigation already spends up to 5000ms on readiness plus 800ms of
+    // idle, and a page carrying a third-party frame that never fills (an
+    // ad slot, a consent shim) would otherwise add the full frame budget
+    // to every single navigation. It is affordable to be impatient at
+    // this point: navigate arms the bridge's settle flag, so the
+    // brain-facing screenshot asks for the full wait when it matters.
+    await waitForVisualStable(this.page, undefined, undefined, 1200).catch(() => {});
 
     // Auto-wait for Cloudflare challenge if detected
     await this.waitForCloudflare();
@@ -443,6 +452,68 @@ export class PageWrapper {
   async screenshotBase64(quality: number = 70): Promise<string> {
     const buffer = await this.screenshot(quality);
     return buffer.toString('base64');
+  }
+
+  /**
+   * Capture a screenshot for the vision path, retrying while the frame
+   * comes back blank.
+   *
+   * The race this closes: a component that re-renders on input unmounts
+   * its subtree, paints one empty frame, then remounts. Anything that
+   * captures on the success edge of a click or a scroll — the async
+   * vision prefetch does exactly that, with no wait at all — has a real
+   * chance of sampling the empty frame. The DOM is already populated by
+   * then, so the blank image keys to the same cache entry the settled
+   * page will produce, and the empty-bbox result outlives the race that
+   * caused it.
+   *
+   * Between attempts we spend the wait on `waitForFramesPainted` rather
+   * than a flat sleep, so an iframe-hosted page (where blank frames are
+   * overwhelmingly concentrated) gets the one wait that can actually
+   * resolve it. The frame helper returns immediately on pages with no
+   * child frames, and the residual sleep covers the same-document case.
+   *
+   * Always returns a frame. When every attempt came back blank, the
+   * caller gets the last one plus `blank: true` and decides what to do
+   * — the contract is "never silently pass off a blank as settled", not
+   * "never return a blank".
+   *
+   * Configurable via env:
+   *   BLANK_FRAME_RETRIES (default 2) — extra attempts after the first
+   *   BLANK_FRAME_DISABLE=1           — capture once, never measure
+   */
+  async captureVisionScreenshot(quality: number = 70): Promise<{
+    b64: string;
+    blank: boolean;
+    ink: number;
+    attempts: number;
+  }> {
+    const envRetries = parseInt(process.env.BLANK_FRAME_RETRIES || '', 10);
+    const retries = Math.max(0, Math.min(5, Number.isFinite(envRetries) ? envRetries : 2));
+    let last: Buffer = Buffer.alloc(0);
+    let stats = { blank: false, ink: 1, contentBands: 10, contentRun: 10, stdev: 255 };
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      last = await this.screenshot(quality);
+      stats = await measurePaint(last);
+      if (!stats.blank) {
+        return { b64: last.toString('base64'), blank: false, ink: stats.ink, attempts: attempt + 1 };
+      }
+      if (attempt === retries) break;
+      // Escalating budget: a hydration gap clears in a few hundred ms, a
+      // cold third-party widget needs seconds.
+      const budget = 400 * (attempt + 1);
+      try {
+        await waitForFramesPainted(this.page, budget);
+      } catch { /* best-effort */ }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return {
+      b64: last.toString('base64'),
+      blank: true,
+      ink: stats.ink,
+      attempts: retries + 1,
+    };
   }
 
   // --- Element interaction ---
@@ -4952,8 +5023,15 @@ export class PageWrapper {
     this.priorSelectorMap = domResult.selectorMap;
 
     let screenshot: string | undefined;
+    let screenshotBlank: boolean | undefined;
+    let screenshotInk: number | undefined;
+    let screenshotAttempts: number | undefined;
     if (useVision) {
-      screenshot = await this.screenshotBase64();
+      const shot = await this.captureVisionScreenshot();
+      screenshot = shot.b64;
+      screenshotBlank = shot.blank;
+      screenshotInk = shot.ink;
+      screenshotAttempts = shot.attempts;
     }
 
     let accessibilityTree: string | undefined;
@@ -4993,6 +5071,9 @@ export class PageWrapper {
     return {
       ...domResult,
       screenshot,
+      screenshotBlank,
+      screenshotInk,
+      screenshotAttempts,
       accessibilityTree,
       pendingDialogs,
       consoleErrors,

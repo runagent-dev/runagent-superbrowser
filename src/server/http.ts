@@ -992,6 +992,13 @@ export function createHttpServer(
         url: state.url,
         title: state.title,
         screenshot: useVision ? state.screenshot : undefined,
+        // Did the capture actually paint? A blank frame keys to the same
+        // vision-cache entry a settled one would (the key is DOM-derived,
+        // never pixel-derived), so the bridge has to be told not to cache
+        // anything computed from it. Absent when vision wasn't requested.
+        screenshotBlank: useVision ? state.screenshotBlank : undefined,
+        screenshotInk: useVision ? state.screenshotInk : undefined,
+        screenshotAttempts: useVision ? state.screenshotAttempts : undefined,
         elements: state.elementTree.clickableElementsToString(),
         scroll_surfaces: scrollSurfaces.map((s2) => ({
           selector: s2.selector, region: s2.region, label: s2.label,
