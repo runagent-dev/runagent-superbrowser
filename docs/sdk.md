@@ -229,6 +229,56 @@ print(client.run(task="find the cheapest 4-star hotel in Sylhet this weekend"))
 This is the generic equivalent of `SuperBrowser(remote=True, persistent=True,
 agent_id="<agent_id>")` — use whichever fits your stack.
 
+## Audit trail (per-run evidence)
+
+`SuperBrowser(audit_dir=...)` makes every in-process run leave the evaluation
+harness's run directory, so a run you launch from the SDK is a first-class run
+for the research tooling (judges, analyzers, the supplement builder):
+
+```python
+from runagent_superbrowser import SuperBrowser
+
+sb = SuperBrowser(auto_start_server=True, audit_dir="eval/runs")   # or SUPERBROWSER_AUDIT_DIR
+res = sb.run("Find the 5-day price chart for Bitcoin.", url="https://www.google.com/finance/", mode="browser")
+print(res.audit_dir)   # eval/runs/sdk/ledger/<task_id>/seed0/
+```
+
+```
+<audit_dir>/<experiment=sdk>/<arm=ledger>/<task_id>/seed<N>/
+  spec.json  meta.json  manifest.json  result.txt  usage.json  config.redacted.json
+  workers/<wid>.json + _roster.jsonl     worker transcripts (+ every role that ran)
+  ledgers/<role_id>/                     events, steps, iterations, ledger.json, live_context.jsonl.gz,
+                                         vision_calls.jsonl, clicks.jsonl, task_summary.json
+  screenshots/NNN-*.jpg + index.jsonl    the ordered frames a screenshot judge scores
+```
+
+What it does and does not do:
+
+- **No behaviour change.** It only turns on the bridge's own gated writers
+  (`SUPERBROWSER_TRACE_VISION/CLICKS/SCREENSHOTS`, `SUPERBROWSER_EVAL_CONTEXT_DUMP`,
+  `SUPERBROWSER_EVAL_CAPTURE_DIR`) for the duration of the run and restores the
+  environment afterwards. The frozen research protocol's confound pins are *not*
+  applied; `manifest.json` records whatever env, git commit (+ diff hash), prompt
+  (`SOUL.md`) hashes, model defaults and engine `/health` were in effect.
+- **Task identity.** `run(..., audit_task={...})` labels the run (pass
+  `eval.core.tasks.Task.to_dict()` to label a verbatim benchmark task, as
+  `examples/03_browser_mode.py` does); otherwise the task id is derived from the
+  instruction and URL. A seed whose run was already judged is never overwritten
+  (`audit_seed` bumps); a stale unjudged attempt is moved to `_failed_attempts/`.
+- **Robust to timeouts and interrupts.** `meta.json` is written at start with
+  `stop_reason: running`, per-iteration rows are banked as they happen, and the
+  terminal files are written in a `finally`. If the process dies, recover with
+  `python -m eval.core.record --experiment sdk --rescue`.
+- **Judge / record afterwards** (needs the repo checkout):
+  `python -m eval.core.judge --experiment sdk` (WebJudge + answer judge →
+  `judges/`, `run_record.json`, `results.jsonl`) or
+  `python -m eval.core.record --experiment sdk` (record without judging).
+- **Screenshots.** The bridge freezes its screenshot directory when it is first
+  imported, so the recorder points it at a per-process inbox in the constructor
+  and moves the frames into the run directory when the run ends. Two
+  `SuperBrowser` instances with different `audit_dir`s in one process are not
+  supported.
+
 ## Constructor reference
 
 ```python

@@ -28,9 +28,7 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -39,38 +37,27 @@ from typing import Any
 from eval import _bootstrap  # noqa: F401  (sys.path + .env)
 from eval._bootstrap import DEFAULT_CONFIG_PATH, NANOBOT_TREE
 
-MEMORY_BASE = Path("/tmp/superbrowser")
-LEDGER_FILES = ("events.jsonl", "steps.jsonl", "facts.jsonl", "episodic.jsonl", "ledger.json",
-                "vision_calls.jsonl", "clicks.jsonl", "live_context.jsonl.gz", "screenshots.jsonl")
-TASK_LEVEL_FILES = ("step_history.json", "step_history.md", "task_summary.json", "usage.json", "checkpoint.json")
-SECRET_KEYS = ("apikey", "api_key", "token", "secret", "password")
+from superbrowser_bridge import audit as _audit
+from superbrowser_bridge.audit import LEDGER_FILES, SECRET_KEYS, TASK_LEVEL_FILES  # noqa: F401  (re-exported)
+
+# Module global on purpose: tests monkeypatch ``run_one.MEMORY_BASE`` and the
+# wrappers below read it at call time.
+MEMORY_BASE = _audit.MEMORY_BASE
 
 
 # --------------------------------------------------------------------- config
 def _redact(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: ("***" if any(s in k.lower() for s in SECRET_KEYS) and isinstance(v, str) and v else _redact(v))
-                for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_redact(x) for x in obj]
-    return obj
+    return _audit.redact(obj)
 
 
 def prepare_nanobot_config(run_dir: Path, *, overrides: dict[str, Any], model: str | None) -> tuple[Path, dict[str, Any]]:
     """Patch agents.defaults with the protocol pins (+ model) into a private
-    temp config, return (path, redacted_effective_config)."""
+    temp config, return (path, redacted_effective_config). The writer lives in
+    ``superbrowser_bridge.audit`` so the SDK's audit trail shares it."""
     src = Path(os.environ.get("NANOBOT_CONFIG", str(DEFAULT_CONFIG_PATH)))
-    data: dict[str, Any] = json.loads(src.read_text()) if src.exists() else {}
-    defaults = data.setdefault("agents", {}).setdefault("defaults", {})
-    defaults.update(overrides)
-    if model:
-        defaults["model"] = model
-    fd, tmp = tempfile.mkstemp(prefix="sb-eval-config-", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f)
-    os.chmod(tmp, 0o600)
-    (run_dir / "config.redacted.json").write_text(json.dumps(_redact(data), indent=2))
-    return Path(tmp), _redact(defaults)
+    tmp, effective = _audit.redact_config(run_dir, overrides=dict(overrides or {}), model=model, config_path=src)
+    assert tmp is not None
+    return tmp, effective
 
 
 # ------------------------------------------------------------------ topologies
@@ -78,6 +65,7 @@ async def _run_orchestrator(spec: dict[str, Any], framed_task: str, timeout: flo
     from nanobot import Nanobot
     from runagent_superbrowser._capture import run_and_capture
     from runagent_superbrowser.modes import apply_mode
+    from superbrowser_bridge.audit import ROSTER_NAME, AuditHook
     from superbrowser_bridge.memory import Memory, set_orchestrator_memory
     from superbrowser_bridge.orchestrator_tools import register_orchestrator_tools
     from superbrowser_bridge.usage import UsageHook, pop, snapshot, track_task
@@ -86,7 +74,13 @@ async def _run_orchestrator(spec: dict[str, Any], framed_task: str, timeout: flo
     provision()
     bot = Nanobot.from_config(workspace=str(workspace_for("orchestrator")))
     register_orchestrator_tools(bot)
-    directive = apply_mode(bot, "browser")
+    # "browser" is the protocol default (the paper's sweeps pin it so every task
+    # drives the engine). SUPERBROWSER_EVAL_MODE=auto leaves the full topology in
+    # place — the orchestrator may answer via the search worker instead — which is
+    # what the cross-harness benchmark uses, since the other harnesses also have
+    # fetch/search tools. The value is recorded in the run's env snapshot.
+    mode = os.environ.get("SUPERBROWSER_EVAL_MODE", "browser").strip() or "browser"
+    directive = apply_mode(bot, mode)
     strip_non_browser_tools(bot)
 
     short = uuid.uuid4().hex[:8]
@@ -95,6 +89,9 @@ async def _run_orchestrator(spec: dict[str, Any], framed_task: str, timeout: flo
     set_orchestrator_memory(memory)
     hook = memory.attach(bot)
     memory.set_goal(spec["task"]["instruction"][:300])
+    cap = os.environ.get("SUPERBROWSER_EVAL_CAPTURE_DIR")
+    audit_hook = AuditHook("orchestrator", memory=memory, task_id=task_id,
+                           roster_path=Path(cap) / ROSTER_NAME if cap else None)
 
     prompt = f"{directive}\n\n{framed_task}" if directive else framed_task
     out: dict[str, Any] = {"orch_task_id": task_id, "stop_reason": "ok", "error": None, "final_answer": "",
@@ -103,7 +100,7 @@ async def _run_orchestrator(spec: dict[str, Any], framed_task: str, timeout: flo
     try:
         with track_task(task_id):
             text, raw = await run_and_capture(bot, prompt, session_key,
-                                              hooks=[hook, UsageHook("orchestrator")], timeout=timeout)
+                                              hooks=[hook, UsageHook("orchestrator"), audit_hook], timeout=timeout)
         out["final_answer"], out["raw_content"] = text, raw
     except asyncio.TimeoutError:
         out["stop_reason"] = "timeout"
@@ -229,41 +226,12 @@ async def _run_flat(spec: dict[str, Any], framed_task: str, timeout: float | Non
 def harvest_memory_dirs(run_dir: Path, role_task_ids: list[str]) -> list[str]:
     """Copy every /tmp/superbrowser/<id>/ the run produced (orchestrator +
     each worker seen in workers/) into run_dir/ledgers/<id>/."""
-    ids: list[str] = list(role_task_ids)
-    for tf in sorted((run_dir / "workers").glob("*.json")):
-        if tf.stem not in ids:
-            ids.append(tf.stem)
-    dest_root = run_dir / "ledgers"
-    for tid in ids:
-        src = MEMORY_BASE / tid
-        if not src.exists():
-            continue
-        dest = dest_root / tid
-        dest.mkdir(parents=True, exist_ok=True)
-        for name in LEDGER_FILES:
-            p = src / "memory" / name
-            if p.exists():
-                shutil.copy2(p, dest / name)
-        for name in TASK_LEVEL_FILES:
-            p = src / name
-            if p.exists():
-                shutil.copy2(p, dest / name)
-    return ids
+    return _audit.harvest_memory_dirs(run_dir, role_task_ids, memory_base=MEMORY_BASE)
 
 
 def index_screenshots(run_dir: Path) -> int:
-    """Count screenshots; write a fallback index only if the bridge did not
-    (it writes ``index.jsonl`` itself when SUPERBROWSER_TRACE_SCREENSHOTS=1)."""
-    d = run_dir / "screenshots"
-    if not d.exists():
-        return 0
-    files = sorted(p for p in d.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
-    if not (d / "index.jsonl").exists():
-        with (d / "index.jsonl").open("w", encoding="utf-8") as f:
-            for i, p in enumerate(files):
-                f.write(json.dumps({"idx": i, "file": p.name, "bytes": p.stat().st_size,
-                                    "mtime": p.stat().st_mtime, "source": "unknown"}) + "\n")
-    return len(files)
+    """Count screenshots; write a fallback index only if the bridge did not."""
+    return _audit.index_screenshots(run_dir)
 
 
 # ----------------------------------------------------------------------- main

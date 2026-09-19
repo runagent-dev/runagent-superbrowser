@@ -147,6 +147,9 @@ class SuperBrowser:
         base_url: str | None = None,
         local_agent_url: str | None = None,
         local_agent_id: str | None = None,
+        audit_dir: str | Path | None = None,
+        audit_experiment: str = "sdk",
+        audit_arm: str = "ledger",
     ) -> None:
         # Load .env FIRST so .env values are visible below and to the bridge.
         # Explicit kwargs still take precedence (they're `x or os.environ...`).
@@ -204,6 +207,21 @@ class SuperBrowser:
         if env:
             os.environ.update({k: str(v) for k, v in env.items()})
 
+        # Audit trail (opt-in): every in-process run leaves the evaluation
+        # harness's run directory under <audit_dir>/<experiment>/<arm>/<task>/seedN/.
+        # The screenshot dir is frozen when the bridge is imported, so it is
+        # pointed at a per-process inbox HERE, before any bridge import; the
+        # recorder moves the frames into the run dir when the run finishes.
+        self._audit = None
+        audit_dir = audit_dir or os.environ.get("SUPERBROWSER_AUDIT_DIR")
+        if audit_dir:
+            from superbrowser_bridge.audit import AuditRecorder, repoint_screenshot_dir
+
+            self._audit = AuditRecorder(audit_dir, experiment=audit_experiment, arm=audit_arm)
+            inbox = self._audit.inbox_screenshot_dir()
+            os.environ["SUPERBROWSER_SCREENSHOT_DIR"] = str(inbox)
+            repoint_screenshot_dir(inbox)
+
         self._server = ServerHandle(self.server_url, cmd=server_cmd, start_timeout=server_start_timeout)
 
     # ----- public API -----
@@ -220,9 +238,17 @@ class SuperBrowser:
         timeout: float | None = None,
         task_handle: str | None = None,
         on_event: Callable[[dict], None] | None = None,
+        audit_task: dict[str, Any] | None = None,
+        audit_seed: int = 0,
     ) -> RunResult:
         """Synchronous entry point. Raises if called from a running event loop —
         use :meth:`arun` there.
+
+        ``audit_task`` (with ``audit_dir`` on the client) labels the recorded run:
+        a dict with ``task_id`` / ``benchmark`` / ``level`` / ``start_url`` /
+        ``instruction`` (e.g. ``eval.core.tasks.Task.to_dict()``); without it the
+        task id is derived from the instruction and URL. ``audit_seed`` names the
+        attempt; a seed whose run was already judged is never overwritten.
 
         ``task_handle`` names the run in the lifecycle registry so another
         thread (or, in local-agent mode, another process) can ``cancel()`` it;
@@ -272,6 +298,8 @@ class SuperBrowser:
                     enable_human_handoff=enable_human_handoff,
                     timeout=timeout,
                     task_handle=task_handle,
+                    audit_task=audit_task,
+                    audit_seed=audit_seed,
                 )
             )
         raise RuntimeError(
@@ -291,6 +319,8 @@ class SuperBrowser:
         timeout: float | None = None,
         task_handle: str | None = None,
         on_event: Callable[[dict], None] | None = None,
+        audit_task: dict[str, Any] | None = None,
+        audit_seed: int = 0,
     ) -> RunResult:
         if self.remote:
             loop = asyncio.get_running_loop()
@@ -314,14 +344,21 @@ class SuperBrowser:
                     on_event=on_event,
                 ),
             )
-        orch, framed, classification = await self._build_inprocess(
-            task,
-            mode=mode,
-            url=url,
-            output_schema=output_schema,
-            force_browser=force_browser,
-            enable_human_handoff=enable_human_handoff,
-        )
+        # The audit recorder sets its env (trace/capture writers) BEFORE the
+        # orchestrator is built: Memory.attach reads the context-dump flag.
+        ar = self._audit_begin(task, url=url, mode=mode, timeout=timeout, audit_task=audit_task, seed=audit_seed)
+        try:
+            orch, framed, classification = await self._build_inprocess(
+                task,
+                mode=mode,
+                url=url,
+                output_schema=output_schema,
+                force_browser=force_browser,
+                enable_human_handoff=enable_human_handoff,
+            )
+        except BaseException as exc:
+            self._audit_abort(ar, exc)
+            raise
 
         from superbrowser_bridge.usage import (
             UsageHook,
@@ -334,8 +371,16 @@ class SuperBrowser:
         handle = task_handle or lifecycle.new_handle()
         lifecycle.register(handle, task, transport="in-process")
 
+        hooks: list[Any] = [orch.hook, UsageHook("orchestrator")]
+        effective = None
+        if ar is not None:
+            effective = await self._audit_after_build(ar, orch, framed, mode)
+            hooks.append(self._audit_hook(ar, orch))
+
         text, raw, error, success = "", "", None, False
         cancelled_by_client = False
+        stop_reason = "ok"
+        usage = None
         try:
             with track_task(orch.task_id):
                 lifecycle.note_orch_task_id(handle, orch.task_id)
@@ -346,7 +391,7 @@ class SuperBrowser:
                         orch.bot,
                         framed,
                         orch.session_key,
-                        hooks=[orch.hook, UsageHook("orchestrator")],
+                        hooks=hooks,
                         timeout=timeout,
                     )
                 )
@@ -360,7 +405,9 @@ class SuperBrowser:
                 error = "the agent returned no answer"
         except asyncio.TimeoutError:
             error = f"task timed out after {timeout}s"
+            stop_reason = "timeout"
         except asyncio.CancelledError:
+            stop_reason = "cancelled"
             if not lifecycle.cancelled(handle):
                 lifecycle.finish(handle, "cancelled")
                 raise  # the caller cancelled arun itself — propagate
@@ -368,6 +415,7 @@ class SuperBrowser:
             error = "cancelled by client"
         except Exception as exc:  # noqa: BLE001 - surface in the result, don't crash
             error = f"{type(exc).__name__}: {exc}"
+            stop_reason = "error"
         finally:
             try:
                 orch.memory.write_task_summary(success=success)
@@ -377,13 +425,20 @@ class SuperBrowser:
                 handle,
                 "cancelled" if cancelled_by_client else ("done" if success else "error"),
             )
-
-        # Aggregate per-task token usage (orchestrator + worker(s) + vision),
-        # persist it, then drop the registry entry. Best-effort — never fail the run.
-        usage = snapshot(orch.task_id)
-        if usage is not None:
-            write_usage_json(usage)
-        pop(orch.task_id)
+            # Aggregate per-task token usage (orchestrator + worker(s) + vision),
+            # persist it, then drop the registry entry. Best-effort — never fail
+            # the run. Done in the finally so the audit trail sees the tokens of a
+            # run that timed out or was interrupted.
+            usage = snapshot(orch.task_id)
+            if usage is not None:
+                write_usage_json(usage)
+            pop(orch.task_id)
+            if ar is not None:
+                self._audit_finish(
+                    ar, final_answer=text, raw_content=raw, stop_reason=stop_reason, error=error,
+                    usage=usage.to_dict() if usage is not None else None, orch_task_id=orch.task_id,
+                    framed_task=framed, effective=effective,
+                )
 
         data = parse_output(text, output_schema) if success else None
         return RunResult(
@@ -401,7 +456,72 @@ class SuperBrowser:
             usage=usage.to_dict() if usage is not None else None,
             task_handle=handle,
             cancelled=cancelled_by_client,
+            audit_dir=str(ar.run_dir) if ar is not None else None,
         )
+
+    # ----- audit trail (opt-in; see superbrowser_bridge.audit) -----
+
+    def _audit_begin(self, task: str, *, url: str | None, mode: str, timeout: float | None,
+                     audit_task: dict[str, Any] | None, seed: int):
+        if self._audit is None:
+            return None
+        try:
+            row = dict(audit_task or {})
+            row.setdefault("instruction", task)
+            if url and not row.get("start_url"):
+                row["start_url"] = url
+            ar = self._audit.begin(task=row, seed=seed, model=self.model, timeout=timeout,
+                                   server_url=self.server_url, mode=mode)
+            ar.apply_env()
+            return ar
+        except Exception as exc:  # noqa: BLE001 - the recorder must never block a run
+            try:
+                from loguru import logger
+
+                logger.warning("audit trail disabled for this run: {}", exc)
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+    async def _audit_after_build(self, ar, orch, framed: str, mode: str):
+        from superbrowser_bridge.audit import redact_config
+
+        effective = None
+        try:
+            ar.write_preliminary_meta(orch.task_id, framed)
+            _, effective = redact_config(ar.run_dir)
+            if self.model:
+                effective = dict(effective or {}, model=self.model)
+            health = await self._server.health_payload() if mode == "browser" else None
+            ar.write_manifest(server_url=self.server_url, health=health, effective_defaults=effective,
+                              extra={"sdk": {"mode": mode, "auto_start_server": self.auto_start_server,
+                                             "model_override": self.model}})
+        except Exception:  # noqa: BLE001
+            pass
+        return effective
+
+    @staticmethod
+    def _audit_hook(ar, orch):
+        from superbrowser_bridge.audit import AuditHook
+
+        return AuditHook("orchestrator", memory=orch.memory, task_id=orch.task_id, roster_path=ar.roster_path)
+
+    @staticmethod
+    def _audit_finish(ar, *, final_answer: str, raw_content: str, stop_reason: str, error: str | None,
+                      usage: dict[str, Any] | None, orch_task_id: str | None, framed_task: str | None,
+                      effective: dict[str, Any] | None) -> None:
+        try:
+            ar.finish(final_answer=final_answer, raw_content=raw_content, stop_reason=stop_reason, error=error,
+                      usage=usage, orch_task_id=orch_task_id, framed_task=framed_task, effective_defaults=effective)
+        finally:
+            ar.restore_env()
+
+    def _audit_abort(self, ar, exc: BaseException) -> None:
+        if ar is None:
+            return
+        self._audit_finish(ar, final_answer="", raw_content="", stop_reason="error",
+                           error=f"{type(exc).__name__}: {exc}", usage=None, orch_task_id=None,
+                           framed_task=None, effective=None)
 
     # ----- streaming (progress / step events) -----
 
@@ -466,6 +586,8 @@ class SuperBrowser:
         enable_human_handoff: bool = True,
         timeout: float | None = None,
         task_handle: str | None = None,
+        audit_task: dict[str, Any] | None = None,
+        audit_seed: int = 0,
     ) -> AsyncIterator[dict]:
         """Stream a task as step-level events, ending with a ``result`` event.
 
@@ -488,14 +610,19 @@ class SuperBrowser:
                 yield ev
             return
 
-        orch, framed, classification = await self._build_inprocess(
-            task,
-            mode=mode,
-            url=url,
-            output_schema=output_schema,
-            force_browser=force_browser,
-            enable_human_handoff=enable_human_handoff,
-        )
+        ar = self._audit_begin(task, url=url, mode=mode, timeout=timeout, audit_task=audit_task, seed=audit_seed)
+        try:
+            orch, framed, classification = await self._build_inprocess(
+                task,
+                mode=mode,
+                url=url,
+                output_schema=output_schema,
+                force_browser=force_browser,
+                enable_human_handoff=enable_human_handoff,
+            )
+        except BaseException as exc:
+            self._audit_abort(ar, exc)
+            raise
         if classification is not None:
             yield {"type": "classification", "classification": classification}
 
@@ -510,9 +637,17 @@ class SuperBrowser:
         handle = task_handle or lifecycle.new_handle()
         lifecycle.register(handle, task, transport="in-process")
 
+        hooks: list[Any] = [orch.hook, UsageHook("orchestrator")]
+        effective = None
+        if ar is not None:
+            effective = await self._audit_after_build(ar, orch, framed, mode)
+            hooks.append(self._audit_hook(ar, orch))
+
         final: dict | None = None
         cancelled_by_client = False
         agen = None
+        usage = None
+        stop_reason = "ok"
         try:
             with track_task(orch.task_id):
                 lifecycle.note_orch_task_id(handle, orch.task_id)
@@ -520,7 +655,7 @@ class SuperBrowser:
                     orch.bot,
                     framed,
                     orch.session_key,
-                    hooks=[orch.hook, UsageHook("orchestrator")],
+                    hooks=hooks,
                     timeout=timeout,
                 )
                 async for ev in agen:
@@ -531,6 +666,9 @@ class SuperBrowser:
                         final = ev
                     else:
                         yield ev
+        except BaseException:
+            stop_reason = "error"
+            raise
         finally:
             # ALWAYS close the inner generator — this is the deterministic
             # cancel point. stream_and_capture's finally does run.cancel() +
@@ -557,11 +695,21 @@ class SuperBrowser:
                 if cancelled_by_client
                 else ("done" if final and final.get("success") else "error"),
             )
-
-        usage = snapshot(orch.task_id)
-        if usage is not None:
-            write_usage_json(usage)
-        pop(orch.task_id)
+            usage = snapshot(orch.task_id)
+            if usage is not None:
+                write_usage_json(usage)
+            pop(orch.task_id)
+            if ar is not None:
+                if cancelled_by_client:
+                    stop_reason = "cancelled"
+                elif final is not None and "timed out" in str(final.get("error") or ""):
+                    stop_reason = "timeout"
+                self._audit_finish(
+                    ar, final_answer=(final or {}).get("text", "") or "", raw_content=(final or {}).get("raw_content", "") or "",
+                    stop_reason=stop_reason, error=(final or {}).get("error") if final else ("cancelled by client" if cancelled_by_client else None),
+                    usage=usage.to_dict() if usage is not None else None, orch_task_id=orch.task_id,
+                    framed_task=framed, effective=effective,
+                )
 
         if cancelled_by_client:
             final = {
@@ -591,6 +739,7 @@ class SuperBrowser:
             "usage": usage.to_dict() if usage is not None else None,
             "task_handle": handle,
             "cancelled": cancelled_by_client,
+            "audit_dir": str(ar.run_dir) if ar is not None else None,
         }
 
     def stream(
@@ -604,6 +753,8 @@ class SuperBrowser:
         enable_human_handoff: bool = True,
         timeout: float | None = None,
         task_handle: str | None = None,
+        audit_task: dict[str, Any] | None = None,
+        audit_seed: int = 0,
     ) -> Iterator[dict]:
         """Synchronous streaming. Raises if called from a running event loop —
         use :meth:`astream` there. Yields the same events as :meth:`astream`."""
@@ -629,7 +780,7 @@ class SuperBrowser:
                     task, mode=mode, url=url, output_schema=output_schema,
                     force_browser=force_browser,
                     enable_human_handoff=enable_human_handoff, timeout=timeout,
-                    task_handle=task_handle,
+                    task_handle=task_handle, audit_task=audit_task, audit_seed=audit_seed,
                 )
             )
             return

@@ -58,6 +58,19 @@ class ServerHandle:
         except Exception:  # noqa: BLE001 - connection refused / timeout / etc.
             return False
 
+    async def health_payload(self) -> Any:
+        """The engine's ``/health`` body (JSON when it is JSON, else the status
+        code) — recorded in a run's audit manifest. Never raises."""
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(f"{self.url}/health")
+                try:
+                    return r.json()
+                except Exception:  # noqa: BLE001
+                    return {"status_code": r.status_code}
+        except Exception:  # noqa: BLE001
+            return None
+
     async def ensure(self, auto_start: bool) -> bool:
         """Guarantee the engine is reachable, starting it if allowed.
 

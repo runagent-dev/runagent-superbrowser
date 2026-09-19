@@ -50,6 +50,10 @@ class RunResult:
             remote mode, or an old agent server).
         cancelled: ``True`` when the run ended because a client requested
             cancellation (``error`` is then ``"cancelled by client"``).
+        audit_dir: When the client was constructed with ``audit_dir=...``, the
+            run directory that holds this run's audit trail (spec, screenshots,
+            transcripts, ledgers, manifest) in the evaluation harness's layout.
+            ``None`` otherwise.
     """
 
     text: str
@@ -66,6 +70,7 @@ class RunResult:
     usage: dict[str, Any] | None = None
     task_handle: str = ""
     cancelled: bool = False
+    audit_dir: str | None = None
 
     def __bool__(self) -> bool:  # `if result:` reads as "did it work?"
         return self.success

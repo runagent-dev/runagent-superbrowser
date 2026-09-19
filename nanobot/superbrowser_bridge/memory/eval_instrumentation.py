@@ -289,4 +289,15 @@ def eval_worker_hooks(memory: Any) -> list[Any]:
             hooks.append(_DistractorAgentHook(memory, n))
         except Exception:
             hooks.append(DistractorHook(memory, n))
+    # The audit trail (SuperBrowser(audit_dir=...) / eval harness) banks one row
+    # per worker iteration; gated so production hook lists stay unchanged.
+    if os.environ.get("SUPERBROWSER_AUDIT_ITERATIONS", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from superbrowser_bridge.audit import ROSTER_NAME, AuditHook
+
+            cap = os.environ.get("SUPERBROWSER_EVAL_CAPTURE_DIR")
+            roster = os.path.join(cap, ROSTER_NAME) if cap else None
+            hooks.append(AuditHook("worker", memory=memory, roster_path=roster))
+        except Exception:
+            pass
     return hooks

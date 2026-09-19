@@ -111,37 +111,11 @@ def protocol_from_args(**overrides: Any) -> Protocol:
 
 
 def describe_environment() -> dict[str, Any]:
-    """Provenance snapshot recorded once per run (no secrets)."""
-    import platform
-    import subprocess
+    """Provenance snapshot recorded once per run (no secrets).
 
-    from eval._bootstrap import REPO_ROOT, read_active_model
+    Lives in ``superbrowser_bridge.audit`` now, so the SDK's audit trail and the
+    harness write the same keys; this wrapper pins the repo root."""
+    from eval._bootstrap import REPO_ROOT
+    from superbrowser_bridge.audit import describe_environment as _describe
 
-    def sh(cmd: list[str]) -> str:
-        try:
-            return subprocess.check_output(cmd, cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL).strip()
-        except Exception:
-            return "unknown"
-
-    info: dict[str, Any] = {
-        "git_sha": sh(["git", "rev-parse", "--short", "HEAD"]),
-        "git_branch": sh(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
-        "git_dirty": bool(sh(["git", "status", "--porcelain"])),
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "vision_model": os.environ.get("VISION_MODEL", ""),
-        "vision_provider": os.environ.get("VISION_PROVIDER", ""),
-        "headless_mode": os.environ.get("SUPERBROWSER_HEADLESS_MODE", os.environ.get("HEADLESS", "")),
-        "active_model": read_active_model(),
-    }
-    try:
-        import nanobot  # noqa: WPS433
-
-        info["nanobot_version"] = getattr(nanobot, "__version__", "unknown")
-        info["nanobot_path"] = os.path.dirname(nanobot.__file__)
-        runner = os.path.join(os.path.dirname(nanobot.__file__), "agent", "runner.py")
-        with open(runner, "rb") as f:
-            info["nanobot_runner_sha256"] = hashlib.sha256(f.read()).hexdigest()[:16]
-    except Exception:
-        info["nanobot_version"] = "unknown"
-    return info
+    return _describe(REPO_ROOT)

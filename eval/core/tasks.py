@@ -248,6 +248,36 @@ def resolve_tasks(spec: str, *, benchmark: str) -> list[Task]:
     return [t for t in tasks if t.task_id in keep]
 
 
+def _norm_text(s: str) -> str:
+    return " ".join(str(s).split()).strip().lower()
+
+
+def find_by_instruction(instruction: str, url: str | None = None, *, benchmarks: Iterable[str] | None = None) -> Task | None:
+    """The frozen benchmark task whose instruction matches ``instruction``
+    (whitespace/case-normalised; ``url``'s domain must match when given).
+
+    Lets an SDK run be labelled with the benchmark task id when the caller typed
+    a benchmark task verbatim (``examples/03_browser_mode.py``); anything else
+    stays a custom task with a derived id, never a silently re-labelled one.
+    """
+    want = _norm_text(instruction)
+    if not want:
+        return None
+    dom = None
+    if url:
+        host = urlparse(url).netloc.lower()
+        dom = host[4:] if host.startswith("www.") else host
+    for name in (list(benchmarks) if benchmarks is not None else available_benchmarks()):
+        try:
+            tasks = load_benchmark(name)
+        except Exception:
+            continue
+        for t in tasks:
+            if _norm_text(t.instruction) == want and (dom is None or not t.domain or t.domain == dom):
+                return t
+    return None
+
+
 # ------------------------------------------------------------------ exclusions
 def load_exclusions() -> dict[str, Any]:
     return _read_json(BENCH_DIR / "exclusions.json", {"rules": [], "task_exclusions": []})
