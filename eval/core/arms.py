@@ -70,6 +70,13 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
        "LLM compression: last K turns verbatim + one regenerated structured summary of older turns", "memory"),
     _A("ledger_noevict", {"SUPERBROWSER_MEMORY_POLICY": "ledger_noevict"}, "python",
        "Diagnostic: Ledger injected but nothing evicted (separates Ledger from eviction)", "memory"),
+    _A("adaptive", {"SUPERBROWSER_MEMORY_POLICY": "adaptive"}, "python",
+       "Budget-adaptive hybrid: Ledger always injected, six-phase eviction deferred "
+       "while context headroom is above threshold and forced at a subgoal boundary or under pressure", "memory"),
+    _A("adaptive87", {"SUPERBROWSER_MEMORY_POLICY": "adaptive",
+                      "SUPERBROWSER_ADAPTIVE_HEADROOM": "0.87"}, "python",
+       "Budget-adaptive hybrid at the calibrated threshold: compacts on the ~45% of turns "
+       "whose headroom falls below 0.87 (the 0.30 default never fired on this workload)", "memory"),
     # ---- E4 dead-end memory --------------------------------------------------
     _A("no_deadend", {"ABLATE_DEAD_END_MEMORY": "1"}, "python",
        "Failures are not remembered as dead-ends (no ledger section, no [DEAD_ENDS_HERE])", "memory"),

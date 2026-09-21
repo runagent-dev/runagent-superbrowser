@@ -215,6 +215,33 @@ def _back_patch_screenshots(
     return n_evicted
 
 
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens_cheap(messages: list) -> int:
+    """Rough prompt size in tokens, at negligible cost.
+
+    Walks text content only; image blocks are skipped because their byte
+    payloads do not scale with the token budget the way text does, and the
+    vision pipeline consumes most of them before they reach messages.
+    """
+    chars = 0
+    try:
+        for m in messages or []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, str):
+                chars += len(c)
+            elif isinstance(c, list):
+                for blk in c:
+                    if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                        chars += len(blk["text"])
+                    elif isinstance(blk, str):
+                        chars += len(blk)
+    except Exception:
+        return 0
+    return chars // _CHARS_PER_TOKEN
+
+
 def _refresh_ledger_in_system_message(
     messages: list[dict[str, Any]],
     ledger_text: str,
@@ -685,6 +712,7 @@ class MemoryHook(AgentHook):
         "keep_recent_turns",
         "_last_seen_messages",
         "_last_autocompact_hash",
+        "_adaptive_last_floor",
         "_bot",
         "_ctx_dump",
         "_policy",
@@ -732,6 +760,7 @@ class MemoryHook(AgentHook):
         # field is enough; the timestamp inside the summary changes on
         # every AutoCompact write so we can't compare metadata blindly.
         self._last_autocompact_hash: str = ""
+        self._adaptive_last_floor: int = -1
         # Bot reference for AutoCompact ingestion (reads session.metadata).
         # Set by Memory.attach via _bind_bot below.
         self._bot: Any | None = None
@@ -809,6 +838,39 @@ class MemoryHook(AgentHook):
                 logger.debug("MemoryHook policy {} failed: {}", self._policy.name, exc)
             self._finish_iteration_instrumentation(context, _est_before, policy=self._policy.name)
             return
+        # Budget-adaptive hybrid (eval): keep the raw window uncompacted
+        # while the context window still has headroom, and spend the
+        # six-phase pass only when it does not — or when a subgoal closes,
+        # which is the seam the compactor was designed around.
+        #
+        # The point is to separate two things the sweep conflated. The
+        # `ledger` arm compacts on every turn whether or not the window is
+        # under pressure; `full_history` never compacts and never bounds.
+        # Neither isolates whether compaction pays for itself when there is
+        # room to spare. This arm does.
+        if self._policy.name == "adaptive":
+            defer, why, headroom = self._adaptive_should_defer(context)
+            self.memory.events.log(
+                "adaptive_gate",
+                {
+                    "iter": context.iteration,
+                    "role": self.memory.role,
+                    "headroom": round(headroom, 4) if headroom is not None else None,
+                    "compacted": not defer,
+                    "reason": why,
+                },
+            )
+            if defer:
+                # Ledger still goes in — only the eviction phases are skipped.
+                self._refresh_ledger_block(
+                    context,
+                    os.environ.get("ABLATE_STRUCTURED_LEDGER") in ("1", "true", "yes"),
+                )
+                self._finish_iteration_instrumentation(
+                    context, _est_before, policy="adaptive",
+                )
+                return
+
         # Ablation toggles (default off → full eviction + structured ledger).
         # Set by the eval ablation harness (eval/run_ablations.py) to isolate a
         # single mechanism for Table 1; production runs never set these.
@@ -1011,9 +1073,77 @@ class MemoryHook(AgentHook):
         # Refresh the ledger block embedded in messages[0]. Runs after
         # back-patch and failure-collapse so the ledger reflects the
         # latest dead-end additions on the same turn.
+        self._refresh_ledger_block(context, _ablate_ledger)
+        self._finish_iteration_instrumentation(context, _est_before, policy="ledger")
+
+    def _adaptive_should_defer(self, context: Any) -> tuple[bool, str, float | None]:
+        """Should this turn skip the eviction phases?
+
+        Returns (defer, reason, headroom). Headroom is the fraction of the
+        context window still free: 1 - estimated_prompt_tokens / window.
+
+        Two things force compaction regardless of headroom. A closing
+        subgoal is the seam the compactor exists to work across, so
+        deferring past it would strand the messages it was meant to fold
+        up. And an unmeasurable context is treated as pressure rather than
+        room — failing toward the production behaviour is the safe
+        direction when the estimate is unavailable.
+        """
+        from .policy import adaptive_headroom_threshold
+
+        # A subgoal that closed since the last turn: compact across it.
         try:
-            ledger_text = "" if _ablate_ledger else self._render_ledger_text()
-            ok = (not _ablate_ledger) and _refresh_ledger_in_system_message(
+            floor = int(getattr(self.memory, "subgoal_message_floor", -1) or -1)
+            last = int(getattr(self, "_adaptive_last_floor", -1))
+            if floor != last:
+                self._adaptive_last_floor = floor
+                if last != -1:
+                    return (False, "subgoal_boundary", None)
+        except Exception:
+            pass
+
+        window = 0
+        try:
+            window = int(os.environ.get("SUPERBROWSER_CONTEXT_WINDOW_TOKENS", "") or 0)
+        except ValueError:
+            window = 0
+        if window <= 0:
+            try:
+                loop = getattr(self._bot, "_loop", None)
+                window = int(getattr(loop, "context_window_tokens", 0) or 0)
+            except Exception:
+                window = 0
+        if window <= 0:
+            return (False, "no_window", None)
+
+        # Character count over a real tokenizer, deliberately. This runs on
+        # EVERY iteration, and the tokenizer chain takes seconds on a large
+        # context — measured at minutes across a test sweep — which would
+        # cost more than the compaction it is deciding whether to skip. The
+        # gate only needs to know which side of a coarse threshold the
+        # context sits on, and ~4 chars/token is accurate enough for that.
+        # Any bias is constant across turns and arms, so it shifts where
+        # the threshold bites rather than making the decision erratic.
+        est = _estimate_tokens_cheap(context.messages)
+        if not est:
+            return (False, "no_estimate", None)
+
+        headroom = 1.0 - (est / window)
+        if headroom >= adaptive_headroom_threshold():
+            return (True, "headroom", headroom)
+        return (False, "pressure", headroom)
+
+    def _refresh_ledger_block(self, context: Any, ablate_ledger: bool) -> None:
+        """Embed the current ledger render into messages[0].
+
+        Extracted so the budget-adaptive path can inject the ledger on a
+        turn where it skipped the eviction phases. The Ledger is the half
+        of the mechanism that costs nothing to keep; deferring compaction
+        must not also defer the structured memory.
+        """
+        try:
+            ledger_text = "" if ablate_ledger else self._render_ledger_text()
+            ok = (not ablate_ledger) and _refresh_ledger_in_system_message(
                 context.messages, ledger_text
             )
             if ok:
@@ -1027,7 +1157,6 @@ class MemoryHook(AgentHook):
                 )
         except Exception as exc:
             logger.debug("MemoryHook ledger-injection failed: {}", exc)
-        self._finish_iteration_instrumentation(context, _est_before, policy="ledger")
 
     def _render_ledger_text(self) -> str:
         """Rendered ledger block; capped to the history budget only when the

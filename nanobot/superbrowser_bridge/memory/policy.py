@@ -43,7 +43,53 @@ if TYPE_CHECKING:  # pragma: no cover
     from .memory import Memory
 
 PolicyName = Literal["ledger", "full", "fifo", "summary", "ledger_noevict"]
-POLICY_NAMES: tuple[str, ...] = ("ledger", "full", "fifo", "summary", "ledger_noevict")
+POLICY_NAMES: tuple[str, ...] = (
+    "ledger", "full", "fifo", "summary", "ledger_noevict", "adaptive",
+)
+
+# Budget-adaptive hybrid: keep the raw window uncompacted while there is
+# context headroom, and only pay for the six-phase pass once headroom runs
+# out (or a subgoal closes, which is the natural seam to compact across).
+#
+# The sweep measured eviction as an always-on policy against never-on
+# baselines, and the always-on arm lost. Neither arm asks the question this
+# one does: whether compaction is worth its cost *when the window is not
+# under pressure*. `full_history` never compacts and never bounds; `ledger`
+# always compacts whether or not it needs to. The threshold below is the
+# fraction of the window that must remain FREE for compaction to be
+# deferred.
+# Calibrated against the observed distribution, not chosen a priori. The
+# first sweep of this arm ran at 0.30 and compacted on 0 of 795 turns: a
+# 200K window and a 0.30 threshold only trigger above 140K tokens, and
+# these tasks peak between 43K and 91K, so headroom never fell below
+# 0.744. The arm silently degenerated into "Ledger, never evict".
+#
+# Measured over those 795 turns, the fraction that WOULD compact is:
+#     0.30 -> 0.0%   0.80 ->  9.2%   0.85 -> 28.3%
+#     0.87 -> 45.3%  0.90 -> 73.2%   0.92 -> 87.5%
+# 0.87 splits the turns near evenly, which is where the arm carries the
+# most information. Expect the realised rate to come in lower: compaction
+# frees context, which raises headroom, which suppresses the next trigger.
+_DEFAULT_ADAPTIVE_HEADROOM = 0.87
+
+
+def adaptive_headroom_threshold() -> float:
+    """Headroom below which the six-phase pass runs. Read at call time so
+    an arm can set it per run and have the value recorded in the run's env."""
+    raw = os.environ.get("SUPERBROWSER_ADAPTIVE_HEADROOM", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if 0.0 < v < 1.0:
+                return v
+            logger.warning("SUPERBROWSER_ADAPTIVE_HEADROOM={!r} out of (0,1); using default", raw)
+        except ValueError:
+            logger.warning("SUPERBROWSER_ADAPTIVE_HEADROOM={!r} is not a float; using default", raw)
+    return _DEFAULT_ADAPTIVE_HEADROOM
+
+
+# Back-compat alias for anything importing the constant directly.
+ADAPTIVE_HEADROOM_THRESHOLD = _DEFAULT_ADAPTIVE_HEADROOM
 
 _DEFAULT_RECENT_K = 5          # == hook._DEFAULT_KEEP_RECENT_TURNS
 _DEFAULT_KEEP_SCREENSHOTS = 2  # == hook._DEFAULT_KEEP_LAST_SCREENSHOTS
@@ -459,7 +505,12 @@ class SummaryPolicy(FifoPolicy):
 
 def build_policy(cfg: MemoryPolicyConfig) -> _Policy | None:
     """Return the policy object, or None for ``ledger`` (existing code path)."""
-    if cfg.name == "ledger":
+    # `adaptive` returns None for the same reason `ledger` does: both run the
+    # six-phase path in the hook. The difference is that `adaptive` gates it
+    # on headroom, which the hook decides per iteration — a _Policy object
+    # cannot express that, because returning one makes the hook bypass the
+    # phases entirely rather than choose.
+    if cfg.name in ("ledger", "adaptive"):
         return None
     return {"full": FullPolicy, "fifo": FifoPolicy, "summary": SummaryPolicy,
             "ledger_noevict": LedgerNoEvictPolicy}[cfg.name](cfg)
