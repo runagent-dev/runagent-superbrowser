@@ -1,0 +1,710 @@
+{
+  "margin_pp": 5,
+  "tost_rule": "Equivalence at \u03b1=0.05 requires the 90% bootstrap interval inside \u00b15 points. A 95% interval that covers zero is only a non-significant difference.",
+  "holm": "Holm is applied within each difference-test family. It is not removed.",
+  "human_equivalence": {
+    "n": 24,
+    "margin": 0.05,
+    "source": "stated totals only; task-level human labels are not in the repository",
+    "pairs": [
+      {
+        "contrast": "ledger_minus_fifo",
+        "k_a": 18,
+        "k_b": 19,
+        "point_diff_pp": -4.17,
+        "n_feasible_tables": 6,
+        "mcnemar_p_range": [
+          1.0,
+          1.0
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          11.67,
+          38.72
+        ],
+        "verdict": "not equivalent: no table consistent with the totals has its 90% interval inside \u00b15 points",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 18,
+            "a_only": 0,
+            "b_only": 1,
+            "both_fail": 5,
+            "discordant": 1,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -12.5,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              -12.5,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              -4.17,
+              2.45
+            ],
+            "tost_90ci_inside_5pp": false
+          },
+          {
+            "both_success": 13,
+            "a_only": 5,
+            "b_only": 6,
+            "both_fail": 0,
+            "discordant": 11,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -29.17,
+              20.83
+            ],
+            "bootstrap_ci90_pp": [
+              -25.0,
+              16.67
+            ],
+            "exact_conditional_ci95_pp": [
+              -26.33,
+              20.16
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      },
+      {
+        "contrast": "ledger_minus_full_history",
+        "k_a": 18,
+        "k_b": 20,
+        "point_diff_pp": -8.33,
+        "n_feasible_tables": 5,
+        "mcnemar_p_range": [
+          0.5,
+          0.7539
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          16.51,
+          36.91
+        ],
+        "verdict": "not equivalent: the rate difference itself is outside \u00b15 points",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 18,
+            "a_only": 0,
+            "b_only": 2,
+            "both_fail": 4,
+            "discordant": 2,
+            "mcnemar_p": 0.5,
+            "bootstrap_ci95_pp": [
+              -20.83,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              -16.67,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              -8.33,
+              2.63
+            ],
+            "tost_90ci_inside_5pp": false
+          },
+          {
+            "both_success": 14,
+            "a_only": 4,
+            "b_only": 6,
+            "both_fail": 0,
+            "discordant": 10,
+            "mcnemar_p": 0.7539,
+            "bootstrap_ci95_pp": [
+              -33.33,
+              16.67
+            ],
+            "bootstrap_ci90_pp": [
+              -29.17,
+              12.5
+            ],
+            "exact_conditional_ci95_pp": [
+              -27.65,
+              15.61
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      },
+      {
+        "contrast": "ledger_minus_adaptive",
+        "k_a": 18,
+        "k_b": 20,
+        "point_diff_pp": -8.33,
+        "n_feasible_tables": 5,
+        "mcnemar_p_range": [
+          0.5,
+          0.7539
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          16.51,
+          36.91
+        ],
+        "verdict": "not equivalent: the rate difference itself is outside \u00b15 points",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 18,
+            "a_only": 0,
+            "b_only": 2,
+            "both_fail": 4,
+            "discordant": 2,
+            "mcnemar_p": 0.5,
+            "bootstrap_ci95_pp": [
+              -20.83,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              -16.67,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              -8.33,
+              2.63
+            ],
+            "tost_90ci_inside_5pp": false
+          },
+          {
+            "both_success": 14,
+            "a_only": 4,
+            "b_only": 6,
+            "both_fail": 0,
+            "discordant": 10,
+            "mcnemar_p": 0.7539,
+            "bootstrap_ci95_pp": [
+              -33.33,
+              16.67
+            ],
+            "bootstrap_ci90_pp": [
+              -29.17,
+              12.5
+            ],
+            "exact_conditional_ci95_pp": [
+              -27.65,
+              15.61
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      },
+      {
+        "contrast": "fifo_minus_full_history",
+        "k_a": 19,
+        "k_b": 20,
+        "point_diff_pp": -4.17,
+        "n_feasible_tables": 5,
+        "mcnemar_p_range": [
+          1.0,
+          1.0
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          11.67,
+          35.02
+        ],
+        "verdict": "not equivalent: no table consistent with the totals has its 90% interval inside \u00b15 points",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 19,
+            "a_only": 0,
+            "b_only": 1,
+            "both_fail": 4,
+            "discordant": 1,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -12.5,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              -12.5,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              -4.17,
+              2.45
+            ],
+            "tost_90ci_inside_5pp": false
+          },
+          {
+            "both_success": 15,
+            "a_only": 4,
+            "b_only": 5,
+            "both_fail": 0,
+            "discordant": 9,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -29.17,
+              20.83
+            ],
+            "bootstrap_ci90_pp": [
+              -25.0,
+              16.67
+            ],
+            "exact_conditional_ci95_pp": [
+              -23.34,
+              17.5
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      },
+      {
+        "contrast": "fifo_minus_adaptive",
+        "k_a": 19,
+        "k_b": 20,
+        "point_diff_pp": -4.17,
+        "n_feasible_tables": 5,
+        "mcnemar_p_range": [
+          1.0,
+          1.0
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          11.67,
+          35.02
+        ],
+        "verdict": "not equivalent: no table consistent with the totals has its 90% interval inside \u00b15 points",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 19,
+            "a_only": 0,
+            "b_only": 1,
+            "both_fail": 4,
+            "discordant": 1,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -12.5,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              -12.5,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              -4.17,
+              2.45
+            ],
+            "tost_90ci_inside_5pp": false
+          },
+          {
+            "both_success": 15,
+            "a_only": 4,
+            "b_only": 5,
+            "both_fail": 0,
+            "discordant": 9,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -29.17,
+              20.83
+            ],
+            "bootstrap_ci90_pp": [
+              -25.0,
+              16.67
+            ],
+            "exact_conditional_ci95_pp": [
+              -23.34,
+              17.5
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      },
+      {
+        "contrast": "full_history_minus_adaptive",
+        "k_a": 20,
+        "k_b": 20,
+        "point_diff_pp": 0.0,
+        "n_feasible_tables": 5,
+        "mcnemar_p_range": [
+          1.0,
+          1.0
+        ],
+        "holm_on_smallest_p": 1.0,
+        "all_feasible_p_at_least_0.05": true,
+        "mde_pp_range": [
+          0.0,
+          33.02
+        ],
+        "verdict": "not established: some tables consistent with the totals pass TOST and some do not",
+        "nonsignificant_is_not_equivalence": true,
+        "extreme_tables": [
+          {
+            "both_success": 20,
+            "a_only": 0,
+            "b_only": 0,
+            "both_fail": 4,
+            "discordant": 0,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              0.0,
+              0.0
+            ],
+            "bootstrap_ci90_pp": [
+              0.0,
+              0.0
+            ],
+            "exact_conditional_ci95_pp": [
+              0.0,
+              0.0
+            ],
+            "tost_90ci_inside_5pp": true
+          },
+          {
+            "both_success": 16,
+            "a_only": 4,
+            "b_only": 4,
+            "both_fail": 0,
+            "discordant": 8,
+            "mcnemar_p": 1.0,
+            "bootstrap_ci95_pp": [
+              -25.0,
+              20.83
+            ],
+            "bootstrap_ci90_pp": [
+              -20.83,
+              20.83
+            ],
+            "exact_conditional_ci95_pp": [
+              -18.99,
+              18.99
+            ],
+            "tost_90ci_inside_5pp": false
+          }
+        ]
+      }
+    ]
+  },
+  "webjudge_paired": {
+    "arms": {
+      "ledger": {
+        "k": 11,
+        "n": 24
+      },
+      "fifo": {
+        "k": 15,
+        "n": 24
+      },
+      "full_history": {
+        "k": 17,
+        "n": 24
+      },
+      "summary": {
+        "k": 13,
+        "n": 24
+      }
+    },
+    "adaptive": "no WebJudge rows in eval/artifacts/ablate10_paper/per_run.csv",
+    "pairs": [
+      {
+        "contrast": "ledger_minus_fifo",
+        "k_a": 11,
+        "k_b": 15,
+        "n": 24,
+        "point_diff_pp": -16.67,
+        "table": {
+          "both_success": 10,
+          "a_only": 1,
+          "b_only": 5,
+          "both_fail": 8,
+          "discordant": 6,
+          "mcnemar_p": 0.2188,
+          "bootstrap_ci95_pp": [
+            -37.5,
+            0.0
+          ],
+          "bootstrap_ci90_pp": [
+            -33.33,
+            0.0
+          ],
+          "exact_conditional_ci95_pp": [
+            -23.5,
+            3.18
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 1.0
+        },
+        "mde_pp_at_observed_discordant_rate": 28.59,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      },
+      {
+        "contrast": "ledger_minus_full_history",
+        "k_a": 11,
+        "k_b": 17,
+        "n": 24,
+        "point_diff_pp": -25.0,
+        "table": {
+          "both_success": 8,
+          "a_only": 3,
+          "b_only": 9,
+          "both_fail": 4,
+          "discordant": 12,
+          "mcnemar_p": 0.146,
+          "bootstrap_ci95_pp": [
+            -50.0,
+            4.17
+          ],
+          "bootstrap_ci90_pp": [
+            -45.83,
+            -4.17
+          ],
+          "exact_conditional_ci95_pp": [
+            -41.11,
+            3.23
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 0.876
+        },
+        "mde_pp_at_observed_discordant_rate": 40.44,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      },
+      {
+        "contrast": "ledger_minus_summary",
+        "k_a": 11,
+        "k_b": 13,
+        "n": 24,
+        "point_diff_pp": -8.33,
+        "table": {
+          "both_success": 7,
+          "a_only": 4,
+          "b_only": 6,
+          "both_fail": 7,
+          "discordant": 10,
+          "mcnemar_p": 0.7539,
+          "bootstrap_ci95_pp": [
+            -33.33,
+            16.67
+          ],
+          "bootstrap_ci90_pp": [
+            -29.17,
+            12.5
+          ],
+          "exact_conditional_ci95_pp": [
+            -27.65,
+            15.61
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 1.0
+        },
+        "mde_pp_at_observed_discordant_rate": 36.91,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      },
+      {
+        "contrast": "fifo_minus_full_history",
+        "k_a": 15,
+        "k_b": 17,
+        "n": 24,
+        "point_diff_pp": -8.33,
+        "table": {
+          "both_success": 12,
+          "a_only": 3,
+          "b_only": 5,
+          "both_fail": 4,
+          "discordant": 8,
+          "mcnemar_p": 0.7266,
+          "bootstrap_ci95_pp": [
+            -33.33,
+            12.5
+          ],
+          "bootstrap_ci90_pp": [
+            -29.17,
+            8.33
+          ],
+          "exact_conditional_ci95_pp": [
+            -24.21,
+            12.95
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 1.0
+        },
+        "mde_pp_at_observed_discordant_rate": 33.02,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      },
+      {
+        "contrast": "fifo_minus_summary",
+        "k_a": 15,
+        "k_b": 13,
+        "n": 24,
+        "point_diff_pp": 8.33,
+        "table": {
+          "both_success": 7,
+          "a_only": 8,
+          "b_only": 6,
+          "both_fail": 3,
+          "discordant": 14,
+          "mcnemar_p": 0.7905,
+          "bootstrap_ci95_pp": [
+            -20.83,
+            37.5
+          ],
+          "bootstrap_ci90_pp": [
+            -16.67,
+            33.33
+          ],
+          "exact_conditional_ci95_pp": [
+            -20.31,
+            33.39
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 1.0
+        },
+        "mde_pp_at_observed_discordant_rate": 43.68,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      },
+      {
+        "contrast": "full_history_minus_summary",
+        "k_a": 17,
+        "k_b": 13,
+        "n": 24,
+        "point_diff_pp": 16.67,
+        "table": {
+          "both_success": 10,
+          "a_only": 7,
+          "b_only": 3,
+          "both_fail": 4,
+          "discordant": 10,
+          "mcnemar_p": 0.3438,
+          "bootstrap_ci95_pp": [
+            -8.33,
+            41.67
+          ],
+          "bootstrap_ci90_pp": [
+            -4.17,
+            37.5
+          ],
+          "exact_conditional_ci95_pp": [
+            -8.6,
+            32.68
+          ],
+          "tost_90ci_inside_5pp": false,
+          "holm_p": 1.0
+        },
+        "mde_pp_at_observed_discordant_rate": 36.91,
+        "tost_passes": false,
+        "difference_significant_after_holm": false
+      }
+    ]
+  },
+  "table2_instruments": {
+    "rows": [
+      {
+        "arm": "ledger",
+        "human": "18/24 (75.0%)",
+        "webjudge": "11/24 (45.83%)",
+        "rate_gap_pp": 29.17,
+        "false_negatives_human_pass_judge_fail": [
+          7,
+          13
+        ],
+        "false_positives_human_fail_judge_pass": [
+          0,
+          6
+        ],
+        "n_feasible_confusion_matrices": 7,
+        "bootstrap_ci95_pp_at_extreme_tables": [
+          [
+            12.5,
+            50.0
+          ],
+          [
+            -4.17,
+            62.5
+          ]
+        ]
+      },
+      {
+        "arm": "fifo",
+        "human": "19/24 (79.17%)",
+        "webjudge": "15/24 (62.5%)",
+        "rate_gap_pp": 16.67,
+        "false_negatives_human_pass_judge_fail": [
+          4,
+          9
+        ],
+        "false_positives_human_fail_judge_pass": [
+          0,
+          5
+        ],
+        "n_feasible_confusion_matrices": 6,
+        "bootstrap_ci95_pp_at_extreme_tables": [
+          [
+            4.17,
+            33.33
+          ],
+          [
+            -12.5,
+            45.83
+          ]
+        ]
+      },
+      {
+        "arm": "full_history",
+        "human": "20/24 (83.33%)",
+        "webjudge": "17/24 (70.83%)",
+        "rate_gap_pp": 12.5,
+        "false_negatives_human_pass_judge_fail": [
+          3,
+          7
+        ],
+        "false_positives_human_fail_judge_pass": [
+          0,
+          4
+        ],
+        "n_feasible_confusion_matrices": 5,
+        "bootstrap_ci95_pp_at_extreme_tables": [
+          [
+            0.0,
+            25.0
+          ],
+          [
+            -12.5,
+            37.5
+          ]
+        ]
+      },
+      {
+        "arm": "adaptive",
+        "human": "20/24",
+        "webjudge": "not in the frozen sweep",
+        "paired_difference": "not computable"
+      },
+      {
+        "arm": "summary",
+        "human": "not re-scored",
+        "webjudge": "13/24",
+        "paired_difference": "not computable"
+      }
+    ]
+  },
+  "framing": {
+    "judge_human_by_condition": "not estimable",
+    "reason": "No human label exists for any framing condition. The stated kappas 0.894 and 0.937 are not in the repository and were not recomputed.",
+    "figure": "not drawn"
+  },
+  "calibration": {
+    "rubric_verbatim": null,
+    "bu_bench_objective_n40": "not in the repository; agreement with regex was not imputed",
+    "phrase_100_percent_exact_parity": "absent from the repository; no sentence was rewritten"
+  },
+  "design_mde_pp_at_n24": {
+    "discordant_rate_0.25": 28.59,
+    "discordant_rate_0.10": 18.08
+  }
+}
