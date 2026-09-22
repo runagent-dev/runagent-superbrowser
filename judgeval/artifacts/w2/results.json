@@ -1,0 +1,83 @@
+{
+  "label": "PROSPECTIVE",
+  "h1_h2": "RETROSPECTIVE",
+  "plan_tag": "w2-analysis-plan-2026-09-22",
+  "rewriter_model": "gemini-3-flash-preview",
+  "arm_status": {
+    "bubench_deepseek-v4.1-flash": "not_run_prompt_absent",
+    "claude-3-5-sonnet": "not_run_no_credential",
+    "webjudge_gpt-5.4-mini": "ran",
+    "gpt-4o": "ran",
+    "gemini-1.5-pro": "not_run_model_not_found"
+  },
+  "exclusion_counts": {
+    "claim_gate_fail": 18,
+    "length_gate_fail": 19,
+    "rewriter_error": 0,
+    "no_target": 7,
+    "human_sample_n": 19,
+    "human_sample_labeled": 0,
+    "human_agreement": null,
+    "unparseable_judge_outputs": 40
+  },
+  "exclusion_sha256": "a57112d4c0b10530447128b3f9e17aabed289fcc5257b99e2062db36368c94c1",
+  "headline_read": "indeterminate",
+  "judges": {
+    "gpt-4o": {
+      "contrasts": {
+        "VERBOSE_CONF_minus_ASSERT": {
+          "n": 0
+        },
+        "VERBOSE_CONF_minus_DISCLOSE": {
+          "n": 0
+        },
+        "DISCLOSE_minus_ASSERT": {
+          "n_pairs": 17,
+          "both_success": 15,
+          "a_only": 0,
+          "b_only": 1,
+          "both_fail": 1,
+          "p_value": 1.0,
+          "diff": -0.058823529411764705,
+          "diff_ci_low": -0.17647058823529413,
+          "diff_ci_high": 0.0,
+          "p_holm": 1.0
+        }
+      },
+      "read": "indeterminate",
+      "n_common": 0
+    },
+    "webjudge_gpt-5.4-mini": {
+      "contrasts": {
+        "VERBOSE_CONF_minus_ASSERT": {
+          "n": 0
+        },
+        "VERBOSE_CONF_minus_DISCLOSE": {
+          "n": 0
+        },
+        "DISCLOSE_minus_ASSERT": {
+          "n_pairs": 17,
+          "both_success": 13,
+          "a_only": 1,
+          "b_only": 2,
+          "both_fail": 1,
+          "p_value": 1.0,
+          "diff": -0.058823529411764705,
+          "diff_ci_low": -0.23529411764705882,
+          "diff_ci_high": 0.11764705882352941,
+          "p_holm": 1.0
+        }
+      },
+      "read": "indeterminate",
+      "n_common": 0
+    }
+  },
+  "n_parseable_verdicts": 80,
+  "deviation": [
+    "NO_IMAGES"
+  ],
+  "two_unnamed_h1_conditions": "not_run_artifact_absent",
+  "status_correction": {
+    "gemini-1.5-pro": "The runner first recorded ran because a credential was present. All 12 key-point calls returned HTTP 404 (models/gemini-1.5-pro is not found). No outcome verdict was requested. The label above matches the log."
+  }
+}

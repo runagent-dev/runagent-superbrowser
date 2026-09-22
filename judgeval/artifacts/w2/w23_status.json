@@ -1,0 +1,11 @@
+{
+  "label": "PROSPECTIVE",
+  "h2_label": "RETROSPECTIVE",
+  "adaptive87_run_dirs": [],
+  "summary_run_dirs": [],
+  "n_runs": 0,
+  "kappa_adaptive87": null,
+  "kappa_summary": null,
+  "reason": "run directories absent; trajectories were not synthesized",
+  "annotator_columns_filled": false
+}

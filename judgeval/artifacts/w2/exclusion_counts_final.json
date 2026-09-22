@@ -1,0 +1,14 @@
+{
+  "exclusion_sha256": "a57112d4c0b10530447128b3f9e17aabed289fcc5257b99e2062db36368c94c1",
+  "counts": {
+    "claim_gate_fail": 18,
+    "length_gate_fail": 19,
+    "rewriter_error": 0,
+    "no_target": 7,
+    "human_sample_n": 19,
+    "human_sample_labeled": 0,
+    "human_agreement": null,
+    "unparseable_judge_outputs": 40
+  },
+  "unparseable_judge_outputs": 40
+}

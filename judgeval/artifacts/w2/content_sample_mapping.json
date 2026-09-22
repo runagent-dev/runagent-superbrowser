@@ -1,0 +1,116 @@
+[
+  {
+    "sample_id": "S-0001",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "ASSERT",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0002",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "ASSERT",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0003",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "ASSERT",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0004",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "DISCLOSE",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0005",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "DISCLOSE",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0006",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "DISCLOSE",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0007",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "FORMAT_PROSE",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0008",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "VERBOSE_CONF",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0009",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "VERBOSE_CONF",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0010",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "VERBOSE_CONF",
+    "source_arm": "full_history"
+  },
+  {
+    "sample_id": "S-0011",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "ASSERT",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0012",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "ASSERT",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0013",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:ledger",
+    "condition": "ASSERT",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0014",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "DISCLOSE",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0015",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "DISCLOSE",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0016",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:ledger",
+    "condition": "DISCLOSE",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0017",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "FORMAT_PROSE",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0018",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "VERBOSE_CONF",
+    "source_arm": "ledger"
+  },
+  {
+    "sample_id": "S-0019",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:ledger",
+    "condition": "VERBOSE_CONF",
+    "source_arm": "ledger"
+  }
+]

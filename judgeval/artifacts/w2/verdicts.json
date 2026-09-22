@@ -1,0 +1,1002 @@
+[
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "ASSERT",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "ASSERT",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "ASSERT",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "ASSERT",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "failure"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "871e7771cecb989972f138ecc373107b:ledger",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "a11ecdff735b51372d536c866011af6f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "a11ecdff735b51372d536c866011af6f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:full_history",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "ASSERT",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "23204728192da9f73197a613d9681c18:full_history",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:ledger",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "95cad96f2e43f3c0d8efad1331c77c8c:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "95cad96f2e43f3c0d8efad1331c77c8c",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "ASSERT",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "ASSERT",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "ASSERT",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "871e7771cecb989972f138ecc373107b:full_history",
+    "condition": "ASSERT",
+    "task_id": "871e7771cecb989972f138ecc373107b",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:full_history",
+    "condition": "ASSERT",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "ASSERT",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:ledger",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "bbbc243b4f18a7a897f0bc84e11d293f:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "bbbc243b4f18a7a897f0bc84e11d293f",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "d71be72aa25c3eab8eea47a0e60382e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "d71be72aa25c3eab8eea47a0e60382e2",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:full_history",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "c521933dad9c0ef9f1dfa2f38b8e4405:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "c521933dad9c0ef9f1dfa2f38b8e4405",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "23204728192da9f73197a613d9681c18:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "23204728192da9f73197a613d9681c18",
+    "source_arm": "ledger",
+    "status": "failure"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "bb314cb80f0f8489135cbf59074d11e2:ledger",
+    "condition": "ASSERT",
+    "task_id": "bb314cb80f0f8489135cbf59074d11e2",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "b6d10e9bd19b4009a02dea0e98f4e1ae:full_history",
+    "condition": "ASSERT",
+    "task_id": "b6d10e9bd19b4009a02dea0e98f4e1ae",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "webjudge_gpt-5.4-mini",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "success"
+  },
+  {
+    "judge_id": "gpt-4o",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "success"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "DISCLOSE",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "733f1d8bf79d5bc2240c5357f928ffff:full_history",
+    "condition": "ASSERT",
+    "task_id": "733f1d8bf79d5bc2240c5357f928ffff",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "26810ed9c123a62992e3eed31db3c5ee:ledger",
+    "condition": "ASSERT",
+    "task_id": "26810ed9c123a62992e3eed31db3c5ee",
+    "source_arm": "ledger",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  },
+  {
+    "judge_id": "gemini-1.5-pro",
+    "unit_id": "c8c1ff115879b3afd14280beb1559b13:full_history",
+    "condition": "DISCLOSE",
+    "task_id": "c8c1ff115879b3afd14280beb1559b13",
+    "source_arm": "full_history",
+    "status": "unparseable",
+    "reason": "no_key_points"
+  }
+]

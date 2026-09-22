@@ -51,6 +51,9 @@ eval/**/__pycache__/
 # the global *.jsonl rule above must not hide the frozen benchmark task files
 !eval/benchmarks/*.jsonl
 !eval/tests/fixtures/**/*.jsonl
+# W2 judge and rewriter calls are the prospective record. The global *.jsonl
+# rule would drop them.
+!judgeval/logs/*.jsonl
 # Web console build artifacts
 console/node_modules/
 console/dist/
