@@ -6,6 +6,8 @@ import json
 import os
 import random
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,14 +49,19 @@ def _scrub(obj):
     return obj
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(_scrub(record), ensure_ascii=False) + "\n"
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-    try:
-        os.write(fd, line.encode())
-    finally:
-        os.close(fd)
+    data = line.encode()
+    with _LOG_LOCK:
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
 
 
 def _expand(vals: dict, *names: str) -> str:
@@ -150,29 +157,40 @@ def shuffled_triples(triples: list[tuple], seed: int = SEED) -> list[tuple]:
 
 
 def _chat(client, model: str, messages: list[dict], *, allow_temperature_retry: bool):
-    """One completion. Seed is dropped on rejection. Temperature is dropped only for judges."""
-    kwargs: dict = {"model": model, "messages": messages, "temperature": 0, "seed": SEED}
+    """One completion.
+
+    Seed is sent once and dropped if the endpoint rejects the field. A completion
+    cap is sent so a thinking model returns instead of holding the socket open;
+    it is dropped if the endpoint rejects the field. Temperature is dropped only
+    for judges, and only once.
+    """
+    kwargs: dict = {"model": model, "messages": messages, "temperature": 0,
+                    "seed": SEED, "max_completion_tokens": 8192}
     seed_sent = True
     retry = False
-    try:
-        return client.chat.completions.create(**kwargs), seed_sent, retry, kwargs
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "seed" in msg:
-            seed_sent = False
-            kwargs.pop("seed", None)
-            try:
-                return client.chat.completions.create(**kwargs), seed_sent, retry, kwargs
-            except Exception as exc2:
-                exc = exc2
-                msg = str(exc).lower()
-        if allow_temperature_retry and any(k in msg for k in ("temperature", "unsupported", "not supported")):
-            retry = True
-            kwargs.pop("temperature", None)
-            kwargs.pop("seed", None)
-            seed_sent = False
+    dropped_seed = False
+    dropped_cap = False
+    while True:
+        try:
             return client.chat.completions.create(**kwargs), seed_sent, retry, kwargs
-        raise
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "seed" in msg and not dropped_seed:
+                dropped_seed = True
+                seed_sent = False
+                kwargs.pop("seed", None)
+                continue
+            if "max_completion_tokens" in msg and not dropped_cap:
+                dropped_cap = True
+                kwargs.pop("max_completion_tokens", None)
+                continue
+            if allow_temperature_retry and not retry and any(
+                k in msg for k in ("temperature", "unsupported", "not supported")
+            ):
+                retry = True
+                kwargs.pop("temperature", None)
+                continue
+            raise
 
 
 def _snapshot(resp) -> str:
@@ -200,7 +218,7 @@ def _log_call(log_path: Path, *, kind: str, messages, content: str, model: str, 
 
 def _client(key: str, base: str | None):
     from openai import OpenAI
-    kwargs = {"api_key": key}
+    kwargs = {"api_key": key, "timeout": 120}
     if base:
         kwargs["base_url"] = base
     return OpenAI(**kwargs)
@@ -215,7 +233,6 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                  key: str, base: str) -> list[dict]:
     client = _client(key, base)
     format_ids = set(plan_format_ids(verify_plan_frozen(root)))
-    rows: list[dict] = []
 
     def one(unit: dict, condition: str, template: str, target: int | None, failure: dict | None, attempt: int):
         instruction = fill_instruction(template, target)
@@ -241,12 +258,14 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                          "deviation": [], "source_arm": unit["source_arm"], "task_id": unit["task_id"]})
         return content
 
-    for unit in units:
+    def rewrite_unit(unit: dict) -> list[dict]:
+        print(f"rewrite {unit['unit_id']}", flush=True)
         produced: dict[str, str] = {}
+        out_rows: list[dict] = []
         for condition in ("ASSERT", "DISCLOSE"):
             text = one(unit, condition, templates[condition], None, None, 0)
             if text is None:
-                rows.append({**_public_unit(unit), "condition": condition, "text": None, "error": True})
+                out_rows.append({**_public_unit(unit), "condition": condition, "text": None, "error": True})
                 continue
             diff = claim_diff(unit["source_report"], text)
             if not diff["equal"]:
@@ -254,16 +273,16 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                 if repaired is not None:
                     text = repaired
             produced[condition] = text
-            rows.append({**_public_unit(unit), "condition": condition, "text": text, "error": False})
+            out_rows.append({**_public_unit(unit), "condition": condition, "text": text, "error": False})
         disclose = produced.get("DISCLOSE")
         if disclose is None:
-            rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": None,
-                         "error": True, "reason": "no_disclose_target"})
+            out_rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": None,
+                             "error": True, "reason": "no_disclose_target"})
         else:
             disclose_diff = claim_diff(unit["source_report"], disclose)
             if not disclose_diff["equal"]:
-                rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": None,
-                             "error": True, "reason": "no_disclose_target"})
+                out_rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": None,
+                                 "error": True, "reason": "no_disclose_target"})
             else:
                 target = token_count(disclose)
                 text = one(unit, "VERBOSE_CONF", templates["VERBOSE_CONF"], target, None, 0)
@@ -277,10 +296,10 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                         repaired = one(unit, "VERBOSE_CONF", templates["VERBOSE_CONF"], target, failure, 1)
                         if repaired is not None:
                             text = repaired
-                rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": text,
-                             "error": text is None, "length_target": target})
+                out_rows.append({**_public_unit(unit), "condition": "VERBOSE_CONF", "text": text,
+                                 "error": text is None, "length_target": target})
         if unit["task_id"] not in format_ids:
-            continue
+            return out_rows
         prose_target = token_count(unit["source_report"])
         prose = one(unit, "FORMAT_PROSE", templates["FORMAT_PROSE"], prose_target, None, 0)
         if prose is not None:
@@ -293,15 +312,15 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                 repaired = one(unit, "FORMAT_PROSE", templates["FORMAT_PROSE"], prose_target, failure, 1)
                 if repaired is not None:
                     prose = repaired
-        rows.append({**_public_unit(unit), "condition": "FORMAT_PROSE", "text": prose, "error": prose is None})
+        out_rows.append({**_public_unit(unit), "condition": "FORMAT_PROSE", "text": prose, "error": prose is None})
         prose_ok = False
         if prose is not None:
             prose_diff = claim_diff(unit["source_report"], prose)
             prose_ok = prose_diff["equal"] and in_band(token_count(prose), prose_target)
         if not prose_ok:
-            rows.append({**_public_unit(unit), "condition": "FORMAT_BULLETS", "text": None,
-                         "error": True, "reason": "no_prose_target"})
-            continue
+            out_rows.append({**_public_unit(unit), "condition": "FORMAT_BULLETS", "text": None,
+                             "error": True, "reason": "no_prose_target"})
+            return out_rows
         bullet_target = token_count(prose)
         bullets = one(unit, "FORMAT_BULLETS", templates["FORMAT_BULLETS"], bullet_target, None, 0)
         if bullets is not None:
@@ -314,8 +333,13 @@ def run_rewrites(root: Path, units: list[dict], templates: dict[str, str], log_p
                 repaired = one(unit, "FORMAT_BULLETS", templates["FORMAT_BULLETS"], bullet_target, failure, 1)
                 if repaired is not None:
                     bullets = repaired
-        rows.append({**_public_unit(unit), "condition": "FORMAT_BULLETS", "text": bullets, "error": bullets is None})
-    return rows
+        out_rows.append({**_public_unit(unit), "condition": "FORMAT_BULLETS", "text": bullets,
+                         "error": bullets is None})
+        return out_rows
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        batches = list(pool.map(rewrite_unit, units))
+    return [row for batch in batches for row in batch]
 
 
 def _public_unit(unit: dict) -> dict:
@@ -627,7 +651,9 @@ def main() -> None:
                         key_points[(spec["judge_id"], task_id)] = None
                         break
                     key_points[(spec["judge_id"], task_id)] = None
-        for unit_id, condition, judge_id in order:
+        for n_call, (unit_id, condition, judge_id) in enumerate(order, start=1):
+            if n_call == 1 or n_call % 10 == 0:
+                print(f"judge {n_call}/{len(order)} {judge_id} {condition}", flush=True)
             if arm_status.get(judge_id) == "not_run_no_credential":
                 continue
             row = text_by[(unit_id, condition)]
