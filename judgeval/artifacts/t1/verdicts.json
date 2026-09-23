@@ -1,0 +1,3098 @@
+[
+  {
+    "stimulus_id": "fixture_iframe_multquiz__baseline_nanobrowser__ASSERT",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__superbrowser__ASSERT",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__superbrowser__ORIGINAL",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__superbrowser__DISCLOSE",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__baseline_nanobrowser__ORIGINAL",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__superbrowser__HEDGED",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__baseline_nanobrowser__DISCLOSE",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_iframe_multquiz__baseline_nanobrowser__HEDGED",
+    "task_id": "fixture_iframe_multquiz",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__superbrowser__HEDGED",
+    "task_id": "fixture_slider_401k",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__superbrowser__ORIGINAL",
+    "task_id": "fixture_slider_401k",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__superbrowser__DISCLOSE",
+    "task_id": "fixture_slider_401k",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__superbrowser__ASSERT",
+    "task_id": "fixture_slider_401k",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__baseline_nanobrowser__ASSERT",
+    "task_id": "fixture_slider_401k",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__baseline_nanobrowser__ORIGINAL",
+    "task_id": "fixture_slider_401k",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__superbrowser__ORIGINAL",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__baseline_nanobrowser__DISCLOSE",
+    "task_id": "fixture_slider_401k",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__superbrowser__ASSERT",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_slider_401k__baseline_nanobrowser__HEDGED",
+    "task_id": "fixture_slider_401k",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__superbrowser__DISCLOSE",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__baseline_nanobrowser__ORIGINAL",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__superbrowser__HEDGED",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__baseline_nanobrowser__ASSERT",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__baseline_nanobrowser__HEDGED",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "fixture_dragdrop_chess__baseline_nanobrowser__DISCLOSE",
+    "task_id": "fixture_dragdrop_chess",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_01",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_01",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__superbrowser__ASSERT",
+    "task_id": "bu_obj_01",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_01",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__superbrowser__HEDGED",
+    "task_id": "bu_obj_01",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_01",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_01",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_01__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_01",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__superbrowser__ASSERT",
+    "task_id": "bu_obj_02",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_02",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_02",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_02",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__superbrowser__HEDGED",
+    "task_id": "bu_obj_02",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_02",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_02",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_03",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_02__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_02",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__superbrowser__ASSERT",
+    "task_id": "bu_obj_03",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_03",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_03",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__superbrowser__HEDGED",
+    "task_id": "bu_obj_03",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_03",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_03",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_03__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_03",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_04",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__superbrowser__ASSERT",
+    "task_id": "bu_obj_04",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_04",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__superbrowser__HEDGED",
+    "task_id": "bu_obj_04",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_04",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_04",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_04",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_04__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_04",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_05",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_05",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_05",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__superbrowser__ASSERT",
+    "task_id": "bu_obj_05",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__superbrowser__HEDGED",
+    "task_id": "bu_obj_05",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_05",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_05",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_06",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_05__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_05",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_06",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__superbrowser__ASSERT",
+    "task_id": "bu_obj_06",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__superbrowser__HEDGED",
+    "task_id": "bu_obj_06",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_06",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_06",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_06",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_06__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_06",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_07",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_07",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__superbrowser__ASSERT",
+    "task_id": "bu_obj_07",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__superbrowser__HEDGED",
+    "task_id": "bu_obj_07",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_07",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_07",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_07",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_08",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_07__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_07",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__superbrowser__ASSERT",
+    "task_id": "bu_obj_08",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_08",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__superbrowser__HEDGED",
+    "task_id": "bu_obj_08",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_08",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_08",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_08",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_08__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_08",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__superbrowser__HEDGED",
+    "task_id": "bu_obj_09",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__superbrowser__ASSERT",
+    "task_id": "bu_obj_09",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_09",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_09",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_09",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_09",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_09",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_09__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_09",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_10",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__superbrowser__ASSERT",
+    "task_id": "bu_obj_10",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__superbrowser__HEDGED",
+    "task_id": "bu_obj_10",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_10",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_10",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_10",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_10",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_10__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_10",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_11",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__superbrowser__ASSERT",
+    "task_id": "bu_obj_11",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_11",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__superbrowser__HEDGED",
+    "task_id": "bu_obj_11",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_11",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_11",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_11",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_11__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_11",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_12",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_12",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__superbrowser__HEDGED",
+    "task_id": "bu_obj_12",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_12",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__superbrowser__ASSERT",
+    "task_id": "bu_obj_12",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_12",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_12",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_13",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_12__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_12",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__superbrowser__ASSERT",
+    "task_id": "bu_obj_13",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_13",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__superbrowser__HEDGED",
+    "task_id": "bu_obj_13",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_13",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_13",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_14",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_13",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_13__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_13",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__superbrowser__ASSERT",
+    "task_id": "bu_obj_14",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__superbrowser__HEDGED",
+    "task_id": "bu_obj_14",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_14",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_14",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_14",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_14",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_14__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_14",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_15",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_15",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__superbrowser__ASSERT",
+    "task_id": "bu_obj_15",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_15",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__superbrowser__HEDGED",
+    "task_id": "bu_obj_15",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_15",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_15",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_16",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_15__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_15",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_16",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__superbrowser__ASSERT",
+    "task_id": "bu_obj_16",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__superbrowser__HEDGED",
+    "task_id": "bu_obj_16",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_16",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_16",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_17",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_16",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_16__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_16",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_17",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__superbrowser__ASSERT",
+    "task_id": "bu_obj_17",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_17",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__superbrowser__HEDGED",
+    "task_id": "bu_obj_17",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_17",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_18",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_17",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_17__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_17",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__superbrowser__ASSERT",
+    "task_id": "bu_obj_18",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__superbrowser__HEDGED",
+    "task_id": "bu_obj_18",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_18",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_18",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_18",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_18",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_18__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_18",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_19",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__superbrowser__ASSERT",
+    "task_id": "bu_obj_19",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_19",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_19",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_19",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__superbrowser__HEDGED",
+    "task_id": "bu_obj_19",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_19",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_19__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_19",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_20",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__superbrowser__ASSERT",
+    "task_id": "bu_obj_20",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_20",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_20",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_20",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_20",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_20",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_20__superbrowser__HEDGED",
+    "task_id": "bu_obj_20",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__superbrowser__ASSERT",
+    "task_id": "bu_obj_21",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_21",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__superbrowser__HEDGED",
+    "task_id": "bu_obj_21",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_21",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_21",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_21",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_21",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_21__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_21",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_22",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__superbrowser__HEDGED",
+    "task_id": "bu_obj_22",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_22",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__superbrowser__ASSERT",
+    "task_id": "bu_obj_22",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_22",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_22",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_23",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__superbrowser__ASSERT",
+    "task_id": "bu_obj_23",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_22",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_22__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_22",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_23",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__superbrowser__HEDGED",
+    "task_id": "bu_obj_23",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_23",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_23",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_23",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_24",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_23__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_23",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_24",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__superbrowser__HEDGED",
+    "task_id": "bu_obj_24",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__superbrowser__ASSERT",
+    "task_id": "bu_obj_24",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_24",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_24",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_25",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_24",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_25",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_24__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_24",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__superbrowser__ASSERT",
+    "task_id": "bu_obj_25",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__superbrowser__HEDGED",
+    "task_id": "bu_obj_25",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_25",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_25",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_25",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_25__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_25",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_26",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__superbrowser__ASSERT",
+    "task_id": "bu_obj_26",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__superbrowser__HEDGED",
+    "task_id": "bu_obj_26",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_26",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_26",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_26",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_26",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_26__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_26",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__superbrowser__ASSERT",
+    "task_id": "bu_obj_27",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__superbrowser__HEDGED",
+    "task_id": "bu_obj_27",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_27",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_27",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_27",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_27",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_27",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__superbrowser__ASSERT",
+    "task_id": "bu_obj_28",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_27__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_27",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_28",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__superbrowser__HEDGED",
+    "task_id": "bu_obj_28",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_28",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_28",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_28",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_28",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_28__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_28",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_29",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__superbrowser__ASSERT",
+    "task_id": "bu_obj_29",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_29",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_29",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__superbrowser__HEDGED",
+    "task_id": "bu_obj_29",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_29",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_29",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_29__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_29",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_30",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__superbrowser__ASSERT",
+    "task_id": "bu_obj_30",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_30",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__superbrowser__HEDGED",
+    "task_id": "bu_obj_30",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_30",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_30",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_30",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_31",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__superbrowser__ASSERT",
+    "task_id": "bu_obj_31",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_31",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__superbrowser__HEDGED",
+    "task_id": "bu_obj_31",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_31",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_30__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_30",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_31",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_31",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_32",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_31__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_31",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_32",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__superbrowser__ASSERT",
+    "task_id": "bu_obj_32",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_32",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__superbrowser__HEDGED",
+    "task_id": "bu_obj_32",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_32",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_32",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_32__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_32",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_33",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__superbrowser__ASSERT",
+    "task_id": "bu_obj_33",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__superbrowser__HEDGED",
+    "task_id": "bu_obj_33",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_33",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_33",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_33",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_33",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_33__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_33",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_34",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_34",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__superbrowser__HEDGED",
+    "task_id": "bu_obj_34",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_34",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__superbrowser__ASSERT",
+    "task_id": "bu_obj_34",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_34",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_34",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_34__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_34",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_35",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__superbrowser__ASSERT",
+    "task_id": "bu_obj_35",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__superbrowser__HEDGED",
+    "task_id": "bu_obj_35",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_35",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_35",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_35",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_35",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_35__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_35",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_36",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_36",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__superbrowser__ASSERT",
+    "task_id": "bu_obj_36",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__superbrowser__HEDGED",
+    "task_id": "bu_obj_36",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_36",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_36",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_36",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_36__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_36",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_37",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__superbrowser__ASSERT",
+    "task_id": "bu_obj_37",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_37",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_37",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__superbrowser__HEDGED",
+    "task_id": "bu_obj_37",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_37",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_38",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_37",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__superbrowser__ASSERT",
+    "task_id": "bu_obj_38",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_37__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_37",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_38",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__superbrowser__HEDGED",
+    "task_id": "bu_obj_38",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_38",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_39",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_38",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_38",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_38__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_38",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": false,
+    "status": "failure",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__superbrowser__ASSERT",
+    "task_id": "bu_obj_39",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_39",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_39",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_39",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_39",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_39",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_39__superbrowser__HEDGED",
+    "task_id": "bu_obj_39",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__superbrowser__ASSERT",
+    "task_id": "bu_obj_40",
+    "harness": "superbrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__superbrowser__ORIGINAL",
+    "task_id": "bu_obj_40",
+    "harness": "superbrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__superbrowser__DISCLOSE",
+    "task_id": "bu_obj_40",
+    "harness": "superbrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__baseline_nanobrowser__ORIGINAL",
+    "task_id": "bu_obj_40",
+    "harness": "baseline_nanobrowser",
+    "condition": "ORIGINAL",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__superbrowser__HEDGED",
+    "task_id": "bu_obj_40",
+    "harness": "superbrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__baseline_nanobrowser__ASSERT",
+    "task_id": "bu_obj_40",
+    "harness": "baseline_nanobrowser",
+    "condition": "ASSERT",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__baseline_nanobrowser__DISCLOSE",
+    "task_id": "bu_obj_40",
+    "harness": "baseline_nanobrowser",
+    "condition": "DISCLOSE",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  },
+  {
+    "stimulus_id": "bu_obj_40__baseline_nanobrowser__HEDGED",
+    "task_id": "bu_obj_40",
+    "harness": "baseline_nanobrowser",
+    "condition": "HEDGED",
+    "y_star": true,
+    "status": "success",
+    "model_id": "gpt-5.4-mini"
+  }
+]
